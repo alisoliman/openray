@@ -1,0 +1,400 @@
+// !$*UTF8*$!
+{
+	archiveVersion = 1;
+	classes = {
+	};
+	objectVersion = 77;
+	objects = {
+
+/* Begin PBXBuildFile section */
+		19E14B999AE3E147677EF06D /* OpenRayApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = C9A8592F64173141E0307EFF /* OpenRayApp.swift */; };
+		2BD00E669ED00D09252BF054 /* WelcomeContentTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 29CB4FB6D0F48565782195AB /* WelcomeContentTests.swift */; };
+		739D067FD62DA396EECE21E2 /* WelcomeContent.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3570B08F95223D41B5BE996D /* WelcomeContent.swift */; };
+		DEE530D51662F408BC3A88A0 /* ContentView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5AE2D610C9A81A325CEE6F58 /* ContentView.swift */; };
+/* End PBXBuildFile section */
+
+/* Begin PBXContainerItemProxy section */
+		4B014C1C88E4BA0BB349CBE1 /* PBXContainerItemProxy */ = {
+			isa = PBXContainerItemProxy;
+			containerPortal = 88CF8FB9EFB88248FC7DC1CA /* Project object */;
+			proxyType = 1;
+			remoteGlobalIDString = 92BB017D89D97B317240159F;
+			remoteInfo = OpenRay;
+		};
+/* End PBXContainerItemProxy section */
+
+/* Begin PBXFileReference section */
+		29CB4FB6D0F48565782195AB /* WelcomeContentTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WelcomeContentTests.swift; sourceTree = "<group>"; };
+		3570B08F95223D41B5BE996D /* WelcomeContent.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WelcomeContent.swift; sourceTree = "<group>"; };
+		5AE2D610C9A81A325CEE6F58 /* ContentView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ContentView.swift; sourceTree = "<group>"; };
+		79EACC1230FEC6871832B623 /* OpenRay.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = OpenRay.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		C9A8592F64173141E0307EFF /* OpenRayApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = OpenRayApp.swift; sourceTree = "<group>"; };
+		EFE29DE9FF8D6F143313CE22 /* OpenRayTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = OpenRayTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
+		FDD6E681C107B2DC09AD562D /* .gitkeep */ = {isa = PBXFileReference; path = .gitkeep; sourceTree = "<group>"; };
+/* End PBXFileReference section */
+
+/* Begin PBXGroup section */
+		180324BA73424DCD55A47405 /* OpenRayTests */ = {
+			isa = PBXGroup;
+			children = (
+				29CB4FB6D0F48565782195AB /* WelcomeContentTests.swift */,
+			);
+			path = OpenRayTests;
+			sourceTree = "<group>";
+		};
+		2D36EE2379A75CE3A67BC767 = {
+			isa = PBXGroup;
+			children = (
+				DFF66B57437D55320A0C6416 /* OpenRay */,
+				180324BA73424DCD55A47405 /* OpenRayTests */,
+				D02F4BEE153FC6B142D5832B /* Products */,
+			);
+			sourceTree = "<group>";
+		};
+		D02F4BEE153FC6B142D5832B /* Products */ = {
+			isa = PBXGroup;
+			children = (
+				79EACC1230FEC6871832B623 /* OpenRay.app */,
+				EFE29DE9FF8D6F143313CE22 /* OpenRayTests.xctest */,
+			);
+			name = Products;
+			sourceTree = "<group>";
+		};
+		DFF66B57437D55320A0C6416 /* OpenRay */ = {
+			isa = PBXGroup;
+			children = (
+				FDD6E681C107B2DC09AD562D /* .gitkeep */,
+				5AE2D610C9A81A325CEE6F58 /* ContentView.swift */,
+				C9A8592F64173141E0307EFF /* OpenRayApp.swift */,
+				3570B08F95223D41B5BE996D /* WelcomeContent.swift */,
+			);
+			path = OpenRay;
+			sourceTree = "<group>";
+		};
+/* End PBXGroup section */
+
+/* Begin PBXNativeTarget section */
+		92BB017D89D97B317240159F /* OpenRay */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = 8152F08B13A41AC33670BA00 /* Build configuration list for PBXNativeTarget "OpenRay" */;
+			buildPhases = (
+				45B10C768149D17E5924653E /* Sources */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+			);
+			name = OpenRay;
+			packageProductDependencies = (
+			);
+			productName = OpenRay;
+			productReference = 79EACC1230FEC6871832B623 /* OpenRay.app */;
+			productType = "com.apple.product-type.application";
+		};
+		D7C36FA99C41FA22084C32FE /* OpenRayTests */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = 4EDBA116F5601C3C1291355A /* Build configuration list for PBXNativeTarget "OpenRayTests" */;
+			buildPhases = (
+				8A3234E432090BD97D95F6BD /* Sources */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+				91821A1CF2D142B3594F4B6B /* PBXTargetDependency */,
+			);
+			name = OpenRayTests;
+			packageProductDependencies = (
+			);
+			productName = OpenRayTests;
+			productReference = EFE29DE9FF8D6F143313CE22 /* OpenRayTests.xctest */;
+			productType = "com.apple.product-type.bundle.unit-test";
+		};
+/* End PBXNativeTarget section */
+
+/* Begin PBXProject section */
+		88CF8FB9EFB88248FC7DC1CA /* Project object */ = {
+			isa = PBXProject;
+			attributes = {
+				BuildIndependentTargetsInParallel = YES;
+				LastUpgradeCheck = 1430;
+				TargetAttributes = {
+					92BB017D89D97B317240159F = {
+						ProvisioningStyle = Automatic;
+					};
+				};
+			};
+			buildConfigurationList = 90B0D473F8FB7F60D2E9A0A5 /* Build configuration list for PBXProject "OpenRay" */;
+			developmentRegion = en;
+			hasScannedForEncodings = 0;
+			knownRegions = (
+				Base,
+				en,
+			);
+			mainGroup = 2D36EE2379A75CE3A67BC767;
+			minimizedProjectReferenceProxies = 1;
+			preferredProjectObjectVersion = 77;
+			productRefGroup = D02F4BEE153FC6B142D5832B /* Products */;
+			projectDirPath = "";
+			projectRoot = "";
+			targets = (
+				92BB017D89D97B317240159F /* OpenRay */,
+				D7C36FA99C41FA22084C32FE /* OpenRayTests */,
+			);
+		};
+/* End PBXProject section */
+
+/* Begin PBXSourcesBuildPhase section */
+		45B10C768149D17E5924653E /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				DEE530D51662F408BC3A88A0 /* ContentView.swift in Sources */,
+				19E14B999AE3E147677EF06D /* OpenRayApp.swift in Sources */,
+				739D067FD62DA396EECE21E2 /* WelcomeContent.swift in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		8A3234E432090BD97D95F6BD /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				2BD00E669ED00D09252BF054 /* WelcomeContentTests.swift in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXSourcesBuildPhase section */
+
+/* Begin PBXTargetDependency section */
+		91821A1CF2D142B3594F4B6B /* PBXTargetDependency */ = {
+			isa = PBXTargetDependency;
+			target = 92BB017D89D97B317240159F /* OpenRay */;
+			targetProxy = 4B014C1C88E4BA0BB349CBE1 /* PBXContainerItemProxy */;
+		};
+/* End PBXTargetDependency section */
+
+/* Begin XCBuildConfiguration section */
+		1093688B8E7D1CE2ECE468FE /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				BUNDLE_LOADER = "$(TEST_HOST)";
+				COMBINE_HIDPI_IMAGES = YES;
+				GENERATE_INFOPLIST_FILE = YES;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/../Frameworks",
+					"@loader_path/../Frameworks",
+				);
+				PRODUCT_BUNDLE_IDENTIFIER = com.alisoliman.openray.tests;
+				SDKROOT = macosx;
+				TEST_HOST = "$(BUILT_PRODUCTS_DIR)/OpenRay.app/Contents/MacOS/OpenRay";
+			};
+			name = Release;
+		};
+		3E5546C7882FC0D5BC0C7C49 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				CODE_SIGN_STYLE = Automatic;
+				COMBINE_HIDPI_IMAGES = YES;
+				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.productivity";
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/../Frameworks",
+				);
+				PRODUCT_BUNDLE_IDENTIFIER = com.alisoliman.openray;
+				PRODUCT_NAME = OpenRay;
+				SDKROOT = macosx;
+			};
+			name = Debug;
+		};
+		671E09EB00BE90742649D47A /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				CLANG_ANALYZER_NONNULL = YES;
+				CLANG_ANALYZER_NUMBER_OBJECT_CONVERSION = YES_AGGRESSIVE;
+				CLANG_CXX_LANGUAGE_STANDARD = "gnu++14";
+				CLANG_CXX_LIBRARY = "libc++";
+				CLANG_ENABLE_MODULES = YES;
+				CLANG_ENABLE_OBJC_ARC = YES;
+				CLANG_ENABLE_OBJC_WEAK = YES;
+				CLANG_WARN_BLOCK_CAPTURE_AUTORELEASING = YES;
+				CLANG_WARN_BOOL_CONVERSION = YES;
+				CLANG_WARN_COMMA = YES;
+				CLANG_WARN_CONSTANT_CONVERSION = YES;
+				CLANG_WARN_DEPRECATED_OBJC_IMPLEMENTATIONS = YES;
+				CLANG_WARN_DIRECT_OBJC_ISA_USAGE = YES_ERROR;
+				CLANG_WARN_DOCUMENTATION_COMMENTS = YES;
+				CLANG_WARN_EMPTY_BODY = YES;
+				CLANG_WARN_ENUM_CONVERSION = YES;
+				CLANG_WARN_INFINITE_RECURSION = YES;
+				CLANG_WARN_INT_CONVERSION = YES;
+				CLANG_WARN_NON_LITERAL_NULL_CONVERSION = YES;
+				CLANG_WARN_OBJC_IMPLICIT_RETAIN_SELF = YES;
+				CLANG_WARN_OBJC_LITERAL_CONVERSION = YES;
+				CLANG_WARN_OBJC_ROOT_CLASS = YES_ERROR;
+				CLANG_WARN_QUOTED_INCLUDE_IN_FRAMEWORK_HEADER = YES;
+				CLANG_WARN_RANGE_LOOP_ANALYSIS = YES;
+				CLANG_WARN_STRICT_PROTOTYPES = YES;
+				CLANG_WARN_SUSPICIOUS_MOVE = YES;
+				CLANG_WARN_UNGUARDED_AVAILABILITY = YES_AGGRESSIVE;
+				CLANG_WARN_UNREACHABLE_CODE = YES;
+				CLANG_WARN__DUPLICATE_METHOD_MATCH = YES;
+				COPY_PHASE_STRIP = NO;
+				DEBUG_INFORMATION_FORMAT = dwarf;
+				ENABLE_STRICT_OBJC_MSGSEND = YES;
+				ENABLE_TESTABILITY = YES;
+				GCC_C_LANGUAGE_STANDARD = gnu11;
+				GCC_DYNAMIC_NO_PIC = NO;
+				GCC_NO_COMMON_BLOCKS = YES;
+				GCC_OPTIMIZATION_LEVEL = 0;
+				GCC_PREPROCESSOR_DEFINITIONS = (
+					"$(inherited)",
+					"DEBUG=1",
+				);
+				GCC_WARN_64_TO_32_BIT_CONVERSION = YES;
+				GCC_WARN_ABOUT_RETURN_TYPE = YES_ERROR;
+				GCC_WARN_UNDECLARED_SELECTOR = YES;
+				GCC_WARN_UNINITIALIZED_AUTOS = YES_AGGRESSIVE;
+				GCC_WARN_UNUSED_FUNCTION = YES;
+				GCC_WARN_UNUSED_VARIABLE = YES;
+				MACOSX_DEPLOYMENT_TARGET = 26.0;
+				MTL_ENABLE_DEBUG_INFO = INCLUDE_SOURCE;
+				MTL_FAST_MATH = YES;
+				ONLY_ACTIVE_ARCH = YES;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SDKROOT = macosx;
+				SUPPORTED_PLATFORMS = macosx;
+				SWIFT_ACTIVE_COMPILATION_CONDITIONS = DEBUG;
+				SWIFT_OPTIMIZATION_LEVEL = "-Onone";
+				SWIFT_VERSION = 6.0;
+			};
+			name = Debug;
+		};
+		8E508D866ACD7E41E68F8567 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				CLANG_ANALYZER_NONNULL = YES;
+				CLANG_ANALYZER_NUMBER_OBJECT_CONVERSION = YES_AGGRESSIVE;
+				CLANG_CXX_LANGUAGE_STANDARD = "gnu++14";
+				CLANG_CXX_LIBRARY = "libc++";
+				CLANG_ENABLE_MODULES = YES;
+				CLANG_ENABLE_OBJC_ARC = YES;
+				CLANG_ENABLE_OBJC_WEAK = YES;
+				CLANG_WARN_BLOCK_CAPTURE_AUTORELEASING = YES;
+				CLANG_WARN_BOOL_CONVERSION = YES;
+				CLANG_WARN_COMMA = YES;
+				CLANG_WARN_CONSTANT_CONVERSION = YES;
+				CLANG_WARN_DEPRECATED_OBJC_IMPLEMENTATIONS = YES;
+				CLANG_WARN_DIRECT_OBJC_ISA_USAGE = YES_ERROR;
+				CLANG_WARN_DOCUMENTATION_COMMENTS = YES;
+				CLANG_WARN_EMPTY_BODY = YES;
+				CLANG_WARN_ENUM_CONVERSION = YES;
+				CLANG_WARN_INFINITE_RECURSION = YES;
+				CLANG_WARN_INT_CONVERSION = YES;
+				CLANG_WARN_NON_LITERAL_NULL_CONVERSION = YES;
+				CLANG_WARN_OBJC_IMPLICIT_RETAIN_SELF = YES;
+				CLANG_WARN_OBJC_LITERAL_CONVERSION = YES;
+				CLANG_WARN_OBJC_ROOT_CLASS = YES_ERROR;
+				CLANG_WARN_QUOTED_INCLUDE_IN_FRAMEWORK_HEADER = YES;
+				CLANG_WARN_RANGE_LOOP_ANALYSIS = YES;
+				CLANG_WARN_STRICT_PROTOTYPES = YES;
+				CLANG_WARN_SUSPICIOUS_MOVE = YES;
+				CLANG_WARN_UNGUARDED_AVAILABILITY = YES_AGGRESSIVE;
+				CLANG_WARN_UNREACHABLE_CODE = YES;
+				CLANG_WARN__DUPLICATE_METHOD_MATCH = YES;
+				COPY_PHASE_STRIP = NO;
+				DEBUG_INFORMATION_FORMAT = "dwarf-with-dsym";
+				ENABLE_NS_ASSERTIONS = NO;
+				ENABLE_STRICT_OBJC_MSGSEND = YES;
+				GCC_C_LANGUAGE_STANDARD = gnu11;
+				GCC_NO_COMMON_BLOCKS = YES;
+				GCC_WARN_64_TO_32_BIT_CONVERSION = YES;
+				GCC_WARN_ABOUT_RETURN_TYPE = YES_ERROR;
+				GCC_WARN_UNDECLARED_SELECTOR = YES;
+				GCC_WARN_UNINITIALIZED_AUTOS = YES_AGGRESSIVE;
+				GCC_WARN_UNUSED_FUNCTION = YES;
+				GCC_WARN_UNUSED_VARIABLE = YES;
+				MACOSX_DEPLOYMENT_TARGET = 26.0;
+				MTL_ENABLE_DEBUG_INFO = NO;
+				MTL_FAST_MATH = YES;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SDKROOT = macosx;
+				SUPPORTED_PLATFORMS = macosx;
+				SWIFT_COMPILATION_MODE = wholemodule;
+				SWIFT_OPTIMIZATION_LEVEL = "-O";
+				SWIFT_VERSION = 6.0;
+			};
+			name = Release;
+		};
+		AE1EA838A70B009E4CDCF514 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				BUNDLE_LOADER = "$(TEST_HOST)";
+				COMBINE_HIDPI_IMAGES = YES;
+				GENERATE_INFOPLIST_FILE = YES;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/../Frameworks",
+					"@loader_path/../Frameworks",
+				);
+				PRODUCT_BUNDLE_IDENTIFIER = com.alisoliman.openray.tests;
+				SDKROOT = macosx;
+				TEST_HOST = "$(BUILT_PRODUCTS_DIR)/OpenRay.app/Contents/MacOS/OpenRay";
+			};
+			name = Debug;
+		};
+		C98C0111DFCA7BD04E33D531 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				CODE_SIGN_STYLE = Automatic;
+				COMBINE_HIDPI_IMAGES = YES;
+				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.productivity";
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/../Frameworks",
+				);
+				PRODUCT_BUNDLE_IDENTIFIER = com.alisoliman.openray;
+				PRODUCT_NAME = OpenRay;
+				SDKROOT = macosx;
+			};
+			name = Release;
+		};
+/* End XCBuildConfiguration section */
+
+/* Begin XCConfigurationList section */
+		4EDBA116F5601C3C1291355A /* Build configuration list for PBXNativeTarget "OpenRayTests" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				AE1EA838A70B009E4CDCF514 /* Debug */,
+				1093688B8E7D1CE2ECE468FE /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Debug;
+		};
+		8152F08B13A41AC33670BA00 /* Build configuration list for PBXNativeTarget "OpenRay" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				3E5546C7882FC0D5BC0C7C49 /* Debug */,
+				C98C0111DFCA7BD04E33D531 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Debug;
+		};
+		90B0D473F8FB7F60D2E9A0A5 /* Build configuration list for PBXProject "OpenRay" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				671E09EB00BE90742649D47A /* Debug */,
+				8E508D866ACD7E41E68F8567 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Debug;
+		};
+/* End XCConfigurationList section */
+	};
+	rootObject = 88CF8FB9EFB88248FC7DC1CA /* Project object */;
+}

@@ -1,0 +1,44 @@
+name: OpenRay
+options:
+  bundleIdPrefix: com.alisoliman
+  deploymentTarget:
+    macOS: "26.0"
+settings:
+  base:
+    SWIFT_VERSION: "6.0"
+    MACOSX_DEPLOYMENT_TARGET: "26.0"
+    SDKROOT: macosx
+    SUPPORTED_PLATFORMS: macosx
+targets:
+  OpenRay:
+    type: application
+    platform: macOS
+    sources:
+      - OpenRay
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.alisoliman.openray
+        PRODUCT_NAME: OpenRay
+        GENERATE_INFOPLIST_FILE: YES
+        INFOPLIST_KEY_LSApplicationCategoryType: public.app-category.productivity
+        CODE_SIGN_STYLE: Automatic
+  OpenRayTests:
+    type: bundle.unit-test
+    platform: macOS
+    sources:
+      - OpenRayTests
+    dependencies:
+      - target: OpenRay
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.alisoliman.openray.tests
+        GENERATE_INFOPLIST_FILE: YES
+schemes:
+  OpenRay:
+    build:
+      targets:
+        OpenRay: all
+        OpenRayTests: [test]
+    test:
+      targets:
+        - OpenRayTests
