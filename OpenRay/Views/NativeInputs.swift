@@ -60,6 +60,9 @@ struct LauncherSearchInput: NSViewRepresentable {
 
         @objc func submitted(_ sender: Any?) {
             if NSApp.currentEvent?.modifierFlags.contains(.command) == true { parent.paste() } else { parent.submit() }
+            if let field = sender as? NSTextField {
+                synchronizeQuery(in: field, editor: field.currentEditor() as? NSTextView)
+            }
         }
 
         func controlTextDidChange(_ notification: Notification) {
@@ -76,7 +79,19 @@ struct LauncherSearchInput: NSViewRepresentable {
                 submitted(control)
             default: return false
             }
+            if let field = control as? NSTextField { synchronizeQuery(in: field, editor: textView) }
             return true
+        }
+
+        private func synchronizeQuery(in field: NSTextField, editor: NSTextView?) {
+            // Navigation can replace the query before SwiftUI updates this view.
+            // Clear the live editor now so the next keystroke cannot restore stale text.
+            let query = parent.text
+            if field.stringValue != query { field.stringValue = query }
+            if let editor, editor.string != query {
+                editor.string = query
+                editor.setSelectedRange(NSRange(location: query.utf16.count, length: 0))
+            }
         }
     }
 }

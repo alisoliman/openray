@@ -6,6 +6,24 @@ import Testing
 
 @MainActor
 struct NativeInputTests {
+    @Test(arguments: [false, true]) func navigationClearsTheNativeEditorBeforeTheNextKeystroke(submitting: Bool) {
+        var query = "previous query"
+        let input = LauncherSearchInput(
+            text: Binding(get: { query }, set: { query = $0 }), placeholder: "Search", focusRequest: 0,
+            submit: { query = "" }, move: { _ in }, cancel: { query = "" }, paste: {})
+        let coordinator = input.makeCoordinator()
+        let field = FocusedSearchField()
+        coordinator.attach(to: field)
+        field.stringValue = query
+        let editor = NSTextView()
+        editor.string = query
+        let command = submitting ? #selector(NSResponder.insertNewline(_:)) : #selector(NSResponder.cancelOperation(_:))
+        #expect(coordinator.control(field, textView: editor, doCommandBy: command))
+        #expect(query.isEmpty)
+        #expect(field.stringValue.isEmpty)
+        #expect(editor.string.isEmpty)
+    }
+
     @Test func emptySearchHasANativeReturnActionWithoutRequiringTextEditing() {
         var submissions = 0
         let input = LauncherSearchInput(

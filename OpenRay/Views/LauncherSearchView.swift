@@ -73,7 +73,7 @@ struct LauncherSearchView: View {
                 ProgressView().controlSize(.small).accessibilityLabel("Searching")
             } else if !model.query.isEmpty {
                 Button("Clear search", systemImage: "xmark.circle.fill") { model.query = "" }
-                    .labelStyle(.iconOnly).buttonStyle(.plain).foregroundStyle(.tertiary)
+                    .labelStyle(.iconOnly).buttonStyle(.plain).foregroundStyle(.secondary)
             }
             Keycap(text: "esc")
         }.padding(.horizontal, 22).frame(height: 72)
@@ -105,8 +105,9 @@ struct LauncherSearchView: View {
             } else {
                 HStack(spacing: 5) {
                     Circle().fill(.green.opacity(0.8)).frame(width: 5, height: 5)
-                    Text("LOCAL & PRIVATE").font(.system(size: 9, weight: .semibold, design: .monospaced)).tracking(0.6)
-                }.foregroundStyle(.tertiary).accessibilityLabel("Local and private")
+                    Text("LOCAL & PRIVATE").font(.system(size: 11, weight: .semibold, design: .monospaced)).tracking(
+                        0.6)
+                }.foregroundStyle(.secondary).accessibilityLabel("Local and private")
             }
         }.padding(.horizontal, 18).frame(height: 44)
     }
@@ -142,7 +143,7 @@ struct LauncherSearchView: View {
                     }
                 }.buttonStyle(.borderedProminent).controlSize(.large)
                 Text("You can pause capture or delete your history at any time.")
-                    .font(.system(size: 11)).foregroundStyle(.tertiary).padding(.top, 13)
+                    .font(.system(size: 11)).foregroundStyle(.secondary).padding(.top, 13)
             }.frame(maxWidth: .infinity, maxHeight: .infinity)
         } else if groups.allSatisfy({ $0.items.isEmpty }) {
             emptyState
@@ -162,7 +163,7 @@ struct LauncherSearchView: View {
             ScrollView {
                 LazyVStack(alignment: .leading, spacing: 3) {
                     ForEach(groups) { group in
-                        Text(group.title).font(.system(size: 11, weight: .medium)).foregroundStyle(.tertiary)
+                        Text(group.title).font(.system(size: 11, weight: .medium)).foregroundStyle(.secondary)
                             .padding(.horizontal, 10).padding(.top, 9).padding(.bottom, 5)
                         ForEach(group.items) { item in resultRow(item, selected: item.id == selectedID).id(item.id) }
                     }
@@ -185,15 +186,15 @@ struct LauncherSearchView: View {
                     Text(item.subtitle).font(.system(size: 11)).foregroundStyle(.secondary).lineLimit(1)
                 }.frame(maxWidth: .infinity, alignment: .leading)
                 if model.store.database.favoriteIDs.contains(item.id) {
-                    Image(systemName: "star.fill").font(.system(size: 8)).foregroundStyle(.tertiary)
+                    Image(systemName: "star.fill").font(.system(size: 8)).foregroundStyle(.secondary)
                 }
-                Text(item.badge).font(.system(size: 10)).foregroundStyle(.tertiary).lineLimit(1)
-                if selected { Image(systemName: "return").font(.system(size: 10)).foregroundStyle(.secondary) }
+                Text(item.badge).font(.system(size: 11)).foregroundStyle(.secondary).lineLimit(1)
+                if selected { Image(systemName: "return").font(.system(size: 11)).foregroundStyle(.secondary) }
             }.padding(.horizontal, 10).frame(height: 53)
                 .background(selected ? Color.primary.opacity(0.075) : .clear, in: .rect(cornerRadius: 8)).contentShape(
                     .rect)
         }
-        .buttonStyle(.plain).accessibilityLabel("\(item.title), \(item.badge)").accessibilityHint(
+        .buttonStyle(.plain).accessibilityLabel(item.accessibilityDescription).accessibilityHint(
             item.primaryActionTitle
         )
         .accessibilityAddTraits(selected ? .isSelected : []).accessibilityIdentifier("result.\(item.id)")
@@ -215,9 +216,9 @@ struct LauncherSearchView: View {
             if model.section == .calculator {
                 EmptyState(
                     symbol: "equal.square",
-                    title: model.query.isEmpty ? "A little less mental math" : "Check that expression",
-                    detail:
-                        "Arithmetic, percentages, scientific functions, and conversions for length, mass, time, temperature, volume, and storage. Currency rates and natural-language dates aren’t supported yet."
+                    title: Calculator.issue(for: model.query)?.title ?? "A little less mental math",
+                    detail: Calculator.issue(for: model.query)?.message
+                        ?? "Arithmetic, percentages, scientific functions, and conversions for length, mass, time, temperature, volume, and storage. Try an example below."
                 )
                 HStack(spacing: 8) {
                     ForEach(["(120 + 45) * 0.2", "10 km in mi", "72 f in c"], id: \.self) { example in
@@ -235,11 +236,28 @@ struct LauncherSearchView: View {
                     detail: model.files.errorMessage
                         ?? "Search by filename using at least two characters. OpenRay uses Spotlight in your home folder and excludes Library. Check Spotlight indexing and folder permissions if files are missing."
                 )
+            } else if model.section == .clipboard && (!model.query.isEmpty || model.clipboardFilter != .all) {
+                EmptyState(
+                    symbol: "line.3.horizontal.decrease.circle", title: "No matching clipboard items",
+                    detail: "Try a different search or show all content types. Your saved history is still available."
+                )
+                HStack(spacing: 12) {
+                    if !model.query.isEmpty {
+                        Button("Clear Search") {
+                            model.query = ""
+                            model.focusRequest += 1
+                        }.buttonStyle(.bordered)
+                    }
+                    if model.clipboardFilter != .all {
+                        Button("Show All Types") { model.clipboardFilter = .all }.buttonStyle(.bordered)
+                    }
+                }
             } else if !model.query.isEmpty {
                 EmptyState(
                     symbol: "magnifyingglass", title: "No matching results",
-                    detail:
-                        "Try a different name or keyword. You can also search the web with a quicklink, such as “web \(model.query)”."
+                    detail: model.section == .home
+                        ? "Try a different name or keyword. You can also search the web with a quicklink, such as “web \(model.query)”."
+                        : "Try a different name or keyword, or clear your search to see all \(model.section.title.lowercased())."
                 )
             } else if model.section == .clipboard {
                 EmptyState(
@@ -290,13 +308,64 @@ struct LauncherSearchView: View {
                     Keycap(text: "⌘ K")
                 }
             }.buttonStyle(.plain)
-                .popover(isPresented: $model.showActions, arrowEdge: .bottom) {
-                    ActionsView(model: model) { item in
-                        model.showActions = false
-                        deletion = item
-                    }
+                .background {
+                    NativeActionsMenu(
+                        isPresented: $model.showActions,
+                        title: selected?.title ?? "OpenRay",
+                        entries: actionEntries(for: selected),
+                        didClose: { model.focusRequest += 1 })
                 }
         }.padding(.horizontal, 18).frame(height: 43)
+    }
+
+    private func actionEntries(for item: LauncherItem?) -> [NativeActionsMenu.Entry] {
+        var entries: [NativeActionsMenu.Entry] = []
+        if let item {
+            entries.append(.init(title: item.primaryActionTitle, symbol: "return") { model.perform(item) })
+            if item.supportsPaste {
+                entries.append(
+                    .init(title: "Paste into Previous App", symbol: "arrow.up.doc") {
+                        model.showActions = false
+                        model.selectedID = item.id
+                        model.pasteSelected()
+                    })
+            }
+            if let text = item.copyText {
+                entries.append(.init(title: "Copy", symbol: "doc.on.doc") { model.copy(text) })
+            }
+            if item.canFavorite {
+                entries.append(
+                    .init(
+                        title: model.store.database.favoriteIDs.contains(item.id)
+                            ? "Remove from Favorites" : "Add to Favorites", symbol: "star"
+                    ) { model.store.toggleFavorite(item.id) })
+            }
+            switch item.action {
+            case .quicklink, .snippet, .note:
+                entries.append(
+                    .init(title: "Edit", symbol: "pencil") {
+                        model.selectedID = item.id
+                        model.editSelected()
+                    })
+                entries.append(.init(title: "Delete…", symbol: "trash") { deletion = item })
+            case .clipboard:
+                entries.append(.init(title: "Delete…", symbol: "trash") { deletion = item })
+            case .file(let url):
+                entries.append(
+                    .init(title: "Reveal in Finder", symbol: "folder") {
+                        NSWorkspace.shared.activateFileViewerSelecting([url])
+                    })
+            case .application(let app):
+                entries.append(
+                    .init(title: "Reveal in Finder", symbol: "folder") {
+                        NSWorkspace.shared.activateFileViewerSelecting([app.url])
+                    })
+            default: break
+            }
+        }
+        entries.append(.init(title: "Settings", symbol: "gearshape") { model.openSettings() })
+        entries.append(.init(title: "Back to Everything", symbol: "magnifyingglass") { model.navigate(to: .home) })
+        return entries
     }
 }
 
@@ -305,10 +374,10 @@ private struct ItemPreview: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
             HStack {
-                Text("PREVIEW").font(.system(size: 9, weight: .semibold)).tracking(1)
+                Text("PREVIEW").font(.system(size: 11, weight: .semibold)).tracking(1)
                 Spacer()
-                Text(metadata).font(.system(size: 10))
-            }.foregroundStyle(.tertiary)
+                Text(metadata).font(.system(size: 11))
+            }.foregroundStyle(.secondary)
             if let resource = item.clipboardImage {
                 ClipboardImageView(resource: resource)
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -319,7 +388,7 @@ private struct ItemPreview: View {
                             Label {
                                 VStack(alignment: .leading, spacing: 3) {
                                     Text(url.lastPathComponent).font(.system(size: 12, weight: .medium))
-                                    Text(url.deletingLastPathComponent().path).font(.system(size: 10)).foregroundStyle(
+                                    Text(url.deletingLastPathComponent().path).font(.system(size: 11)).foregroundStyle(
                                         .secondary)
                                 }.textSelection(.enabled)
                             } icon: {
@@ -329,7 +398,7 @@ private struct ItemPreview: View {
                     }.frame(maxWidth: .infinity, alignment: .leading)
                 }
                 Text("File references only. Originals aren’t duplicated or modified.")
-                    .font(.system(size: 10)).foregroundStyle(.tertiary)
+                    .font(.system(size: 11)).foregroundStyle(.secondary)
             } else {
                 ScrollView {
                     Text(item.copyText ?? item.subtitle).font(.system(size: 12)).lineSpacing(4).textSelection(.enabled)
@@ -339,8 +408,8 @@ private struct ItemPreview: View {
             if case .clipboard(let entry) = item.action {
                 Divider()
                 Text(entry.sourceName).font(.system(size: 11, weight: .medium))
-                Text(entry.copiedAt, format: .dateTime.month().day().hour().minute()).font(.system(size: 10))
-                    .foregroundStyle(.tertiary)
+                Text(entry.copiedAt, format: .dateTime.month().day().hour().minute()).font(.system(size: 11))
+                    .foregroundStyle(.secondary)
             }
         }.padding(18).background(.primary.opacity(0.015))
     }
@@ -355,69 +424,5 @@ private struct ItemPreview: View {
             }
         }
         return "\((item.copyText ?? "").count.formatted()) characters"
-    }
-}
-
-private struct ActionsView: View {
-    @Bindable var model: LauncherModel
-    var delete: (LauncherItem) -> Void
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 4) {
-            Text(model.selectedItem?.title ?? "OpenRay").font(.system(size: 11, weight: .semibold)).foregroundStyle(
-                .secondary
-            ).padding(8)
-            if let item = model.selectedItem {
-                action(item.primaryActionTitle, "return") { model.perform(item) }
-                if item.supportsPaste {
-                    action("Paste into Previous App", "arrow.up.doc") {
-                        model.showActions = false
-                        model.pasteSelected()
-                    }
-                }
-                if let text = item.copyText {
-                    action("Copy", "doc.on.doc") {
-                        model.copy(text)
-                        model.showActions = false
-                    }
-                }
-                if item.canFavorite {
-                    action(
-                        model.store.database.favoriteIDs.contains(item.id)
-                            ? "Remove from Favorites" : "Add to Favorites", "star"
-                    ) {
-                        model.store.toggleFavorite(item.id)
-                        model.showActions = false
-                    }
-                }
-                switch item.action {
-                case .quicklink, .snippet, .note:
-                    action("Edit", "pencil") { model.editSelected() }
-                    action("Delete…", "trash") { delete(item) }
-                case .clipboard: action("Delete…", "trash") { delete(item) }
-                case .file(let url):
-                    action("Reveal in Finder", "folder") {
-                        NSWorkspace.shared.activateFileViewerSelecting([url])
-                        model.showActions = false
-                    }
-                case .application(let app):
-                    action("Reveal in Finder", "folder") {
-                        NSWorkspace.shared.activateFileViewerSelecting([app.url])
-                        model.showActions = false
-                    }
-                default: EmptyView()
-                }
-                Divider().padding(.vertical, 5)
-            }
-            action("Settings", "gearshape") { model.openSettings() }
-            action("Back to Everything", "magnifyingglass") { model.navigate(to: .home) }
-        }.padding(8).frame(width: 270)
-    }
-
-    private func action(_ title: String, _ symbol: String, perform: @escaping () -> Void) -> some View {
-        Button(action: perform) {
-            Label(title, systemImage: symbol).font(.system(size: 12))
-                .frame(maxWidth: .infinity, alignment: .leading).padding(8).contentShape(.rect)
-        }.buttonStyle(.plain)
     }
 }

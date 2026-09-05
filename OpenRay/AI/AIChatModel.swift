@@ -56,7 +56,9 @@ final class AIChatModel {
     func send() {
         refreshAvailability()
         guard canSend else { return }
-        let prompt = draft.trimmingCharacters(in: .whitespacesAndNewlines)
+        // Writing operations need the exact passage, including surrounding layout.
+        // canSend already rejects whitespace-only drafts without modifying them.
+        let prompt = action == .chat ? draft.trimmingCharacters(in: .whitespacesAndNewlines) : draft
         draft = ""
         errorMessage = nil
         isGenerating = true

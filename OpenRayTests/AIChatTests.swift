@@ -61,6 +61,35 @@ struct AIChatTests {
         #expect(engine.prompts.isEmpty)
     }
 
+    @Test(arguments: AIAction.allCases.filter { $0 != .chat })
+    func writingActionsPreserveTheRawPassage(action: AIAction) async {
+        let source = "\t  The bus arrives at noon.\n\n    Please meet me outside.\n\n"
+        let engine = TestAIEngine()
+        engine.snapshots = [source]
+        let chat = AIChatModel(engine: engine)
+        chat.open(action)
+        chat.draft = source
+        chat.send()
+        await chat.waitForResponse()
+        #expect(engine.prompts == [source])
+        #expect(chat.messages.first?.text == source)
+        #expect(chat.messages.last?.text == source)
+    }
+
+    @Test(arguments: AIAction.allCases)
+    func whitespaceOnlyDraftsNeverGenerate(action: AIAction) async {
+        let engine = TestAIEngine()
+        let chat = AIChatModel(engine: engine)
+        chat.open(action)
+        chat.draft = " \t\n\n"
+        #expect(!chat.canSend)
+        chat.send()
+        await chat.waitForResponse()
+        #expect(engine.prompts.isEmpty)
+        #expect(chat.messages.isEmpty)
+        #expect(chat.draft == " \t\n\n")
+    }
+
     @Test func importedTextIsNotSilentlyTruncated() {
         let chat = AIChatModel(engine: TestAIEngine())
         chat.draft = "Keep my draft"
@@ -128,13 +157,69 @@ struct AIChatTests {
         }
     }
 
-    @Test(.enabled(if: ProcessInfo.processInfo.environment["OPENRAY_TEST_AI"] == "1"), .timeLimit(.minutes(1)))
-    func realOnDeviceModelStreamsAResponse() async throws {
+    @Test func writingOperationsWrapPassagesAndKeepChatInstructionsSeparate() {
+        let source = "Can you send the report?"
+        #expect(AIAction.chat.prompt(for: source) == source)
+        for action in AIAction.allCases where action != .chat {
+            #expect(action.prompt(for: source).contains("<passage>\n\(source)\n</passage>"))
+            #expect(!action.instructions.contains("Use earlier messages"))
+            #expect(action.instructions.contains("not a chat message"))
+        }
+    }
+
+    @Test(.enabled(if: ProcessInfo.processInfo.environment["OPENRAY_TEST_AI"] == "1"), .timeLimit(.minutes(3)))
+    func realOnDeviceWritingActionsRespectTransformationContracts() async throws {
         let engine = FoundationModelEngine()
         #expect(engine.availability == .available)
-        var response = ""
-        try await engine.stream("Rewrite this as a polite reminder: The team meeting starts at 2 pm.", action: .rewrite)
-        { response = $0 }
-        #expect(!response.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+        let chat = AIChatModel(engine: engine)
+        func generate(_ source: String, action: AIAction) async throws -> String {
+            chat.open(action)
+            chat.draft = source
+            chat.send()
+            await chat.waitForResponse()
+            #expect(chat.errorMessage == nil)
+            let message = try #require(chat.messages.last)
+            #expect(message.role == .assistant)
+            let response = message.text
+            print("LIVE AI [\(action.rawValue)] INPUT: \(source)\nOUTPUT: \(response)")
+            #expect(!response.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+            return response
+        }
+
+        // Different clean passages also exercise repeated requests in one writing mode.
+        for source in [
+            "Alex will send the report on Monday. Jamie will review it on Tuesday. The team meets Wednesday.",
+            "The train arrives at six.\n\nPlease meet me outside the station.",
+            "Can you send the report by Friday?",
+            "\t  The bus arrives at noon.\n\n",
+        ] {
+            let response = try await generate(source, action: .proofread)
+            #expect(response == source)
+        }
+        let corrected = try await generate("She go to the store yesterday and buyed three apple.", action: .proofread)
+        #expect(corrected == "She went to the store yesterday and bought three apples.")
+
+        let extracted = try await generate(
+            "Alex will send the report on Monday. Jamie will review it on Tuesday. The office has blue walls.",
+            action: .actionItems)
+        let items = extracted.split(separator: "\n")
+        #expect(items.count == 2)
+        #expect(items.allSatisfy { $0.hasPrefix("- ") })
+        #expect(items.contains { $0.contains("Alex") && $0.contains("Monday") && $0.lowercased().contains("send") })
+        #expect(items.contains { $0.contains("Jamie") && $0.contains("Tuesday") && $0.lowercased().contains("review") })
+        #expect(!extracted.contains("blue"))
+        let noTasks = try await generate(
+            "The building is made of red brick. The lobby has two windows.", action: .actionItems)
+        #expect(noTasks == "No action items found.")
+
+        let source = "The library opens at 9 am and closes at 6 pm. It is closed on Sunday."
+        let summary = try await generate(source, action: .summarize)
+        #expect(summary.contains("9") && summary.contains("6") && summary.contains("Sunday"))
+        let rewrite = try await generate("I wanted to let you know that the meeting starts at 2 pm.", action: .rewrite)
+        #expect(rewrite.contains("2") && rewrite.lowercased().contains("meeting"))
+        let shortened = try await generate(
+            "Due to the fact that the meeting has been canceled, there is no need for you to attend.", action: .shorten)
+        #expect(shortened.lowercased().contains("cancel"))
+        #expect(shortened.split(separator: " ").count < 19)
     }
 }

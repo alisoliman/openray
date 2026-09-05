@@ -7,16 +7,85 @@ struct Calculation: Equatable, Sendable {
 }
 
 enum Calculator {
+    enum Issue: Error, Equatable, Sendable {
+        case incompleteExpression
+        case divisionByZero
+        case domainError
+        case unsupportedCurrencyConversion
+        case unsupportedConversion
+        case incompatibleUnits
+        case invalidExpression
+        case resultOutOfRange
+        case expressionTooComplex
+
+        var title: String {
+            switch self {
+            case .incompleteExpression: "Finish the expression"
+            case .divisionByZero: "Cannot divide by zero"
+            case .domainError: "No real-number result"
+            case .unsupportedCurrencyConversion: "Currency conversion is unavailable"
+            case .unsupportedConversion: "Unit not supported"
+            case .incompatibleUnits: "These units do not match"
+            case .invalidExpression: "Check the expression"
+            case .resultOutOfRange: "Result is too large"
+            case .expressionTooComplex: "Simplify the expression"
+            }
+        }
+
+        var message: String {
+            switch self {
+            case .incompleteExpression:
+                "Add the missing number, closing parenthesis, or target unit to continue."
+            case .divisionByZero:
+                "The divisor evaluates to zero. Change it to a nonzero value."
+            case .domainError:
+                "Use a nonnegative value for sqrt, a positive value for log or ln, and powers with a real result."
+            case .unsupportedCurrencyConversion:
+                "Exchange rates are not available. You can convert length, mass, time, storage, temperature, and volume."
+            case .unsupportedConversion:
+                "Try supported units, such as 10 km in mi, 72 f in c, or 1 GiB in MiB."
+            case .incompatibleUnits:
+                "Choose units of the same kind, such as kg to lb or km to mi."
+            case .invalidExpression:
+                "Use numbers, +, −, ×, ÷, %, powers, parentheses, or functions such as sqrt(144)."
+            case .resultOutOfRange:
+                "Try smaller numbers or break the calculation into steps."
+            case .expressionTooComplex:
+                "Use fewer than 513 characters and reduce nested parentheses or signs."
+            }
+        }
+    }
+
+    static func issue(for input: String) -> Issue? {
+        guard !input.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return nil }
+        do {
+            _ = try calculate(input)
+            return nil
+        } catch let issue as Issue {
+            return issue
+        } catch {
+            return .invalidExpression
+        }
+    }
+
     static func evaluate(_ input: String) -> Calculation? {
+        try? calculate(input)
+    }
+
+    private static func calculate(_ input: String) throws -> Calculation {
         let input = input.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !input.isEmpty, input.count <= 512 else { return nil }
-        if let conversion = convert(input) { return conversion }
+        guard !input.isEmpty else { throw Issue.incompleteExpression }
+        guard input.count <= 512 else { throw Issue.expressionTooComplex }
         let normalized = input.replacingOccurrences(of: "×", with: "*")
             .replacingOccurrences(of: "÷", with: "/")
             .replacingOccurrences(of: "−", with: "-")
             .replacingOccurrences(of: "π", with: "pi")
+        if var conversion = try convert(normalized) {
+            conversion.expression = input
+            return conversion
+        }
         var parser = ExpressionParser(normalized)
-        guard let value = try? parser.parse(), value.isFinite else { return nil }
+        let value = try parser.parse()
         return Calculation(expression: input, result: format(value), detail: "Calculator · Return to copy")
     }
 
@@ -75,21 +144,30 @@ enum Calculator {
         return result
     }()
 
-    private static func convert(_ input: String) -> Calculation? {
-        let pattern = #"^(.+?)\s*([a-zA-Z°]+)\s+(?:in|to|as)\s+([a-zA-Z°]+)$"#
+    private static let currencyUnits = Set(Locale.commonISOCurrencyCodes.map { $0.lowercased() })
+        .union(["$", "€", "£", "¥", "₹", "dollar", "dollars", "euro", "euros", "yen"])
+
+    private static func convert(_ input: String) throws -> Calculation? {
+        let pattern = #"^(.+?)\s*([\p{L}°\p{Sc}]+)\s+(?:in|to|as)(?:\s+([\p{L}°\p{Sc}]+))?$"#
         guard let regex = try? NSRegularExpression(pattern: pattern, options: .caseInsensitive),
             let match = regex.firstMatch(in: input, range: NSRange(input.startIndex..., in: input)),
             let expressionRange = Range(match.range(at: 1), in: input),
-            let sourceRange = Range(match.range(at: 2), in: input),
-            let targetRange = Range(match.range(at: 3), in: input),
-            let source = units[input[sourceRange].lowercased()],
-            let target = units[input[targetRange].lowercased()],
-            source.dimension == target.dimension
+            let sourceRange = Range(match.range(at: 2), in: input)
         else { return nil }
         var parser = ExpressionParser(String(input[expressionRange]))
-        guard let number = try? parser.parse() else { return nil }
+        let number = try parser.parse()
+        guard let targetRange = Range(match.range(at: 3), in: input) else { throw Issue.incompleteExpression }
+        let sourceName = input[sourceRange].lowercased()
+        let targetName = input[targetRange].lowercased()
+        if currencyUnits.contains(sourceName) || currencyUnits.contains(targetName) {
+            throw Issue.unsupportedCurrencyConversion
+        }
+        guard let source = units[sourceName], let target = units[targetName] else {
+            throw Issue.unsupportedConversion
+        }
+        guard source.dimension == target.dimension else { throw Issue.incompatibleUnits }
         let result = (number * source.scale + source.offset - target.offset) / target.scale
-        guard result.isFinite else { return nil }
+        guard result.isFinite else { throw Issue.resultOutOfRange }
         return Calculation(
             expression: input, result: "\(format(result)) \(target.symbol)", detail: "Unit conversion · Return to copy")
     }
@@ -97,7 +175,7 @@ enum Calculator {
 
 /// A bounded arithmetic grammar, never an expression evaluator or shell interpreter.
 private struct ExpressionParser {
-    private enum Failure: Error { case invalid }
+    private typealias Issue = Calculator.Issue
     private let characters: [Character]
     private var index = 0
     private var depth = 0
@@ -107,17 +185,17 @@ private struct ExpressionParser {
     mutating func parse() throws -> Double {
         let result = try expression()
         skipSpaces()
-        guard index == characters.count, result.isFinite else { throw Failure.invalid }
-        return result
+        guard index == characters.count else { throw Issue.invalidExpression }
+        return try checked(result)
     }
 
     private mutating func expression() throws -> Double {
         var result = try product()
         while true {
             if consume("+") {
-                result += try product()
+                result = try checked(result + product())
             } else if consume("-") {
-                result -= try product()
+                result = try checked(result - product())
             } else {
                 return result
             }
@@ -128,11 +206,11 @@ private struct ExpressionParser {
         var result = try unary()
         while true {
             if consume("*") {
-                result *= try unary()
+                result = try checked(result * unary())
             } else if consume("/") {
                 let divisor = try unary()
-                guard divisor != 0 else { throw Failure.invalid }
-                result /= divisor
+                guard divisor != 0 else { throw Issue.divisionByZero }
+                result = try checked(result / divisor)
             } else {
                 return result
             }
@@ -142,19 +220,23 @@ private struct ExpressionParser {
     private mutating func unary() throws -> Double {
         depth += 1
         defer { depth -= 1 }
-        guard depth < 64 else { throw Failure.invalid }
+        guard depth < 64 else { throw Issue.expressionTooComplex }
         if consume("+") { return try unary() }
         if consume("-") { return try -unary() }
         var result = try primary()
         while consume("%") { result /= 100 }
-        if consume("^") { result = pow(result, try unary()) }
+        if consume("^") {
+            let exponent = try unary()
+            guard result != 0 || exponent >= 0 else { throw Issue.divisionByZero }
+            result = try checked(pow(result, exponent))
+        }
         return result
     }
 
     private mutating func primary() throws -> Double {
         if consume("(") {
             let result = try expression()
-            guard consume(")") else { throw Failure.invalid }
+            try closeParenthesis()
             return result
         }
         skipSpaces()
@@ -164,11 +246,16 @@ private struct ExpressionParser {
             let name = String(characters[start..<index])
             if name == "pi" { return .pi }
             if name == "e" { return M_E }
-            guard consume("(") else { throw Failure.invalid }
+            guard ["sqrt", "abs", "round", "floor", "ceil", "sin", "cos", "tan", "log", "ln"].contains(name) else {
+                throw Issue.invalidExpression
+            }
+            guard consume("(") else { throw expectedMoreInput() }
             let value = try expression()
-            guard consume(")") else { throw Failure.invalid }
+            try closeParenthesis()
             switch name {
-            case "sqrt": return sqrt(value)
+            case "sqrt":
+                guard value >= 0 else { throw Issue.domainError }
+                return sqrt(value)
             case "abs": return abs(value)
             case "round": return value.rounded()
             case "floor": return floor(value)
@@ -176,19 +263,44 @@ private struct ExpressionParser {
             case "sin": return sin(value)
             case "cos": return cos(value)
             case "tan": return tan(value)
-            case "log": return log10(value)
-            case "ln": return log(value)
-            default: throw Failure.invalid
+            case "log", "ln":
+                guard value > 0 else { throw Issue.domainError }
+                return name == "log" ? log10(value) : log(value)
+            default: throw Issue.invalidExpression
             }
         }
-        while index < characters.count, characters[index].isNumber || characters[index] == "." { index += 1 }
+        while index < characters.count, characters[index].isNumber { index += 1 }
+        if index < characters.count, characters[index] == "." {
+            index += 1
+            while index < characters.count, characters[index].isNumber { index += 1 }
+        }
+        guard start != index, characters[start..<index].contains(where: \.isNumber) else {
+            throw expectedMoreInput()
+        }
         if index < characters.count, characters[index] == "e" {
             index += 1
             if index < characters.count, characters[index] == "+" || characters[index] == "-" { index += 1 }
+            let exponentStart = index
             while index < characters.count, characters[index].isNumber { index += 1 }
+            guard index > exponentStart else { throw expectedMoreInput() }
         }
-        guard start != index, let number = Double(String(characters[start..<index])) else { throw Failure.invalid }
-        return number
+        guard let number = Double(String(characters[start..<index])) else { throw Issue.invalidExpression }
+        return try checked(number)
+    }
+
+    private func checked(_ value: Double) throws -> Double {
+        guard !value.isNaN else { throw Issue.domainError }
+        guard value.isFinite else { throw Issue.resultOutOfRange }
+        return value
+    }
+
+    private mutating func closeParenthesis() throws {
+        guard consume(")") else { throw expectedMoreInput() }
+    }
+
+    private mutating func expectedMoreInput() -> Issue {
+        skipSpaces()
+        return index == characters.count ? .incompleteExpression : .invalidExpression
     }
 
     private mutating func consume(_ character: Character) -> Bool {

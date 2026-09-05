@@ -16,7 +16,7 @@ struct SettingsView: View {
                 Text("Make OpenRay yours").font(.system(size: 17, weight: .semibold))
                 Spacer()
                 Button("Refresh Status", systemImage: "arrow.clockwise") { model.refreshPermissions() }
-                    .font(.system(size: 11)).buttonStyle(.borderless)
+                    .font(.system(size: 12)).buttonStyle(.borderless)
             }.padding(.horizontal, 22).frame(height: 64)
             Divider()
             if let message = model.message ?? model.store.errorMessage ?? model.shortcutError {
@@ -56,7 +56,7 @@ struct SettingsView: View {
                             Text(
                                 "Needed only for window layouts, pasting into other apps, selected text, and optional snippet expansion. App search, quicklinks, notes, calculator, and AI work without it."
                             )
-                            .font(.system(size: 11)).foregroundStyle(.secondary)
+                            .font(.system(size: 12)).foregroundStyle(.secondary)
                         }
                         Spacer()
                         if !model.accessibilityAllowed {
@@ -68,7 +68,7 @@ struct SettingsView: View {
                     Text(
                         "When enabled, only a short keyword buffer is held in memory. Typing is never saved. Expansion is skipped during Secure Input and in excluded apps."
                     )
-                    .font(.system(size: 11)).foregroundStyle(.secondary)
+                    .font(.system(size: 12)).foregroundStyle(.secondary)
                 } header: {
                     Text("Cross-app features")
                 }
@@ -78,12 +78,12 @@ struct SettingsView: View {
                     Toggle("Include copied images", isOn: optionalPreference(\.clipboardImagesEnabled))
                     Toggle("Include copied files", isOn: optionalPreference(\.clipboardFilesEnabled))
                     if let note = model.clipboard.accessMessage {
-                        Label(note, systemImage: "hand.raised").font(.system(size: 11)).foregroundStyle(.orange)
+                        Label(note, systemImage: "hand.raised").font(.system(size: 12)).foregroundStyle(.orange)
                     }
                     Text(
                         "Copied text, images, and file references are saved locally. Content marked confidential or transient and known password managers are excluded. Unmarked sensitive content can still be captured; pause capture or add an exclusion when needed."
                     )
-                    .font(.system(size: 11)).foregroundStyle(.secondary)
+                    .font(.system(size: 12)).foregroundStyle(.secondary)
                     Picker("Keep history for", selection: preference(\.clipboardRetentionDays)) {
                         Text("1 day").tag(1)
                         Text("7 days").tag(7)
@@ -95,10 +95,10 @@ struct SettingsView: View {
                     Text(
                         "History is also bounded to 64 MB. Images are saved as PNGs up to 10 MB each; copied files are references to the originals."
                     )
-                    .font(.system(size: 11)).foregroundStyle(.secondary)
+                    .font(.system(size: 12)).foregroundStyle(.secondary)
                     VStack(alignment: .leading, spacing: 7) {
                         Text("Excluded apps (one bundle identifier per line)").font(.system(size: 12))
-                        TextEditor(text: $exclusions).font(.system(size: 11, design: .monospaced))
+                        TextEditor(text: $exclusions).font(.system(size: 12, design: .monospaced))
                             .frame(height: 65).scrollContentBackground(.hidden)
                             .padding(6).background(.primary.opacity(0.035), in: .rect(cornerRadius: 5))
                             .accessibilityLabel("Excluded application bundle identifiers")
@@ -112,6 +112,9 @@ struct SettingsView: View {
                                 model.message = "Clipboard exclusions saved."
                             }
                         }
+                        .buttonStyle(.bordered)
+                        .foregroundStyle(.primary)
+                        .accessibilityIdentifier("settings.saveExclusions")
                     }
                     HStack {
                         Text("\(model.store.database.clipboard.count) saved entries").foregroundStyle(.secondary)
@@ -125,11 +128,11 @@ struct SettingsView: View {
 
                 Section("Apple Intelligence") {
                     Label(model.ai.availability.title, systemImage: "sparkles").foregroundStyle(.purple)
-                    Text(model.ai.availability.detail).font(.system(size: 11)).foregroundStyle(.secondary)
+                    Text(model.ai.availability.detail).font(.system(size: 12)).foregroundStyle(.secondary)
                     Text(
                         "AI uses Apple’s Foundation Models framework. Clipboard and selected text are shared with the model only when you click their buttons. Chats are not saved automatically, and no cloud fallback is used."
                     )
-                    .font(.system(size: 11)).foregroundStyle(.secondary)
+                    .font(.system(size: 12)).foregroundStyle(.secondary)
                     if !model.ai.availability.isAvailable {
                         Button("Open System Settings") {
                             NSWorkspace.shared.open(URL(fileURLWithPath: "/System/Applications/System Settings.app"))
@@ -141,12 +144,12 @@ struct SettingsView: View {
                     Text(
                         "Quicklinks, snippets, notes, favorites, preferences, and enabled clipboard history are stored in Application Support/OpenRay. No account or analytics."
                     )
-                    .font(.system(size: 11)).foregroundStyle(.secondary)
+                    .font(.system(size: 12)).foregroundStyle(.secondary)
                     if let url = model.store.fileURL {
                         Button("Reveal Library in Finder") { NSWorkspace.shared.activateFileViewerSelecting([url]) }
                             .disabled(!FileManager.default.fileExists(atPath: url.path))
                     }
-                    Text("OpenRay · Native Swift 6 · macOS 26+").font(.system(size: 11)).foregroundStyle(.tertiary)
+                    Text("OpenRay · Native Swift 6 · macOS 26+").font(.system(size: 12)).foregroundStyle(.secondary)
                 }
             }.formStyle(.grouped)
         }

@@ -21,8 +21,8 @@ struct AIChatView: View {
                 Image(systemName: "lock.shield").foregroundStyle(.green)
                 Text("On-device · Conversation kept in memory only")
                 Spacer()
-                Text("AI can make mistakes. Review the result.").foregroundStyle(.tertiary)
-            }.font(.system(size: 10)).foregroundStyle(.secondary).padding(.horizontal, 20).frame(height: 35)
+                Text("AI can make mistakes. Review the result.")
+            }.font(.system(size: 11)).foregroundStyle(.secondary).padding(.horizontal, 20).frame(height: 38)
         }
         .onAppear { model.ai.refreshAvailability() }
     }
@@ -40,7 +40,7 @@ struct AIChatView: View {
                 model.ai.newConversation()
                 model.focusRequest += 1
             }
-            .font(.system(size: 11)).buttonStyle(.borderless).disabled(model.ai.isGenerating).keyboardShortcut("n")
+            .font(.system(size: 12)).buttonStyle(.borderless).disabled(model.ai.isGenerating).keyboardShortcut("n")
         }.padding(.horizontal, 20).frame(height: 64)
     }
 
@@ -113,14 +113,18 @@ struct AIChatView: View {
                     Text(message.role == .user ? "You" : "OpenRay AI").font(.system(size: 11, weight: .semibold))
                         .foregroundStyle(.secondary)
                     if message.isPartial && !model.ai.isGenerating {
-                        Text("Stopped").font(.system(size: 10)).foregroundStyle(.orange)
+                        Text("Stopped").font(.system(size: 11, weight: .medium)).foregroundStyle(.secondary)
                     }
                 }
                 if message.text.isEmpty && model.ai.isGenerating {
                     ProgressView("Thinking on your Mac…").controlSize(.small).font(.system(size: 12))
                 } else {
-                    Text(message.text).font(.system(size: 13)).lineSpacing(4).textSelection(.enabled)
-                        .frame(maxWidth: .infinity, alignment: .leading)
+                    Text(
+                        message.role == .assistant
+                            ? AIMessageFormatting.attributed(message.text) : AttributedString(message.text)
+                    )
+                    .font(.system(size: 13)).lineSpacing(4).textSelection(.enabled)
+                    .frame(maxWidth: .infinity, alignment: .leading)
                 }
                 if message.role == .assistant && !message.text.isEmpty && !model.ai.isGenerating {
                     HStack(spacing: 16) {
@@ -131,7 +135,7 @@ struct AIChatView: View {
                                     title: "AI — " + String((model.ai.messages.first?.text ?? "Response").prefix(50)),
                                     content: message.text))
                         }
-                    }.font(.system(size: 10)).buttonStyle(.plain).foregroundStyle(.secondary)
+                    }.font(.system(size: 12, weight: .medium)).buttonStyle(.plain).foregroundStyle(.primary)
                 }
             }
         }
@@ -146,7 +150,7 @@ struct AIChatView: View {
                         model.ai.action == .chat
                             ? "Ask anything, or paste text to work with…" : "Paste the text you’d like to work with…"
                     )
-                    .font(.system(size: 13)).foregroundStyle(.tertiary).padding(.top, 10).padding(.leading, 12)
+                    .font(.system(size: 13)).foregroundStyle(.secondary).padding(.top, 10).padding(.leading, 12)
                     .allowsHitTesting(false)
                 }
                 AIComposerInput(text: $chat.draft, focusRequest: model.focusRequest, submit: model.ai.send)
@@ -168,7 +172,7 @@ struct AIChatView: View {
                 }
                 Spacer()
                 Text("\(model.ai.draft.count.formatted()) / \(AIChatModel.inputLimit.formatted())")
-                    .font(.system(size: 10)).foregroundStyle(
+                    .font(.system(size: 11)).foregroundStyle(
                         model.ai.draft.count > AIChatModel.inputLimit ? Color.red : .secondary)
                 if model.ai.isGenerating {
                     Button(model.ai.isCancelling ? "Stopping…" : "Stop", systemImage: "stop.fill") { model.ai.cancel() }
@@ -185,7 +189,7 @@ struct AIChatView: View {
                     .buttonStyle(.borderedProminent).disabled(!model.ai.canSend)
                     .keyboardShortcut(.return, modifiers: .command).accessibilityIdentifier("ai.send")
                 }
-            }.font(.system(size: 11)).buttonStyle(.plain).foregroundStyle(.secondary)
+            }.font(.system(size: 12)).buttonStyle(.plain).foregroundStyle(.primary)
         }.padding(.horizontal, 20).padding(.top, 8).padding(.bottom, 14)
     }
 }
