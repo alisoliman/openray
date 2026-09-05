@@ -1,0 +1,506 @@
+import AppKit
+import Observation
+import ServiceManagement
+
+@MainActor
+@Observable
+final class LauncherModel {
+    enum Destination { case search, ai, settings }
+    var destination: Destination = .search
+    private(set) var section: LauncherSection = .home
+    var query = "" { didSet { if query != oldValue { searchChanged() } } }
+    var selectedID: String?
+    var clipboardFilter: ClipboardFilter = .all { didSet { if clipboardFilter != oldValue { selectedID = nil } } }
+    var editor: LibraryEditor?
+    var showActions = false
+    var message: String?
+    var focusRequest = 0
+    private(set) var shortcutError: String?
+    private(set) var accessibilityAllowed = false
+    private(set) var loginEnabled = false
+    private(set) var loginNeedsApproval = false
+
+    let store: LibraryStore
+    let applications = ApplicationCatalog()
+    let files = FileSearchService()
+    let ai: AIChatModel
+    let windows = WindowManager()
+    @ObservationIgnored let clipboard: ClipboardService
+    @ObservationIgnored let snippets: SnippetExpander
+    @ObservationIgnored private let hotKey = GlobalHotKey()
+    @ObservationIgnored weak var panel: LauncherPanelController?
+    @ObservationIgnored var previousApplication: NSRunningApplication?
+    @ObservationIgnored private var isStarted = false
+
+    init(store: LibraryStore = LibraryStore(), ai: AIChatModel = AIChatModel(), pasteboard: NSPasteboard = .general) {
+        self.store = store
+        self.ai = ai
+        clipboard = ClipboardService(store: store, pasteboard: pasteboard)
+        snippets = SnippetExpander(store: store)
+    }
+
+    var results: [LauncherItem] {
+        guard query.count <= 512 else { return [] }
+        var items: [LauncherItem] = []
+        switch section {
+        case .home:
+            items = commandItems + applicationItems + quicklinkItems + snippetItems + noteItems + savedFileItems
+            items += clipboardItems.filter { store.database.favoriteIDs.contains($0.id) }
+            if query.count >= 2 { items += fileItems }
+        case .applications: items = applicationItems
+        case .files: items = fileItems
+        case .clipboard:
+            items = clipboardItems.filter { item in
+                if case .clipboard(let entry) = item.action { return clipboardFilter.includes(entry) }
+                return false
+            }
+        case .snippets: items = snippetItems
+        case .quicklinks: items = quicklinkItems
+        case .notes: items = noteItems
+        case .calculator: items = []
+        case .windows: items = windowItems
+        }
+
+        var seenIDs = Set<String>()
+        items = items.filter { seenIDs.insert($0.id).inserted }
+        let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !trimmed.isEmpty {
+            items = items.compactMap { item -> (LauncherItem, Int)? in
+                if case .quicklink(let link, let argument) = item.action, link.argument(in: trimmed) != nil {
+                    return (item, argument.isEmpty ? 1_000 : 1_100)
+                }
+                let titleScore = SearchMatcher.score(trimmed, in: item.title)
+                let keywordScore = SearchMatcher.score(trimmed, in: item.keywords).map { $0 - 80 }
+                guard let score = [titleScore, keywordScore].compactMap({ $0 }).max() else { return nil }
+                let appBoost: Int
+                if case .application = item.action { appBoost = 70 } else { appBoost = 0 }
+                return (item, score + appBoost + (store.database.favoriteIDs.contains(item.id) ? 15 : 0))
+            }.sorted {
+                $0.1 == $1.1 ? $0.0.title.localizedStandardCompare($1.0.title) == .orderedAscending : $0.1 > $1.1
+            }.map(\.0)
+        } else if section == .home {
+            let usage = Dictionary(uniqueKeysWithValues: store.database.usage.map { ($0.id, $0.lastUsed) })
+            items.sort { lhs, rhs in
+                let leftFavorite = store.database.favoriteIDs.contains(lhs.id)
+                let rightFavorite = store.database.favoriteIDs.contains(rhs.id)
+                if leftFavorite != rightFavorite { return leftFavorite }
+                let leftDate = usage[lhs.id] ?? .distantPast
+                let rightDate = usage[rhs.id] ?? .distantPast
+                if leftDate != rightDate { return leftDate > rightDate }
+                // Keep the curated command order ahead of the installed app catalog.
+                return false
+            }
+            items = Array(items.prefix(14))
+        }
+        if section == .home || section == .calculator, let calculation = Calculator.evaluate(trimmed) {
+            items.insert(
+                LauncherItem(
+                    id: "calculation", title: calculation.result,
+                    subtitle: calculation.expression, symbol: "equal", tint: .green,
+                    badge: "Calculator", action: .calculation(calculation)), at: 0)
+        }
+        return Array(items.prefix(section == .home ? 45 : 100))
+    }
+
+    var groups: [LauncherResultGroup] {
+        let items = results
+        guard query.isEmpty, section == .home else {
+            return [LauncherResultGroup(title: query.isEmpty ? section.title : "Results", items: items)]
+        }
+        let favorites = items.filter { store.database.favoriteIDs.contains($0.id) }
+        let recentIDs = Set(store.database.usage.map(\.id))
+        let recent = items.filter { !store.database.favoriteIDs.contains($0.id) && recentIDs.contains($0.id) }
+        let suggestions = items.filter { !store.database.favoriteIDs.contains($0.id) && !recentIDs.contains($0.id) }
+        return [
+            LauncherResultGroup(title: "Favorites", items: favorites),
+            LauncherResultGroup(title: "Recently Used", items: recent),
+            LauncherResultGroup(title: "Suggestions", items: suggestions),
+        ].filter { !$0.items.isEmpty }
+    }
+
+    var orderedResults: [LauncherItem] { groups.flatMap(\.items) }
+    var selectedItem: LauncherItem? { orderedResults.first(where: { $0.id == selectedID }) ?? orderedResults.first }
+
+    func start() async {
+        guard !isStarted else { return }
+        isStarted = true
+        applyPreferences()
+        await applications.refresh()
+        synchronizeSelection()
+    }
+
+    func stop() {
+        hotKey.unregister()
+        clipboard.stop()
+        snippets.stop()
+        files.stop()
+        ai.cancel()
+    }
+
+    func applyPreferences() {
+        if isStarted {
+            if clipboard.usesGeneralPasteboard {
+                do {
+                    try hotKey.register(store.database.preferences.hotKey) { [weak self] in self?.panel?.toggle() }
+                    shortcutError = nil
+                } catch { shortcutError = error.localizedDescription }
+            } else {
+                hotKey.unregister()
+                shortcutError = nil
+            }
+            clipboard.configure()
+            if clipboard.usesGeneralPasteboard { snippets.configure() } else { snippets.stop() }
+        }
+        refreshPermissions()
+    }
+
+    func refreshPermissions() {
+        accessibilityAllowed = windows.hasPermission
+        clipboard.refreshAccessStatus()
+        loginEnabled = SMAppService.mainApp.status == .enabled
+        loginNeedsApproval = SMAppService.mainApp.status == .requiresApproval
+        ai.refreshAvailability()
+        if isStarted && clipboard.usesGeneralPasteboard { snippets.configure() }
+    }
+
+    func setLaunchAtLogin(_ enabled: Bool) {
+        guard clipboard.usesGeneralPasteboard else {
+            message = "Launch at login is disabled for the isolated verification instance."
+            return
+        }
+        do {
+            if enabled { try SMAppService.mainApp.register() } else { try SMAppService.mainApp.unregister() }
+            refreshPermissions()
+        } catch { message = "Launch at login could not be changed: \(error.localizedDescription)" }
+    }
+
+    func navigate(to section: LauncherSection) {
+        destination = .search
+        self.section = section
+        query = ""
+        searchChanged()
+        message = nil
+        showActions = false
+        synchronizeSelection()
+        focusRequest += 1
+    }
+
+    func openAI(_ action: AIAction = .chat) {
+        let switchingWhileBusy = ai.isGenerating && ai.action != action
+        ai.open(action)
+        destination = .ai
+        files.stop()
+        message =
+            switchingWhileBusy
+            ? "Stop the current response or wait for it to finish before switching AI commands." : nil
+        showActions = false
+    }
+
+    func openSettings() {
+        destination = .settings
+        files.stop()
+        showActions = false
+        refreshPermissions()
+    }
+
+    func goBack() {
+        if showActions {
+            showActions = false
+        } else if destination != .search || section != .home {
+            navigate(to: .home)
+        } else if !query.isEmpty {
+            query = ""
+        } else {
+            panel?.dismiss()
+        }
+    }
+
+    func resumeSearch() {
+        if destination == .search, section == .home || section == .files {
+            files.search(query, showRecent: section == .files)
+        }
+    }
+
+    func synchronizeSelection() {
+        let items = orderedResults
+        if !items.contains(where: { $0.id == selectedID }) { selectedID = items.first?.id }
+    }
+
+    func moveSelection(_ offset: Int) {
+        let items = orderedResults
+        guard !items.isEmpty else { return }
+        let index = items.firstIndex(where: { $0.id == selectedID }) ?? 0
+        selectedID = items[(index + offset + items.count) % items.count].id
+    }
+
+    func performSelected() {
+        if let selectedItem { perform(selectedItem) }
+    }
+
+    func perform(_ item: LauncherItem) {
+        showActions = false
+        message = nil
+        switch item.action {
+        case .application(let app):
+            Task {
+                do {
+                    _ = try await NSWorkspace.shared.openApplication(
+                        at: app.url, configuration: NSWorkspace.OpenConfiguration())
+                    store.recordUse(of: item.id)
+                    panel?.dismiss(restoreFocus: false)
+                } catch { message = "Could not open \(app.name): \(error.localizedDescription)" }
+            }
+        case .file(let url): open(url, itemID: item.id)
+        case .section(let section):
+            store.recordUse(of: item.id)
+            navigate(to: section)
+        case .ai(let action):
+            store.recordUse(of: item.id)
+            openAI(action)
+        case .settings: openSettings()
+        case .quicklink(let link, let argument):
+            if link.needsQuery && argument.isEmpty {
+                editor = .quicklinkQuery(link, "")
+            } else {
+                openQuicklink(link, query: argument)
+            }
+        case .clipboard(let entry):
+            copy(entry)
+            store.recordUse(of: item.id)
+        case .snippet(let snippet):
+            copy(snippet.expanded())
+            store.recordUse(of: item.id)
+        case .calculation(let calculation): copy(calculation.result)
+        case .note(let note):
+            editor = .note(note)
+            store.recordUse(of: item.id)
+        case .window(let layout):
+            do {
+                try windows.arrange(layout, application: previousApplication)
+                store.recordUse(of: item.id)
+                panel?.dismiss(restoreFocus: false)
+            } catch { message = error.localizedDescription }
+        }
+    }
+
+    func openQuicklink(_ link: Quicklink, query: String) {
+        do { open(try link.resolvedURL(query: query), itemID: "quicklink.\(link.id)") } catch {
+            message = error.localizedDescription
+        }
+    }
+
+    func copy(_ text: String) {
+        message = clipboard.copy(text) ? "Copied to clipboard" : "Could not write to the clipboard. Try again."
+    }
+
+    func copy(_ entry: ClipboardEntry) {
+        message =
+            clipboard.copy(entry)
+            ? "Copied to clipboard" : (clipboard.contentMessage ?? "Could not write to the clipboard. Try again.")
+    }
+
+    func pasteSelected() {
+        guard let item = selectedItem, item.supportsPaste else { return }
+        if case .clipboard(let entry) = item.action {
+            finishPaste(copied: clipboard.copy(entry))
+        } else if let text = item.copyText {
+            paste(text)
+        }
+    }
+
+    func paste(_ text: String) {
+        finishPaste(copied: clipboard.copy(text))
+    }
+
+    private func finishPaste(copied: Bool) {
+        guard copied else {
+            message = clipboard.contentMessage ?? "Could not copy the content."
+            return
+        }
+        guard clipboard.usesGeneralPasteboard else {
+            message = "Copied to the isolated verification pasteboard. Cross-app paste is disabled in this mode."
+            return
+        }
+        guard let target = previousApplication, !target.isTerminated, windows.hasPermission else {
+            message = "Copied. Press ⌘V in your app, or enable Accessibility in Settings for direct paste."
+            return
+        }
+        let changeCount = clipboard.changeCount
+        panel?.dismiss(restoreFocus: false)
+        Task {
+            do { try await SyntheticInput.paste(into: target, expectedChangeCount: changeCount) } catch {
+                message = error.localizedDescription
+                panel?.show()
+            }
+        }
+    }
+
+    func useSelectionForAI() {
+        do { ai.useText(try windows.selectedText(in: previousApplication)) } catch {
+            message = error.localizedDescription
+        }
+    }
+
+    func editSelected() {
+        guard let item = selectedItem else { return }
+        showActions = false
+        switch item.action {
+        case .quicklink(let link, _): editor = .quicklink(link)
+        case .snippet(let snippet): editor = .snippet(snippet)
+        case .note(let note): editor = .note(note)
+        default: break
+        }
+    }
+
+    func delete(_ item: LauncherItem) {
+        store.update { database in
+            switch item.action {
+            case .quicklink(let link, _): database.quicklinks.removeAll { $0.id == link.id }
+            case .snippet(let snippet): database.snippets.removeAll { $0.id == snippet.id }
+            case .note(let note): database.notes.removeAll { $0.id == note.id }
+            case .clipboard(let entry): database.clipboard.removeAll { $0.id == entry.id }
+            default: return
+            }
+            database.favoriteIDs.remove(item.id)
+            database.usage.removeAll { $0.id == item.id }
+        }
+        synchronizeSelection()
+    }
+
+    func createItem() {
+        switch section {
+        case .snippets: editor = .snippet(Snippet(name: "", keyword: "", content: ""))
+        case .quicklinks: editor = .quicklink(Quicklink(name: "", template: "https://", keyword: ""))
+        case .notes: editor = .note(QuickNote(title: "", content: ""))
+        default: break
+        }
+    }
+
+    private func open(_ url: URL, itemID: String) {
+        if NSWorkspace.shared.open(url) {
+            store.recordUse(of: itemID)
+            panel?.dismiss(restoreFocus: false)
+        } else {
+            message =
+                "macOS could not open \(url.lastPathComponent.isEmpty ? url.absoluteString : url.lastPathComponent)."
+        }
+    }
+
+    private func searchChanged() {
+        selectedID = nil
+        message = nil
+        guard query.count <= 512 else {
+            files.stop()
+            message = "Keep search queries under 512 characters. For a longer passage, open Ask AI."
+            return
+        }
+        if section == .home || section == .files {
+            files.search(query, showRecent: section == .files)
+        } else {
+            files.stop()
+        }
+    }
+
+    private var applicationItems: [LauncherItem] {
+        applications.applications.map { app in
+            LauncherItem(
+                id: app.id, title: app.name, subtitle: app.url.deletingLastPathComponent().path,
+                symbol: "app", badge: "Application", keywords: app.bundleIdentifier ?? "",
+                iconURL: app.url, action: .application(app))
+        }
+    }
+
+    private var fileItems: [LauncherItem] {
+        files.results.map { file in
+            LauncherItem(
+                id: file.id, title: file.name, subtitle: file.url.deletingLastPathComponent().path,
+                symbol: "doc", badge: "File", iconURL: file.url, action: .file(file.url))
+        }
+    }
+
+    private var savedFileItems: [LauncherItem] {
+        let ids = store.database.favoriteIDs.union(store.database.usage.map(\.id)).sorted()
+        return ids.filter { $0.hasPrefix("file./") }.map { id in
+            let url = URL(fileURLWithPath: String(id.dropFirst("file.".count)))
+            return LauncherItem(
+                id: id, title: url.lastPathComponent, subtitle: url.deletingLastPathComponent().path,
+                symbol: "doc", badge: "File", iconURL: url, action: .file(url))
+        }
+    }
+
+    private var clipboardItems: [LauncherItem] {
+        store.database.clipboard.map { entry in
+            LauncherItem(
+                id: "clipboard.\(entry.id)", title: entry.title, subtitle: entry.sourceName,
+                symbol: entry.symbol, tint: .orange, badge: entry.kindTitle, keywords: entry.searchableText,
+                clipboardImage: entry.image.flatMap { store.imageResource(for: $0) },
+                action: .clipboard(entry))
+        }
+    }
+
+    private var quicklinkItems: [LauncherItem] {
+        store.database.quicklinks.map { link in
+            let argument = link.argument(in: query) ?? ""
+            return LauncherItem(
+                id: "quicklink.\(link.id)", title: link.name,
+                subtitle: argument.isEmpty ? link.template : "Search for “\(argument)”",
+                symbol: "link", tint: .blue, badge: "Quicklink", keywords: link.keyword,
+                action: .quicklink(link, argument))
+        }
+    }
+
+    private var snippetItems: [LauncherItem] {
+        store.database.snippets.map { snippet in
+            LauncherItem(
+                id: "snippet.\(snippet.id)", title: snippet.name,
+                subtitle: snippet.keyword.isEmpty ? String(snippet.content.prefix(90)) : snippet.keyword,
+                symbol: "text.quote", tint: .orange, badge: "Snippet",
+                keywords: snippet.keyword + " " + snippet.content, action: .snippet(snippet))
+        }
+    }
+
+    private var noteItems: [LauncherItem] {
+        store.database.notes.sorted { $0.modifiedAt > $1.modifiedAt }.map { note in
+            LauncherItem(
+                id: "note.\(note.id)", title: note.title, subtitle: String(note.content.prefix(90)),
+                symbol: "note.text", tint: .green, badge: "Note", keywords: note.content, action: .note(note))
+        }
+    }
+
+    private var windowItems: [LauncherItem] {
+        WindowLayout.allCases.map { layout in
+            LauncherItem(
+                id: "window.\(layout.id)", title: layout.title, subtitle: "Arrange the previously focused window",
+                symbol: layout.symbol, tint: .purple, badge: "Window", keywords: "window resize move tile",
+                action: .window(layout))
+        }
+    }
+
+    private var commandItems: [LauncherItem] {
+        var commands = [
+            LauncherItem(
+                id: "ai.chat", title: "Ask AI", subtitle: "Your private, on-device assistant",
+                symbol: "sparkles", tint: .purple, badge: "Apple Intelligence", keywords: "chat assistant write",
+                action: .ai(.chat))
+        ]
+        commands += LauncherSection.allCases.filter { $0 != .home }.map { section in
+            LauncherItem(
+                id: "section.\(section.id)", title: section.title,
+                subtitle: section.placeholder.replacingOccurrences(of: "…", with: ""),
+                symbol: section.symbol, tint: section == .clipboard ? .orange : .blue,
+                badge: "Command", keywords: "search " + section.title, action: .section(section))
+        }
+        commands += AIAction.allCases.filter { $0 != .chat }.map { action in
+            LauncherItem(
+                id: "ai.\(action.id)", title: action.title, subtitle: action.subtitle,
+                symbol: action.symbol, tint: .purple, badge: "AI Command", keywords: "AI writing text",
+                action: .ai(action))
+        }
+        commands += windowItems
+        commands.append(
+            LauncherItem(
+                id: "settings", title: "OpenRay Settings", subtitle: "Make it your own",
+                symbol: "gearshape", badge: "Command", keywords: "preferences permissions shortcut", action: .settings))
+        return commands
+    }
+}
