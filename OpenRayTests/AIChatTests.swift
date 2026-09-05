@@ -61,6 +61,35 @@ struct AIChatTests {
         #expect(engine.prompts.isEmpty)
     }
 
+    @Test(arguments: AIAction.allCases.filter { $0 != .chat })
+    func writingActionsPreserveTheRawPassage(action: AIAction) async {
+        let source = "\t  The bus arrives at noon.\n\n    Please meet me outside.\n\n"
+        let engine = TestAIEngine()
+        engine.snapshots = [source]
+        let chat = AIChatModel(engine: engine)
+        chat.open(action)
+        chat.draft = source
+        chat.send()
+        await chat.waitForResponse()
+        #expect(engine.prompts == [source])
+        #expect(chat.messages.first?.text == source)
+        #expect(chat.messages.last?.text == source)
+    }
+
+    @Test(arguments: AIAction.allCases)
+    func whitespaceOnlyDraftsNeverGenerate(action: AIAction) async {
+        let engine = TestAIEngine()
+        let chat = AIChatModel(engine: engine)
+        chat.open(action)
+        chat.draft = " \t\n\n"
+        #expect(!chat.canSend)
+        chat.send()
+        await chat.waitForResponse()
+        #expect(engine.prompts.isEmpty)
+        #expect(chat.messages.isEmpty)
+        #expect(chat.draft == " \t\n\n")
+    }
+
     @Test func importedTextIsNotSilentlyTruncated() {
         let chat = AIChatModel(engine: TestAIEngine())
         chat.draft = "Keep my draft"
@@ -142,9 +171,16 @@ struct AIChatTests {
     func realOnDeviceWritingActionsRespectTransformationContracts() async throws {
         let engine = FoundationModelEngine()
         #expect(engine.availability == .available)
+        let chat = AIChatModel(engine: engine)
         func generate(_ source: String, action: AIAction) async throws -> String {
-            var response = ""
-            try await engine.stream(source, action: action) { response = $0 }
+            chat.open(action)
+            chat.draft = source
+            chat.send()
+            await chat.waitForResponse()
+            #expect(chat.errorMessage == nil)
+            let message = try #require(chat.messages.last)
+            #expect(message.role == .assistant)
+            let response = message.text
             print("LIVE AI [\(action.rawValue)] INPUT: \(source)\nOUTPUT: \(response)")
             #expect(!response.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
             return response
@@ -155,6 +191,7 @@ struct AIChatTests {
             "Alex will send the report on Monday. Jamie will review it on Tuesday. The team meets Wednesday.",
             "The train arrives at six.\n\nPlease meet me outside the station.",
             "Can you send the report by Friday?",
+            "\t  The bus arrives at noon.\n\n",
         ] {
             let response = try await generate(source, action: .proofread)
             #expect(response == source)

@@ -1,6 +1,6 @@
 # UI/UX review fixes — 5 September 2026
 
-All ten findings in [the merged-PR review](UI-UX-REVIEW.md) are addressed on `codex/fix-ui-ux-review`, based on merge commit `500862c`. Changes remain uncommitted for review.
+This report records the fixes for all ten findings in [the merged-PR review](UI-UX-REVIEW.md), based on merge commit `500862c`.
 
 | Finding | Change | Verification |
 | --- | --- | --- |
@@ -19,10 +19,21 @@ The final native pass also exposed a rapid-navigation race: typing immediately a
 
 ## Validation
 
-- Full macOS suite: **95 tests across 13 suites passed**. [Test log](/tmp/openray-ux-tests.log) and [final result bundle](/tmp/openray-ux-fixes/Logs/Test/Test-OpenRay-2026.09.05_20-21-50-+0200.xcresult).
-- Focused AI run: **14 tests passed**, including nine live generations across the five writing actions. [AI log](/tmp/openray-ai-fixes-test.log) and [result bundle](/tmp/openray-ai-fixes/Logs/Test/Test-OpenRay-2026.09.05_20-08-56-+0200.xcresult).
-- Original-source regression run demonstrated the Actions/selection/ranking failures before fixes. [Baseline log](/tmp/openray-ux-baseline.log). The native editor race had a separate failing reproduction. [Native input red log](/tmp/openray-native-red.log).
-- The interactive build succeeded with bundle identifier `com.alisoliman.openray.uxfixes`. [Build log](/tmp/openray-ux-ui-build.log). It ran with `--in-memory-library --verification-pasteboard OpenRayVerification.UXFixes`.
+The original fix set was verified on 5 September 2026:
+
+- Full macOS suite: **95 tests across 13 suites passed**.
+- Focused AI run: **14 tests passed**, including nine live generations across the five writing actions.
+- Original-source regression tests demonstrated the Actions/selection/ranking failures before fixes. The native editor race had a separate failing reproduction.
+- The interactive build succeeded with bundle identifier `com.alisoliman.openray.uxfixes`. It ran with `--in-memory-library --verification-pasteboard OpenRayVerification.UXFixes`.
 - Swift formatting and `git diff --check` passed. New Swift files are included through the project's synchronized groups.
 
-Screenshots and accessibility trees were inspected inline; no standalone screenshot files are claimed. `/tmp` artifacts may be removed by system cleanup. The original review's explicit OS permission, persistent-data, global shortcut, cross-app paste, keyword expansion, display, and VoiceOver coverage limits still apply. Guided AI output improves the tested contracts; it cannot guarantee semantic correctness for every future passage or model revision.
+PR review follow-up on 6 September 2026:
+
+- Writing actions now pass the raw draft through `AIChatModel.send()`, retaining leading indentation and trailing blank lines. Empty-input validation still rejects whitespace-only drafts, and chat keeps its existing trimming behavior.
+- The new regression failed for all five writing actions before the fix. It now passes, along with whitespace-only validation for all six modes.
+- The full macOS suite passed **97 tests across 13 suites**, including **ten live generations** through `AIChatModel` and the real on-device engine. The live proofreading cases include leading whitespace and trailing blank lines.
+- Historical source links use commit permalinks, and local-only artifact links and transient working-tree status have been removed.
+
+To reproduce the automated checks on a compatible Mac, run `./scripts/verify.sh`. Run `./scripts/verify.sh --ai` to include live Apple Intelligence generation. See the [verification instructions](README.md#verification) for requirements.
+
+Build logs and test result bundles were retained locally on the review machine; they are not repository artifacts. Screenshots and accessibility trees were inspected inline; no standalone screenshot files are claimed. The original review's explicit OS permission, persistent-data, global shortcut, cross-app paste, keyword expansion, display, and VoiceOver coverage limits still apply. Guided AI output improves the tested contracts; it cannot guarantee semantic correctness for every future passage or model revision.
