@@ -1,0 +1,67 @@
+# OpenRay UI/UX review — 5 September 2026
+
+**Resolution:** All ten findings below have since been addressed. See [UI-UX-FIXES.md](UI-UX-FIXES.md) for changes and verification. The remainder of this document preserves the original merged-PR review.
+
+Reviewed the merged PR #3 at `500862c` (`56df38c` feature commit), after fast-forwarding the clean local `main` from `6c3bf51`. The earlier welcome-only build is excluded from these findings. No application implementation was changed.
+
+Built and tested the merged source on the host Mac. All **76 tests across 10 suites passed**. Used Computer Use for native UI interactions and visual inspection. The interactive build used a distinct bundle identifier, `com.alisoliman.openray.uireview`, with `--in-memory-library --verification-pasteboard OpenRayVerification.UIReview`. This avoided changing the normal library and kept clipboard fixtures on a dedicated pasteboard. The real application catalog, Spotlight, window service, and Apple Intelligence engine remained in use.
+
+**Assessment:** Core functionality is substantially implemented and usable. The main issues are keyboard routing, inconsistent settings presentation, unavailable help, and AI output presentation. This is broad feature coverage, not certification of every OS permission, display configuration, or failure state.
+
+**Prioritized findings**
+
+1. **P1 — Actions popover sends arrow keys to the results behind it.** In Apps, search `calc`, select Calculator, and press ⌘K. Press ↓. The selected result changes to Chess and the popover title changes to Chess; focus remains in `launcher.search`. Return can therefore execute a different result instead of navigating the actions. Reproduced first with a note, then with multiple app results. Move focus into the popover, provide action selection, and restore search focus on dismissal. See [LauncherSearchView.swift](/Users/ali/Dev/openray/OpenRay/Views/LauncherSearchView.swift:361) and its [shortcut handler](/Users/ali/Dev/openray/OpenRay/Views/LauncherSearchView.swift:38).
+
+2. **P2 — Escape does not leave embedded Settings.** Open Settings with ⌘, from search, then press Escape. The settings screen remains, with focus on the launcher dialog. Repeated both immediately after opening Settings and after interacting with its controls. The Back button works, but its help text explicitly advertises “Back (Esc).” Handle Escape when settings has no text input first responder, not only through the search/composer adapters. See [ContentView.swift](/Users/ali/Dev/openray/OpenRay/ContentView.swift:28).
+
+3. **P2 — Native Settings ignores the chosen appearance.** Set Appearance to Light in embedded Settings: the panel becomes light. Open OpenRay → Settings… from the native app menu: the separate settings window remains dark while its Appearance picker visibly says Light. Apply the shared appearance policy to both scene roots. The modifier is on [ContentView.swift](/Users/ali/Dev/openray/OpenRay/ContentView.swift:23), while the separate [Settings scene](/Users/ali/Dev/openray/OpenRay/OpenRayApp.swift:26) bypasses it.
+
+4. **P2 — Help is a dead end.** Help → OpenRay Help opens the alert “Help isn’t available for OpenRay.” Provide an in-app shortcut/feature guide or route the command to maintained documentation. This particularly affects discovery of the global shortcut, query templates, direct paste, and the AI Return versus ⌘Return convention. About does work and reports version 0.1.0 (1).
+
+5. **P2 — AI displays generated Markdown literally.** Ask for a numbered list of common nouns with definitions. The model generates `1. **Dog**: ...`; the screenshot visibly contains the asterisks. This also affects stopped output. Render the supported Markdown subset safely, or consistently request plain text. The current [message rendering](/Users/ali/Dev/openray/OpenRay/Views/AIChatView.swift:122) uses `Text(message.text)`.
+
+6. **P2 — Proofreading can return conversational filler instead of corrected text.** In Fix Spelling & Grammar, submit `Alex will send the report on Monday. Jamie will review it on Tuesday. The team meets Wednesday.` The live model returned “That sounds like a solid plan! Is there anything else I can help with?” A separate error-containing input, `She go to the store yesterday and buyed three apple.`, correctly became `She went to the store yesterday and bought three apples.` Treat this as an observed, nondeterministic quality failure, not a claim that all proofreading fails. Add live output evaluations for already-correct passages and strengthen the transformation contract around [AI action instructions](/Users/ali/Dev/openray/OpenRay/AI/AIModels.swift:53). Action-item extraction also returned a prose paraphrase in this session rather than a clearly actionable list; it preserved the supplied owners/dates.
+
+7. **P2 — Accessible file-result names omit identifying paths.** Searching `snippets` produced multiple separate folder rows named “snippets, File.” Their paths were available only in implementation identifiers, while the spoken label is title plus badge. A screen-reader user cannot distinguish these matches from the labels. Include a useful parent path or subtitle in the accessible label/value. See [resultRow](/Users/ali/Dev/openray/OpenRay/Views/LauncherSearchView.swift:196). This finding is grounded in the accessibility tree; a full VoiceOver session was not run.
+
+8. **P3 — Exact feature commands can rank below same-named folders.** Searching `snippets` in All placed two folders named `snippets` above the Snippets command. Command discovery then depends on the contents of the user's home folder. Consider a deterministic priority for exact built-in command matches, or visibly group commands and files. This is a ranking recommendation: the folders are valid matches. See [ranking](/Users/ali/Dev/openray/OpenRay/App/LauncherModel.swift:72).
+
+9. **P3 — Error/empty-state guidance is insufficiently contextual.** In Clipboard, leave query `README` and choose Images: the no-results view suggests searching the web rather than clearing the query or changing the filter. In Calculator, `1 / 0`, `sqrt(-1)`, `2 +`, and `100 USD in EUR` all show the same “Check that expression” feature-description block. Preserve the reassuring layout, but distinguish filter mismatch, incomplete expression, domain error, and unsupported conversion. See [empty states](/Users/ali/Dev/openray/OpenRay/Views/LauncherSearchView.swift:218).
+
+10. **P3 — Small, faint secondary text weakens readability.** Light-mode screenshots show particularly faint privacy badges, preview metadata, footer guidance, and some coral action text. Several labels use 9–10 point type and tertiary colors; enabled controls such as Save Exclusions can look weak. Increase hierarchy and contrast for useful guidance and actionable controls. This is a visual assessment, not a measured contrast-compliance audit. See [scope badge](/Users/ali/Dev/openray/OpenRay/Views/LauncherSearchView.swift:108), [preview metadata](/Users/ali/Dev/openray/OpenRay/Views/LauncherSearchView.swift:308), and [AI footer](/Users/ali/Dev/openray/OpenRay/Views/AIChatView.swift:24).
+
+**Coverage and evidence**
+
+| Area | Exercised live | Outcome / limits |
+| --- | --- | --- |
+| Startup and home | Fresh in-memory launch, initial typing without clicking, home layout, scopes, favorites, recents, scrolling | Search immediately accepted `6 * 7`; result 42. Home and result layouts visually inspected. |
+| Keyboard navigation | Arrow selection, Return, ⌘K, ⌘N, ⌘S, ⌘,, Escape, rapid typing after Back and editor dismissal | Search/editor focus restoration worked. Actions routing and Settings Escape issues above. |
+| Applications | `calc` search, selection, Return to open Calculator, index refresh | Calculator changed from not running to running. Index displayed 171 applications. Broad fuzzy matches include low-relevance apps, though Calculator ranked first. |
+| Files | Recent-search entry, `project.yml`, result actions, Copy, Reveal in Finder | Correct repository file returned; Finder visibly selected it. Copy produced success feedback. Arbitrary user files were not opened. |
+| Calculator | `6 * 7`, `200 * 15%`, `sqrt(144)`, `10 km in mi`, `72 f in c`, `1 GiB in MiB`, `(120 + 45) * 0.2`; copy; invalid expressions | Correct results: 42, 30, 12, 6.21371192237 mi, 22.2222222222 °C, 1024 MiB, 33. Invalid inputs handled without a crash; guidance issue above. |
+| Notes | Empty state, empty-title validation, create, multiline content, Unicode via native paste, save, reopen/edit, search, favorite, action menu, delete dialog/cancel | Saved note content preserved emoji and Japanese text. Native simulated typing did not reliably enter non-ASCII characters; paste verified actual Unicode support. Deletion was canceled. |
+| Snippets | Empty state, create, keyword `;uireview`, `{date}`/`{time}`, preview, Return copy, ⌘Return | Preview expanded the date/time. Copy succeeded; direct paste displayed the expected verification-mode explanation. Automatic cross-app expansion is disabled in this mode. |
+| Quicklinks | Built-in templates, creation, invalid URL validation, valid query template, query sheet, Return to open | Invalid link showed a useful error. Test URL opened in Edge as `https://example.com/?q=hello%20%26%20world`, verified through browser tab inventory. |
+| Clipboard | Opt-in screen, enable private capture, PNG capture/preview, grouped file references, search, Images filter, Return copy, pause capture, clear-history dialog/cancel | Image copy retained PNG data and the `com.openray.generated` marker. Two file references were grouped and previewed. The fixture script confirmed native PNG formats; no General clipboard history was captured. Clear-history deletion was canceled. |
+| AI chat | Empty state, multiline Return, ⌘Return, real local generation, Copy, Save as Note, New Chat, 6,580-character input, streaming, Stop, recovery | Oversized input preserved and Send disabled at 6,000 limit. Stop showed an explicit partial label and fresh-session explanation; next prompt returned `OK.`. |
+| AI writing commands | Summarize, Improve Writing, Fix Spelling & Grammar, Make Shorter, Extract Action Items | All five screens opened and accepted real requests. Summarization preserved library hours; rewrite and error-containing proofreading worked. Quality issues above. |
+| AI imports | Use Clipboard | Explicitly imported the known fixture text `Hello.` from the private board. Selected-text import was not tested against user content. |
+| Windows | Left/right/top/bottom halves, maximize, center, all four quarters, next display, restore | Every command invoked against the previously active Finder window without an error banner; Finder screenshots showed changed size, then a restored larger window. Exact coordinates and each monitor's geometry were not instrumented, so this is not a geometry certification. |
+| Settings | Both entry points, light/dark, shortcut choices, retention choices, capacity choices, app refresh, status refresh, exclusions save, capture pause, clear dialog, bottom sections | Controls and scroll layout inspected. Options: three shortcut choices, 1/7/30 days, 50/100/250/500 entries. Appearance inconsistency above. |
+| Native integration | Application menu, Edit menu, About, Help, Settings window | About works. Help fails. Standard OS editing services were inspected but not activated. |
+| Accessibility | Native AX labels, focused elements, selected results, editor content, decorative images, status feedback | Useful input identifiers and labels exist. File disambiguation and action focus need improvement. Not a full assistive-technology audit. |
+
+**Explicit coverage limits**
+
+The private-pasteboard mode disables global shortcut registration, real cross-app paste, keyword expansion, and login-item changes. Those paths were not certified end to end. OS permission grant/denial, background General-pasteboard permission, denied Accessibility, unavailable/downloading AI models, persistent library corruption/migration, restart persistence, full-disk behavior, multi-monitor coordinates, display scaling, large system text, and VoiceOver remain separate checks. Deterministic tests cover several corresponding model/service cases; that does not replace their live UI verification.
+
+Permanent deletion was reviewed through its confirmation and cancellation paths, without committing deletion. Launch-at-login registration and OS privacy changes were not applied. The memory-only library has no Reveal Library file, so the persistent-library reveal action was source-inspected rather than exercised.
+
+**Verification artifacts**
+
+- Test log: [/tmp/openray-ui-review-test.log](/tmp/openray-ui-review-test.log).
+- Test result bundle: [/tmp/openray-ui-review/Logs/Test/Test-OpenRay-2026.09.05_19-37-39-+0200.xcresult](/tmp/openray-ui-review/Logs/Test/Test-OpenRay-2026.09.05_19-37-39-+0200.xcresult).
+- Isolated build log: [/tmp/openray-ui-review-build.log](/tmp/openray-ui-review-build.log).
+- Native screenshots and accessibility observations were inspected inline during the review; no standalone screenshot files are claimed here.
+
+The temporary paths may be removed by normal system cleanup. This report is the durable review record.

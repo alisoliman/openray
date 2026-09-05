@@ -34,6 +34,63 @@ struct CalculatorTests {
     }
 
     @Test(arguments: [
+        ("2 +", Calculator.Issue.incompleteExpression),
+        ("(2 + 3", .incompleteExpression),
+        ("sqrt(", .incompleteExpression),
+        ("sqrt", .incompleteExpression),
+        ("1e-", .incompleteExpression),
+        ("1 km in", .incompleteExpression),
+        ("1 / 0", .divisionByZero),
+        ("1 / (3 - 3)", .divisionByZero),
+        ("1 / -0", .divisionByZero),
+        ("0^-1", .divisionByZero),
+        ("sqrt(-1)", .domainError),
+        ("ln(0)", .domainError),
+        ("log(-10)", .domainError),
+        ("(-2)^0.5", .domainError),
+        ("100 USD in EUR", .unsupportedCurrencyConversion),
+        ("100 $ in €", .unsupportedCurrencyConversion),
+        ("1 parsec in m", .unsupportedConversion),
+        ("1 m in parsec", .unsupportedConversion),
+        ("2 kg to km", .incompatibleUnits),
+        ("2 + km to m", .incompleteExpression),
+        ("1 / 0 km to m", .divisionByZero),
+        ("sqrt(-1) km to m", .domainError),
+        ("2 ** 3", .invalidExpression),
+        ("1..2", .invalidExpression),
+        ("1e-x", .invalidExpression),
+        ("unknown(2)", .invalidExpression),
+        ("1e999", .resultOutOfRange),
+        ("1e308 * 10", .resultOutOfRange),
+        ("1e308 km to m", .resultOutOfRange),
+    ])
+    func contextualIssues(input: String, expected: Calculator.Issue) {
+        #expect(Calculator.issue(for: input) == expected)
+        #expect(Calculator.evaluate(input) == nil)
+    }
+
+    @Test(arguments: [
+        ("0", "0"), ("-0", "0"), ("-2 + 3", "1"), ("1 / -2", "-0.5"),
+        ("1 / 1e-15", "1000000000000000"), ("sqrt(0)", "0"), ("(-2)^3", "-8"),
+        ("-1e-3 km to m", "-1 m"), ("−1 km to m", "-1000 m"),
+        ("(2 × 3) km to m", "6000 m"), ("1e3km to m", "1000000 m"),
+    ])
+    func validInputsDoNotProduceIssues(input: String, expected: String) {
+        #expect(Calculator.issue(for: input) == nil)
+        #expect(Calculator.evaluate(input)?.result == expected)
+    }
+
+    @Test func emptyInputHasNoIssue() {
+        #expect(Calculator.issue(for: "  \n") == nil)
+    }
+
+    @Test func boundedParserReportsItsLimit() {
+        let input = String(repeating: "(", count: 64) + "1" + String(repeating: ")", count: 64)
+        #expect(Calculator.issue(for: input) == .expressionTooComplex)
+        #expect(Calculator.issue(for: String(repeating: "1", count: 513)) == .expressionTooComplex)
+    }
+
+    @Test(arguments: [
         "", "Safari", "1/0", "sqrt(-1)", "2 +", "(2+3", "2) + 3", "1..2", "1e", "2 ** 3", "2 kg to km", "50 USD to EUR",
         "random(5)", "1; exit", "1e999", "NaN", "2 + 3 garbage",
         String(repeating: "(", count: 100) + "1" + String(repeating: ")", count: 100),

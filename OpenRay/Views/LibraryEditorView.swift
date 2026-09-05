@@ -90,7 +90,7 @@ struct LibraryEditorView: View {
             }
             if let error { Text(error).font(.system(size: 12)).foregroundStyle(.red) }
             HStack {
-                Label("Saved only on this Mac", systemImage: "lock").font(.system(size: 11)).foregroundStyle(.tertiary)
+                Label("Saved only on this Mac", systemImage: "lock").font(.system(size: 11)).foregroundStyle(.secondary)
                 Spacer()
                 Button("Cancel", role: .cancel) { dismiss() }.keyboardShortcut(.cancelAction)
                 Button(isQuery ? "Open Link" : "Save", action: save).buttonStyle(.borderedProminent)

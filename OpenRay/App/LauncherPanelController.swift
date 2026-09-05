@@ -1,9 +1,26 @@
 import AppKit
 import SwiftUI
 
-private final class LauncherPanel: NSPanel {
+final class LauncherPanel: NSPanel {
+    var escapeAction: (() -> Bool)?
+
     override var canBecomeKey: Bool { true }
     override var canBecomeMain: Bool { true }
+
+    override func sendEvent(_ event: NSEvent) {
+        if handleEscapeKey(event) { return }
+        super.sendEvent(event)
+    }
+
+    /// The borderless host has no scene focus target when Settings opens. Handle
+    /// its unclaimed Escape here, while leaving text editing and sheets native.
+    func handleEscapeKey(_ event: NSEvent) -> Bool {
+        guard event.type == .keyDown, event.keyCode == 53,
+            event.modifierFlags.intersection([.command, .control, .option, .shift]).isEmpty,
+            attachedSheet == nil, !(firstResponder is NSTextView)
+        else { return false }
+        return escapeAction?() ?? false
+    }
 }
 
 @MainActor
@@ -86,6 +103,11 @@ final class LauncherPanelController: NSObject, NSWindowDelegate {
         panel.hasShadow = true
         panel.isMovableByWindowBackground = false
         panel.delegate = self
+        panel.escapeAction = { [weak model] in
+            guard let model, model.destination == .settings, model.editor == nil else { return false }
+            model.goBack()
+            return true
+        }
         panel.contentView = NSHostingView(rootView: ContentView(model: model))
         window = panel
     }

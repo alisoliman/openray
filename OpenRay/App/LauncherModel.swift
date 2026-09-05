@@ -74,9 +74,12 @@ final class LauncherModel {
                 guard let score = [titleScore, keywordScore].compactMap({ $0 }).max() else { return nil }
                 let appBoost: Int
                 if case .application = item.action { appBoost = 70 } else { appBoost = 0 }
-                return (item, score + appBoost + (store.database.favoriteIDs.contains(item.id) ? 15 : 0))
+                let commandBoost = item.isBuiltInCommand && titleScore == 1_000 ? 200 : 0
+                return (item, score + appBoost + commandBoost + (store.database.favoriteIDs.contains(item.id) ? 15 : 0))
             }.sorted {
-                $0.1 == $1.1 ? $0.0.title.localizedStandardCompare($1.0.title) == .orderedAscending : $0.1 > $1.1
+                if $0.1 != $1.1 { return $0.1 > $1.1 }
+                let comparison = $0.0.title.localizedStandardCompare($1.0.title)
+                return comparison == .orderedSame ? $0.0.id < $1.0.id : comparison == .orderedAscending
             }.map(\.0)
         } else if section == .home {
             let usage = Dictionary(uniqueKeysWithValues: store.database.usage.map { ($0.id, $0.lastUsed) })
@@ -227,6 +230,7 @@ final class LauncherModel {
     }
 
     func moveSelection(_ offset: Int) {
+        guard !showActions else { return }
         let items = orderedResults
         guard !items.isEmpty else { return }
         let index = items.firstIndex(where: { $0.id == selectedID }) ?? 0
@@ -234,6 +238,7 @@ final class LauncherModel {
     }
 
     func performSelected() {
+        guard !showActions else { return }
         if let selectedItem { perform(selectedItem) }
     }
 
@@ -499,8 +504,9 @@ final class LauncherModel {
         commands += windowItems
         commands.append(
             LauncherItem(
-                id: "settings", title: "OpenRay Settings", subtitle: "Make it your own",
-                symbol: "gearshape", badge: "Command", keywords: "preferences permissions shortcut", action: .settings))
+                id: "settings", title: "Settings", subtitle: "Make OpenRay your own",
+                symbol: "gearshape", badge: "Command", keywords: "openray settings preferences permissions shortcut",
+                action: .settings))
         return commands
     }
 }
