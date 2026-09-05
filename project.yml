@@ -6,6 +6,7 @@ options:
 settings:
   base:
     SWIFT_VERSION: "6.0"
+    SWIFT_STRICT_CONCURRENCY: complete
     MACOSX_DEPLOYMENT_TARGET: "26.0"
     SDKROOT: macosx
     SUPPORTED_PLATFORMS: macosx
@@ -21,6 +22,11 @@ targets:
         PRODUCT_NAME: OpenRay
         GENERATE_INFOPLIST_FILE: YES
         INFOPLIST_KEY_LSApplicationCategoryType: public.app-category.productivity
+        INFOPLIST_KEY_LSUIElement: YES
+        MARKETING_VERSION: "0.1.0"
+        CURRENT_PROJECT_VERSION: "1"
+        ENABLE_HARDENED_RUNTIME: YES
+        ENABLE_APP_SANDBOX: NO
         CODE_SIGN_STYLE: Automatic
   OpenRayTests:
     type: bundle.unit-test
@@ -40,5 +46,7 @@ schemes:
         OpenRay: all
         OpenRayTests: [test]
     test:
+      environmentVariables:
+        OPENRAY_TEST_AI: $(OPENRAY_TEST_AI)
       targets:
         - OpenRayTests
