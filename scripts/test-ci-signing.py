@@ -34,7 +34,20 @@ elif tool == "openssl":
         sys.exit(99)
 elif tool == "security":
     action = args[0]
-    # Every security invocation must name a keychain owned by this fixture.
+    search_file = Path(os.environ["MOCK_KEYCHAIN_LIST"])
+    search_list = json.loads(search_file.read_text())
+    if action == "list-keychains":
+        assert args[1:3] == ["-d", "user"]
+        if os.environ.get("MOCK_FAIL") == "list-keychains":
+            sys.exit(1)
+        if len(args) > 3:
+            assert args[3] == "-s"
+            search_file.write_text(json.dumps(args[4:]))
+        else:
+            for name in search_list:
+                print("    " + json.dumps(name))
+        sys.exit(0)
+    # Mutations other than search-list registration must name our own keychain.
     keychain = next((Path(arg) for arg in args if arg.endswith(".keychain-db")), None)
     assert keychain is not None
     assert keychain.parent.parent == Path(os.environ["RUNNER_TEMP"])
@@ -43,6 +56,7 @@ elif tool == "security":
         keychain.write_text("fixture-encrypted-keychain")
     elif action == "delete-keychain":
         keychain.unlink()
+        search_file.write_text(json.dumps([name for name in search_list if name != str(keychain)]))
     elif action == "find-identity":
         names = os.environ.get("MOCK_IDENTITIES", "Developer ID Application: Example Developer (EXAMPLE123)").split("|")
         for number, name in enumerate(names, 1):
@@ -67,6 +81,22 @@ elif tool == "xcrun":
     if os.environ.get("MOCK_FAIL") == "notarytool":
         print("fixture-notary-private-key", file=sys.stderr)
         sys.exit(1)
+elif tool == "codesign":
+    if "--sign" in args:
+        keychain = Path(args[args.index("--keychain") + 1])
+        assert keychain.is_file()
+        assert Path(args[-1]).is_file()
+        if str(keychain) not in json.loads(Path(os.environ["MOCK_KEYCHAIN_LIST"]).read_text()):
+            print("no identity found", file=sys.stderr)
+            sys.exit(1)
+        if os.environ.get("MOCK_FAIL") == "codesign":
+            print("fixture-certificate-password: no identity found", file=sys.stderr)
+            sys.exit(1)
+    else:
+        assert "--verify" in args
+        assert Path(args[-1]).is_file()
+        if os.environ.get("MOCK_FAIL") == "codesign-verify":
+            sys.exit(1)
 else:
     sys.exit(99)
 '''
@@ -81,13 +111,16 @@ class SigningLifecycleTests(unittest.TestCase):
         self.runner.mkdir()
         self.bin = self.root / "bin"
         self.bin.mkdir()
-        for name in ("security", "xcrun", "openssl", "uname"):
+        for name in ("security", "xcrun", "openssl", "uname", "codesign"):
             mock = self.bin / name
             mock.write_text(MOCK_TOOL)
             mock.chmod(0o755)
         self.github_env = self.root / "github-env"
         self.github_env.touch()
         self.calls_path = self.root / "calls.jsonl"
+        self.original_keychains = [str(self.root / "login.keychain-db"), str(self.root / "other keychain.keychain-db")]
+        self.search_path = self.root / "keychain-search-list.json"
+        self.search_path.write_text(json.dumps(self.original_keychains))
         self.env = {
             "PATH": f"{self.bin}:{os.environ['PATH']}",
             "GITHUB_ACTIONS": "true",
@@ -95,6 +128,7 @@ class SigningLifecycleTests(unittest.TestCase):
             "RUNNER_TEMP": str(self.runner),
             "GITHUB_ENV": str(self.github_env),
             "MOCK_CALLS": str(self.calls_path),
+            "MOCK_KEYCHAIN_LIST": str(self.search_path),
             "APPLE_CERTIFICATE_P12_BASE64": base64.b64encode(b"fixture-certificate-and-private-key").decode(),
             "APPLE_CERTIFICATE_PASSWORD": "fixture-certificate-password",
             "APPLE_NOTARY_KEY_P8_BASE64": base64.b64encode(b"fixture-notary-private-key").decode(),
@@ -130,7 +164,8 @@ class SigningLifecycleTests(unittest.TestCase):
         self.assertEqual(directory.stat().st_mode & 0o777, 0o700)
         self.assertEqual({path.name for path in directory.iterdir()}, {".openray-ci-signing", "release.keychain-db"})
         self.assertEqual(exported["OPENRAY_SIGNING_KEYCHAIN"], exported["OPENRAY_NOTARY_KEYCHAIN"])
-        self.assertFalse(any(call[1] in {"list-keychains", "default-keychain"} for call in self.calls() if call[0] == "security"))
+        self.assertEqual(json.loads(self.search_path.read_text()), [*self.original_keychains, exported["OPENRAY_SIGNING_KEYCHAIN"]])
+        self.assertFalse(any(call[1] == "default-keychain" for call in self.calls() if call[0] == "security"))
         self.assertEqual(set(exported), {
             "OPENRAY_SIGNING_IDENTITY", "OPENRAY_SIGNING_KEYCHAIN", "OPENRAY_NOTARY_PROFILE",
             "OPENRAY_NOTARY_KEYCHAIN", "OPENRAY_SIGNING_DIRECTORY",
@@ -140,6 +175,7 @@ class SigningLifecycleTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertFalse(directory.exists())
         self.assertEqual(unrelated.read_text(), "leave this keychain alone")
+        self.assertEqual(json.loads(self.search_path.read_text()), self.original_keychains)
         self.assertEqual(self.run_script("cleanup").returncode, 0)
 
     def test_missing_secret_fails_before_keychain_changes(self):
@@ -150,6 +186,24 @@ class SigningLifecycleTests(unittest.TestCase):
         self.assertFalse(any(call[0] == "security" for call in self.calls()))
         self.assertEqual(list(self.runner.iterdir()), [])
 
+    def test_setup_rejects_an_identity_that_is_listed_but_cannot_sign(self):
+        self.env["MOCK_FAIL"] = "codesign"
+        result = self.run_script()
+        self.assertNotEqual(result.returncode, 0, "Setup must exercise codesign before reporting usable credentials")
+        self.assertIn("sign", result.stderr)
+        self.assertEqual(self.github_env.read_text(), "")
+        self.assertEqual(list(self.runner.iterdir()), [])
+
+    def test_setup_handles_an_empty_keychain_search_list(self):
+        self.search_path.write_text("[]")
+        result = self.run_script()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        exported = self.exported()
+        self.assertEqual(json.loads(self.search_path.read_text()), [exported["OPENRAY_SIGNING_KEYCHAIN"]])
+        self.env.update(exported)
+        self.assertEqual(self.run_script("cleanup").returncode, 0)
+        self.assertEqual(json.loads(self.search_path.read_text()), [])
+
     def test_invalid_base64_is_removed_without_import(self):
         self.env["APPLE_CERTIFICATE_P12_BASE64"] = "not base64!"
         result = self.run_script()
@@ -157,14 +211,15 @@ class SigningLifecycleTests(unittest.TestCase):
         self.assertEqual(list(self.runner.iterdir()), [])
         self.assertFalse(any(call[0] == "security" for call in self.calls()))
 
-    def test_failed_import_and_notarization_remove_all_temporary_credentials(self):
-        for failure in ("create-keychain", "import", "notarytool"):
+    def test_failed_setup_removes_credentials_and_preserves_other_keychains(self):
+        for failure in ("create-keychain", "import", "list-keychains", "codesign", "codesign-verify", "notarytool"):
             with self.subTest(failure=failure):
                 self.env["MOCK_FAIL"] = failure
                 result = self.run_script()
                 self.assertNotEqual(result.returncode, 0)
                 self.assertEqual(list(self.runner.iterdir()), [])
                 self.assertEqual(self.github_env.read_text(), "")
+                self.assertEqual(json.loads(self.search_path.read_text()), self.original_keychains)
                 self.assertTrue(any(call[:2] == ["security", "delete-keychain"] for call in self.calls()))
 
     def test_apple_development_identity_cannot_be_used(self):
