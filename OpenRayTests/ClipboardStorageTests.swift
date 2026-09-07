@@ -29,7 +29,7 @@ struct ClipboardStorageTests {
         try original.write(to: url)
         let store = LibraryStore(fileURL: url)
         #expect(!store.isReadOnly)
-        #expect(store.database.schemaVersion == 2)
+        #expect(store.database.schemaVersion == LibraryDatabase.currentSchemaVersion)
         #expect(store.database.clipboard == [entry])
         #expect(store.database.preferences.clipboardEnabled)
         #expect(!store.database.preferences.capturesClipboardImages)
@@ -39,7 +39,7 @@ struct ClipboardStorageTests {
         let reopened = LibraryStore(fileURL: url)
         #expect(reopened.database.clipboard == [entry])
         #expect(reopened.database.notes.count == 2)
-        #expect(reopened.database.schemaVersion == 2)
+        #expect(reopened.database.schemaVersion == LibraryDatabase.currentSchemaVersion)
         #expect(!reopened.database.preferences.capturesClipboardImages)
     }
 
