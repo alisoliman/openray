@@ -14,6 +14,7 @@ The selected product is a direct-download OpenRay app for **Apple silicon Macs o
 - Writing commands have explicit transformation contracts. Proofreading and extraction use greedy sampling; quality remains subject to model limitations described below.
 - The bundle includes a privacy manifest describing no tracking or collected data. The [privacy information](privacy-policy.md) distinguishes local persistence from external links and public support posts.
 - [Packaging](../scripts/package-release.sh) creates an archive, ZIP, drag-to-Applications DMG, checksums, and logs. Production mode requires a Developer ID identity and notarization profile, verifies acceptance, staples tickets, and runs distribution-policy checks. Preview mode is distinctly labeled.
+- The [GitHub pipeline](GITHUB-RELEASES.md) adds preview CI, signed SemVer releases, stable Latest downloads, draft retries, checksums, and provenance. The `release` environment allows only `v*` tags; its Apple secrets are still required. Integration with current `main` preserves structured AI writing, aliases, and global command hotkeys, and consolidates the native menus and Help.
 
 ## Verification evidence
 
@@ -21,8 +22,10 @@ Environment: Xcode 26.6 (17F113), macOS 26.6.2 (25G83), physical Apple silicon M
 
 | Check | Result |
 | --- | --- |
-| Aggregate deterministic tests | 82 passed, 0 failed; 2 opt-in model tests skipped. 84 total test cases. |
-| Final AI suite with `OPENRAY_TEST_AI=1` | 9 passed, 0 skipped, 0 failed, including actual on-device generation and quality-evaluation attachments. |
+| Aggregate deterministic tests after integrating current `main` | 147 passed, 0 failed; 2 opt-in model tests skipped. 149 total test cases, including parameterized coverage. |
+| Initial candidate AI suite with `OPENRAY_TEST_AI=1` | 9 passed, 0 skipped, 0 failed, including actual on-device generation and quality-evaluation attachments. This predates integration of main's structured writing generation. |
+| Release automation | 34 release-helper tests and 8 isolated signing lifecycle tests passed; workflow lint passed. No real credentials used by these tests. |
+| Version override packaging | Preview archive verified version 0.2.3, build 42, and arm64-only executable. Overrides did not rewrite source settings. |
 | Swift formatting, shell/JavaScript syntax, plist validation, whitespace | Passed for changed files. |
 | Release archive | Successful; executable contains only `arm64`; hardened runtime enabled. |
 | Preview bundle | Ad-hoc signature verifies; app icon and privacy manifest are present. |
@@ -34,16 +37,16 @@ The interactive app used a separate bundle identifier, an in-memory library, and
 
 Local evidence (ignored build outputs, not committed release assets):
 
-- `.build/verification/Logs/Test/Test-OpenRay-2026.09.07_12-00-10-+0200.xcresult` — deterministic run.
+- `.build/verification/Logs/Test/Test-OpenRay-2026.09.07_12-35-29-+0200.xcresult` — deterministic run after main integration.
 - `.build/verification/Logs/Test/Test-OpenRay-2026.09.07_12-01-22-+0200.xcresult` — final AI run.
 - `.build/releases/release-candidate-preview/` — final preview archive, ZIP, DMG, checksums, and signature/package logs.
 - `.build/releases/release-candidate-preview/ai-evaluation/` — exported model outputs and evaluation summary.
 
-The final preview files are `OpenRay-0.1.0-local-preview.dmg` and `OpenRay-0.1.0-local-preview.zip`. Version/build remains 0.1.0 (1). The existing user-authored `UI-UX-REVIEW.md` was preserved.
+The initial candidate preview files are `OpenRay-0.1.0-local-preview.dmg` and `OpenRay-0.1.0-local-preview.zip`. Source version/build remains 0.1.0 (1); tagged CI builds override those values. The merged source must be rebuilt by the pipeline before distribution. Main includes an updated tracked `UI-UX-REVIEW.md`; the original local copy was retained at `.build/merge-preservation/UI-UX-REVIEW.local-20260907.md`.
 
-## Known AI quality limitation
+## Earlier AI quality observations
 
-The bounded live evaluation includes already-correct proofreading, correction of a sentence with grammar errors, extraction of tasks with owners/dates, and a descriptive passage containing no tasks. Earlier runs exposed conversational filler, unnecessary tense changes, and descriptions being presented as action items. Revised instructions and sampling improved the first three fixtures; description-versus-task recognition still failed in an observed run. Passing the integration suite establishes that model streaming and reporting work, not that every generated answer is correct. Quality observations and exact outputs are recorded separately from deterministic service checks.
+The initial bounded live evaluation includes already-correct proofreading, correction of a sentence with grammar errors, extraction of tasks with owners/dates, and a descriptive passage containing no tasks. Earlier runs exposed conversational filler, unnecessary tense changes, and descriptions being presented as action items. Revised instructions and sampling improved the first three fixtures; description-versus-task recognition still failed in an observed run. These observations predate integration of main's guided writing outputs and passage-preservation checks. Passing an integration suite establishes that model streaming and reporting work, not that every generated answer is correct. Quality observations and exact outputs are recorded separately from deterministic service checks.
 
 OpenRay already tells users to review generated text. It does not automatically execute extracted tasks or operate applications through AI. These limitations must remain visible in release notes and future model evaluations.
 
