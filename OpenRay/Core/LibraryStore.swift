@@ -9,6 +9,7 @@ final class LibraryStore {
     private(set) var errorMessage: String?
     private(set) var isReadOnly = false
     let fileURL: URL?
+    @ObservationIgnored var commandBindingsDidChange: (() -> Void)?
     @ObservationIgnored private let images: ClipboardImageStore
 
     init(fileURL: URL? = LibraryStore.defaultURL) {
@@ -18,6 +19,7 @@ final class LibraryStore {
         guard let fileURL, FileManager.default.fileExists(atPath: fileURL.path) else { return }
         do {
             var decoded = try JSONDecoder().decode(LibraryDatabase.self, from: Data(contentsOf: fileURL))
+            decoded.discardUnavailableCommandBindings()
             try decoded.validate()
             decoded.schemaVersion = LibraryDatabase.currentSchemaVersion
             database = decoded
@@ -41,6 +43,7 @@ final class LibraryStore {
         do {
             var next = database
             try mutation(&next)
+            next.discardUnavailableCommandBindings()
             next.schemaVersion = LibraryDatabase.currentSchemaVersion
             let removedClipboardIDs = Set(database.clipboard.map { "clipboard.\($0.id)" })
                 .subtracting(next.clipboard.map { "clipboard.\($0.id)" })
@@ -60,7 +63,9 @@ final class LibraryStore {
             }
             let removedImages = Set(database.clipboard.compactMap(\.image).map(\.id))
                 .subtracting(next.clipboard.compactMap(\.image).map(\.id))
+            let bindingsChanged = database.commandBindings != next.commandBindings
             database = next
+            if bindingsChanged { commandBindingsDidChange?() }
             if !removedImages.isEmpty {
                 Task { await ClipboardImageProcessor.shared.forget(removedImages) }
             }
@@ -73,6 +78,30 @@ final class LibraryStore {
         } catch {
             errorMessage = error.localizedDescription
             return false
+        }
+    }
+
+    @discardableResult
+    func saveCommandBinding(_ binding: CommandBinding) -> Bool {
+        update { database in
+            var binding = binding
+            binding.alias = binding.alias?.trimmingCharacters(in: .whitespacesAndNewlines)
+            if binding.alias?.isEmpty == true { binding.alias = nil }
+            try binding.validate()
+            if binding.isEmpty {
+                database.commandBindings.removeAll { $0.targetID == binding.targetID }
+            } else if let index = database.commandBindings.firstIndex(where: { $0.targetID == binding.targetID }) {
+                database.commandBindings[index] = binding
+            } else {
+                database.commandBindings.append(binding)
+            }
+        }
+    }
+
+    @discardableResult
+    func removeCommandBinding(for targetID: String) -> Bool {
+        update { database in
+            database.commandBindings.removeAll { $0.targetID == targetID }
         }
     }
 

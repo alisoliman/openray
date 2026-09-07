@@ -46,6 +46,8 @@ struct SettingsView: View {
                     }
                 }
 
+                CommandBindingsView(model: model)
+
                 Section {
                     HStack(alignment: .top, spacing: 12) {
                         Image(systemName: model.accessibilityAllowed ? "checkmark.shield.fill" : "hand.raised")
