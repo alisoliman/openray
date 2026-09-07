@@ -137,4 +137,66 @@ struct AIChatTests {
         { response = $0 }
         #expect(!response.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
     }
+
+    @Test(.enabled(if: ProcessInfo.processInfo.environment["OPENRAY_TEST_AI"] == "1"), .timeLimit(.minutes(2)))
+    func realWritingCommandQualityEvaluation() async throws {
+        let correct = "Alex will send the report on Monday. Jamie will review it on Tuesday. The team meets Wednesday."
+        let unchanged = try await evaluateWriting(correct, action: .proofread, named: "already-correct")
+
+        let corrected = try await evaluateWriting(
+            "She go to the store yesterday and buyed three apple.", action: .proofread, named: "grammar-errors")
+
+        let actions = try await evaluateWriting(correct, action: .actionItems, named: "owners-and-dates")
+        let lines = actions.split(whereSeparator: \.isNewline)
+        let normalizedLines = lines.map { $0.lowercased() }
+
+        let noActions = try await evaluateWriting(
+            "The library has two floors. Its walls are blue.", action: .actionItems, named: "no-actions")
+
+        // Model quality is evaluated and reported separately from deterministic service correctness.
+        // These observations are not exact-output build gates across changing on-device model versions.
+        let checks: [(String, Bool)] = [
+            ("Already-correct proofreading returns the passage unchanged", unchanged == correct),
+            (
+                "Proofreading corrects the supplied grammar errors",
+                corrected.contains("went") && corrected.contains("bought") && corrected.contains("three apples")
+            ),
+            (
+                "Action extraction returns one bullet per line",
+                !lines.isEmpty && lines.allSatisfy { $0.hasPrefix("- ") }
+            ),
+            (
+                "Action extraction preserves Alex's task and date",
+                normalizedLines.contains { $0.contains("alex") && $0.contains("monday") && $0.contains("report") }
+            ),
+            (
+                "Action extraction preserves Jamie's task and date",
+                normalizedLines.contains { $0.contains("jamie") && $0.contains("tuesday") && $0.contains("review") }
+            ),
+            (
+                "Descriptions produce no action items",
+                noActions.lowercased().contains("no action items") && !noActions.contains("- ")
+            ),
+        ]
+        Attachment.record(
+            checks.map { "\($0.1 ? "MEETS EXPECTATION" : "QUALITY DEVIATION"): \($0.0)" }.joined(separator: "\n"),
+            named: "writing-evaluation-summary.txt")
+        if checks.contains(where: { !$0.1 }) {
+            Issue.record(
+                "The on-device writing evaluation found quality deviations. Review writing-evaluation-summary.txt and the output attachments.",
+                severity: .warning)
+        }
+    }
+
+    private func evaluateWriting(_ prompt: String, action: AIAction, named name: String) async throws -> String {
+        let engine = FoundationModelEngine()
+        try #require(engine.availability == .available)
+        var response = ""
+        try await engine.stream(prompt, action: action) { response = $0 }
+        Attachment.record(
+            "Action: \(action.rawValue)\nInput:\n\(prompt)\n\nOutput:\n\(response)",
+            named: "writing-command-\(name).txt")
+        #expect(!response.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+        return response.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
 }

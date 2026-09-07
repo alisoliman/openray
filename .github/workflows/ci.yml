@@ -1,0 +1,77 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  workflow-checks:
+    name: Workflow and release tooling
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Lint GitHub workflows
+        run: ./scripts/check-workflows.sh
+      - name: Test release automation
+        run: |
+          python3 -m unittest discover -s scripts/tests -v
+          python3 scripts/test-ci-signing.py
+      - name: Check helper syntax
+        run: |
+          bash -n scripts/ci-signing.sh scripts/check-workflows.sh
+          node --check scripts/ui-smoke.mjs
+
+  macos:
+    name: Apple silicon build and tests
+    needs: workflow-checks
+    runs-on: macos-26
+    timeout-minutes: 25
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_26.6.app/Contents/Developer
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Verify toolchain and architecture
+        run: |
+          test "$(uname -m)" = arm64
+          xcodebuild -version
+          zsh -n scripts/package-release.sh scripts/verify.sh
+      - name: Run deterministic tests
+        run: ./scripts/verify.sh
+      - name: Package local preview
+        run: ./scripts/package-release.sh --preview --skip-tests --output "$RUNNER_TEMP/openray-preview"
+      - name: Save preview artifacts
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: OpenRay-preview-${{ github.sha }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/openray-preview/OpenRay-*-local-preview.dmg
+            ${{ runner.temp }}/openray-preview/OpenRay-*-local-preview.zip
+            ${{ runner.temp }}/openray-preview/SHA256SUMS
+            ${{ runner.temp }}/openray-preview/PREVIEW-ONLY.txt
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
+      - name: Save test and build diagnostics
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: OpenRay-checks-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            .build/verification/Logs/Test/*.xcresult
+            ${{ runner.temp }}/openray-preview/archive.log
+          include-hidden-files: true
+          retention-days: 14

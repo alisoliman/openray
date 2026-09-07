@@ -26,6 +26,15 @@ final class LibraryStore {
             isReadOnly = true
             errorMessage =
                 "Your library could not be loaded. The original file is untouched. \(error.localizedDescription)"
+            return
+        }
+        // An interrupted image capture can leave a PNG that no saved entry owns.
+        // Only a successfully decoded library can authorize removing those files.
+        do {
+            try images.reconcile(keeping: database.clipboard.compactMap(\.image))
+        } catch {
+            errorMessage =
+                "Your library was loaded, but some unused clipboard images could not be removed: \(error.localizedDescription)"
         }
     }
 

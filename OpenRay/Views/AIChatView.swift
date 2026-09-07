@@ -21,8 +21,8 @@ struct AIChatView: View {
                 Image(systemName: "lock.shield").foregroundStyle(.green)
                 Text("On-device · Conversation kept in memory only")
                 Spacer()
-                Text("AI can make mistakes. Review the result.").foregroundStyle(.tertiary)
-            }.font(.system(size: 10)).foregroundStyle(.secondary).padding(.horizontal, 20).frame(height: 35)
+                Text("AI can make mistakes. Review the result.")
+            }.font(.system(size: 11)).foregroundStyle(.secondary).padding(.horizontal, 20).frame(height: 35)
         }
         .onAppear { model.ai.refreshAvailability() }
     }
@@ -119,7 +119,8 @@ struct AIChatView: View {
                 if message.text.isEmpty && model.ai.isGenerating {
                     ProgressView("Thinking on your Mac…").controlSize(.small).font(.system(size: 12))
                 } else {
-                    Text(message.text).font(.system(size: 13)).lineSpacing(4).textSelection(.enabled)
+                    AIMessageText(message: message).equatable()
+                        .font(.system(size: 13)).lineSpacing(4).textSelection(.enabled)
                         .frame(maxWidth: .infinity, alignment: .leading)
                 }
                 if message.role == .assistant && !message.text.isEmpty && !model.ai.isGenerating {
@@ -131,7 +132,7 @@ struct AIChatView: View {
                                     title: "AI — " + String((model.ai.messages.first?.text ?? "Response").prefix(50)),
                                     content: message.text))
                         }
-                    }.font(.system(size: 10)).buttonStyle(.plain).foregroundStyle(.secondary)
+                    }.font(.system(size: 11)).buttonStyle(.plain).foregroundStyle(.secondary)
                 }
             }
         }
@@ -147,7 +148,7 @@ struct AIChatView: View {
                             ? "Ask anything, or paste text to work with…" : "Paste the text you’d like to work with…"
                     )
                     .font(.system(size: 13)).foregroundStyle(.tertiary).padding(.top, 10).padding(.leading, 12)
-                    .allowsHitTesting(false)
+                    .allowsHitTesting(false).accessibilityHidden(true)
                 }
                 AIComposerInput(text: $chat.draft, focusRequest: model.focusRequest, submit: model.ai.send)
                     .padding(6).frame(height: 77)
@@ -183,9 +184,28 @@ struct AIChatView: View {
                         }
                     }
                     .buttonStyle(.borderedProminent).disabled(!model.ai.canSend)
-                    .keyboardShortcut(.return, modifiers: .command).accessibilityIdentifier("ai.send")
+                    .keyboardShortcut(.return, modifiers: .command).accessibilityLabel("Send message")
+                    .accessibilityIdentifier("ai.send")
                 }
             }.font(.system(size: 11)).buttonStyle(.plain).foregroundStyle(.secondary)
         }.padding(.horizontal, 20).padding(.top, 8).padding(.bottom, 14)
+    }
+}
+
+struct AIMessageText: View, Equatable {
+    let message: ChatMessage
+
+    var body: some View { Text(Self.attributedText(for: message)) }
+
+    static func attributedText(for message: ChatMessage) -> AttributedString {
+        guard message.role == .assistant,
+            var text = try? AttributedString(
+                markdown: message.text,
+                options: .init(interpretedSyntax: .inlineOnlyPreservingWhitespace))
+        else { return AttributedString(message.text) }
+        // Responses support emphasis and inline code. Generated link targets are
+        // kept inert; Copy and Save as Note retain the original response text.
+        text.link = nil
+        return text
     }
 }

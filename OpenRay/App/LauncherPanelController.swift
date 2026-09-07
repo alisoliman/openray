@@ -1,9 +1,11 @@
 import AppKit
 import SwiftUI
 
-private final class LauncherPanel: NSPanel {
+final class LauncherPanel: NSPanel {
+    var onCancel: (() -> Void)?
     override var canBecomeKey: Bool { true }
     override var canBecomeMain: Bool { true }
+    override func cancelOperation(_ sender: Any?) { onCancel?() }
 }
 
 @MainActor
@@ -85,6 +87,7 @@ final class LauncherPanelController: NSObject, NSWindowDelegate {
         panel.backgroundColor = .clear
         panel.hasShadow = true
         panel.isMovableByWindowBackground = false
+        panel.onCancel = { [weak model] in model?.goBack() }
         panel.delegate = self
         panel.contentView = NSHostingView(rootView: ContentView(model: model))
         window = panel

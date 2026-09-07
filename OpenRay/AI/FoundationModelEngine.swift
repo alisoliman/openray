@@ -43,9 +43,14 @@ final class FoundationModelEngine: AIEngine {
         }
         guard let session else { throw AIServiceError.unavailable(.unavailable) }
         do {
+            // Proofreading and extraction should preserve source facts without creative variation.
+            let options =
+                switch action {
+                case .proofread, .actionItems: GenerationOptions(sampling: .greedy, maximumResponseTokens: 900)
+                default: GenerationOptions(temperature: 0.4, maximumResponseTokens: 900)
+                }
             let stream = session.streamResponse(
-                to: Prompt(prompt),
-                options: GenerationOptions(temperature: 0.4, maximumResponseTokens: 900))
+                to: Prompt(prompt), options: options)
             for try await snapshot in stream {
                 try Task.checkCancellation()
                 onSnapshot(snapshot.content)

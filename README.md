@@ -4,7 +4,7 @@ A native, keyboard-first macOS launcher inspired by [Raycast’s core features](
 
 ## Requirements
 
-- macOS 26.0 or later.
+- An Apple silicon Mac (M1 or later) running macOS 26.0 or later. Intel Macs are not supported.
 - Xcode 26.6 / Swift 6.3.3 or later. The project uses Swift 6 language mode (`SWIFT_VERSION = 6.0`); the installed Xcode supplies the compiler. [Swift 6.3.3 release announcement](https://forums.swift.org/t/announcing-swift-6-3-3/87888).
 - AI requires an eligible Apple silicon Mac, Apple Intelligence enabled, a supported language, and the on-device model downloaded. Everything else works without AI.
 
@@ -19,7 +19,31 @@ xcodebuild -project OpenRay.xcodeproj -scheme OpenRay \
 open DerivedData/Build/Products/Debug/OpenRay.app
 ```
 
-The checked-in project includes source folders automatically; XcodeGen is not required. `project.yml` is retained for optional project regeneration. Distribution outside your own Mac requires appropriate Developer ID signing and notarization.
+The checked-in project includes source folders automatically; XcodeGen is not required. `project.yml` is retained for optional project regeneration. Both build configurations target Apple silicon (`arm64`).
+
+## Direct-download releases
+
+OpenRay uses direct distribution to preserve its cross-app features. Public releases require Developer ID Application signing and Apple notarization; it is not a Mac App Store build. See the [release guide](docs/RELEASE.md) for credentials, release checks, and the manual smoke test.
+
+The [GitHub release pipeline](docs/GITHUB-RELEASES.md) builds Apple silicon previews for pull requests and `main`, then signs and notarizes versioned releases from SemVer tags such as `v1.2.3`. Stable releases update GitHub's native Latest link; prereleases remain separate. The guide covers the one-time signing secrets, draft preparation, and permanent download URLs.
+
+Build a clearly labeled local installer preview without distribution credentials:
+
+```sh
+./scripts/package-release.sh --preview
+```
+
+With an installed Developer ID Application certificate and a configured notarization Keychain profile:
+
+```sh
+export OPENRAY_SIGNING_IDENTITY='Developer ID Application: Your Name (TEAMID)'
+export OPENRAY_NOTARY_PROFILE='OpenRay-notary'
+./scripts/package-release.sh
+```
+
+The script creates an Apple silicon Release archive, ZIP, drag-to-Applications DMG, checksums, and verification logs under `.build/releases/`. Production mode requires signing, notarization acceptance, stapling, and distribution-policy checks before it reports success. A `local-preview` artifact is ad-hoc signed and must not be published as a production download. Releases currently use manual download/replacement; there is no automatic updater.
+
+Choose **OpenRay Help** from the menu bar for the built-in guide and privacy explanation, or report a reproducible bug through [GitHub Issues](https://github.com/alisoliman/openray/issues). GitHub issues are public; omit private clipboard content and personal paths. See the [privacy notice](docs/privacy-policy.md) and [support guide](docs/support.md).
 
 OpenRay opens a floating launcher and stays in the menu bar after dismissal. Press **⌥ Space** to toggle it. If another application owns that shortcut, choose an alternative in Settings. Keep the app at a stable location before enabling launch at login or granting Accessibility; ad-hoc-signed development rebuilds may need authorization again.
 
