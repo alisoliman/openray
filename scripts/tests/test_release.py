@@ -13,6 +13,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from urllib.parse import quote
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import release
@@ -75,6 +76,7 @@ class FakeGitHub:
         if argv[1] == "api":
             endpoint = argv[2].removeprefix(f"repos/{REPO}/")
             if endpoint.startswith("commits/"):
+                assert endpoint == f"commits/{quote('refs/tags/' + self.tag, safe='')}"
                 self.tag_checks += 1
                 if self.tag_checks == self.move_tag_on_check:
                     self.sha = "b" * 40
@@ -320,6 +322,13 @@ class PublishTests(ReleaseFixture):
         with self.assertRaisesRegex(release.ReleaseError, "does not resolve"):
             self.publish(fake)
         self.assertEqual(fake.mutations(), [])
+
+    def test_commit_check_uses_qualified_tag_ref(self):
+        fake = FakeGitHub(self.output)
+        self.publish(fake, public=False)
+        checks = [command for command in fake.calls if command[1] == "api" and "/commits/" in command[2]]
+        self.assertTrue(checks)
+        self.assertTrue(all(command[2].endswith("/commits/refs%2Ftags%2Fv1.2.3") for command in checks))
 
     def test_tag_move_before_final_publication_leaves_draft(self):
         fake = FakeGitHub(self.output)

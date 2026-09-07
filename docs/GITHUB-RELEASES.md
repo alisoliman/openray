@@ -65,21 +65,25 @@ The versioned download and latest-release link do not add an automatic updater t
 
 ## Prepare an existing tag manually
 
-In **Actions → Release → Run workflow**, select `main`, enter an existing remote tag, and leave `publish` unchecked to prepare a draft. For example:
+Run the workflow at the existing version tag, supply that same tag as the `tag` input, and leave `publish` unchecked to prepare a draft. The CLI makes the selected ref explicit:
 
 ```sh
-gh workflow run release.yml --ref main -f tag=v1.2.3 -F publish=false
+gh workflow run release.yml --ref v1.2.3 -f tag=v1.2.3 -F publish=false
 ```
 
 Use this for an existing unpublished tag or a release retry. A newly pushed version tag also triggers the automatic publishing path described above; a separate manual draft run does not cancel that path.
 
+The workflow rejects dispatches from `main` or a different tag. The triggering commit must match the tag's resolved commit, which binds GitHub's build provenance to the actual source and rejects a tag that moved while the run was queued. The selected tag must already contain the release workflow.
+
 To request publication from a manual run:
 
 ```sh
-gh workflow run release.yml --ref main -f tag=v1.2.3 -F publish=true
+gh workflow run release.yml --ref v1.2.3 -f tag=v1.2.3 -F publish=true
 ```
 
 Monitor the [Release workflow](https://github.com/alisoliman/openray/actions/workflows/release.yml) and inspect its summary and the resulting draft or published release. A failed signing, notarization, checksum, or upload check must be resolved before the version is presented as ready. Do not upload a `local-preview` artifact to a release to work around a failed production build.
+
+If only publication fails, **Re-run failed jobs** reuses the successful build's artifact ID. A new complete run may refresh an unpublished draft for the same tag and source commit, then verify all uploaded bytes again. Published assets are never replaced by this pipeline; source corrections require a new version.
 
 ## Release contents and verification
 

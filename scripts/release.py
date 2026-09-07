@@ -226,7 +226,9 @@ class GitHub:
         return self.paginated("releases?per_page=100")
 
     def assert_tag(self, tag: str, sha: str) -> None:
-        commit = self.api(f"commits/{quote(tag, safe='')}")
+        # An unqualified name can resolve a branch with the same name. Require
+        # the actual tag ref, including for annotated tags that peel to a commit.
+        commit = self.api(f"commits/{quote('refs/tags/' + tag, safe='')}")
         if not isinstance(commit, dict) or commit.get("sha") != sha:
             raise ReleaseError(f"Remote tag {tag} does not resolve to the requested commit. No tag will be created or moved.")
 
