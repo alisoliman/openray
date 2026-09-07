@@ -59,6 +59,24 @@ struct LauncherItem: Identifiable, Sendable {
     var canFavorite: Bool {
         if case .calculation = action { false } else { true }
     }
+
+    var isBuiltInCommand: Bool {
+        switch action {
+        case .section, .ai, .settings, .window: true
+        default: false
+        }
+    }
+
+    var accessibilityDescription: String {
+        switch action {
+        case .file(let url):
+            "\(title), \(badge), in \(url.deletingLastPathComponent().path)"
+        case .application(let app):
+            "\(title), \(badge), in \(app.url.deletingLastPathComponent().path)"
+        default:
+            "\(title), \(badge)"
+        }
+    }
 }
 
 struct LauncherResultGroup: Identifiable {

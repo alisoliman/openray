@@ -33,9 +33,6 @@ struct LauncherSearchView: View {
             footer(selected: selected)
         }
         .onChange(of: items.map(\.id), initial: true) { model.synchronizeSelection() }
-        .onChange(of: model.showActions) { _, isPresented in
-            if !isPresented { model.focusRequest += 1 }
-        }
         .background {
             Group {
                 Button("Actions") { model.showActions.toggle() }.keyboardShortcut("k")
@@ -76,7 +73,7 @@ struct LauncherSearchView: View {
                 ProgressView().controlSize(.small).accessibilityLabel("Searching")
             } else if !model.query.isEmpty {
                 Button("Clear search", systemImage: "xmark.circle.fill") { model.query = "" }
-                    .labelStyle(.iconOnly).buttonStyle(.plain).foregroundStyle(.tertiary)
+                    .labelStyle(.iconOnly).buttonStyle(.plain).foregroundStyle(.secondary)
             }
             Keycap(text: "esc")
         }.padding(.horizontal, 22).frame(height: 72)
@@ -108,7 +105,7 @@ struct LauncherSearchView: View {
             } else {
                 HStack(spacing: 5) {
                     Circle().fill(.green.opacity(0.8)).frame(width: 5, height: 5)
-                    Text("LOCAL & PRIVATE").font(.system(size: 10, weight: .semibold, design: .monospaced)).tracking(
+                    Text("LOCAL & PRIVATE").font(.system(size: 11, weight: .semibold, design: .monospaced)).tracking(
                         0.6)
                 }.foregroundStyle(.secondary).accessibilityLabel("Local and private")
             }
@@ -146,7 +143,7 @@ struct LauncherSearchView: View {
                     }
                 }.buttonStyle(.borderedProminent).controlSize(.large)
                 Text("You can pause capture or delete your history at any time.")
-                    .font(.system(size: 11)).foregroundStyle(.tertiary).padding(.top, 13)
+                    .font(.system(size: 11)).foregroundStyle(.secondary).padding(.top, 13)
             }.frame(maxWidth: .infinity, maxHeight: .infinity)
         } else if groups.allSatisfy({ $0.items.isEmpty }) {
             emptyState
@@ -166,7 +163,7 @@ struct LauncherSearchView: View {
             ScrollView {
                 LazyVStack(alignment: .leading, spacing: 3) {
                     ForEach(groups) { group in
-                        Text(group.title).font(.system(size: 11, weight: .medium)).foregroundStyle(.tertiary)
+                        Text(group.title).font(.system(size: 11, weight: .medium)).foregroundStyle(.secondary)
                             .padding(.horizontal, 10).padding(.top, 9).padding(.bottom, 5)
                         ForEach(group.items) { item in resultRow(item, selected: item.id == selectedID).id(item.id) }
                     }
@@ -189,15 +186,15 @@ struct LauncherSearchView: View {
                     Text(item.subtitle).font(.system(size: 11)).foregroundStyle(.secondary).lineLimit(1)
                 }.frame(maxWidth: .infinity, alignment: .leading)
                 if model.store.database.favoriteIDs.contains(item.id) {
-                    Image(systemName: "star.fill").font(.system(size: 8)).foregroundStyle(.tertiary)
+                    Image(systemName: "star.fill").font(.system(size: 8)).foregroundStyle(.secondary)
                 }
-                Text(item.badge).font(.system(size: 10)).foregroundStyle(.tertiary).lineLimit(1)
-                if selected { Image(systemName: "return").font(.system(size: 10)).foregroundStyle(.secondary) }
+                Text(item.badge).font(.system(size: 11)).foregroundStyle(.secondary).lineLimit(1)
+                if selected { Image(systemName: "return").font(.system(size: 11)).foregroundStyle(.secondary) }
             }.padding(.horizontal, 10).frame(height: 53)
                 .background(selected ? Color.primary.opacity(0.075) : .clear, in: .rect(cornerRadius: 8)).contentShape(
                     .rect)
         }
-        .buttonStyle(.plain).accessibilityLabel("\(item.title), \(item.badge)")
+        .buttonStyle(.plain).accessibilityLabel(item.accessibilityDescription)
         .accessibilityValue(item.subtitle).accessibilityHint(
             item.primaryActionTitle
         )
@@ -220,9 +217,9 @@ struct LauncherSearchView: View {
             if model.section == .calculator {
                 EmptyState(
                     symbol: "equal.square",
-                    title: model.query.isEmpty ? "A little less mental math" : "Check that expression",
-                    detail:
-                        "Arithmetic, percentages, scientific functions, and conversions for length, mass, time, temperature, volume, and storage. Currency rates and natural-language dates aren’t supported yet."
+                    title: Calculator.issue(for: model.query)?.title ?? "A little less mental math",
+                    detail: Calculator.issue(for: model.query)?.message
+                        ?? "Arithmetic, percentages, scientific functions, and conversions for length, mass, time, temperature, volume, and storage. Try an example below."
                 )
                 HStack(spacing: 8) {
                     ForEach(["(120 + 45) * 0.2", "10 km in mi", "72 f in c"], id: \.self) { example in
@@ -242,10 +239,10 @@ struct LauncherSearchView: View {
                 )
             } else if model.section == .clipboard && (!model.query.isEmpty || model.clipboardFilter != .all) {
                 EmptyState(
-                    symbol: "clipboard", title: "No matching clipboard items",
-                    detail: "Try another search or show all content types. Capture only saves new copies while enabled."
+                    symbol: "line.3.horizontal.decrease.circle", title: "No matching clipboard items",
+                    detail: "Try a different search or show all content types. Your saved history is still available."
                 )
-                HStack {
+                HStack(spacing: 12) {
                     if !model.query.isEmpty {
                         Button("Clear Search") {
                             model.query = ""
@@ -259,8 +256,9 @@ struct LauncherSearchView: View {
             } else if !model.query.isEmpty {
                 EmptyState(
                     symbol: "magnifyingglass", title: "No matching results",
-                    detail:
-                        "Try a different name or keyword. You can also search the web with a quicklink, such as “web \(model.query)”."
+                    detail: model.section == .home
+                        ? "Try a different name or keyword. You can also search the web with a quicklink, such as “web \(model.query)”."
+                        : "Try a different name or keyword, or clear your search to see all \(model.section.title.lowercased())."
                 )
             } else if model.section == .clipboard {
                 EmptyState(
@@ -312,19 +310,24 @@ struct LauncherSearchView: View {
                 }
             }.buttonStyle(.plain).accessibilityIdentifier("launcher.actions")
                 .background {
-                    LauncherActionsMenu(isPresented: $model.showActions, entries: actions(for: selected))
-                        .accessibilityHidden(true)
+                    NativeActionsMenu(
+                        isPresented: $model.showActions,
+                        title: selected?.title ?? "OpenRay",
+                        entries: actionEntries(for: selected),
+                        didClose: { model.focusRequest += 1 }
+                    )
+                    .accessibilityHidden(true)
                 }
         }.padding(.horizontal, 18).frame(height: 43)
     }
 
-    private func actions(for item: LauncherItem?) -> [LauncherMenuEntry] {
-        var entries: [LauncherMenuEntry] = [.heading(item?.title ?? "OpenRay")]
+    private func actionEntries(for item: LauncherItem?) -> [NativeActionsMenu.Entry] {
+        var entries: [NativeActionsMenu.Entry] = []
         if let item {
-            entries.append(.action(title: item.primaryActionTitle, symbol: "return") { model.perform(item) })
+            entries.append(.init(title: item.primaryActionTitle, symbol: "return") { model.perform(item) })
             if item.supportsPaste {
                 entries.append(
-                    .action(title: "Paste into Previous App", symbol: "arrow.up.doc") {
+                    .init(title: "Paste into Previous App", symbol: "arrow.up.doc") {
                         model.showActions = false
                         model.selectedID = item.id
                         guard model.selectedItem?.id == item.id else { return }
@@ -332,59 +335,41 @@ struct LauncherSearchView: View {
                     })
             }
             if let text = item.copyText {
-                entries.append(
-                    .action(title: "Copy", symbol: "doc.on.doc") {
-                        model.copy(text)
-                        model.showActions = false
-                    })
+                entries.append(.init(title: "Copy", symbol: "doc.on.doc") { model.copy(text) })
             }
             if item.canFavorite {
                 entries.append(
-                    .action(
+                    .init(
                         title: model.store.database.favoriteIDs.contains(item.id)
                             ? "Remove from Favorites" : "Add to Favorites", symbol: "star"
-                    ) {
-                        model.store.toggleFavorite(item.id)
-                        model.showActions = false
-                    })
+                    ) { model.store.toggleFavorite(item.id) })
             }
             switch item.action {
             case .quicklink, .snippet, .note:
                 entries.append(
-                    .action(title: "Edit", symbol: "pencil") {
+                    .init(title: "Edit", symbol: "pencil") {
                         model.selectedID = item.id
                         guard model.selectedItem?.id == item.id else { return }
                         model.editSelected()
                     })
-                entries.append(
-                    .action(title: "Delete…", symbol: "trash") {
-                        model.showActions = false
-                        deletion = item
-                    })
+                entries.append(.init(title: "Delete…", symbol: "trash") { deletion = item })
             case .clipboard:
-                entries.append(
-                    .action(title: "Delete…", symbol: "trash") {
-                        model.showActions = false
-                        deletion = item
-                    })
+                entries.append(.init(title: "Delete…", symbol: "trash") { deletion = item })
             case .file(let url):
                 entries.append(
-                    .action(title: "Reveal in Finder", symbol: "folder") {
+                    .init(title: "Reveal in Finder", symbol: "folder") {
                         NSWorkspace.shared.activateFileViewerSelecting([url])
-                        model.showActions = false
                     })
             case .application(let app):
                 entries.append(
-                    .action(title: "Reveal in Finder", symbol: "folder") {
+                    .init(title: "Reveal in Finder", symbol: "folder") {
                         NSWorkspace.shared.activateFileViewerSelecting([app.url])
-                        model.showActions = false
                     })
             default: break
             }
-            entries.append(.separator)
         }
-        entries.append(.action(title: "Settings", symbol: "gearshape") { model.openSettings() })
-        entries.append(.action(title: "Back to Everything", symbol: "magnifyingglass") { model.navigate(to: .home) })
+        entries.append(.init(title: "Settings", symbol: "gearshape") { model.openSettings() })
+        entries.append(.init(title: "Back to Everything", symbol: "magnifyingglass") { model.navigate(to: .home) })
         return entries
     }
 }
@@ -394,9 +379,9 @@ private struct ItemPreview: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
             HStack {
-                Text("PREVIEW").font(.system(size: 10, weight: .semibold)).tracking(1)
+                Text("PREVIEW").font(.system(size: 11, weight: .semibold)).tracking(1)
                 Spacer()
-                Text(metadata).font(.system(size: 10))
+                Text(metadata).font(.system(size: 11))
             }.foregroundStyle(.secondary)
             if let resource = item.clipboardImage {
                 ClipboardImageView(resource: resource)
@@ -408,7 +393,7 @@ private struct ItemPreview: View {
                             Label {
                                 VStack(alignment: .leading, spacing: 3) {
                                     Text(url.lastPathComponent).font(.system(size: 12, weight: .medium))
-                                    Text(url.deletingLastPathComponent().path).font(.system(size: 10)).foregroundStyle(
+                                    Text(url.deletingLastPathComponent().path).font(.system(size: 11)).foregroundStyle(
                                         .secondary)
                                 }.textSelection(.enabled)
                             } icon: {

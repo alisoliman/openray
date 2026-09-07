@@ -203,7 +203,7 @@ struct UsageRecord: Codable, Equatable, Sendable {
 }
 
 struct LibraryDatabase: Codable, Equatable, Sendable {
-    static let currentSchemaVersion = 2
+    static let currentSchemaVersion = 3
     var schemaVersion = LibraryDatabase.currentSchemaVersion
     var preferences = AppPreferences()
     var quicklinks = Quicklink.defaults
@@ -212,6 +212,58 @@ struct LibraryDatabase: Codable, Equatable, Sendable {
     var clipboard: [ClipboardEntry] = []
     var favoriteIDs: Set<String> = ["section.clipboard", "ai.chat", "section.notes"]
     var usage: [UsageRecord] = []
+    var commandBindings: [CommandBinding] = []
+
+    private enum CodingKeys: String, CodingKey {
+        case schemaVersion, preferences, quicklinks, snippets, notes, clipboard, favoriteIDs, usage, commandBindings
+    }
+
+    /// Retired commands may have obsolete payloads. Ignore them before decoding
+    /// fields whose representation is no longer relevant to this version.
+    private struct AvailableCommandBinding: Decodable {
+        var binding: CommandBinding?
+
+        private enum CodingKeys: String, CodingKey { case targetID }
+
+        init(from decoder: Decoder) throws {
+            let container = try decoder.container(keyedBy: CodingKeys.self)
+            let targetID = try container.decode(String.self, forKey: .targetID)
+            if CuratedCommand.supports(targetID) { binding = try CommandBinding(from: decoder) }
+        }
+    }
+
+    init() {}
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        schemaVersion = try container.decode(Int.self, forKey: .schemaVersion)
+        preferences = try container.decode(AppPreferences.self, forKey: .preferences)
+        quicklinks = try container.decode([Quicklink].self, forKey: .quicklinks)
+        snippets = try container.decode([Snippet].self, forKey: .snippets)
+        notes = try container.decode([QuickNote].self, forKey: .notes)
+        clipboard = try container.decode([ClipboardEntry].self, forKey: .clipboard)
+        favoriteIDs = try container.decode(Set<String>.self, forKey: .favoriteIDs)
+        usage = try container.decode([UsageRecord].self, forKey: .usage)
+        commandBindings =
+            try container.decodeIfPresent([AvailableCommandBinding].self, forKey: .commandBindings)?
+            .compactMap(\.binding) ?? []
+    }
+
+    func binding(for targetID: String) -> CommandBinding? {
+        commandBindings.first { $0.targetID == targetID && CuratedCommand.supports($0.targetID) }
+    }
+
+    /// Aliases match the entire query so ordinary searches with arguments stay searches.
+    func aliasTarget(for query: String) -> String? {
+        guard let query = CommandBinding.normalizedAlias(query) else { return nil }
+        return commandBindings.first {
+            CuratedCommand.supports($0.targetID) && CommandBinding.normalizedAlias($0.alias) == query
+        }?.targetID
+    }
+
+    mutating func discardUnavailableCommandBindings() {
+        commandBindings.removeAll { !CuratedCommand.supports($0.targetID) }
+    }
 
     func validate() throws {
         guard (1...Self.currentSchemaVersion).contains(schemaVersion) else {
@@ -220,6 +272,7 @@ struct LibraryDatabase: Codable, Equatable, Sendable {
         let identities = [
             quicklinks.map { $0.id.uuidString }, snippets.map { $0.id.uuidString },
             notes.map { $0.id.uuidString }, clipboard.map { $0.id.uuidString }, usage.map(\.id),
+            commandBindings.map(\.targetID),
         ]
         guard identities.allSatisfy({ Set($0).count == $0.count }) else {
             throw LibraryValidationError("The library contains duplicate item identifiers.")
@@ -231,6 +284,19 @@ struct LibraryDatabase: Codable, Equatable, Sendable {
         }
         for link in quicklinks { try link.validate() }
         for snippet in snippets { try snippet.validate(against: snippets) }
+        var aliases = Set<String>()
+        let keywords = Set(
+            (quicklinks.map(\.keyword) + snippets.map(\.keyword)).compactMap(CommandBinding.normalizedAlias))
+        for binding in commandBindings {
+            try binding.validate()
+            guard let alias = CommandBinding.normalizedAlias(binding.alias) else { continue }
+            guard aliases.insert(alias).inserted else {
+                throw LibraryValidationError("Another command already uses this alias.")
+            }
+            guard !keywords.contains(alias) else {
+                throw LibraryValidationError("This alias is already used by a quicklink or snippet keyword.")
+            }
+        }
         guard clipboard.allSatisfy(\.isValid) else {
             throw LibraryValidationError("The library contains invalid clipboard content.")
         }

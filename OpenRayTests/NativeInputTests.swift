@@ -6,6 +6,24 @@ import Testing
 
 @MainActor
 struct NativeInputTests {
+    @Test(arguments: [false, true]) func navigationClearsTheNativeEditorBeforeTheNextKeystroke(submitting: Bool) {
+        var query = "previous query"
+        let input = LauncherSearchInput(
+            text: Binding(get: { query }, set: { query = $0 }), placeholder: "Search", focusRequest: 0,
+            submit: { query = "" }, move: { _ in }, cancel: { query = "" }, paste: {})
+        let coordinator = input.makeCoordinator()
+        let field = FocusedSearchField()
+        coordinator.attach(to: field)
+        field.stringValue = query
+        let editor = NSTextView()
+        editor.string = query
+        let command = submitting ? #selector(NSResponder.insertNewline(_:)) : #selector(NSResponder.cancelOperation(_:))
+        #expect(coordinator.control(field, textView: editor, doCommandBy: command))
+        #expect(query.isEmpty)
+        #expect(field.stringValue.isEmpty)
+        #expect(editor.string.isEmpty)
+    }
+
     @Test func emptySearchHasANativeReturnActionWithoutRequiringTextEditing() {
         var submissions = 0
         let input = LauncherSearchInput(
@@ -26,19 +44,21 @@ struct NativeInputTests {
 
     @Test func actionsUseNativeMenuItemsWithIndependentRetainedHandlers() {
         var actions: [String] = []
-        let menu = LauncherActionsMenu.Coordinator.makeMenu(entries: [
-            .heading("Calculator"),
-            .action(title: "Open", symbol: "return") { actions.append("open") },
-            .action(title: "Favorite", symbol: "star") { actions.append("favorite") },
-            .separator,
-            .action(title: "Settings", symbol: "gearshape") { actions.append("settings") },
-        ])
+        let presenter = NativeActionsMenu(
+            isPresented: .constant(true), title: "Calculator",
+            entries: [
+                .init(title: "Open", symbol: "return") { actions.append("open") },
+                .init(title: "Favorite", symbol: "star") { actions.append("favorite") },
+                .init(title: "Settings", symbol: "gearshape") { actions.append("settings") },
+            ], didClose: {})
+        let coordinator = presenter.makeCoordinator()
+        let menu = coordinator.makeMenu()
 
-        #expect(menu.items.map(\.title) == ["Calculator", "Open", "Favorite", "", "Settings"])
+        #expect(menu.items.filter { !$0.isHidden }.map(\.title) == ["Calculator", "", "Open", "Favorite", "Settings"])
         #expect(menu.items[0].isEnabled == false)
-        #expect(menu.items[3].isSeparatorItem)
-        #expect(menu.items[2].isEnabled)
-        menu.performActionForItem(at: 2)
+        #expect(menu.items[1].isSeparatorItem)
+        #expect(menu.items[3].isEnabled)
+        menu.performActionForItem(at: 3)
         #expect(actions == ["favorite"])
         menu.performActionForItem(at: 4)
         #expect(actions == ["favorite", "settings"])
@@ -51,6 +71,17 @@ struct NativeInputTests {
         panel.onCancel = { cancellations += 1 }
         panel.cancelOperation(nil)
         #expect(cancellations == 1)
+    }
+
+    @Test func panelCancelLeavesAnActiveTextEditorInPlace() {
+        let panel = LauncherPanel()
+        let editor = NSTextView(frame: NSRect(x: 0, y: 0, width: 200, height: 100))
+        panel.contentView = editor
+        #expect(panel.makeFirstResponder(editor))
+        var cancellations = 0
+        panel.onCancel = { cancellations += 1 }
+        panel.cancelOperation(nil)
+        #expect(cancellations == 0)
     }
 
     @Test func assistantMarkdownKeepsParagraphsAndListMarkersAndRendersEmphasis() {

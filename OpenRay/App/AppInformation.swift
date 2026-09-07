@@ -1,4 +1,4 @@
-import SwiftUI
+import Foundation
 
 enum AppInformation {
     static var version: String {
@@ -9,14 +9,4 @@ enum AppInformation {
 
     static let documentationURL = URL(string: "https://github.com/alisoliman/openray#readme")!
     static let supportURL = URL(string: "https://github.com/alisoliman/openray/issues")!
-}
-
-extension AppAppearance {
-    var colorScheme: ColorScheme? {
-        switch self {
-        case .system: nil
-        case .light: .light
-        case .dark: .dark
-        }
-    }
 }

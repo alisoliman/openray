@@ -1,92 +1,6 @@
 import AppKit
 import SwiftUI
 
-enum LauncherMenuEntry {
-    case heading(String)
-    case separator
-    case action(title: String, symbol: String, perform: @MainActor () -> Void)
-}
-
-/// Native menu tracking owns keyboard navigation and accessibility while the
-/// launcher search field remains the panel's normal first responder.
-struct LauncherActionsMenu: NSViewRepresentable {
-    @Binding var isPresented: Bool
-    var entries: [LauncherMenuEntry]
-
-    func makeCoordinator() -> Coordinator { Coordinator(parent: self) }
-    func makeNSView(context: Context) -> NSView { NSView() }
-
-    func updateNSView(_ view: NSView, context: Context) {
-        let coordinator = context.coordinator
-        coordinator.parent = self
-        if isPresented {
-            coordinator.present(in: view)
-        } else {
-            coordinator.menu?.cancelTracking()
-        }
-    }
-
-    @MainActor
-    final class Coordinator {
-        var parent: LauncherActionsMenu
-        var menu: NSMenu?
-        private var presentationScheduled = false
-
-        init(parent: LauncherActionsMenu) { self.parent = parent }
-
-        func present(in view: NSView) {
-            guard menu == nil, !presentationScheduled else { return }
-            presentationScheduled = true
-            // Wait for SwiftUI to finish updating the anchor and its binding.
-            DispatchQueue.main.async { [weak self, weak view] in
-                guard let self else { return }
-                self.presentationScheduled = false
-                guard self.parent.isPresented else { return }
-                guard let view, view.window?.isVisible == true else {
-                    self.parent.isPresented = false
-                    return
-                }
-                let menu = Self.makeMenu(entries: self.parent.entries)
-                self.menu = menu
-                menu.popUp(positioning: nil, at: NSPoint(x: 0, y: view.bounds.maxY), in: view)
-                self.menu = nil
-                self.parent.isPresented = false
-            }
-        }
-
-        static func makeMenu(entries: [LauncherMenuEntry]) -> NSMenu {
-            let menu = NSMenu()
-            menu.autoenablesItems = false
-            for entry in entries {
-                switch entry {
-                case .heading(let title):
-                    let item = NSMenuItem(title: title, action: nil, keyEquivalent: "")
-                    item.isEnabled = false
-                    menu.addItem(item)
-                case .separator:
-                    menu.addItem(.separator())
-                case .action(let title, let symbol, let perform):
-                    let target = MenuActionTarget(perform: perform)
-                    let item = NSMenuItem(
-                        title: title, action: #selector(MenuActionTarget.invoke(_:)), keyEquivalent: "")
-                    item.image = NSImage(systemSymbolName: symbol, accessibilityDescription: nil)
-                    item.target = target
-                    item.representedObject = target
-                    menu.addItem(item)
-                }
-            }
-            return menu
-        }
-    }
-
-    @MainActor
-    private final class MenuActionTarget: NSObject {
-        let perform: @MainActor () -> Void
-        init(perform: @escaping @MainActor () -> Void) { self.perform = perform }
-        @objc func invoke(_ sender: Any?) { perform() }
-    }
-}
-
 /// Floating NSHostingView panels don't have SwiftUI's scene focus lifecycle.
 /// These controls restore the real first responder without resigning an active
 /// editor, which would commit stale text or drop keystrokes during navigation.
@@ -146,6 +60,9 @@ struct LauncherSearchInput: NSViewRepresentable {
 
         @objc func submitted(_ sender: Any?) {
             if NSApp.currentEvent?.modifierFlags.contains(.command) == true { parent.paste() } else { parent.submit() }
+            if let field = sender as? NSTextField {
+                synchronizeQuery(in: field, editor: field.currentEditor() as? NSTextView)
+            }
         }
 
         func controlTextDidChange(_ notification: Notification) {
@@ -162,7 +79,19 @@ struct LauncherSearchInput: NSViewRepresentable {
                 submitted(control)
             default: return false
             }
+            if let field = control as? NSTextField { synchronizeQuery(in: field, editor: textView) }
             return true
+        }
+
+        private func synchronizeQuery(in field: NSTextField, editor: NSTextView?) {
+            // Navigation can replace the query before SwiftUI updates this view.
+            // Clear the live editor now so the next keystroke cannot restore stale text.
+            let query = parent.text
+            if field.stringValue != query { field.stringValue = query }
+            if let editor, editor.string != query {
+                editor.string = query
+                editor.setSelectedRange(NSRange(location: query.utf16.count, length: 0))
+            }
         }
     }
 }

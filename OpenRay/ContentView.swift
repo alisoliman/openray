@@ -20,22 +20,19 @@ struct ContentView: View {
         .clipShape(.rect(cornerRadius: 14))
         .overlay { RoundedRectangle(cornerRadius: 14).strokeBorder(.primary.opacity(0.12), lineWidth: 1) }
         .tint(RayStyle.accent)
-        .preferredColorScheme(preferredScheme)
+        .appAppearance(model.store.database.preferences.appearance)
         .sheet(item: $model.editor) { context in LibraryEditorView(context: context, model: model) }
         .onChange(of: model.editor?.id) { _, newValue in
             if newValue == nil { model.focusRequest += 1 }
         }
-        .onExitCommand { model.goBack() }
+        .onExitCommand {
+            // Settings uses the panel's native responder-aware fallback. Text
+            // editing and modal dismissal must get their own Escape first.
+            guard model.editor == nil, model.destination != .settings else { return }
+            model.goBack()
+        }
         .background {
             Button("Open Settings") { model.openSettings() }.keyboardShortcut(",").hidden()
-        }
-    }
-
-    private var preferredScheme: ColorScheme? {
-        switch model.store.database.preferences.appearance {
-        case .system: nil
-        case .light: .light
-        case .dark: .dark
         }
     }
 }

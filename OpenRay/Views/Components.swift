@@ -1,7 +1,15 @@
+import AppKit
 import SwiftUI
 
 enum RayStyle {
-    static let accent = Color(red: 1, green: 0.38, blue: 0.36)
+    static let accent = Color(
+        nsColor: NSColor(name: nil) { appearance in
+            if appearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua {
+                NSColor(srgbRed: 1, green: 0.46, blue: 0.43, alpha: 1)
+            } else {
+                NSColor(srgbRed: 0.72, green: 0.18, blue: 0.18, alpha: 1)
+            }
+        })
     static let subtleFill = Color.primary.opacity(0.045)
 }
 
@@ -25,7 +33,7 @@ struct Keycap: View {
     var text: String
     var body: some View {
         Text(text)
-            .font(.system(size: 10, weight: .medium, design: .rounded)).foregroundStyle(.secondary)
+            .font(.system(size: 11, weight: .medium, design: .rounded)).foregroundStyle(.secondary)
             .padding(.horizontal, 5).frame(minWidth: 19, minHeight: 20)
             .background(.primary.opacity(0.06), in: .rect(cornerRadius: 4))
             .overlay { RoundedRectangle(cornerRadius: 4).strokeBorder(.primary.opacity(0.06)) }

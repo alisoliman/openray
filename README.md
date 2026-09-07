@@ -54,6 +54,7 @@ If Accessibility is enabled in System Settings but OpenRay still reports it unav
 | Feature | Behavior |
 | --- | --- |
 | Launcher | Fuzzy app and command search, installed app icons, favorites, recents, keyboard navigation, and a contextual action menu. |
+| Command bindings | Globally unique aliases and standard global hotkeys for a curated set of frequent commands, configured in Settings. |
 | Applications | Discovers user/system Applications folders and Finder; launches using `NSWorkspace`. Refresh the index in Settings after installing apps. |
 | Files | Spotlight filename search in your home folder, with recent results, open, reveal in Finder, copy path, and favorites. Explicitly filters Library, hidden paths, app contents, `node_modules`, and DerivedData. Requires Spotlight indexing and normal macOS folder access. |
 | Calculator | Arithmetic, parentheses, powers, percentages, scientific functions, and unit conversions for length, mass, duration, temperature, storage, and volume. Uses a bounded parser, never shell or expression evaluation. |
@@ -75,6 +76,16 @@ Try `6 * 7`, `200 * 15%`, `sqrt(144)`, `10 km in mi`, `72 f in c`, or `1 GiB in 
 - **⌘S**: save an editor. **⌘,**: Settings.
 - **Escape**: close actions, return from a feature, clear the root query, or dismiss the launcher.
 - In AI, **Return** inserts a newline and **⌘Return** sends. **Stop** cancels generation.
+
+### Command aliases and hotkeys
+
+In **Settings → Command aliases & hotkeys**, edit a command to set an alias, record a shortcut, or remove its binding. The supported commands are Applications, Files, Clipboard History, Snippets, Quicklinks, Notes, Calculator, Window Management, Ask AI, Settings, Left Half, Right Half, Maximize, Center, and Restore Window. Window commands retain their existing Accessibility and focused-window checks. Individual apps, quicklinks, clipboard entries, snippets, and other AI/window actions are outside this initial curated list.
+
+An exact alias match wins in every launcher search section, ignoring case and surrounding whitespace. Aliases must be a single token of up to 32 characters and cannot duplicate another alias or a quicklink/snippet keyword. Existing command names still work through ordinary search. Bindings are saved in the local library and survive restart; older libraries retain their launcher shortcut preference.
+
+Shortcuts use a physical key position plus Command, Control, Option, and/or Shift. Their label follows the current keyboard layout. Modifier-only gestures, separate left/right modifiers, and all-four-modifier Hyper shortcuts are unsupported. Known reserved macOS combinations and enabled system symbolic shortcuts are blocked. Other detected conflicts require **Save Anyway**; macOS does not expose every application's shortcuts. The launcher has priority over command bindings, followed by command bindings in saved order. A conflicting binding can remain saved but inactive, with an explanation in Settings. Removing the active binding lets the next saved assignment register.
+
+If registration fails, the working launcher shortcut is preserved when possible, and **OpenRay's menu bar → Open OpenRay** remains available. Recording temporarily pauses OpenRay's shortcuts until a key is captured or recording is canceled. Saving or removing a binding updates registrations immediately.
 
 ## Permissions and privacy
 
@@ -115,7 +126,7 @@ On a Mac with Apple Intelligence ready, also run the actual model integration te
 ./scripts/verify.sh --ai
 ```
 
-The suite covers search and stable selection, URL escaping, arithmetic/conversions, persistence and corrupt-file preservation, clipboard opt-in/exclusions/retention, PNG/TIFF capture and restore, grouped file references, media storage/cleanup, migration, in-flight cancellation, snippet matching and Unicode insertion chunks, multi-display geometry, and AI streaming/cancellation/context recovery. Live window manipulation, global shortcut delivery, and cross-app text expansion still require interactive OS-level verification with the relevant permissions.
+The suite covers search and stable selection, command alias uniqueness/ranking, binding migration and persistence, reserved-key validation, shortcut registration lifecycle/failure recovery with an isolated backend, in-process Carbon event routing, URL escaping, arithmetic/conversions, persistence and corrupt-file preservation, clipboard opt-in/exclusions/retention, PNG/TIFF capture and restore, grouped file references, media storage/cleanup, migration, in-flight cancellation, snippet matching and Unicode insertion chunks, multi-display geometry, and AI streaming/cancellation/context recovery. Live window manipulation, global shortcut delivery, and cross-app text expansion still require interactive OS-level verification with the relevant permissions.
 
 For UI verification without writing test notes or snippets into the normal library, launch the executable with `--in-memory-library`. This uses the real services and model, but discards library edits on exit. `scripts/ui-smoke.mjs` contains Computer Use regression checks for initial focus, focus restoration after editor dismissal, and rapid typing after Back. The floating panel uses small AppKit input adapters to manage actual first-responder changes without timing-based focus resets.
 

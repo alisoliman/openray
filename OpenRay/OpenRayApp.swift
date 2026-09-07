@@ -3,7 +3,6 @@ import SwiftUI
 @main
 struct OpenRayApp: App {
     @NSApplicationDelegateAdaptor(OpenRayDelegate.self) private var delegate
-    @Environment(\.openWindow) private var openWindow
 
     var body: some Scene {
         MenuBarExtra("OpenRay", systemImage: "command.square.fill") {
@@ -20,7 +19,7 @@ struct OpenRayApp: App {
                 delegate.model.openSettings()
                 delegate.model.panel?.show()
             }
-            Button("OpenRay Help") { openWindow(id: "help") }
+            OpenRayHelpButton()
             Divider()
             Button("Quit OpenRay") { NSApp.terminate(nil) }
                 .keyboardShortcut("q")
@@ -28,18 +27,17 @@ struct OpenRayApp: App {
         Settings {
             SettingsView(model: delegate.model, showsBackButton: false)
                 .frame(width: 640, height: 560)
+                .appAppearance(delegate.model.store.database.preferences.appearance)
         }
-        Window("OpenRay Help", id: "help") {
-            HelpView(model: delegate.model)
-                .frame(minWidth: 560, idealWidth: 620, minHeight: 500, idealHeight: 660)
+        .commands {
+            CommandGroup(replacing: .help) { OpenRayHelpButton() }
         }
-        .defaultSize(width: 620, height: 660)
+        Window("OpenRay Help", id: OpenRayHelpView.windowID) {
+            OpenRayHelpView(model: delegate.model)
+                .appAppearance(delegate.model.store.database.preferences.appearance)
+        }
+        .defaultSize(width: 700, height: 660)
         .defaultLaunchBehavior(.suppressed)
         .restorationBehavior(.disabled)
-        .commands {
-            CommandGroup(replacing: .help) {
-                Button("OpenRay Help") { openWindow(id: "help") }
-            }
-        }
     }
 }

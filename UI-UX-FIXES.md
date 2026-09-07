@@ -1,0 +1,39 @@
+# UI/UX review fixes — 5 September 2026
+
+This report records the fixes for all ten findings in [the merged-PR review](UI-UX-REVIEW.md), based on merge commit `500862c`.
+
+| Finding | Change | Verification |
+| --- | --- | --- |
+| 1. Actions keyboard routing | Replaced the SwiftUI popover with an AppKit menu that owns keyboard navigation and snapshots the selected item's actions. Underlying result commands are guarded while Actions is open. | Native UI: opened with ⌘K, selected Copy with arrows, executed with Return, saw copy feedback, and immediately typed into search. ⌘K also dismissed the menu. Regression tests cover underlying selection, Return, and action identity. |
+| 2. Settings Escape | The launcher panel routes unclaimed Escape from Settings back to search, preserving native text-editor and sheet handling. | Native UI: ⌘, followed by Escape returned to focused search. Tests cover unclaimed, modified, and text-editing Escape. |
+| 3. Settings appearance | Launcher, native Settings, and Help use a shared appearance modifier. | Native screenshots: choosing Light in embedded Settings also produced a light native Settings window whose picker read Light. Shared policy tests cover Light, Dark, and System. |
+| 4. Unavailable Help | Added a native Help window with search, shortcuts, reusable items, calculator, window management, AI, and privacy guidance. | Help → OpenRay Help opened the guide without an unavailable alert. Light appearance and readable layout inspected; Help did not launch automatically. |
+| 5. Literal AI Markdown | Assistant messages render a safe native Markdown subset. Copy and Save preserve the raw output. Generated links and images do not open or load resources. | Live chat produced a numbered list with bold Dog, Cat, and Bird; both streaming and completed display omitted literal asterisks. Save as Note retained the original Markdown. Tests cover emphasis, lists, code, paragraphs, and unfinished fences. |
+| 6. Unreliable writing transforms | Added guided output, action-specific contracts, fresh transform sessions, proofreading preservation, and explicit action-item lists/no-task output. | Nine real-model generations across all five transforms passed. The original already-correct passage also passed in the native UI, returning the passage unchanged. Layout and no-task regressions passed. |
+| 7. Ambiguous accessible file names | File and application result labels include their parent directories. | Native accessibility tree distinguished identically named `snippets` directories by parent path. Automated disambiguation checks passed. |
+| 8. Command ranking | Exact built-in commands receive priority and deterministic ties. The Settings command is discoverable by the exact title Settings. | Native `snippets` search placed the command first above same-named folders. Tests cover Snippets, Notes, and Settings competing with favorite files. |
+| 9. Generic error and empty states | Calculator reports parser-specific problems. Clipboard mismatch offers Clear Search and Show All Types with contextual guidance. | Native UI showed distinct explanations for `1 / 0`, `sqrt(-1)`, `2 +`, and `100 USD in EUR`. Clipboard README + Images showed both recovery buttons; each reset the appropriate state. Calculator regressions cover valid calculations, malformed input, units, and numerical limits. |
+| 10. Weak secondary text | Increased useful small labels to 11–12 points, replaced tertiary guidance with secondary styling, adapted the accent for Light mode, and gave Save Exclusions a bordered control. | Light Settings, dark search/results, calculator, clipboard, and AI screenshots inspected. This is a visual readability check, not a formal contrast or assistive-technology certification. |
+
+The final native pass also exposed a rapid-navigation race: typing immediately after Back could append to the previous query before SwiftUI updated the native field editor. Search now synchronizes navigation changes within the native callback. The regression test failed against the prior implementation and passes for both Escape and Return; the live Back-and-type reproduction now starts a fresh query.
+
+## Validation
+
+The original fix set was verified on 5 September 2026:
+
+- Full macOS suite: **95 tests across 13 suites passed**.
+- Focused AI run: **14 tests passed**, including nine live generations across the five writing actions.
+- Original-source regression tests demonstrated the Actions/selection/ranking failures before fixes. The native editor race had a separate failing reproduction.
+- The interactive build succeeded with bundle identifier `com.alisoliman.openray.uxfixes`. It ran with `--in-memory-library --verification-pasteboard OpenRayVerification.UXFixes`.
+- Swift formatting and `git diff --check` passed. New Swift files are included through the project's synchronized groups.
+
+PR review follow-up on 6 September 2026:
+
+- Writing actions now pass the raw draft through `AIChatModel.send()`, retaining leading indentation and trailing blank lines. Empty-input validation still rejects whitespace-only drafts, and chat keeps its existing trimming behavior.
+- The new regression failed for all five writing actions before the fix. It now passes, along with whitespace-only validation for all six modes.
+- The full macOS suite passed **97 tests across 13 suites**, including **ten live generations** through `AIChatModel` and the real on-device engine. The live proofreading cases include leading whitespace and trailing blank lines.
+- Historical source links use commit permalinks, and local-only artifact links and transient working-tree status have been removed.
+
+To reproduce the automated checks on a compatible Mac, run `./scripts/verify.sh`. Run `./scripts/verify.sh --ai` to include live Apple Intelligence generation. See the [verification instructions](README.md#verification) for requirements.
+
+Build logs and test result bundles were retained locally on the review machine; they are not repository artifacts. Screenshots and accessibility trees were inspected inline; no standalone screenshot files are claimed. The original review's explicit OS permission, persistent-data, global shortcut, cross-app paste, keyword expansion, display, and VoiceOver coverage limits still apply. Guided AI output improves the tested contracts; it cannot guarantee semantic correctness for every future passage or model revision.

@@ -22,7 +22,7 @@ These links resolve only after a stable release has been published. There is no 
 
 ## One-time configuration
 
-Create a GitHub environment named **`release`** under **Settings → Environments**. Configure its deployment restrictions for the trusted release refs that the workflow uses. Store the following environment secrets under **Settings → Environments → release → Environment secrets**:
+The repository's **`release`** environment is configured to allow only tags matching `v*`. For a fork, create that environment under **Settings → Environments**, choose selected branches/tags, and add the `v*` tag rule. Store the following environment secrets under **Settings → Environments → release → Environment secrets**:
 
 | Secret | Value |
 | --- | --- |
@@ -38,7 +38,7 @@ Optionally set the environment variable `OPENRAY_SIGNING_IDENTITY` to the exact 
 
 Enable **Settings → General → Releases → Enable release immutability** to enforce server-side protection for future published versions. The workflow refuses to replace published assets, but GitHub's repository setting is what prevents later manual or API changes to those assets and tags. Titles, release notes, and latest/prerelease labels remain editable. Immutability applies to future releases and does not retrofit older ones. [GitHub immutable releases](https://docs.github.com/en/code-security/concepts/supply-chain-security/immutable-releases), [enable release immutability](https://docs.github.com/en/code-security/how-tos/secure-your-supply-chain/establish-provenance-and-integrity/prevent-release-changes).
 
-Protect the default branch and release tags according to the repository's maintainer policy. Review changes to `.github/workflows/` and the release scripts as changes to the publishing process. These repository settings and credentials are setup steps; the workflow files do not apply them automatically.
+Protect the default branch and release tags according to the repository's maintainer policy. Review changes to `.github/workflows/` and the release scripts as changes to the publishing process. Beyond the configured release environment, these repository settings and credentials remain setup steps; the workflow files do not apply them automatically.
 
 ## Publish a version
 

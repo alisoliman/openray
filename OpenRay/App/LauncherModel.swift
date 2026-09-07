@@ -16,6 +16,7 @@ final class LauncherModel {
     var message: String?
     var focusRequest = 0
     private(set) var shortcutError: String?
+    private(set) var commandShortcutErrors: [String: String] = [:]
     private(set) var accessibilityAllowed = false
     private(set) var loginEnabled = false
     private(set) var loginNeedsApproval = false
@@ -31,16 +32,26 @@ final class LauncherModel {
     @ObservationIgnored weak var panel: LauncherPanelController?
     @ObservationIgnored var previousApplication: NSRunningApplication?
     @ObservationIgnored private var isStarted = false
+    @ObservationIgnored private var isRecordingShortcut = false
+    @ObservationIgnored private var commandBindingEditorCount = 0
 
     init(store: LibraryStore = LibraryStore(), ai: AIChatModel = AIChatModel(), pasteboard: NSPasteboard = .general) {
         self.store = store
         self.ai = ai
         clipboard = ClipboardService(store: store, pasteboard: pasteboard)
         snippets = SnippetExpander(store: store)
+        store.commandBindingsDidChange = { [weak self] in self?.synchronizeCommandHotKeys() }
     }
 
     var results: [LauncherItem] {
         guard query.count <= 512 else { return [] }
+        // Aliases are a single global namespace, independent of section, usage,
+        // favorites, quicklink arguments and calculator interpretation.
+        if let targetID = store.database.aliasTarget(for: query),
+            let command = bindableCommands.first(where: { $0.id == targetID })
+        {
+            return [command]
+        }
         var items: [LauncherItem] = []
         switch section {
         case .home:
@@ -74,9 +85,12 @@ final class LauncherModel {
                 guard let score = [titleScore, keywordScore].compactMap({ $0 }).max() else { return nil }
                 let appBoost: Int
                 if case .application = item.action { appBoost = 70 } else { appBoost = 0 }
-                return (item, score + appBoost + (store.database.favoriteIDs.contains(item.id) ? 15 : 0))
+                let commandBoost = item.isBuiltInCommand && titleScore == 1_000 ? 200 : 0
+                return (item, score + appBoost + commandBoost + (store.database.favoriteIDs.contains(item.id) ? 15 : 0))
             }.sorted {
-                $0.1 == $1.1 ? $0.0.title.localizedStandardCompare($1.0.title) == .orderedAscending : $0.1 > $1.1
+                if $0.1 != $1.1 { return $0.1 > $1.1 }
+                let comparison = $0.0.title.localizedStandardCompare($1.0.title)
+                return comparison == .orderedSame ? $0.0.id < $1.0.id : comparison == .orderedAscending
             }.map(\.0)
         } else if section == .home {
             let usage = Dictionary(uniqueKeysWithValues: store.database.usage.map { ($0.id, $0.lastUsed) })
@@ -130,6 +144,8 @@ final class LauncherModel {
     }
 
     func stop() {
+        isStarted = false
+        isRecordingShortcut = false
         hotKey.unregister()
         clipboard.stop()
         snippets.stop()
@@ -139,19 +155,139 @@ final class LauncherModel {
 
     func applyPreferences() {
         if isStarted {
-            if clipboard.usesGeneralPasteboard {
-                do {
-                    try hotKey.register(store.database.preferences.hotKey) { [weak self] in self?.panel?.toggle() }
-                    shortcutError = nil
-                } catch { shortcutError = error.localizedDescription }
-            } else {
-                hotKey.unregister()
-                shortcutError = nil
-            }
             clipboard.configure()
             if clipboard.usesGeneralPasteboard { snippets.configure() } else { snippets.stop() }
         }
         refreshPermissions()
+    }
+
+    var bindableCommands: [LauncherItem] {
+        let commands = commandItems
+        return CuratedCommand.targetIDs.compactMap { id in commands.first { $0.id == id } }
+    }
+
+    func commandBinding(for targetID: String) -> CommandBinding {
+        store.database.binding(for: targetID) ?? CommandBinding(targetID: targetID)
+    }
+
+    func bindingWarnings(for binding: CommandBinding) -> [String] {
+        guard let shortcut = binding.shortcut else { return [] }
+        var warnings = CommandShortcutPolicy.conflictWarnings(for: shortcut)
+        if shortcut == store.database.preferences.hotKey.shortcut {
+            warnings.append(
+                "This shortcut opens the launcher. The command binding will stay inactive while the launcher uses it.")
+        }
+        for other in store.database.commandBindings
+        where other.targetID != binding.targetID && other.shortcut == shortcut {
+            let title = bindableCommands.first { $0.id == other.targetID }?.title ?? other.targetID
+            warnings.append(
+                "This shortcut is also assigned to \(title). Only the first saved assignment can be active; remove the other shortcut to use it here."
+            )
+        }
+        return warnings
+    }
+
+    @discardableResult
+    func saveCommandBinding(_ binding: CommandBinding, allowConflicts: Bool = false) -> Bool {
+        do {
+            try validateCommandBinding(binding)
+            let warnings = bindingWarnings(for: binding)
+            guard allowConflicts || warnings.isEmpty else {
+                message = warnings.joined(separator: " ") + " Choose Save Anyway to keep this assignment."
+                return false
+            }
+            guard store.saveCommandBinding(binding) else {
+                message = store.errorMessage
+                return false
+            }
+            message = commandShortcutErrors[binding.targetID] ?? "Command binding saved."
+            synchronizeSelection()
+            return true
+        } catch {
+            message = error.localizedDescription
+            return false
+        }
+    }
+
+    func validateCommandBinding(_ binding: CommandBinding) throws {
+        try binding.validate()
+        if let shortcut = binding.shortcut {
+            try CommandShortcutPolicy.validate(
+                shortcut: shortcut, reservedShortcuts: CommandShortcutPolicy.systemReservedShortcuts())
+        }
+        var candidate = store.database
+        candidate.commandBindings.removeAll { $0.targetID == binding.targetID }
+        if !binding.isEmpty { candidate.commandBindings.append(binding) }
+        try candidate.validate()
+    }
+
+    @discardableResult
+    func removeCommandBinding(for targetID: String) -> Bool {
+        guard store.removeCommandBinding(for: targetID) else {
+            message = store.errorMessage
+            return false
+        }
+        message = "Command binding removed."
+        synchronizeSelection()
+        return true
+    }
+
+    func beginShortcutRecording() {
+        guard !isRecordingShortcut else { return }
+        isRecordingShortcut = true
+        hotKey.unregister()
+    }
+
+    func beginCommandBindingEditing() { commandBindingEditorCount += 1 }
+
+    func endCommandBindingEditing() { commandBindingEditorCount = max(0, commandBindingEditorCount - 1) }
+
+    func endShortcutRecording() {
+        guard isRecordingShortcut else { return }
+        isRecordingShortcut = false
+        synchronizeCommandHotKeys()
+    }
+
+    private func synchronizeCommandHotKeys() {
+        guard isStarted, !isRecordingShortcut else { return }
+        guard clipboard.usesGeneralPasteboard else {
+            hotKey.unregister()
+            shortcutError = nil
+            commandShortcutErrors = [:]
+            return
+        }
+        let issues = hotKey.synchronize(
+            launcher: store.database.preferences.hotKey, bindings: store.database.commandBindings,
+            onLauncher: { [weak self] in self?.panel?.toggle() },
+            onCommand: { [weak self] in self?.performBoundCommand(targetID: $0) })
+        shortcutError = issues.first { $0.targetID == GlobalHotKey.launcherTargetID }?.message
+        commandShortcutErrors = Dictionary(
+            issues.filter { $0.targetID != GlobalHotKey.launcherTargetID }.map { ($0.targetID, $0.message) },
+            uniquingKeysWith: { first, second in first + " " + second })
+    }
+
+    /// Global invocations use the same dispatch as selected search results.
+    /// Resolve again at delivery so a removed or disallowed target cannot run.
+    func performBoundCommand(targetID: String) {
+        guard !isRecordingShortcut, commandBindingEditorCount == 0,
+            store.database.binding(for: targetID)?.shortcut != nil,
+            let command = bindableCommands.first(where: { $0.id == targetID })
+        else { return }
+        guard editor == nil else {
+            message = "Save or cancel the current editor before using a command shortcut."
+            panel?.show()
+            return
+        }
+        let front = NSWorkspace.shared.frontmostApplication
+        if let front, front.processIdentifier != ProcessInfo.processInfo.processIdentifier {
+            previousApplication = front
+        }
+        perform(command)
+        if case .window = command.action {
+            if message != nil { panel?.show() }
+        } else {
+            panel?.show()
+        }
     }
 
     func refreshPermissions() {
@@ -160,6 +296,7 @@ final class LauncherModel {
         loginEnabled = SMAppService.mainApp.status == .enabled
         loginNeedsApproval = SMAppService.mainApp.status == .requiresApproval
         ai.refreshAvailability()
+        synchronizeCommandHotKeys()
         if isStarted && clipboard.usesGeneralPasteboard { snippets.configure() }
     }
 
@@ -227,6 +364,7 @@ final class LauncherModel {
     }
 
     func moveSelection(_ offset: Int) {
+        guard !showActions else { return }
         let items = orderedResults
         guard !items.isEmpty else { return }
         let index = items.firstIndex(where: { $0.id == selectedID }) ?? 0
@@ -234,6 +372,7 @@ final class LauncherModel {
     }
 
     func performSelected() {
+        guard !showActions else { return }
         if let selectedItem { perform(selectedItem) }
     }
 
@@ -499,8 +638,9 @@ final class LauncherModel {
         commands += windowItems
         commands.append(
             LauncherItem(
-                id: "settings", title: "OpenRay Settings", subtitle: "Make it your own",
-                symbol: "gearshape", badge: "Command", keywords: "preferences permissions shortcut", action: .settings))
+                id: "settings", title: "Settings", subtitle: "Make OpenRay your own",
+                symbol: "gearshape", badge: "Command", keywords: "openray settings preferences permissions shortcut",
+                action: .settings))
         return commands
     }
 }
