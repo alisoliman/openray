@@ -51,11 +51,13 @@ cleanup_directory() {
   [[ -f "$openray_directory/.openray-ci-signing" && ! -L "$openray_directory/.openray-ci-signing" ]] || return 1
 
   if [[ -f "$openray_directory/release.keychain-db" && ! -L "$openray_directory/release.keychain-db" ]]; then
+    # Deleting our keychain also removes only its entry from the search list.
     security delete-keychain "$openray_directory/release.keychain-db" >/dev/null 2>&1 || openray_cleanup_result=1
   fi
   # Also remove a keychain file if the security tool could not delete it.
   rm -f -- "$openray_directory/certificate.p12" "$openray_directory/notary-key.p8" \
-    "$openray_directory/release.keychain-db" "$openray_directory/.openray-ci-signing" || openray_cleanup_result=1
+    "$openray_directory/signing-probe" "$openray_directory/release.keychain-db" \
+    "$openray_directory/.openray-ci-signing" || openray_cleanup_result=1
   rmdir -- "$openray_directory" || openray_cleanup_result=1
   return "$openray_cleanup_result"
 }
@@ -127,6 +129,20 @@ security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$openray_
   "$OPENRAY_SIGNING_KEYCHAIN" >/dev/null 2>&1 || fail 'Unable to grant codesign access to the imported signing key.'
 unset openray_keychain_password
 
+# codesign requires search-list membership even with an explicit --keychain.
+# Preserve existing entries and the default keychain; cleanup deletes only ours.
+openray_keychain_list=$(security list-keychains -d user 2>/dev/null) || fail 'Unable to read the runner keychain search list.'
+openray_search_keychains=()
+openray_keychain_pattern='^[[:space:]]*"([^"]+)"[[:space:]]*$'
+while IFS= read -r openray_keychain_entry; do
+  [[ -n "$openray_keychain_entry" ]] || continue
+  [[ "$openray_keychain_entry" =~ $openray_keychain_pattern ]] || fail 'Unable to parse the runner keychain search list.'
+  [[ "${BASH_REMATCH[1]}" == "$OPENRAY_SIGNING_KEYCHAIN" ]] || openray_search_keychains+=("${BASH_REMATCH[1]}")
+done <<<"$openray_keychain_list"
+openray_search_keychains+=("$OPENRAY_SIGNING_KEYCHAIN")
+security list-keychains -d user -s "${openray_search_keychains[@]}" >/dev/null 2>&1 ||
+  fail 'Unable to register the temporary signing keychain.'
+
 openray_identity_output=$(security find-identity -v -p codesigning "$OPENRAY_SIGNING_KEYCHAIN" 2>/dev/null) || fail 'Unable to inspect the imported signing identity.'
 openray_identity_pattern='^[[:space:]]*[0-9]+\)[[:space:]]+[0-9A-Fa-f]{40}[[:space:]]+"(Developer ID Application: [^"]+)"[[:space:]]*$'
 openray_identities=()
@@ -140,6 +156,17 @@ done <<<"$openray_identity_output"
 [[ ${#openray_identities[@]} == 1 ]] || fail 'Expected exactly one valid Developer ID Application identity. Export the correct certificate/private key or set OPENRAY_SIGNING_IDENTITY to its full name.'
 OPENRAY_SIGNING_IDENTITY="${openray_identities[0]}"
 [[ "$OPENRAY_SIGNING_IDENTITY" != *$'\r'* ]] || fail 'The signing identity cannot contain line breaks.'
+
+# Listing an identity does not establish that codesign can use its private key.
+# Exercise the real signer before spending time on the app archive. This probe
+# stays on the runner and does not request a timestamp or notarization ticket.
+cp /usr/bin/true "$OPENRAY_SIGNING_DIRECTORY/signing-probe"
+codesign --force --sign "$OPENRAY_SIGNING_IDENTITY" --keychain "$OPENRAY_SIGNING_KEYCHAIN" \
+  --options runtime --timestamp=none "$OPENRAY_SIGNING_DIRECTORY/signing-probe" >/dev/null 2>&1 ||
+  fail 'The imported identity is listed but cannot sign an executable. Check the temporary keychain search list and private-key access.'
+codesign --verify --strict "$OPENRAY_SIGNING_DIRECTORY/signing-probe" >/dev/null 2>&1 ||
+  fail 'The signing preflight produced an invalid signature.'
+rm -f -- "$OPENRAY_SIGNING_DIRECTORY/signing-probe"
 
 # Validation is on by default: invalid/revoked keys fail before an archive is built.
 xcrun notarytool store-credentials "$OPENRAY_NOTARY_PROFILE" --key "$openray_notary_key" \
