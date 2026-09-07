@@ -38,5 +38,6 @@ struct OpenRayApp: App {
         }
         .defaultSize(width: 700, height: 660)
         .defaultLaunchBehavior(.suppressed)
+        .restorationBehavior(.disabled)
     }
 }

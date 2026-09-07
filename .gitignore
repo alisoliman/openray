@@ -4,3 +4,5 @@ DerivedData/
 .manual-build/
 xcuserdata/
 *.xcuserstate
+__pycache__/
+*.py[cod]

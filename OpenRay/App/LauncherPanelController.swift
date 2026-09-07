@@ -2,10 +2,19 @@ import AppKit
 import SwiftUI
 
 final class LauncherPanel: NSPanel {
+    var onCancel: (() -> Void)?
     var escapeAction: (() -> Bool)?
 
     override var canBecomeKey: Bool { true }
     override var canBecomeMain: Bool { true }
+
+    override func cancelOperation(_ sender: Any?) {
+        guard attachedSheet == nil, !(firstResponder is NSTextView) else {
+            super.cancelOperation(sender)
+            return
+        }
+        onCancel?()
+    }
 
     override func sendEvent(_ event: NSEvent) {
         if handleEscapeKey(event) { return }
@@ -102,6 +111,7 @@ final class LauncherPanelController: NSObject, NSWindowDelegate {
         panel.backgroundColor = .clear
         panel.hasShadow = true
         panel.isMovableByWindowBackground = false
+        panel.onCancel = { [weak model] in model?.goBack() }
         panel.delegate = self
         panel.escapeAction = { [weak model] in
             guard let model, model.destination == .settings, model.editor == nil else { return false }

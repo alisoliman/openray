@@ -86,6 +86,78 @@ struct ClipboardStorageTests {
         #expect(try String(contentsOf: unrelated, encoding: .utf8) == "unrelated file")
     }
 
+    @Test func pausedCaptureStillExpiresSavedTextAndImages() async throws {
+        let directory = FileManager.default.temporaryDirectory.appending(path: "OpenRayPausedRetention-\(UUID())")
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let store = LibraryStore(fileURL: directory.appending(path: "library.json"))
+        #expect(store.update { $0.preferences.clipboardEnabled = true })
+        let prepared = try ClipboardImageCodec.prepare(ClipboardFixtures.image())
+        #expect(store.captureImage(prepared, sourceName: "Fixture"))
+        let text = ClipboardEntry(text: "Saved before pausing", sourceName: "Fixture")
+        #expect(store.capture(text))
+        store.toggleFavorite("clipboard.\(text.id)")
+        store.recordUse(of: "clipboard.\(text.id)")
+        #expect(store.update { $0.preferences.clipboardEnabled = false })
+
+        let board = NSPasteboard(name: .init("OpenRayTests.\(UUID())"))
+        defer { board.releaseGlobally() }
+        let service = ClipboardService(
+            store: store, pasteboard: board,
+            captureContext: {
+                Issue.record("Paused history maintenance must not read the source application or capture content.")
+                return ClipboardCaptureContext(sourceName: "Unexpected", secureInput: false)
+            })
+        service.configure()
+        defer { service.stop() }
+        #expect(store.database.clipboard.count == 2)
+        board.clearContents()
+        board.setString("Copied while paused", forType: .string)
+        let change = board.changeCount
+        await service.poll(now: Date.now.addingTimeInterval(8 * 86_400))
+
+        #expect(store.database.clipboard.isEmpty)
+        #expect(!store.database.favoriteIDs.contains("clipboard.\(text.id)"))
+        #expect(!store.database.usage.contains { $0.id == "clipboard.\(text.id)" })
+        #expect(store.imageData(for: prepared.image) == nil)
+        #expect(board.changeCount == change)
+        #expect(board.string(forType: .string) == "Copied while paused")
+    }
+
+    @Test func reopeningValidLibraryRemovesImagesOrphanedByInterruptedCapture() throws {
+        let directory = FileManager.default.temporaryDirectory.appending(path: "OpenRayOrphanRecovery-\(UUID())")
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let url = directory.appending(path: "library.json")
+        let store = LibraryStore(fileURL: url)
+        #expect(store.update { $0.preferences.clipboardEnabled = true })
+        let kept = try ClipboardImageCodec.prepare(ClipboardFixtures.image())
+        #expect(store.captureImage(kept, sourceName: "Fixture"))
+        let orphan = try ClipboardImageCodec.prepare(ClipboardFixtures.image(red: 0.9))
+        try ClipboardImageStore(libraryURL: url).save(orphan)
+        let original = try Data(contentsOf: url)
+
+        let reopened = LibraryStore(fileURL: url)
+
+        #expect(!reopened.isReadOnly)
+        #expect(reopened.imageData(for: kept.image) == kept.png)
+        #expect(reopened.imageData(for: orphan.image) == nil)
+        #expect(try Data(contentsOf: url) == original)
+    }
+
+    @Test func unreadableLibraryNeverDeletesItsImagesDuringStartup() throws {
+        let directory = FileManager.default.temporaryDirectory.appending(path: "OpenRayUnreadableImages-\(UUID())")
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let url = directory.appending(path: "library.json")
+        let image = try ClipboardImageCodec.prepare(ClipboardFixtures.image())
+        try ClipboardImageStore(libraryURL: url).save(image)
+        try Data("damaged metadata".utf8).write(to: url)
+
+        let store = LibraryStore(fileURL: url)
+
+        #expect(store.isReadOnly)
+        #expect(store.imageData(for: image.image) == image.png)
+        #expect(try String(contentsOf: url, encoding: .utf8) == "damaged metadata")
+    }
+
     @Test func historyEnforcesAnOverallByteBudget() {
         let store = LibraryStore(fileURL: nil)
         store.update {

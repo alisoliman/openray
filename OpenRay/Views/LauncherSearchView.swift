@@ -194,7 +194,8 @@ struct LauncherSearchView: View {
                 .background(selected ? Color.primary.opacity(0.075) : .clear, in: .rect(cornerRadius: 8)).contentShape(
                     .rect)
         }
-        .buttonStyle(.plain).accessibilityLabel(item.accessibilityDescription).accessibilityHint(
+        .buttonStyle(.plain).accessibilityLabel(item.accessibilityDescription)
+        .accessibilityValue(item.subtitle).accessibilityHint(
             item.primaryActionTitle
         )
         .accessibilityAddTraits(selected ? .isSelected : []).accessibilityIdentifier("result.\(item.id)")
@@ -307,13 +308,15 @@ struct LauncherSearchView: View {
                     Text("Actions").font(.system(size: 11, weight: .medium))
                     Keycap(text: "⌘ K")
                 }
-            }.buttonStyle(.plain)
+            }.buttonStyle(.plain).accessibilityIdentifier("launcher.actions")
                 .background {
                     NativeActionsMenu(
                         isPresented: $model.showActions,
                         title: selected?.title ?? "OpenRay",
                         entries: actionEntries(for: selected),
-                        didClose: { model.focusRequest += 1 })
+                        didClose: { model.focusRequest += 1 }
+                    )
+                    .accessibilityHidden(true)
                 }
         }.padding(.horizontal, 18).frame(height: 43)
     }
@@ -327,6 +330,7 @@ struct LauncherSearchView: View {
                     .init(title: "Paste into Previous App", symbol: "arrow.up.doc") {
                         model.showActions = false
                         model.selectedID = item.id
+                        guard model.selectedItem?.id == item.id else { return }
                         model.pasteSelected()
                     })
             }
@@ -345,6 +349,7 @@ struct LauncherSearchView: View {
                 entries.append(
                     .init(title: "Edit", symbol: "pencil") {
                         model.selectedID = item.id
+                        guard model.selectedItem?.id == item.id else { return }
                         model.editSelected()
                     })
                 entries.append(.init(title: "Delete…", symbol: "trash") { deletion = item })

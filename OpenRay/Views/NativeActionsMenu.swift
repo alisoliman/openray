@@ -21,12 +21,22 @@ struct NativeActionsMenu: NSViewRepresentable {
 
     func updateNSView(_ view: NSView, context: Context) {
         context.coordinator.parent = self
-        guard isPresented, !context.coordinator.isTracking else { return }
+        guard isPresented else {
+            context.coordinator.cancelTracking()
+            return
+        }
+        guard !context.coordinator.isTracking else { return }
         context.coordinator.isTracking = true
         // Leave SwiftUI's update transaction before starting AppKit's menu loop.
         DispatchQueue.main.async { [weak view, coordinator = context.coordinator] in
-            guard let view, view.window != nil, coordinator.parent.isPresented else {
+            guard coordinator.parent.isPresented else {
                 coordinator.isTracking = false
+                return
+            }
+            guard let view, view.window?.isVisible == true else {
+                coordinator.isTracking = false
+                coordinator.parent.isPresented = false
+                coordinator.parent.didClose()
                 return
             }
             coordinator.present(in: view)
@@ -38,6 +48,7 @@ struct NativeActionsMenu: NSViewRepresentable {
         var parent: NativeActionsMenu
         var isTracking = false
         private var activeEntries: [Entry] = []
+        private var activeMenu: NSMenu?
 
         init(parent: NativeActionsMenu) { self.parent = parent }
 
@@ -67,11 +78,15 @@ struct NativeActionsMenu: NSViewRepresentable {
 
         func present(in view: NSView) {
             let menu = makeMenu()
+            activeMenu = menu
             menu.popUp(positioning: nil, at: NSPoint(x: view.bounds.minX, y: view.bounds.maxY), in: view)
+            activeMenu = nil
             isTracking = false
             parent.isPresented = false
             parent.didClose()
         }
+
+        func cancelTracking() { activeMenu?.cancelTracking() }
 
         @objc private func performEntry(_ sender: NSMenuItem) {
             guard activeEntries.indices.contains(sender.tag) else { return }

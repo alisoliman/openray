@@ -21,6 +21,8 @@ struct OpenRayHelpView: View {
                         .font(.system(size: 26, weight: .semibold))
                     Text("Find, create, and work from your keyboard.")
                         .font(.system(size: 15)).foregroundStyle(.secondary)
+                    Text("Version \(AppInformation.version) · Apple silicon · macOS 26+")
+                        .font(.system(size: 12)).foregroundStyle(.secondary)
                 }
 
                 section("Start with search", symbol: "magnifyingglass") {
@@ -76,6 +78,16 @@ struct OpenRayHelpView: View {
                         """
                     )
                     .foregroundStyle(.secondary)
+                }
+
+                section("Command aliases and hotkeys", symbol: "command") {
+                    Text(
+                        """
+                        In Settings, use Command aliases & hotkeys to assign an alias or global \
+                        shortcut to the available commands. Type an alias in the launcher to find \
+                        its command, or use a global shortcut while another app is active. Save \
+                        changes in the command editor; shortcut conflicts appear in Settings.
+                        """)
                 }
 
                 section("Make everyday work reusable", symbol: "square.stack.3d.up") {
@@ -142,7 +154,7 @@ struct OpenRayHelpView: View {
                     Text(
                         """
                         AI runs on this Mac using Apple Intelligence, with no cloud fallback. It \
-                        requires an eligible Mac, Apple Intelligence enabled, a supported \
+                        requires an eligible Apple silicon Mac, Apple Intelligence enabled, a supported \
                         language, and the model downloaded. Settings shows readiness. Review \
                         generated text; the model does not browse for live information.
                         """)
@@ -151,16 +163,19 @@ struct OpenRayHelpView: View {
                 section("Your data and permissions", symbol: "hand.raised") {
                     Text(
                         """
-                        No account or analytics. Notes, snippets, links, preferences, and enabled \
-                        clipboard history are stored in ~/Library/Application Support/OpenRay. \
+                        No account, analytics, ads, or cloud sync. Notes, snippets, links, preferences, \
+                        favorites, recent-use history, and enabled clipboard history are stored in \
+                        ~/Library/Application Support/OpenRay. \
                         Reveal Library in Finder is available in Settings. The files are local and \
-                        are not encrypted by OpenRay.
+                        restricted to your user account but are not encrypted by OpenRay. Back up \
+                        library.json and ClipboardImages together.
                         """)
                     Text(
                         """
                         Clipboard capture and keyword expansion are off initially. Clipboard \
                         permission is separate from Accessibility. Known password managers and \
-                        confidential or transient clipboard content are excluded, but unmarked \
+                        confidential or transient clipboard content are excluded. Capture also \
+                        pauses during Secure Input, but unmarked \
                         sensitive content can still be captured. Add app bundle identifiers to \
                         exclusions or pause capture when needed. Retention, entry count, and media \
                         limits are shown in Settings.
@@ -169,7 +184,8 @@ struct OpenRayHelpView: View {
                         """
                         Accessibility is used only for window layouts, direct paste, selected-text \
                         import, and optional keyword expansion. Other features work without it. \
-                        OpenRay does not change system permissions for you.
+                        OpenRay does not save what you type for expansion or change system \
+                        permissions for you.
                         """)
                     Text(
                         """
@@ -179,6 +195,34 @@ struct OpenRayHelpView: View {
                         OpenRay. Clearing clipboard history does not alter the current system \
                         clipboard or delete original copied files.
                         """)
+                    Text(
+                        """
+                        Clipboard images are stored locally as PNGs. Copied files are references \
+                        to the originals. Opening a quicklink, help link, or support link hands \
+                        its URL to your browser. Search-template queries are sent to the service \
+                        you choose, whose privacy practices apply.
+                        """)
+                }
+
+                section("Help and feedback", symbol: "questionmark.circle") {
+                    Text(
+                        """
+                        If a shortcut fails, choose another in Settings. If permissions change, \
+                        reopen the same app build and use Refresh Status. Install OpenRay in \
+                        Applications before enabling launch at login or granting Accessibility.
+                        """)
+                    HStack(spacing: 20) {
+                        Link("Read the guide", destination: AppInformation.documentationURL)
+                        Link("Report an issue", destination: AppInformation.supportURL)
+                    }
+                    Text(
+                        """
+                        GitHub issues are public. Include your OpenRay and macOS versions and \
+                        steps to reproduce; remove private text, clipboard contents, and personal \
+                        file paths from screenshots and logs.
+                        """
+                    )
+                    .foregroundStyle(.secondary)
                 }
             }
             .font(.system(size: 13))

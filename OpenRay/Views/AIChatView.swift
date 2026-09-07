@@ -119,12 +119,9 @@ struct AIChatView: View {
                 if message.text.isEmpty && model.ai.isGenerating {
                     ProgressView("Thinking on your Mac…").controlSize(.small).font(.system(size: 12))
                 } else {
-                    Text(
-                        message.role == .assistant
-                            ? AIMessageFormatting.attributed(message.text) : AttributedString(message.text)
-                    )
-                    .font(.system(size: 13)).lineSpacing(4).textSelection(.enabled)
-                    .frame(maxWidth: .infinity, alignment: .leading)
+                    AIMessageText(message: message).equatable()
+                        .font(.system(size: 13)).lineSpacing(4).textSelection(.enabled)
+                        .frame(maxWidth: .infinity, alignment: .leading)
                 }
                 if message.role == .assistant && !message.text.isEmpty && !model.ai.isGenerating {
                     HStack(spacing: 16) {
@@ -151,7 +148,7 @@ struct AIChatView: View {
                             ? "Ask anything, or paste text to work with…" : "Paste the text you’d like to work with…"
                     )
                     .font(.system(size: 13)).foregroundStyle(.secondary).padding(.top, 10).padding(.leading, 12)
-                    .allowsHitTesting(false)
+                    .allowsHitTesting(false).accessibilityHidden(true)
                 }
                 AIComposerInput(text: $chat.draft, focusRequest: model.focusRequest, submit: model.ai.send)
                     .padding(6).frame(height: 77)
@@ -187,9 +184,21 @@ struct AIChatView: View {
                         }
                     }
                     .buttonStyle(.borderedProminent).disabled(!model.ai.canSend)
-                    .keyboardShortcut(.return, modifiers: .command).accessibilityIdentifier("ai.send")
+                    .keyboardShortcut(.return, modifiers: .command).accessibilityLabel("Send message")
+                    .accessibilityIdentifier("ai.send")
                 }
             }.font(.system(size: 12)).buttonStyle(.plain).foregroundStyle(.primary)
         }.padding(.horizontal, 20).padding(.top, 8).padding(.bottom, 14)
+    }
+}
+
+struct AIMessageText: View, Equatable {
+    let message: ChatMessage
+
+    var body: some View { Text(Self.attributedText(for: message)) }
+
+    static func attributedText(for message: ChatMessage) -> AttributedString {
+        message.role == .assistant
+            ? AIMessageFormatting.attributed(message.text) : AttributedString(message.text)
     }
 }

@@ -6,6 +6,7 @@ struct SettingsView: View {
     @Bindable var model: LauncherModel
     var showsBackButton = true
     @Environment(\.scenePhase) private var scenePhase
+    @Environment(\.openWindow) private var openWindow
     @State private var clearHistory = false
     @State private var exclusions = ""
 
@@ -151,11 +152,14 @@ struct SettingsView: View {
                         Button("Reveal Library in Finder") { NSWorkspace.shared.activateFileViewerSelecting([url]) }
                             .disabled(!FileManager.default.fileExists(atPath: url.path))
                     }
-                    Text("OpenRay · Native Swift 6 · macOS 26+").font(.system(size: 12)).foregroundStyle(.secondary)
+                    Button("Help & Privacy") { openWindow(id: OpenRayHelpView.windowID) }
+                    Text("OpenRay \(AppInformation.version) · Apple silicon · macOS 26+")
+                        .font(.system(size: 12)).foregroundStyle(.secondary)
                 }
             }.formStyle(.grouped)
         }
         .tint(RayStyle.accent)
+        .appAppearance(model.store.database.preferences.appearance)
         .onAppear {
             exclusions = model.store.database.preferences.excludedClipboardBundleIDs.joined(separator: "\n")
             model.refreshPermissions()

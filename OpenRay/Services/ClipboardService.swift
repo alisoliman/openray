@@ -86,9 +86,10 @@ final class ClipboardService {
             previousPolicy = policy
         }
         store.pruneClipboard()
+        lastPrune = .now
         refreshAccessStatus()
-        guard store.database.preferences.clipboardEnabled else { return }
-        let timer = Timer(timeInterval: 0.75, repeats: true) { [weak self] _ in
+        // Pausing capture must not extend the lifetime of already saved history.
+        let timer = Timer(timeInterval: preferences.clipboardEnabled ? 0.75 : 60, repeats: true) { [weak self] _ in
             Task { @MainActor [weak self] in await self?.poll() }
         }
         RunLoop.main.add(timer, forMode: .common)
@@ -101,19 +102,19 @@ final class ClipboardService {
         captureGeneration += 1
     }
 
-    func poll() async {
+    func poll(now: Date = .now) async {
+        if now.timeIntervalSince(lastPrune) >= 60 {
+            store.pruneClipboard(now: now)
+            lastPrune = now
+        }
         guard store.database.preferences.clipboardEnabled, !isProcessing else { return }
         refreshAccessStatus()
         guard pasteboard.accessBehavior != .alwaysDeny else { return }
-        if Date.now.timeIntervalSince(lastPrune) > 60 {
-            store.pruneClipboard()
-            lastPrune = .now
-        }
         guard pasteboard.changeCount != lastChange else { return }
         lastChange = pasteboard.changeCount
         let change = lastChange
         let generation = captureGeneration
-        let copiedAt = Date.now
+        let copiedAt = now
         let source = captureContext()
         guard
             ClipboardPolicy.shouldCapture(

@@ -48,18 +48,19 @@ struct LibraryEditorView: View {
             if case .quicklinkQuery = context {
                 Text(content).font(.system(size: 12)).foregroundStyle(.secondary).lineLimit(2)
                 TextField("Search term", text: $argument).textFieldStyle(.roundedBorder)
-                    .focused($nameFocused).onSubmit(save).accessibilityIdentifier("editor.argument")
+                    .focused($nameFocused).onSubmit(save).accessibilityLabel("Search term")
+                    .accessibilityIdentifier("editor.argument")
             } else {
                 VStack(alignment: .leading, spacing: 7) {
                     Text("Name").font(.system(size: 12, weight: .medium))
                     TextField("Give it a memorable name", text: $name).textFieldStyle(.roundedBorder)
-                        .focused($nameFocused).accessibilityIdentifier("editor.name")
+                        .focused($nameFocused).accessibilityLabel("Name").accessibilityIdentifier("editor.name")
                 }
                 if case .quicklink = context {
                     VStack(alignment: .leading, spacing: 7) {
                         Text("Link").font(.system(size: 12, weight: .medium))
                         TextField("https://example.com/search?q={query}", text: $content).textFieldStyle(.roundedBorder)
-                            .accessibilityIdentifier("editor.content")
+                            .accessibilityLabel("Link").accessibilityIdentifier("editor.content")
                         Text("Use {query} for a search term, or enter an absolute file/folder path.")
                             .font(.system(size: 11)).foregroundStyle(.secondary)
                     }
@@ -78,7 +79,7 @@ struct LibraryEditorView: View {
                     VStack(alignment: .leading, spacing: 7) {
                         Text("Keyword (optional)").font(.system(size: 12, weight: .medium))
                         TextField(isSnippet ? ";email" : "web", text: $keyword).textFieldStyle(.roundedBorder)
-                            .accessibilityIdentifier("editor.keyword")
+                            .accessibilityLabel("Keyword, optional").accessibilityIdentifier("editor.keyword")
                         Text(
                             isSnippet
                                 ? "Type the keyword to expand when enabled in Settings. {date} and {time} are supported in text."
