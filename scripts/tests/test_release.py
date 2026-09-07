@@ -13,6 +13,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 from urllib.parse import quote
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -55,6 +56,7 @@ class FakeGitHub:
         self.current_checks = 0
         self.fail_upload = None
         self.corrupt_download = None
+        self.hidden_draft_reads = 0
 
     @staticmethod
     def record(identifier, tag, *, draft=False, prerelease=False):
@@ -84,6 +86,9 @@ class FakeGitHub:
             if endpoint == "releases?per_page=100":
                 assert "--paginate" in argv and "--slurp" in argv
                 # Separate pages ensure latest selection is not based on page one.
+                if self.item and self.item["draft"] and self.hidden_draft_reads:
+                    self.hidden_draft_reads -= 1
+                    return [[], self.other_releases]
                 return [[self.item] if self.item else [], self.other_releases]
             if endpoint == "releases/41":
                 self.current_checks += 1
@@ -299,6 +304,30 @@ class PublishTests(ReleaseFixture):
         self.assertIn("Draft ready", self.publish(fake, public=False))
         self.assertTrue(fake.item["draft"])
         self.assertEqual(fake.mutations("edit"), [])
+
+    def test_new_draft_lookup_retries_until_visible_without_creating_again(self):
+        fake = FakeGitHub(self.output)
+        fake.hidden_draft_reads = 2
+        with patch("time.sleep") as sleep:
+            self.assertIn("Published verified release", self.publish(fake))
+        self.assertEqual(sleep.call_count, 2)
+        self.assertEqual(len(fake.mutations("create")), 1)
+        self.assertEqual(len(fake.mutations("upload")), 4)
+        self.assertEqual(len(fake.mutations("edit")), 1)
+
+    def test_new_draft_lookup_stops_after_bounded_retries_without_uploading(self):
+        fake = FakeGitHub(self.output)
+        fake.hidden_draft_reads = 100
+        with patch("time.sleep") as sleep:
+            with self.assertRaisesRegex(release.ReleaseError, "Could not locate the newly created draft release"):
+                self.publish(fake)
+        self.assertEqual(sleep.call_count, 4)
+        self.assertTrue(all(call.args == (2,) for call in sleep.call_args_list))
+        self.assertEqual(fake.hidden_draft_reads, 95)
+        self.assertEqual(len(fake.mutations("create")), 1)
+        self.assertEqual(fake.mutations("upload"), [])
+        self.assertEqual(fake.mutations("edit"), [])
+        self.assertTrue(fake.item["draft"])
 
     def test_backport_checks_all_release_pages(self):
         fake = FakeGitHub(self.output)

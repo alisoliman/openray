@@ -17,6 +17,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 from dataclasses import dataclass
 from typing import Callable
 from urllib.parse import quote
@@ -287,7 +288,13 @@ def publish(directory: Path, repo: str, version: Version, sha: str, *, public: b
             "--draft", f"--prerelease={str(version.prerelease).lower()}", "--latest=false",
             "--title", f"OpenRay {version.version}", "--generate-notes",
         )
-        matching = [release for release in github.releases() if release.get("tag_name") == version.tag]
+        # A successful create can precede visibility in the releases listing.
+        # Retry only this read; never create another draft or hide API errors.
+        for attempt in range(5):
+            matching = [release for release in github.releases() if release.get("tag_name") == version.tag]
+            if matching or attempt == 4:
+                break
+            time.sleep(2)
         if len(matching) != 1:
             raise ReleaseError("Could not locate the newly created draft release.")
     release_id = matching[0].get("id")
