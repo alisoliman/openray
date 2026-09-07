@@ -6,7 +6,7 @@ The selected product is a direct-download OpenRay app for **Apple silicon Macs o
 
 ## Completed changes
 
-- Both Xcode configurations, XcodeGen configuration, packaging, and installation guidance target `arm64`.
+- Both checked-in Xcode configurations, packaging, and installation guidance target `arm64`.
 - The Actions menu uses native menu tracking, preserving the selected result while arrows, Return, and Escape navigate actions. Embedded Settings supports Escape; native Settings follows the chosen appearance.
 - Built-in Help covers shortcuts, permissions, local data, AI behavior, and the verified public GitHub support channel. The auxiliary Help window is excluded from automatic launch and restoration.
 - File-result accessibility includes identifying paths, editor inputs have explicit labels, and AI output renders inline emphasis without making generated links active.
