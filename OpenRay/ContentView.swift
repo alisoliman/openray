@@ -20,6 +20,9 @@ struct ContentView: View {
             case .pomodoro:
                 PomodoroView(model: model)
                     .modifier(RayDestinationEntrance())
+            case .caffeinate:
+                CaffeinateView(model: model)
+                    .modifier(RayDestinationEntrance())
             }
         }
         .frame(width: 780, height: 570)
@@ -39,7 +42,9 @@ struct ContentView: View {
         .onExitCommand {
             // Dashboards use the panel's native responder-aware fallback. Text
             // editing and modal dismissal must get their own Escape first.
-            guard model.editor == nil, model.destination != .settings, model.destination != .pomodoro else { return }
+            guard model.editor == nil, model.destination != .settings, model.destination != .pomodoro,
+                model.destination != .caffeinate
+            else { return }
             model.goBack()
         }
         .background {

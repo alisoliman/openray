@@ -87,6 +87,7 @@ final class LauncherPanelController: NSObject, NSWindowDelegate {
         model.refreshPermissions()
         model.store.pruneClipboard()
         model.pomodoro.refresh()
+        model.caffeinate.refresh()
         let shouldAnimate = isOpening && !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
         window.alphaValue = shouldAnimate ? 0 : 1
         NSApp.activate()
@@ -164,7 +165,8 @@ final class LauncherPanelController: NSObject, NSWindowDelegate {
         panel.workspaceShortcutAction = { [weak model] index in model?.selectWorkspaceShortcut(index) ?? false }
         panel.delegate = self
         panel.escapeAction = { [weak model] in
-            guard let model, model.destination == .settings || model.destination == .pomodoro,
+            guard let model,
+                model.destination == .settings || model.destination == .pomodoro || model.destination == .caffeinate,
                 model.editor == nil
             else { return false }
             model.goBack()

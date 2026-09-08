@@ -5,7 +5,7 @@ import ServiceManagement
 @MainActor
 @Observable
 final class LauncherModel {
-    enum Destination { case search, ai, settings, pomodoro }
+    enum Destination { case search, ai, settings, pomodoro, caffeinate }
     var destination: Destination = .search
     private(set) var section: LauncherSection = .home
     var query = "" { didSet { if query != oldValue { searchChanged() } } }
@@ -26,6 +26,7 @@ final class LauncherModel {
     let files = FileSearchService()
     private(set) var ai: AIChatModel
     let pomodoro: PomodoroService
+    let caffeinate: CaffeinateService
     let windows = WindowManager()
     @ObservationIgnored let clipboard: ClipboardService
     @ObservationIgnored let snippets: SnippetExpander
@@ -42,10 +43,12 @@ final class LauncherModel {
     init(
         store: LibraryStore = LibraryStore(), ai: AIChatModel = AIChatModel(),
         pasteboard: NSPasteboard = .general,
+        caffeinate: CaffeinateService = CaffeinateService(),
         aiFactory: @escaping @MainActor () -> AIChatModel = { AIChatModel() }
     ) {
         self.store = store
         self.ai = ai
+        self.caffeinate = caffeinate
         self.aiFactory = aiFactory
         aiSessions = [ai.action: ai]
         pomodoro = PomodoroService(store: store)
@@ -164,6 +167,7 @@ final class LauncherModel {
         files.stop()
         ai.cancel()
         pomodoro.stopMonitoring()
+        caffeinate.shutdown()
     }
 
     func applyPreferences() {
@@ -296,9 +300,10 @@ final class LauncherModel {
             previousApplication = front
         }
         perform(command)
-        if case .window = command.action {
+        switch command.action {
+        case .window, .startCaffeinate, .stopCaffeinate, .toggleCaffeinate:
             if message != nil { panel?.show() }
-        } else {
+        default:
             panel?.show()
         }
     }
@@ -394,7 +399,7 @@ final class LauncherModel {
             }
         case .ai:
             switchAIAction(AIAction.workspaceActions[index])
-        case .settings, .pomodoro:
+        case .settings, .pomodoro, .caffeinate:
             return false
         }
         return true
@@ -457,6 +462,15 @@ final class LauncherModel {
         message = nil
         pomodoro.refresh()
         if start { pomodoro.start() }
+    }
+
+    func openCaffeinate() {
+        aiReturnContext = nil
+        destination = .caffeinate
+        files.stop()
+        showActions = false
+        message = nil
+        caffeinate.refresh()
     }
 
     func goBack() {
@@ -527,6 +541,15 @@ final class LauncherModel {
         case .startPomodoro:
             openPomodoro(start: true)
             store.recordUse(of: item.id)
+        case .caffeinate:
+            openCaffeinate()
+            store.recordUse(of: item.id)
+        case .startCaffeinate:
+            finishCaffeinateCommand(item, succeeded: caffeinate.start())
+        case .stopCaffeinate:
+            finishCaffeinateCommand(item, succeeded: caffeinate.stop())
+        case .toggleCaffeinate:
+            finishCaffeinateCommand(item, succeeded: caffeinate.toggle())
         case .quicklink(let link, let argument):
             if link.needsQuery && argument.isEmpty {
                 editor = .quicklinkQuery(link, "")
@@ -549,6 +572,18 @@ final class LauncherModel {
                 store.recordUse(of: item.id)
                 panel?.dismiss(restoreFocus: false)
             } catch { message = error.localizedDescription }
+        }
+    }
+
+    private func finishCaffeinateCommand(_ item: LauncherItem, succeeded: Bool) {
+        if succeeded {
+            store.recordUse(of: item.id)
+            panel?.dismiss()
+        } else {
+            aiReturnContext = nil
+            destination = .caffeinate
+            files.stop()
+            message = caffeinate.errorMessage
         }
     }
 
@@ -768,6 +803,28 @@ final class LauncherModel {
                 id: "pomodoro.start", title: "Start Pomodoro", subtitle: "Start or resume your focus timer",
                 symbol: "play.circle", tint: .coral, badge: "Command", keywords: "focus timer begin resume break",
                 action: .startPomodoro),
+            LauncherItem(
+                id: "caffeinate.open", title: "Caffeinate", subtitle: caffeinate.statusText,
+                symbol: caffeinate.isActive ? "cup.and.saucer.fill" : "cup.and.saucer", tint: .orange,
+                badge: caffeinate.isActive ? "Active" : "Command",
+                keywords: "coffee caffeine awake sleep duration timer status",
+                action: .caffeinate),
+            LauncherItem(
+                id: "caffeinate.start", title: "Start Caffeinate",
+                subtitle: "Keep your Mac and display awake indefinitely",
+                symbol: "cup.and.saucer.fill", tint: .orange, badge: "Command",
+                keywords: "coffee caffeine awake prevent sleep on",
+                action: .startCaffeinate),
+            LauncherItem(
+                id: "caffeinate.stop", title: "Stop Caffeinate",
+                subtitle: "Let your Mac follow its normal sleep settings",
+                symbol: "moon.zzz", tint: .orange, badge: "Command", keywords: "coffee caffeine decaffeinate sleep off",
+                action: .stopCaffeinate),
+            LauncherItem(
+                id: "caffeinate.toggle", title: "Toggle Caffeinate",
+                subtitle: caffeinate.isActive ? "Stop keeping your Mac awake" : "Keep your Mac awake indefinitely",
+                symbol: "power", tint: .orange, badge: caffeinate.isActive ? "Active" : "Command",
+                keywords: "coffee caffeine awake sleep switch on off", action: .toggleCaffeinate),
         ]
         commands += AIAction.allCases.filter { $0 != .chat }.map { action in
             LauncherItem(

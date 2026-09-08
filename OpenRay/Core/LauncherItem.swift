@@ -15,6 +15,10 @@ struct LauncherItem: Identifiable, Sendable {
         case settings
         case pomodoro
         case startPomodoro
+        case caffeinate
+        case startCaffeinate
+        case stopCaffeinate
+        case toggleCaffeinate
     }
     enum Tint: Sendable { case blue, green, orange, purple, coral, neutral }
     var id: String
@@ -48,6 +52,9 @@ struct LauncherItem: Identifiable, Sendable {
         case .note: "Open Note"
         case .ai: "Open AI"
         case .startPomodoro: "Start Timer"
+        case .startCaffeinate: "Keep Awake"
+        case .stopCaffeinate: "Stop Caffeinate"
+        case .toggleCaffeinate: "Toggle Caffeinate"
         default: "Open"
         }
     }
@@ -65,7 +72,9 @@ struct LauncherItem: Identifiable, Sendable {
 
     var isBuiltInCommand: Bool {
         switch action {
-        case .section, .ai, .settings, .window, .pomodoro, .startPomodoro: true
+        case .section, .ai, .settings, .window, .pomodoro, .startPomodoro,
+            .caffeinate, .startCaffeinate, .stopCaffeinate, .toggleCaffeinate:
+            true
         default: false
         }
     }

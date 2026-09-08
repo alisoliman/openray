@@ -162,6 +162,33 @@ struct OpenRayHelpView: View {
                         """)
                 }
 
+                section("Stay awake with Caffeinate", symbol: "cup.and.saucer") {
+                    Text(
+                        """
+                        Search Caffeinate to open its controls and status, Start Caffeinate to \
+                        keep your Mac awake indefinitely, Stop Caffeinate to stop, or Toggle \
+                        Caffeinate to switch it on or off. Start, Stop, and Toggle act immediately \
+                        and dismiss the launcher when successful. All four commands support aliases \
+                        and global shortcuts. The menu bar shows a coffee icon while active, with \
+                        status and controls.
+                        """)
+                    Text(
+                        """
+                        Choose Indefinitely, 10 or 30 minutes, 1, 2, 4, 8, or 12 hours, or a custom \
+                        duration of 1–1,440 minutes, then press Start Caffeinate or Update Duration. \
+                        Updating starts the chosen duration from now and replaces the current \
+                        deadline. Timed sessions stop automatically.
+                        """)
+                    Text(
+                        """
+                        Caffeinate uses native macOS sleep assertions to prevent idle system and \
+                        display sleep while OpenRay runs. Closing the launcher leaves it active; \
+                        quitting OpenRay stops it. Sessions are not saved or resumed after \
+                        relaunch. Closing a laptop lid or choosing Sleep manually still takes \
+                        precedence.
+                        """)
+                }
+
                 section("Calculate and arrange windows", symbol: "equal.square") {
                     Text(
                         """
