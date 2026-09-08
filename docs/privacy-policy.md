@@ -1,12 +1,16 @@
 # OpenRay privacy information
 
-Last updated: 7 September 2026. This notice describes the OpenRay application and its public GitHub help links. It does not describe a separate download website or support service that is not part of this repository.
+Last updated: 8 September 2026. This notice describes the OpenRay application and its public GitHub help links. It does not describe a separate download website or support service that is not part of this repository.
 
 ## What OpenRay does with your data
 
 OpenRay is a local macOS launcher. Its current app implementation has no account system, advertising, analytics SDK, cloud sync, or cloud AI provider. It does not upload your local library to an OpenRay server.
 
 The app stores your notes, snippets, quicklinks, favorites, settings, and recent-use records on your Mac. Recent-use records include item identifiers, counts, and last-used times to support recents and ranking. Identifiers may contain application identifiers or file paths. The app scans standard Applications locations to list installed apps and uses Spotlight for filename search. The current file-search result list is kept in memory; a file you favorite or use can also be represented in your saved library records.
+
+## Pomodoro
+
+Pomodoro configuration, timer state, and completed focus sessions are stored in the local JSON library. State includes the current phase, its deadline or paused remaining time, and progress through the cycle. Completed-session records include timing and duration information used to show daily progress and the latest 20 sessions. Older records remain in the library, and resetting the cycle preserves them. OpenRay does not monitor the content of your work or share these records with a server. Timer state is restored after relaunch, including completion of an overdue phase.
 
 ## Clipboard history
 
@@ -47,7 +51,7 @@ For the direct-download app, the default library is stored in:
 
 The JSON library and saved PNG images are not encrypted by OpenRay. The app applies owner-only permissions to its data directories and files, but local system access, device backups, and other software with sufficient access can affect their confidentiality. Device encryption and backups are controlled separately by you and macOS.
 
-Delete notes, snippets, quicklinks, and history from the app to remove their saved records. To remove the entire local library, quit OpenRay, use Finder's Go to Folder to open `~/Library/Application Support/`, and move the `OpenRay` folder to Trash. Emptying Trash is a separate action. Keep a backup first if you may need the data. Removing the app alone does not remove that library. Copies in backups and content previously shared with other apps or websites must be managed separately.
+Delete notes, snippets, quicklinks, and clipboard history from the app to remove their saved records. To remove the entire local library, quit OpenRay, use Finder's Go to Folder to open `~/Library/Application Support/`, and move the `OpenRay` folder to Trash. Emptying Trash is a separate action. Keep a backup first if you may need the data. Removing the app alone does not remove that library. Copies in backups and content previously shared with other apps or websites must be managed separately.
 
 ## Help and public issue reporting
 
@@ -55,4 +59,4 @@ The app's guide and support links open the [OpenRay GitHub repository](https://g
 
 If a separate website, private support channel, updater, analytics service, or cloud feature is introduced, update this notice to explain that service's actual data handling. The application's local storage statements must not be extended to an unreviewed external service.
 
-Implementation basis: `LibraryModels.swift`, `LibraryStore.swift`, `ClipboardService.swift`, `ClipboardImageStore.swift`, `SnippetExpander.swift`, `ApplicationCatalog.swift`, `FileSearchService.swift`, `WindowManager.swift`, `AIChatModel.swift`, and `FoundationModelEngine.swift`. Recheck this notice whenever those data flows change.
+Implementation basis: `LibraryModels.swift`, `LibraryStore.swift`, `PomodoroModels.swift`, `PomodoroService.swift`, `ClipboardService.swift`, `ClipboardImageStore.swift`, `SnippetExpander.swift`, `ApplicationCatalog.swift`, `FileSearchService.swift`, `WindowManager.swift`, `AIChatModel.swift`, and `FoundationModelEngine.swift`. Recheck this notice whenever those data flows change.

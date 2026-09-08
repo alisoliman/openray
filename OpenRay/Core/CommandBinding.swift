@@ -7,6 +7,7 @@ enum CuratedCommand {
         "section.quicklinks", "section.notes", "section.calculator", "section.windows",
         "ai.chat", "settings", "window.leftHalf", "window.rightHalf", "window.maximize",
         "window.center", "window.restore",
+        "pomodoro.open", "pomodoro.start",
     ]
 
     static func supports(_ targetID: String) -> Bool { targetIDs.contains(targetID) }

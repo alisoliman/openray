@@ -6,17 +6,20 @@ import Testing
 
 @MainActor
 struct SettingsWindowTests {
-    @Test func panelRoutesUnclaimedEscapeToSettingsAndRestoresSearchFocusRequest() throws {
+    @Test(arguments: ["settings", "pomodoro"])
+    func panelRoutesUnclaimedEscapeAndRestoresSearchFocusRequest(destination: String) throws {
         let model = LauncherModel(
             store: LibraryStore(fileURL: nil), ai: AIChatModel(engine: TestAIEngine()),
             pasteboard: NSPasteboard.withUniqueName())
         let panel = LauncherPanel()
         panel.escapeAction = {
-            guard model.destination == .settings, model.editor == nil else { return false }
+            guard model.destination == .settings || model.destination == .pomodoro, model.editor == nil else {
+                return false
+            }
             model.goBack()
             return true
         }
-        model.openSettings()
+        if destination == "settings" { model.openSettings() } else { model.openPomodoro() }
         let previousFocusRequest = model.focusRequest
         #expect(panel.handleEscapeKey(try keyEvent(code: 53)))
         #expect(model.destination == .search)

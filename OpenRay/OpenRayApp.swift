@@ -5,7 +5,7 @@ struct OpenRayApp: App {
     @NSApplicationDelegateAdaptor(OpenRayDelegate.self) private var delegate
 
     var body: some Scene {
-        MenuBarExtra("OpenRay", systemImage: "command.square.fill") {
+        MenuBarExtra {
             Button("Open OpenRay    \(delegate.model.store.database.preferences.hotKey.title)") {
                 delegate.model.panel?.show(section: .home)
             }
@@ -15,6 +15,8 @@ struct OpenRayApp: App {
             }
             Button("Clipboard History") { delegate.model.panel?.show(section: .clipboard) }
             Divider()
+            PomodoroMenuContent(model: delegate.model)
+            Divider()
             Button("Settings…") {
                 delegate.model.openSettings()
                 delegate.model.panel?.show()
@@ -23,6 +25,8 @@ struct OpenRayApp: App {
             Divider()
             Button("Quit OpenRay") { NSApp.terminate(nil) }
                 .keyboardShortcut("q")
+        } label: {
+            PomodoroMenuBarLabel(service: delegate.model.pomodoro)
         }
         Settings {
             SettingsView(model: delegate.model, showsBackButton: false)
