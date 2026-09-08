@@ -5,7 +5,7 @@ import ServiceManagement
 @MainActor
 @Observable
 final class LauncherModel {
-    enum Destination { case search, ai, settings }
+    enum Destination { case search, ai, settings, pomodoro }
     var destination: Destination = .search
     private(set) var section: LauncherSection = .home
     var query = "" { didSet { if query != oldValue { searchChanged() } } }
@@ -25,6 +25,7 @@ final class LauncherModel {
     let applications = ApplicationCatalog()
     let files = FileSearchService()
     let ai: AIChatModel
+    let pomodoro: PomodoroService
     let windows = WindowManager()
     @ObservationIgnored let clipboard: ClipboardService
     @ObservationIgnored let snippets: SnippetExpander
@@ -38,6 +39,7 @@ final class LauncherModel {
     init(store: LibraryStore = LibraryStore(), ai: AIChatModel = AIChatModel(), pasteboard: NSPasteboard = .general) {
         self.store = store
         self.ai = ai
+        pomodoro = PomodoroService(store: store)
         clipboard = ClipboardService(store: store, pasteboard: pasteboard)
         snippets = SnippetExpander(store: store)
         store.commandBindingsDidChange = { [weak self] in self?.synchronizeCommandHotKeys() }
@@ -138,6 +140,7 @@ final class LauncherModel {
     func start() async {
         guard !isStarted else { return }
         isStarted = true
+        pomodoro.startMonitoring()
         applyPreferences()
         await applications.refresh()
         synchronizeSelection()
@@ -151,6 +154,7 @@ final class LauncherModel {
         snippets.stop()
         files.stop()
         ai.cancel()
+        pomodoro.stopMonitoring()
     }
 
     func applyPreferences() {
@@ -340,6 +344,15 @@ final class LauncherModel {
         refreshPermissions()
     }
 
+    func openPomodoro(start: Bool = false) {
+        destination = .pomodoro
+        files.stop()
+        showActions = false
+        message = nil
+        pomodoro.refresh()
+        if start { pomodoro.start() }
+    }
+
     func goBack() {
         if showActions {
             showActions = false
@@ -397,6 +410,12 @@ final class LauncherModel {
             store.recordUse(of: item.id)
             openAI(action)
         case .settings: openSettings()
+        case .pomodoro:
+            store.recordUse(of: item.id)
+            openPomodoro()
+        case .startPomodoro:
+            openPomodoro(start: true)
+            store.recordUse(of: item.id)
         case .quicklink(let link, let argument):
             if link.needsQuery && argument.isEmpty {
                 editor = .quicklinkQuery(link, "")
@@ -629,6 +648,16 @@ final class LauncherModel {
                 symbol: section.symbol, tint: section == .clipboard ? .orange : .blue,
                 badge: "Command", keywords: "search " + section.title, action: .section(section))
         }
+        commands += [
+            LauncherItem(
+                id: "pomodoro.open", title: "Pomodoro", subtitle: "Track your focus sessions and breaks",
+                symbol: "timer", tint: .coral, badge: "Command", keywords: "focus timer productivity break history",
+                action: .pomodoro),
+            LauncherItem(
+                id: "pomodoro.start", title: "Start Pomodoro", subtitle: "Start or resume your focus timer",
+                symbol: "play.circle", tint: .coral, badge: "Command", keywords: "focus timer begin resume break",
+                action: .startPomodoro),
+        ]
         commands += AIAction.allCases.filter { $0 != .chat }.map { action in
             LauncherItem(
                 id: "ai.\(action.id)", title: action.title, subtitle: action.subtitle,

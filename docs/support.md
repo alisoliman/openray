@@ -26,6 +26,14 @@ If macOS reports an unidentified developer, a damaged app, or a verification fai
 
 **Launch at login is pending.** Enable it in OpenRay Settings, then approve OpenRay in macOS Login Items if prompted. Disable it in OpenRay Settings when it is no longer wanted.
 
+## Pomodoro timer
+
+Search **Start Pomodoro** to start or resume the current timer phase, or **Pomodoro** to open the timer and view today's completed sessions, focus minutes, and the latest 20 completed focus sessions. A new cycle begins with focus. Both commands can have aliases and global shortcuts in Settings. The menu bar shows the active countdown and offers timer controls; closing the launcher leaves the timer running.
+
+The defaults are 25 minutes of focus, a 5-minute short break, and a 15-minute long break after every four completed focus sessions, with a daily goal of eight sessions. **Settings → Pomodoro** lets you adjust these values, enable automatic break starts, and choose whether to play a completion sound. Each focus session starts manually. Pause and resume to preserve remaining time, skip a break, or reset the cycle. Only fully completed focus sessions add to your progress. Changed durations apply to the next phase.
+
+**The timer finished while the Mac was asleep or OpenRay was closed.** The saved deadline is checked when OpenRay runs again, and an overdue phase is completed then. If automatic break starts are enabled, the break begins when that completion is processed. OpenRay does not count unattended focus cycles or play a completion sound while it is closed. Your timer state and completed-session history are included in the local library backup.
+
 ## Back up, reset, and uninstall
 
 Choose **Reveal Library in Finder** in Settings to locate the saved library. Quit the app before making a manual backup, and copy both `library.json` and the `ClipboardImages` folder together. AI conversations are not included unless you explicitly saved a response as a note.

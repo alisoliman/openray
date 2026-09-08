@@ -30,6 +30,7 @@ AI features additionally require Apple Intelligence enabled, a supported languag
 | Snippets | Save reusable text with `{date}` and `{time}` placeholders; optionally expand keywords as you type in other apps. |
 | Quicklinks | Open named URLs, files, and folders, or search the web with `{query}` templates and keywords. |
 | Notes | Create, edit, search, and copy local notes. Save an AI response as a note when you want to keep it. |
+| Pomodoro | Start a focus timer, take short or long breaks, and track completed focus sessions with configurable durations and a daily goal. |
 | Window management | Arrange windows in halves or quarters, maximize, center, move to the next display, or restore their original frame. |
 | AI | Chat, summarize, rewrite, proofread, shorten text, and extract action items using Apple's on-device Foundation Models framework. |
 
@@ -53,11 +54,21 @@ In AI, **Return** inserts a newline. Use **Stop** to cancel a response.
 
 ### Command aliases and hotkeys
 
-In **Settings → Command aliases & hotkeys**, choose **Edit…** beside a command to assign an alias, record a shortcut, or remove its binding. Bindings are available for Applications, Files, Clipboard History, Snippets, Quicklinks, Notes, Calculator, Window Management, Ask AI, Settings, and these window commands: Left Half, Right Half, Maximize, Center, and Restore Window. They are saved in your local library. Individual apps, snippets, quicklinks, and clipboard entries do not have command bindings.
+In **Settings → Command aliases & hotkeys**, choose **Edit…** beside a command to assign an alias, record a shortcut, or remove its binding. Bindings are available for Applications, Files, Clipboard History, Snippets, Quicklinks, Notes, Calculator, Pomodoro, Start Pomodoro, Window Management, Ask AI, Settings, and these window commands: Left Half, Right Half, Maximize, Center, and Restore Window. They are saved in your local library. Individual apps, snippets, quicklinks, and clipboard entries do not have command bindings.
 
 Type an exact alias in any search section to bring its command to the top. Matching ignores case and surrounding whitespace. Aliases must be a single token of up to 32 characters and unique across command aliases, quicklink keywords, and snippet keywords.
 
 Shortcuts combine a physical key with Command, Control, Option, and/or Shift; labels follow the keyboard layout. Modifier-only gestures, separate left/right modifiers, and all-four-modifier Hyper shortcuts are unsupported. Reserved macOS shortcuts are blocked; other detected conflicts require **Save Anyway**. A saved shortcut may remain inactive if it conflicts, with an explanation in Settings. The launcher shortcut has priority, followed by command bindings in saved order. Recording temporarily pauses OpenRay's shortcuts, and saving or removing a binding updates them immediately. **Menu bar → Open OpenRay** remains available if a shortcut fails. Window commands still require Accessibility and an accessible focused window.
+
+## Pomodoro
+
+Search **Start Pomodoro** to start or resume the current timer phase, or **Pomodoro** to open the timer and your progress. A new cycle begins with focus. Both commands support aliases and global shortcuts. The menu bar also provides timer controls and shows the active countdown. Closing the launcher or pressing Escape leaves the timer running.
+
+The default cycle uses a **25-minute focus**, a **5-minute short break**, and a **15-minute long break after every four completed focus sessions**, with a daily goal of **eight sessions**. Change these in **Settings → Pomodoro**: focus 1–180 minutes, short break 1–60 minutes, long break 1–120 minutes, long-break interval 1–12 sessions, and daily goal 1–24 sessions. You can also enable automatic break starts and turn the completion sound on or off. Sound is on and automatic break starts are off by default. Duration changes apply to the next phase; they preserve the remaining time of an active or paused phase.
+
+Pause and resume as needed, skip a break, or reset the cycle. Each focus session starts manually. Only completed focus sessions count toward today's sessions and focus minutes; resetting an unfinished session or skipping a break adds no credit. Completed focus sessions are saved locally, with the latest 20 shown in the timer.
+
+Timer state and progress are saved with your library. A running timer keeps its deadline across sleep or relaunch; an overdue phase is completed when OpenRay next checks it. An automatic break begins at that check, and OpenRay does not create a series of unattended focus sessions. Completion sounds play only while the app is running.
 
 ## Permissions and privacy
 
@@ -75,7 +86,7 @@ AI runs on-device with no cloud fallback. Clipboard and selected text enter a co
 
 ### Local data
 
-Preferences, command bindings, favorites, recents, snippets, quicklinks, notes, and enabled clipboard history are stored in:
+Preferences, command bindings, favorites, recents, snippets, quicklinks, notes, Pomodoro configuration, timer state and completed-session history, and enabled clipboard history are stored in:
 
 ```text
 ~/Library/Application Support/OpenRay/library.json
@@ -123,7 +134,7 @@ On a Mac with Apple Intelligence ready, include the actual model integration tes
 ./scripts/verify.sh --ai
 ```
 
-The default suite uses isolated temporary libraries and private test pasteboards. It covers search and alias ranking, command-binding validation and migration, shortcut registration and failure recovery, calculations, persistence, clipboard media and privacy rules, snippets, window geometry, and AI state handling. In-process shortcut routing is tested, but global delivery, live window manipulation, and text expansion require interactive verification with the relevant permissions.
+The default suite uses isolated temporary libraries and private test pasteboards. It covers search and alias ranking, command-binding validation and migration, shortcut registration and failure recovery, calculations, persistence, clipboard media and privacy rules, snippets, Pomodoro cycles and progress, window geometry, and AI state handling. In-process shortcut routing is tested, but global delivery, live window manipulation, and text expansion require interactive verification with the relevant permissions.
 
 [CI](.github/workflows/ci.yml) also checks workflow and release tooling and packages an installer preview. See [CONTRIBUTING.md](CONTRIBUTING.md) for formatting and contribution checks.
 

@@ -86,6 +86,7 @@ struct LauncherSearchView: View {
                 scopeButton("Apps", symbol: "app") { model.navigate(to: .applications) }
                 scopeButton("Files", symbol: "folder") { model.navigate(to: .files) }
                 scopeButton("Ask AI", symbol: "sparkles") { model.openAI() }
+                scopeButton("Pomodoro", symbol: "timer") { model.openPomodoro() }
             } else {
                 Label(model.section.title, systemImage: model.section.symbol)
                     .font(.system(size: 12, weight: .medium)).foregroundStyle(.secondary)
