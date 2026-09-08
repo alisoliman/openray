@@ -3,10 +3,13 @@ import SwiftUI
 
 struct AIChatView: View {
     @Bindable var model: LauncherModel
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @Namespace private var modeSelection
 
     var body: some View {
         VStack(spacing: 0) {
             header
+            modeBar
             Divider().opacity(0.6)
             if let message = model.message { StatusBanner(message: message) { model.message = nil } }
             if let error = model.ai.errorMessage { StatusBanner(message: error) }
@@ -14,34 +17,92 @@ struct AIChatView: View {
                 unavailable
             } else {
                 conversation
-                composer
             }
+            composer
             Divider().opacity(0.6)
             HStack(spacing: 7) {
                 Image(systemName: "lock.shield").foregroundStyle(.green)
-                Text("On-device · Conversation kept in memory only")
+                Text("On-device · Private by default")
                 Spacer()
-                Text("AI can make mistakes. Review the result.")
+                Text("⇧⇥ Previous   ⇥ Next tool").accessibilityHidden(true)
+                Divider().frame(height: 14).padding(.horizontal, 6)
+                Button {
+                    model.showActions.toggle()
+                } label: {
+                    HStack(spacing: 7) {
+                        Text("Actions")
+                        Keycap(text: "⌘ K")
+                    }
+                }.buttonStyle(RayControlStyle()).keyboardShortcut("k")
+                    .accessibilityIdentifier("ai.actions")
+                    .background {
+                        NativeActionsMenu(
+                            isPresented: $model.showActions, title: model.ai.action.title,
+                            entries: actionEntries, didClose: { model.focusRequest += 1 }
+                        )
+                        .accessibilityHidden(true)
+                    }
             }.font(.system(size: 11)).foregroundStyle(.secondary).padding(.horizontal, 20).frame(height: 38)
         }
         .onAppear { model.ai.refreshAvailability() }
+
     }
 
     private var header: some View {
         HStack(spacing: 12) {
-            BackButton { model.navigate(to: .home) }
-            Image(systemName: "sparkles").font(.system(size: 21)).foregroundStyle(.purple)
-            VStack(alignment: .leading, spacing: 3) {
-                Text(model.ai.action.title).font(.system(size: 15, weight: .semibold))
-                Text("Apple Intelligence").font(.system(size: 11)).foregroundStyle(.secondary)
-            }
+            BackButton { model.goBack() }
+            HStack(spacing: 8) {
+                Text("OpenRay").foregroundStyle(.secondary)
+                Image(systemName: "chevron.right").font(.system(size: 9, weight: .medium)).foregroundStyle(.tertiary)
+                Text("AI Workspace").fontWeight(.semibold)
+            }.font(.system(size: 13))
             Spacer()
-            Button("New Chat", systemImage: "square.and.pencil") {
+            HStack(spacing: 5) {
+                Circle().fill(model.ai.availability.isAvailable ? Color.green : .orange).frame(width: 5, height: 5)
+                Text("Apple Intelligence").font(.system(size: 10, weight: .medium))
+            }.foregroundStyle(.secondary)
+            Button {
                 model.ai.newConversation()
                 model.focusRequest += 1
+            } label: {
+                Image(systemName: "square.and.pencil").font(.system(size: 14))
+                    .frame(width: 30, height: 30)
             }
-            .font(.system(size: 12)).buttonStyle(.borderless).disabled(model.ai.isGenerating).keyboardShortcut("n")
-        }.padding(.horizontal, 20).frame(height: 64)
+            .buttonStyle(RayControlStyle()).disabled(model.ai.isGenerating).keyboardShortcut("n")
+            .accessibilityLabel("New conversation").help("New conversation in this tool (⌘N)")
+        }.padding(.horizontal, 20).frame(height: 58)
+    }
+
+    private var modeBar: some View {
+        HStack(spacing: 4) {
+            ForEach(Array(AIAction.workspaceActions.enumerated()), id: \.element.id) { index, action in
+                let selected = model.ai.action == action
+                Button {
+                    model.switchAIAction(action)
+                } label: {
+                    HStack(spacing: 6) {
+                        Image(systemName: action.symbol).font(.system(size: 12, weight: .medium)).accessibilityHidden(
+                            true)
+                        Text(action.shortTitle).font(.system(size: 11, weight: .medium))
+                    }
+                    .frame(maxWidth: .infinity).frame(height: 33)
+                    .foregroundStyle(selected ? Color.purple : Color.secondary)
+                    .background {
+                        if selected {
+                            RoundedRectangle(cornerRadius: 8)
+                                .fill(.purple.opacity(0.11))
+                                .overlay { RoundedRectangle(cornerRadius: 8).strokeBorder(.purple.opacity(0.16)) }
+                                .matchedGeometryEffect(id: "ai.mode", in: modeSelection)
+                        }
+                    }
+                }
+                .buttonStyle(RayControlStyle()).disabled(model.ai.isGenerating && !selected)
+                .accessibilityLabel(action.title).accessibilityAddTraits(selected ? .isSelected : [])
+                .accessibilityIdentifier("ai.mode.\(action.id)").help("\(action.title) (⌘\(index + 1)) · Tab to switch")
+            }
+        }
+        .padding(.horizontal, 18).padding(.bottom, 12)
+        .animation(reduceMotion ? nil : .spring(response: 0.3, dampingFraction: 0.82), value: model.ai.action)
     }
 
     private var unavailable: some View {
@@ -63,23 +124,9 @@ struct AIChatView: View {
         ScrollViewReader { proxy in
             ScrollView {
                 if model.ai.messages.isEmpty {
-                    VStack(spacing: 10) {
-                        EmptyState(
-                            symbol: model.ai.action.symbol,
-                            title: model.ai.action == .chat
-                                ? "A little help. Entirely on your Mac." : model.ai.action.title,
-                            detail: model.ai.action == .chat
-                                ? "Brainstorm an idea, find the right words, or work through a question. Nothing is sent to a cloud model."
-                                : model.ai.action.subtitle + ". Paste a passage below to get started.")
-                        if model.ai.action == .chat {
-                            HStack(spacing: 8) {
-                                suggestion(
-                                    "Draft a thoughtful reply", "Help me draft a thoughtful reply to this message: ")
-                                suggestion("Brainstorm an idea", "Help me brainstorm ideas for ")
-                                suggestion("Explain simply", "Explain this in simple terms: ")
-                            }
-                        }
-                    }.padding(.top, 12)
+                    welcome
+                        .id(model.ai.action)
+                        .transition(reduceMotion ? .opacity : .opacity.combined(with: .offset(y: 6)))
                 } else {
                     LazyVStack(alignment: .leading, spacing: 21) {
                         ForEach(model.ai.messages) { message in messageView(message) }
@@ -90,6 +137,62 @@ struct AIChatView: View {
             .onChange(of: model.ai.messages.last?.text) { proxy.scrollTo("conversation.end", anchor: .bottom) }
             .onChange(of: model.ai.messages.count) { proxy.scrollTo("conversation.end", anchor: .bottom) }
         }.frame(maxWidth: .infinity, maxHeight: .infinity)
+            .animation(reduceMotion ? nil : .easeOut(duration: 0.18), value: model.ai.action)
+    }
+
+    private var welcome: some View {
+        VStack(spacing: 12) {
+            ZStack {
+                Circle().fill(.purple.opacity(0.08)).frame(width: 88, height: 88).blur(radius: 10)
+                RoundedRectangle(cornerRadius: 19)
+                    .fill(
+                        LinearGradient(
+                            colors: [.purple.opacity(0.16), .indigo.opacity(0.05)],
+                            startPoint: .topLeading, endPoint: .bottomTrailing)
+                    )
+                    .frame(width: 62, height: 62)
+                    .overlay { RoundedRectangle(cornerRadius: 19).strokeBorder(.purple.opacity(0.18)) }
+                Image(systemName: model.ai.action.symbol)
+                    .font(.system(size: 26, weight: .light)).foregroundStyle(.purple)
+                    .contentTransition(reduceMotion ? .identity : .symbolEffect(.replace))
+            }.frame(height: 76).accessibilityHidden(true)
+            VStack(spacing: 7) {
+                Text(welcomeTitle).font(.system(size: 22, weight: .semibold, design: .rounded))
+                Text(model.ai.action.subtitle + ".")
+                    .font(.system(size: 12)).foregroundStyle(.secondary)
+            }
+            if model.ai.action == .chat {
+                HStack(spacing: 8) {
+                    suggestion("Draft a reply", "Help me draft a thoughtful reply to this message: ")
+                    suggestion("Brainstorm", "Help me brainstorm ideas for ")
+                    suggestion("Explain simply", "Explain this in simple terms: ")
+                }.padding(.top, 6)
+            } else {
+                suggestion("Try an example", examplePassage).padding(.top, 6)
+            }
+        }.padding(.top, 20).padding(.bottom, 16).frame(maxWidth: .infinity)
+    }
+
+    private var welcomeTitle: String {
+        switch model.ai.action {
+        case .chat: "What’s on your mind?"
+        case .rewrite: "Find the right words."
+        case .summarize: "Less reading. More clarity."
+        case .proofread: "Your voice, polished."
+        case .shorten: "Make every word count."
+        case .actionItems: "Turn notes into next steps."
+        }
+    }
+
+    private var examplePassage: String {
+        switch model.ai.action {
+        case .actionItems:
+            "We agreed to launch the new homepage on Friday. Sam will finish the copy by Wednesday. I’ll review the final designs tomorrow and share feedback with the team."
+        case .proofread:
+            "Thanks for you're feedback on the proposal. I’ve made the change we discussed and the updated version are ready for review."
+        default:
+            "I wanted to reach out to let you know that we’ve finished the first round of designs. It would be really helpful if you could take a look when you have a chance and let us know what you think before we move on to the next stage."
+        }
     }
 
     private func suggestion(_ title: String, _ prompt: String) -> some View {
@@ -100,7 +203,7 @@ struct AIChatView: View {
             Text(title).font(.system(size: 11)).padding(.horizontal, 10).padding(.vertical, 8)
                 .background(.primary.opacity(0.045), in: .rect(cornerRadius: 7))
                 .overlay { RoundedRectangle(cornerRadius: 7).strokeBorder(.primary.opacity(0.06)) }
-        }.buttonStyle(.plain)
+        }.buttonStyle(RayControlStyle())
     }
 
     private func messageView(_ message: ChatMessage) -> some View {
@@ -138,8 +241,46 @@ struct AIChatView: View {
         }
     }
 
+    private var actionEntries: [NativeActionsMenu.Entry] {
+        var entries: [NativeActionsMenu.Entry] = []
+        if model.ai.isGenerating {
+            entries.append(.init(title: "Stop Response", symbol: "stop.fill") { model.ai.cancel() })
+        } else {
+            if let response = model.ai.messages.last(where: { $0.role == .assistant && !$0.text.isEmpty }) {
+                entries.append(.init(title: "Copy Last Response", symbol: "doc.on.doc") { model.copy(response.text) })
+            }
+            entries.append(
+                .init(title: "New Conversation", symbol: "square.and.pencil") {
+                    model.ai.newConversation()
+                })
+            for action in AIAction.workspaceActions where action != model.ai.action {
+                entries.append(
+                    .init(title: action.title, symbol: action.symbol) {
+                        model.showActions = false
+                        model.switchAIAction(action)
+                    })
+            }
+        }
+        entries.append(.init(title: "Use Clipboard", symbol: "clipboard", perform: importClipboard))
+        entries.append(.init(title: "Use Selected Text", symbol: "selection.pin.in.out") { model.useSelectionForAI() })
+        entries.append(
+            .init(title: "Back to Launcher", symbol: "arrow.left") {
+                model.showActions = false
+                model.goBack()
+            })
+        return entries
+    }
+
+    private func importClipboard() {
+        if let text = model.clipboard.readText() {
+            model.ai.useText(text)
+        } else {
+            model.message = "There is no text on the clipboard."
+        }
+        model.focusRequest += 1
+    }
+
     private var composer: some View {
-        @Bindable var chat = model.ai
         return VStack(spacing: 8) {
             ZStack(alignment: .topLeading) {
                 if model.ai.draft.isEmpty {
@@ -150,19 +291,23 @@ struct AIChatView: View {
                     .font(.system(size: 13)).foregroundStyle(.secondary).padding(.top, 10).padding(.leading, 12)
                     .allowsHitTesting(false).accessibilityHidden(true)
                 }
-                AIComposerInput(text: $chat.draft, focusRequest: model.focusRequest, submit: model.ai.send)
-                    .padding(6).frame(height: 77)
-            }.background(.primary.opacity(0.045), in: .rect(cornerRadius: 8))
-                .overlay { RoundedRectangle(cornerRadius: 8).strokeBorder(.primary.opacity(0.09)) }
-            HStack(spacing: 13) {
-                Button("Use Clipboard", systemImage: "clipboard") {
-                    if let text = model.clipboard.readText() {
-                        model.ai.useText(text)
-                    } else {
-                        model.message = "There is no text on the clipboard."
-                    }
-                    model.focusRequest += 1
+                AIComposerInput(
+                    text: Binding(get: { model.ai.draft }, set: { model.ai.draft = $0 }),
+                    focusRequest: model.focusRequest, submit: { model.ai.send() },
+                    cycleAction: model.cycleAIAction, cancel: model.goBack,
+                    sessionIdentity: { model.ai.action.id }
+                ).padding(6).frame(height: 88)
+            }.background(.primary.opacity(0.025), in: .rect(cornerRadius: 12))
+                .overlay {
+                    RoundedRectangle(cornerRadius: 12)
+                        .strokeBorder(
+                            LinearGradient(
+                                colors: [.purple.opacity(0.3), .primary.opacity(0.1)],
+                                startPoint: .topLeading, endPoint: .bottomTrailing))
                 }
+                .shadow(color: .purple.opacity(0.035), radius: 12, y: 3)
+            HStack(spacing: 13) {
+                Button("Use Clipboard", systemImage: "clipboard", action: importClipboard)
                 Button("Use Selected Text", systemImage: "selection.pin.in.out") {
                     model.useSelectionForAI()
                     model.focusRequest += 1
@@ -179,7 +324,7 @@ struct AIChatView: View {
                         model.ai.send()
                     } label: {
                         HStack {
-                            Text("Send")
+                            Text(model.ai.action == .chat ? "Ask" : model.ai.action.shortTitle)
                             Text("⌘↩").opacity(0.65)
                         }
                     }

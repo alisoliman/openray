@@ -2,7 +2,19 @@ import Foundation
 
 enum AIAction: String, CaseIterable, Identifiable, Sendable {
     case chat, summarize, rewrite, proofread, shorten, actionItems
+    static let workspaceActions: [AIAction] = [.chat, .rewrite, .summarize, .proofread, .shorten, .actionItems]
     var id: String { rawValue }
+    var shortTitle: String {
+        switch self {
+        case .chat: "Ask"
+        case .rewrite: "Rewrite"
+        case .summarize: "Summarize"
+        case .proofread: "Proofread"
+        case .shorten: "Shorten"
+        case .actionItems: "Actions"
+        }
+    }
+
     var title: String {
         switch self {
         case .chat: "Ask AI"

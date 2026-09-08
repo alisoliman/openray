@@ -12,6 +12,7 @@ struct LauncherSearchInput: NSViewRepresentable {
     var move: (Int) -> Void
     var cancel: () -> Void
     var paste: () -> Void
+    var enterAI: () -> Bool = { false }
 
     func makeCoordinator() -> Coordinator { Coordinator(parent: self) }
 
@@ -71,7 +72,14 @@ struct LauncherSearchInput: NSViewRepresentable {
         }
 
         func control(_ control: NSControl, textView: NSTextView, doCommandBy commandSelector: Selector) -> Bool {
+            guard !textView.hasMarkedText() else { return false }
             switch commandSelector {
+            case #selector(NSResponder.insertTab(_:)):
+                guard
+                    (NSApp.currentEvent?.modifierFlags ?? []).intersection([.command, .control, .option, .shift])
+                        .isEmpty
+                else { return false }
+                guard parent.enterAI() else { return false }
             case #selector(NSResponder.moveDown(_:)): parent.move(1)
             case #selector(NSResponder.moveUp(_:)): parent.move(-1)
             case #selector(NSResponder.cancelOperation(_:)): parent.cancel()
@@ -122,6 +130,9 @@ struct AIComposerInput: NSViewRepresentable {
     @Binding var text: String
     var focusRequest: Int
     var submit: () -> Void
+    var cycleAction: (Int) -> Bool = { _ in false }
+    var cancel: () -> Void = {}
+    var sessionIdentity: () -> String = { "composer" }
 
     func makeCoordinator() -> Coordinator { Coordinator(parent: self) }
 
@@ -132,6 +143,9 @@ struct AIComposerInput: NSViewRepresentable {
         scroll.drawsBackground = false
         let editor = FocusedComposerTextView()
         editor.delegate = context.coordinator
+        editor.prepareForInput = { [weak editor, weak coordinator = context.coordinator] in
+            if let editor { coordinator?.synchronizeEditor(editor) }
+        }
         editor.isRichText = false
         editor.allowsUndo = true
         editor.drawsBackground = false
@@ -158,12 +172,7 @@ struct AIComposerInput: NSViewRepresentable {
     func updateNSView(_ scroll: NSScrollView, context: Context) {
         context.coordinator.parent = self
         guard let editor = scroll.documentView as? FocusedComposerTextView else { return }
-        if editor.string != text {
-            editor.string = text
-            let end = NSRange(location: text.utf16.count, length: 0)
-            editor.setSelectedRange(end)
-            editor.scrollRangeToVisible(end)
-        }
+        context.coordinator.synchronizeEditor(editor)
         if editor.focusRequest != focusRequest {
             editor.focusRequest = focusRequest
             editor.focusIfNeeded()
@@ -173,7 +182,53 @@ struct AIComposerInput: NSViewRepresentable {
     @MainActor
     final class Coordinator: NSObject, NSTextViewDelegate {
         var parent: AIComposerInput
-        init(parent: AIComposerInput) { self.parent = parent }
+        private var sessionID: String
+        private weak var editor: NSTextView?
+        private weak var observedUndoManager: UndoManager?
+        init(parent: AIComposerInput) {
+            self.parent = parent
+            sessionID = parent.sessionIdentity()
+        }
+
+        func synchronizeEditor(_ editor: NSTextView) {
+            self.editor = editor
+            observeUndoManager(editor.undoManager)
+            guard !editor.hasMarkedText() else { return }
+            let identity = parent.sessionIdentity()
+            let text = parent.text
+            if sessionID != identity || editor.string != text {
+                // Undo ranges belong to the previous tool or imported passage.
+                editor.breakUndoCoalescing()
+                editor.undoManager?.removeAllActions()
+                sessionID = identity
+            }
+            if editor.string != text {
+                editor.string = text
+                let end = NSRange(location: text.utf16.count, length: 0)
+                editor.setSelectedRange(end)
+                editor.scrollRangeToVisible(end)
+            }
+        }
+
+        private func observeUndoManager(_ manager: UndoManager?) {
+            guard observedUndoManager !== manager else { return }
+            let center = NotificationCenter.default
+            center.removeObserver(self, name: .NSUndoManagerDidUndoChange, object: nil)
+            center.removeObserver(self, name: .NSUndoManagerDidRedoChange, object: nil)
+            observedUndoManager = manager
+            if let manager {
+                for name in [Notification.Name.NSUndoManagerDidUndoChange, .NSUndoManagerDidRedoChange] {
+                    center.addObserver(self, selector: #selector(historyChanged(_:)), name: name, object: manager)
+                }
+            }
+        }
+
+        @objc private func historyChanged(_ notification: Notification) {
+            // NSTextView can apply native undo without calling textDidChange.
+            // Publish it before a later SwiftUI update restores the old draft.
+            guard let editor else { return }
+            parent.text = editor.string
+        }
 
         func textDidChange(_ notification: Notification) {
             guard let editor = notification.object as? NSTextView else { return }
@@ -181,6 +236,25 @@ struct AIComposerInput: NSViewRepresentable {
         }
 
         func textView(_ textView: NSTextView, doCommandBy commandSelector: Selector) -> Bool {
+            guard !textView.hasMarkedText() else { return false }
+            if commandSelector == #selector(NSResponder.insertTab(_:)) {
+                guard (NSApp.currentEvent?.modifierFlags ?? []).intersection([.command, .control, .option]).isEmpty
+                else { return false }
+                guard parent.cycleAction(1) else { return false }
+                synchronizeEditor(textView)
+                return true
+            }
+            if commandSelector == #selector(NSResponder.insertBacktab(_:)) {
+                guard (NSApp.currentEvent?.modifierFlags ?? []).intersection([.command, .control, .option]).isEmpty
+                else { return false }
+                guard parent.cycleAction(-1) else { return false }
+                synchronizeEditor(textView)
+                return true
+            }
+            if commandSelector == #selector(NSResponder.cancelOperation(_:)) {
+                parent.cancel()
+                return true
+            }
             if commandSelector == #selector(NSResponder.insertNewline(_:)),
                 NSApp.currentEvent?.modifierFlags.contains(.command) == true
             {
@@ -194,6 +268,22 @@ struct AIComposerInput: NSViewRepresentable {
 
 final class FocusedComposerTextView: NSTextView {
     var focusRequest = -1
+    var prepareForInput: (() -> Void)?
+
+    override func keyDown(with event: NSEvent) {
+        prepareForInput?()
+        super.keyDown(with: event)
+    }
+
+    override func performKeyEquivalent(with event: NSEvent) -> Bool {
+        prepareForInput?()
+        return super.performKeyEquivalent(with: event)
+    }
+
+    override func insertText(_ insertString: Any, replacementRange: NSRange) {
+        prepareForInput?()
+        super.insertText(insertString, replacementRange: replacementRange)
+    }
 
     override func viewDidMoveToWindow() {
         super.viewDidMoveToWindow()
@@ -204,6 +294,7 @@ final class FocusedComposerTextView: NSTextView {
                 name: NSWindow.didBecomeKeyNotification, object: window)
         }
         focusIfNeeded()
+        prepareForInput?()
     }
 
     func focusIfNeeded() {
