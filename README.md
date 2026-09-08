@@ -31,6 +31,7 @@ AI features additionally require Apple Intelligence enabled, a supported languag
 | Quicklinks | Open named URLs, files, and folders, or search the web with `{query}` templates and keywords. |
 | Notes | Create, edit, search, and copy local notes. Save an AI response as a note when you want to keep it. |
 | Pomodoro | Start a focus timer, take short or long breaks, and track completed focus sessions with configurable durations and a daily goal. |
+| Caffeinate | Keep your Mac and display awake indefinitely or for a chosen duration, with status and controls in the menu bar. |
 | Window management | Arrange windows in halves or quarters, maximize, center, move to the next display, or restore their original frame. |
 | AI | Chat, summarize, rewrite, proofread, shorten text, and extract action items using Apple's on-device Foundation Models framework. |
 
@@ -54,7 +55,7 @@ In AI, **Return** inserts a newline. Use **Stop** to cancel a response.
 
 ### Command aliases and hotkeys
 
-In **Settings → Command aliases & hotkeys**, choose **Edit…** beside a command to assign an alias, record a shortcut, or remove its binding. Bindings are available for Applications, Files, Clipboard History, Snippets, Quicklinks, Notes, Calculator, Pomodoro, Start Pomodoro, Window Management, Ask AI, Settings, and these window commands: Left Half, Right Half, Maximize, Center, and Restore Window. They are saved in your local library. Individual apps, snippets, quicklinks, and clipboard entries do not have command bindings.
+In **Settings → Command aliases & hotkeys**, choose **Edit…** beside a command to assign an alias, record a shortcut, or remove its binding. Bindings are available for Applications, Files, Clipboard History, Snippets, Quicklinks, Notes, Calculator, Pomodoro, Start Pomodoro, Caffeinate, Start Caffeinate, Stop Caffeinate, Toggle Caffeinate, Window Management, Ask AI, Settings, and these window commands: Left Half, Right Half, Maximize, Center, and Restore Window. They are saved in your local library. Individual apps, snippets, quicklinks, and clipboard entries do not have command bindings.
 
 Type an exact alias in any search section to bring its command to the top. Matching ignores case and surrounding whitespace. Aliases must be a single token of up to 32 characters and unique across command aliases, quicklink keywords, and snippet keywords.
 
@@ -69,6 +70,14 @@ The default cycle uses a **25-minute focus**, a **5-minute short break**, and a 
 Pause and resume as needed, skip a break, or reset the cycle. Each focus session starts manually. Only completed focus sessions count toward today's sessions and focus minutes; resetting an unfinished session or skipping a break adds no credit. Completed focus sessions are saved locally, with the latest 20 shown in the timer.
 
 Timer state and progress are saved with your library. A running timer keeps its deadline across sleep or relaunch; an overdue phase is completed when OpenRay next checks it. An automatic break begins at that check, and OpenRay does not create a series of unattended focus sessions. Completion sounds play only while the app is running.
+
+## Caffeinate
+
+Search **Caffeinate** to open its controls and status, **Start Caffeinate** to keep your Mac awake indefinitely, **Stop Caffeinate** to stop, or **Toggle Caffeinate** to switch it on or off. Start, Stop, and Toggle act immediately and dismiss the launcher when successful. All four commands support aliases and global shortcuts. The menu bar shows a coffee icon while active, with status and controls.
+
+Choose **Indefinitely**, **10 or 30 minutes**, **1, 2, 4, 8, or 12 hours**, or a custom duration of **1–1,440 minutes**, then press **Start Caffeinate** or **Update Duration**. Updating starts the chosen duration from now and replaces the current deadline. Timed sessions stop automatically.
+
+Caffeinate uses native macOS sleep assertions to prevent idle system and display sleep while OpenRay runs. Closing the launcher leaves it active; quitting OpenRay stops it. Sessions are not saved or resumed after relaunch. Caffeinate does not override closing a laptop lid or choosing Sleep manually.
 
 ## Permissions and privacy
 

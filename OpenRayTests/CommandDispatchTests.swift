@@ -51,7 +51,7 @@ struct CommandDispatchTests {
         let model = model()
         defer { model.stop() }
         #expect(model.bindableCommands.map(\.id) == CuratedCommand.targetIDs)
-        #expect(model.bindableCommands.count == 17)
+        #expect(model.bindableCommands.count == 21)
         #expect(!CuratedCommand.supports("ai.summarize"))
         #expect(!CuratedCommand.supports("window.nextDisplay"))
         #expect(!CuratedCommand.supports("quicklink.any"))

@@ -11,6 +11,7 @@ struct ContentView: View {
             case .ai: AIChatView(model: model)
             case .settings: SettingsView(model: model)
             case .pomodoro: PomodoroView(model: model)
+            case .caffeinate: CaffeinateView(model: model)
             }
         }
         .frame(width: 780, height: 570)
@@ -29,7 +30,9 @@ struct ContentView: View {
         .onExitCommand {
             // Dashboards use the panel's native responder-aware fallback. Text
             // editing and modal dismissal must get their own Escape first.
-            guard model.editor == nil, model.destination != .settings, model.destination != .pomodoro else { return }
+            guard model.editor == nil, model.destination != .settings, model.destination != .pomodoro,
+                model.destination != .caffeinate
+            else { return }
             model.goBack()
         }
         .background {

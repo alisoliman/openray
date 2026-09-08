@@ -69,6 +69,7 @@ final class LauncherPanelController: NSObject, NSWindowDelegate {
         model.refreshPermissions()
         model.store.pruneClipboard()
         model.pomodoro.refresh()
+        model.caffeinate.refresh()
         NSApp.activate()
         window.makeKeyAndOrderFront(nil)
         model.resumeSearch()
@@ -115,7 +116,8 @@ final class LauncherPanelController: NSObject, NSWindowDelegate {
         panel.onCancel = { [weak model] in model?.goBack() }
         panel.delegate = self
         panel.escapeAction = { [weak model] in
-            guard let model, model.destination == .settings || model.destination == .pomodoro,
+            guard let model,
+                model.destination == .settings || model.destination == .pomodoro || model.destination == .caffeinate,
                 model.editor == nil
             else { return false }
             model.goBack()

@@ -8,6 +8,7 @@ enum CuratedCommand {
         "ai.chat", "settings", "window.leftHalf", "window.rightHalf", "window.maximize",
         "window.center", "window.restore",
         "pomodoro.open", "pomodoro.start",
+        "caffeinate.open", "caffeinate.start", "caffeinate.stop", "caffeinate.toggle",
     ]
 
     static func supports(_ targetID: String) -> Bool { targetIDs.contains(targetID) }

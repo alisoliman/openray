@@ -17,6 +17,8 @@ struct OpenRayApp: App {
             Divider()
             PomodoroMenuContent(model: delegate.model)
             Divider()
+            CaffeinateMenuContent(model: delegate.model)
+            Divider()
             Button("Settings…") {
                 delegate.model.openSettings()
                 delegate.model.panel?.show()
@@ -26,7 +28,13 @@ struct OpenRayApp: App {
             Button("Quit OpenRay") { NSApp.terminate(nil) }
                 .keyboardShortcut("q")
         } label: {
-            PomodoroMenuBarLabel(service: delegate.model.pomodoro)
+            HStack(spacing: 4) {
+                PomodoroMenuBarLabel(service: delegate.model.pomodoro)
+                if delegate.model.caffeinate.isActive {
+                    Image(systemName: "cup.and.saucer.fill")
+                        .accessibilityLabel("Caffeinate active. \(delegate.model.caffeinate.statusText)")
+                }
+            }
         }
         Settings {
             SettingsView(model: delegate.model, showsBackButton: false)
