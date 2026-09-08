@@ -36,7 +36,9 @@ struct AIWorkspaceTests {
         #expect(model.focusRequest == focus + 1)
     }
 
-    @Test(arguments: ["AI", "Ask AI", "Rewrite", "Fix Spelling & Grammar", " Settings ", "chat"])
+    @Test(arguments: [
+        "AI", "Ask AI", "Rewrite", "Fix Spelling & Grammar", " Settings ", "chat", "Pomodoro", "Start Pomodoro",
+    ])
     func commandSearchesAreNotImportedAsPassages(query: String) {
         let model = model()
         defer { model.stop() }
@@ -250,6 +252,35 @@ struct AIWorkspaceTests {
         #expect(model.quickAI())
         model.navigate(to: .notes)
         model.openAI()
+        model.goBack()
+        #expect(model.query.isEmpty)
+    }
+
+    @Test func pomodoroNavigationPreservesAIDraftsWithoutRestoringAnEarlierQuickEntrySearch() {
+        let model = model()
+        defer { model.stop() }
+        model.query = "An earlier question"
+        #expect(model.quickAI())
+        let chat = model.ai
+        model.switchAIAction(.rewrite)
+        model.ai.draft = "A rewrite in progress"
+        let rewrite = model.ai
+
+        model.openPomodoro()
+        #expect(model.destination == .pomodoro)
+        #expect(!model.quickAI())
+        #expect(!model.cycleAIAction(1))
+        #expect(model.ai === rewrite)
+        model.goBack()
+        #expect(model.destination == .search)
+        #expect(model.query.isEmpty)
+
+        model.openAI(.rewrite)
+        #expect(model.ai === rewrite)
+        #expect(model.ai.draft == "A rewrite in progress")
+        model.switchAIAction(.chat)
+        #expect(model.ai === chat)
+        #expect(model.ai.draft == "An earlier question")
         model.goBack()
         #expect(model.query.isEmpty)
     }

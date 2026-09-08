@@ -131,6 +131,13 @@ struct LauncherSearchView: View {
                 .accessibilityIdentifier("launcher.moreFeatures")
             Spacer(minLength: 8)
             Button {
+                model.openPomodoro()
+            } label: {
+                Label("Pomodoro", systemImage: "timer").font(.system(size: 11, weight: .medium))
+                    .padding(.horizontal, 9).padding(.vertical, 7).foregroundStyle(.secondary)
+            }.buttonStyle(RayControlStyle()).help("Open Pomodoro")
+                .accessibilityIdentifier("launcher.pomodoro")
+            Button {
                 model.openAI()
             } label: {
                 Label("AI", systemImage: "sparkles").font(.system(size: 11, weight: .medium))

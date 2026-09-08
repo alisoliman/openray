@@ -203,7 +203,7 @@ struct UsageRecord: Codable, Equatable, Sendable {
 }
 
 struct LibraryDatabase: Codable, Equatable, Sendable {
-    static let currentSchemaVersion = 3
+    static let currentSchemaVersion = 4
     var schemaVersion = LibraryDatabase.currentSchemaVersion
     var preferences = AppPreferences()
     var quicklinks = Quicklink.defaults
@@ -213,9 +213,11 @@ struct LibraryDatabase: Codable, Equatable, Sendable {
     var favoriteIDs: Set<String> = ["section.clipboard", "ai.chat", "section.notes"]
     var usage: [UsageRecord] = []
     var commandBindings: [CommandBinding] = []
+    var pomodoro = PomodoroData()
 
     private enum CodingKeys: String, CodingKey {
-        case schemaVersion, preferences, quicklinks, snippets, notes, clipboard, favoriteIDs, usage, commandBindings
+        case schemaVersion, preferences, quicklinks, snippets, notes, clipboard, favoriteIDs, usage, commandBindings,
+            pomodoro
     }
 
     /// Retired commands may have obsolete payloads. Ignore them before decoding
@@ -247,6 +249,7 @@ struct LibraryDatabase: Codable, Equatable, Sendable {
         commandBindings =
             try container.decodeIfPresent([AvailableCommandBinding].self, forKey: .commandBindings)?
             .compactMap(\.binding) ?? []
+        pomodoro = try container.decodeIfPresent(PomodoroData.self, forKey: .pomodoro) ?? PomodoroData()
     }
 
     func binding(for targetID: String) -> CommandBinding? {
@@ -300,6 +303,7 @@ struct LibraryDatabase: Codable, Equatable, Sendable {
         guard clipboard.allSatisfy(\.isValid) else {
             throw LibraryValidationError("The library contains invalid clipboard content.")
         }
+        try pomodoro.validate()
     }
 }
 

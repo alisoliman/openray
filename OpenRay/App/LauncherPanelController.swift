@@ -36,7 +36,7 @@ final class LauncherPanel: NSPanel {
         super.sendEvent(event)
     }
 
-    /// The borderless host has no scene focus target when Settings opens. Handle
+    /// The borderless host has no scene focus target when a dashboard opens. Handle
     /// its unclaimed Escape here, while leaving text editing and sheets native.
     func handleEscapeKey(_ event: NSEvent) -> Bool {
         guard event.type == .keyDown, event.keyCode == 53,
@@ -86,6 +86,7 @@ final class LauncherPanelController: NSObject, NSWindowDelegate {
         }
         model.refreshPermissions()
         model.store.pruneClipboard()
+        model.pomodoro.refresh()
         let shouldAnimate = isOpening && !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
         window.alphaValue = shouldAnimate ? 0 : 1
         NSApp.activate()
@@ -163,7 +164,9 @@ final class LauncherPanelController: NSObject, NSWindowDelegate {
         panel.workspaceShortcutAction = { [weak model] index in model?.selectWorkspaceShortcut(index) ?? false }
         panel.delegate = self
         panel.escapeAction = { [weak model] in
-            guard let model, model.destination == .settings, model.editor == nil else { return false }
+            guard let model, model.destination == .settings || model.destination == .pomodoro,
+                model.editor == nil
+            else { return false }
             model.goBack()
             return true
         }

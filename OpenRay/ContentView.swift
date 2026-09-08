@@ -17,6 +17,9 @@ struct ContentView: View {
             case .settings:
                 SettingsView(model: model)
                     .modifier(RayDestinationEntrance())
+            case .pomodoro:
+                PomodoroView(model: model)
+                    .modifier(RayDestinationEntrance())
             }
         }
         .frame(width: 780, height: 570)
@@ -34,9 +37,9 @@ struct ContentView: View {
             if newValue == nil { model.focusRequest += 1 }
         }
         .onExitCommand {
-            // Settings uses the panel's native responder-aware fallback. Text
+            // Dashboards use the panel's native responder-aware fallback. Text
             // editing and modal dismissal must get their own Escape first.
-            guard model.editor == nil, model.destination != .settings else { return }
+            guard model.editor == nil, model.destination != .settings, model.destination != .pomodoro else { return }
             model.goBack()
         }
         .background {

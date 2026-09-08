@@ -36,7 +36,7 @@ struct OpenRayHelpView: View {
                         """
                         Search an app name, a filename, or a command such as Snippets or Fix \
                         Spelling & Grammar. The feature bar opens All, Apps, Files, Clipboard, \
-                        Notes, and AI. More opens Snippets, Quicklinks, Windows, and Calculator. \
+                        Notes, Pomodoro, and AI. More opens Snippets, Quicklinks, Windows, and Calculator. \
                         Files uses Spotlight in your home folder; hidden files, \
                         Library, and generated development folders are excluded.
                         """)
@@ -135,6 +135,33 @@ struct OpenRayHelpView: View {
                         """)
                 }
 
+                section("Focus with Pomodoro", symbol: "timer") {
+                    Text(
+                        """
+                        Search Start Pomodoro to start or resume the current phase, or Pomodoro \
+                        to open the timer and see today's completed sessions, focus minutes, and \
+                        recent history. A new cycle begins with focus. \
+                        Both commands support aliases and global shortcuts. The menu bar shows the \
+                        active countdown and timer controls. Closing the launcher leaves it running.
+                        """)
+                    Text(
+                        """
+                        Start with 25 minutes of focus, 5-minute short breaks, and a 15-minute long \
+                        break after four completed sessions. Settings lets you change durations, \
+                        the long-break interval, and the daily goal of eight sessions, and choose \
+                        automatic break starts or a completion sound. Each focus session starts \
+                        manually. Changed durations apply to the next phase.
+                        """)
+                    Text(
+                        """
+                        Pause and resume, skip a break, or reset the cycle. Only completed focus \
+                        sessions count toward progress; reset preserves completed history. Timer \
+                        state and history are saved locally. After sleep or relaunch, an overdue \
+                        phase completes when OpenRay checks its saved deadline. An automatic break \
+                        begins at that point. Sounds play only while OpenRay is running.
+                        """)
+                }
+
                 section("Calculate and arrange windows", symbol: "equal.square") {
                     Text(
                         """
@@ -180,7 +207,8 @@ struct OpenRayHelpView: View {
                     Text(
                         """
                         No account, analytics, ads, or cloud sync. Notes, snippets, links, preferences, \
-                        favorites, recent-use history, and enabled clipboard history are stored in \
+                        favorites, recent-use history, Pomodoro state and history, and enabled \
+                        clipboard history are stored in \
                         ~/Library/Application Support/OpenRay. \
                         Reveal Library in Finder is available in Settings. The files are local and \
                         restricted to your user account but are not encrypted by OpenRay. Back up \

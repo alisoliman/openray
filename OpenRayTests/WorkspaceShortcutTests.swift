@@ -108,6 +108,31 @@ struct WorkspaceShortcutTests {
         #expect(!panel.handleWorkspaceShortcut(try keyEvent("2")))
     }
 
+    @Test func pomodoroLeavesWorkspaceNumbersUnclaimedAndKeepsItsTimerRunningOnReturn() throws {
+        let model = model()
+        defer { model.stop() }
+        let panel = LauncherPanel()
+        panel.workspaceShortcutAction = model.selectWorkspaceShortcut
+        model.openPomodoro(start: true)
+        let state = model.pomodoro.state
+        let focus = model.focusRequest
+
+        for index in 0..<6 {
+            #expect(!model.selectWorkspaceShortcut(index))
+            #expect(!panel.handleWorkspaceShortcut(try keyEvent(String(index + 1))))
+        }
+        #expect(model.destination == .pomodoro)
+        #expect(model.focusRequest == focus)
+        #expect(model.pomodoro.state == state)
+
+        model.goBack()
+        #expect(model.destination == .search)
+        #expect(model.pomodoro.state.status == .running)
+        #expect(panel.handleWorkspaceShortcut(try keyEvent("6")))
+        #expect(model.destination == .ai)
+        #expect(model.pomodoro.state == state)
+    }
+
     @Test func nativeWorkspaceRoutingLeavesMarkedTextAndSheetsAlone() throws {
         let panel = LauncherPanel(
             contentRect: NSRect(x: 0, y: 0, width: 300, height: 200), styleMask: .borderless,

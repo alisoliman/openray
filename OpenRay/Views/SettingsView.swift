@@ -49,6 +49,8 @@ struct SettingsView: View {
 
                 CommandBindingsView(model: model)
 
+                PomodoroSettingsSection(service: model.pomodoro)
+
                 Section {
                     HStack(alignment: .top, spacing: 12) {
                         Image(systemName: model.accessibilityAllowed ? "checkmark.shield.fill" : "hand.raised")
