@@ -36,6 +36,16 @@ AI features additionally require Apple Intelligence enabled, a supported languag
 
 Try `6 * 7`, `200 * 15%`, `sqrt(144)`, `10 km in mi`, `72 f in c`, or `web swift concurrency`. Calculator `%` divides the preceding value by 100; trigonometric functions use radians. Storage conversions distinguish decimal MB/GB from binary MiB/GiB.
 
+## A workspace from the launch
+
+The feature bar gives you direct access to **All, Apps, Files, Clipboard, Notes, Pomodoro, and AI**. Open **More** for **Snippets, Quicklinks, Windows, and Calculator**.
+
+Type a question or passage in **All**, then press **Tab** to carry it into the AI workspace as an editable draft. Choose **Ask, Rewrite, Summarize, Proofread, Shorten, or Actions** from the tool bar, or press **Tab / Shift-Tab** in the composer to move between them. **Actions** extracts action items. Moving into AI or changing tools does not send your text; **⌘Return** runs the selected tool.
+
+If Ask already has an unsent draft, Tab keeps it and shows a reminder; go Back to recover the new search text.
+
+Each AI tool keeps its own draft and conversation while OpenRay is running. Switching tools preserves your work; **⌘N** starts fresh in the current tool. AI drafts and conversations stay in memory. Use **Save as Note** to keep a response after quitting.
+
 ## Keyboard shortcuts
 
 | Shortcut | Action |
@@ -43,14 +53,17 @@ Try `6 * 7`, `200 * 15%`, `sqrt(144)`, `10 km in mi`, `72 f in c`, or `web swift
 | **⌥ Space** | Show or hide OpenRay; configurable in Settings. |
 | **↑ / ↓** | Select a result. |
 | **Return** | Open, run, or copy the selected result. |
-| **⌘K** | Show actions for the selected result. |
+| **⌘K** | Show actions for the selected result or current AI tool. |
+| **Tab** | From All, open AI with the search text as a draft; in the AI composer, select the next tool. |
+| **Shift-Tab** | In the AI composer, select the previous tool. |
+| **⌘1–⌘6** | In search: All, Apps, Files, Clipboard, Notes, AI. In AI: Ask, Rewrite, Summarize, Proofread, Shorten, Actions. |
 | **⌘Return** | Paste a supported result into the previously active app; send a message in AI. |
 | **⌘N** | Create an item in Snippets, Quicklinks, or Notes; start a new AI conversation. |
 | **⌘S** | Save an editor. |
 | **⌘,** | Open Settings. |
 | **Escape** | Close actions, go back, clear the search, or dismiss the launcher. |
 
-In AI, **Return** inserts a newline. Use **Stop** to cancel a response.
+In AI, **Return** inserts a newline. Use **Stop** to cancel a response before changing tools.
 
 ### Command aliases and hotkeys
 
@@ -134,7 +147,7 @@ On a Mac with Apple Intelligence ready, include the actual model integration tes
 ./scripts/verify.sh --ai
 ```
 
-The default suite uses isolated temporary libraries and private test pasteboards. It covers search and alias ranking, command-binding validation and migration, shortcut registration and failure recovery, calculations, persistence, clipboard media and privacy rules, snippets, Pomodoro cycles and progress, window geometry, and AI state handling. In-process shortcut routing is tested, but global delivery, live window manipulation, and text expansion require interactive verification with the relevant permissions.
+The default suite uses isolated temporary libraries and private test pasteboards. It covers search and alias ranking, command-binding validation and migration, shortcut registration and failure recovery, calculations, persistence, clipboard media and privacy rules, snippets, Pomodoro navigation and shortcut routing, window geometry, and AI state handling. In-process shortcut routing is tested, but global delivery, live window manipulation, and text expansion require interactive verification with the relevant permissions.
 
 [CI](.github/workflows/ci.yml) also checks workflow and release tooling and packages an installer preview. See [CONTRIBUTING.md](CONTRIBUTING.md) for formatting and contribution checks.
 

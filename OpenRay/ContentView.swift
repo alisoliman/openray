@@ -3,23 +3,33 @@ import SwiftUI
 struct ContentView: View {
     @Bindable var model: LauncherModel
     @Environment(\.colorScheme) private var colorScheme
+    @Environment(\.colorSchemeContrast) private var contrast
 
     var body: some View {
-        VStack(spacing: 0) {
+        ZStack {
             switch model.destination {
-            case .search: LauncherSearchView(model: model)
-            case .ai: AIChatView(model: model)
-            case .settings: SettingsView(model: model)
-            case .pomodoro: PomodoroView(model: model)
+            case .search:
+                LauncherSearchView(model: model)
+                    .modifier(RayDestinationEntrance(isRoot: true))
+            case .ai:
+                AIChatView(model: model)
+                    .modifier(RayDestinationEntrance())
+            case .settings:
+                SettingsView(model: model)
+                    .modifier(RayDestinationEntrance())
+            case .pomodoro:
+                PomodoroView(model: model)
+                    .modifier(RayDestinationEntrance())
             }
         }
         .frame(width: 780, height: 570)
-        .background(
-            colorScheme == .dark
-                ? Color(red: 0.095, green: 0.10, blue: 0.12) : Color(red: 0.98, green: 0.98, blue: 0.99)
-        )
+        .background { backdrop }
         .clipShape(.rect(cornerRadius: 14))
-        .overlay { RoundedRectangle(cornerRadius: 14).strokeBorder(.primary.opacity(0.12), lineWidth: 1) }
+        .overlay {
+            RoundedRectangle(cornerRadius: 14)
+                .strokeBorder(.primary.opacity(contrast == .increased ? 0.35 : 0.12), lineWidth: 1)
+                .allowsHitTesting(false)
+        }
         .tint(RayStyle.accent)
         .appAppearance(model.store.database.preferences.appearance)
         .sheet(item: $model.editor) { context in LibraryEditorView(context: context, model: model) }
@@ -35,6 +45,25 @@ struct ContentView: View {
         .background {
             Button("Open Settings") { model.openSettings() }.keyboardShortcut(",").hidden()
         }
+    }
+
+    private var backdrop: some View {
+        ZStack(alignment: .topLeading) {
+            colorScheme == .dark
+                ? Color(red: 0.095, green: 0.10, blue: 0.12) : Color(red: 0.98, green: 0.98, blue: 0.99)
+            if contrast != .increased {
+                RadialGradient(
+                    colors: [
+                        (model.destination == .ai ? Color.purple : RayStyle.accent)
+                            .opacity(colorScheme == .dark ? 0.10 : 0.035),
+                        .clear,
+                    ], center: .topLeading, startRadius: 0, endRadius: 390
+                )
+                .frame(height: 220)
+            }
+        }
+        .allowsHitTesting(false)
+        .accessibilityHidden(true)
     }
 }
 
