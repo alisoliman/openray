@@ -16,7 +16,8 @@ struct CaffeinateCommandTests {
         LauncherModel(
             store: LibraryStore(fileURL: nil), ai: AIChatModel(engine: TestAIEngine()),
             pasteboard: NSPasteboard.withUniqueName(),
-            caffeinate: CaffeinateService(assertions: assertions, automaticallyMonitors: false))
+            caffeinate: CaffeinateService(assertions: assertions, automaticallyMonitors: false),
+            aiFactory: { AIChatModel(engine: TestAIEngine()) })
     }
 
     @Test func exactCommandTitlesOutrankFavoriteAndRecentContent() {
@@ -57,6 +58,22 @@ struct CaffeinateCommandTests {
         #expect(!model.caffeinate.isActive)
         #expect(assertions.createAttempts == 0)
         #expect(model.store.database.usage.first?.id == "caffeinate.open")
+    }
+
+    @Test(arguments: ["Caffeinate", "Start Caffeinate", "Stop Caffeinate", "Toggle Caffeinate"])
+    func commandSearchesAreNotImportedIntoTheAIWorkspace(query: String) {
+        let assertions = CaffeinateCommandAssertions()
+        let model = model(assertions: assertions)
+        defer { model.stop() }
+        model.query = query
+
+        #expect(model.quickAI())
+
+        #expect(model.destination == .ai)
+        #expect(model.ai.draft.isEmpty)
+        #expect(model.ai.messages.isEmpty)
+        #expect(!model.caffeinate.isActive)
+        #expect(assertions.createAttempts == 0)
     }
 
     @Test func exactAliasesDispatchAllFourCommandsFromOtherSections() {
@@ -218,6 +235,52 @@ struct CaffeinateCommandTests {
         #expect(assertions.releaseAttempts.count == 1)
     }
 
+    @Test func dashboardIgnoresWorkspaceNumbersAndSessionSurvivesAIReturnTransitions() throws {
+        let assertions = CaffeinateCommandAssertions()
+        let model = model(assertions: assertions)
+        defer { model.stop() }
+        let panel = LauncherPanel()
+        panel.workspaceShortcutAction = model.selectWorkspaceShortcut
+        #expect(model.caffeinate.start(minutes: 30))
+        let deadline = try #require(model.caffeinate.deadline)
+        let activeIDs = assertions.activeIDs
+        model.openCaffeinate()
+        let focus = model.focusRequest
+
+        for index in 0..<6 {
+            #expect(!model.selectWorkspaceShortcut(index))
+            #expect(!panel.handleWorkspaceShortcut(try workspaceKeyEvent(String(index + 1))))
+        }
+        #expect(!model.quickAI())
+        #expect(!model.cycleAIAction(1))
+        #expect(model.destination == .caffeinate)
+        #expect(model.focusRequest == focus)
+        #expect(model.caffeinate.deadline == deadline)
+
+        model.goBack()
+        #expect(model.destination == .search)
+        #expect(panel.handleWorkspaceShortcut(try workspaceKeyEvent("6")))
+        #expect(model.destination == .ai)
+        #expect(panel.handleWorkspaceShortcut(try workspaceKeyEvent("2")))
+        #expect(model.ai.action == .rewrite)
+        model.goBack()
+
+        let query = "Help me describe this idea clearly."
+        model.query = query
+        #expect(model.quickAI())
+        #expect(model.ai.action == .chat)
+        #expect(model.ai.draft == query)
+        model.goBack()
+        #expect(model.destination == .search)
+        #expect(model.section == .home)
+        #expect(model.query == query)
+        #expect(model.caffeinate.isActive)
+        #expect(model.caffeinate.deadline == deadline)
+        #expect(assertions.activeIDs == activeIDs)
+        #expect(assertions.createAttempts == 1)
+        #expect(assertions.releaseAttempts.isEmpty)
+    }
+
     @Test(arguments: [false, true])
     func failedOperationsRevealTheDashboardWithoutRecordingUsage(bound: Bool) throws {
         let assertions = CaffeinateCommandAssertions()
@@ -306,6 +369,14 @@ struct CaffeinateCommandTests {
         #expect(model.caffeinate.errorMessage == nil)
         #expect(assertions.createAttempts == 0)
         #expect(assertions.releaseAttempts.isEmpty)
+    }
+
+    private func workspaceKeyEvent(_ characters: String) throws -> NSEvent {
+        try #require(
+            NSEvent.keyEvent(
+                with: .keyDown, location: .zero, modifierFlags: .command, timestamp: 0, windowNumber: 0,
+                context: nil, characters: characters, charactersIgnoringModifiers: characters,
+                isARepeat: false, keyCode: 0))
     }
 }
 

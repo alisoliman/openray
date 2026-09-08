@@ -13,6 +13,81 @@ enum RayStyle {
     static let subtleFill = Color.primary.opacity(0.045)
 }
 
+enum RayMotion {
+    static let panelRevealDuration: TimeInterval = 0.16
+
+    static func feedback(reduceMotion: Bool) -> Animation? {
+        reduceMotion ? nil : .easeOut(duration: 0.14)
+    }
+
+    static func navigation(reduceMotion: Bool) -> Animation? {
+        reduceMotion ? nil : .spring(response: 0.26, dampingFraction: 0.92)
+    }
+
+}
+
+/// Animates only the newly installed view. An outgoing transition would retain
+/// its AppKit editor and let its later removal clear the new first responder.
+struct RayDestinationEntrance: ViewModifier {
+    var isRoot = false
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @State private var hasAppeared = false
+
+    func body(content: Content) -> some View {
+        content
+            .offset(x: hasAppeared || reduceMotion ? 0 : (isRoot ? -14 : 14))
+            .opacity(hasAppeared || reduceMotion ? 1 : 0.7)
+            .onAppear {
+                withAnimation(RayMotion.navigation(reduceMotion: reduceMotion)) {
+                    hasAppeared = true
+                }
+            }
+            .transition(.identity)
+    }
+}
+
+/// Keeps the label's own colors and layout while giving every launcher control
+/// the same quiet hover and press response.
+struct RayControlStyle: ButtonStyle {
+    func makeBody(configuration: Configuration) -> some View {
+        ControlBody(configuration: configuration)
+    }
+
+    private struct ControlBody: View {
+        let configuration: ButtonStyleConfiguration
+        @Environment(\.isEnabled) private var isEnabled
+        @Environment(\.accessibilityReduceMotion) private var reduceMotion
+        @Environment(\.colorSchemeContrast) private var contrast
+        @State private var isHovered = false
+
+        private var fillOpacity: Double {
+            guard isEnabled else { return 0 }
+            if configuration.isPressed { return contrast == .increased ? 0.14 : 0.075 }
+            if isHovered { return contrast == .increased ? 0.10 : 0.035 }
+            return 0
+        }
+
+        var body: some View {
+            configuration.label
+                .background(Color.primary.opacity(fillOpacity), in: .rect(cornerRadius: 8))
+                .overlay {
+                    RoundedRectangle(cornerRadius: 8)
+                        .strokeBorder(
+                            Color.primary.opacity(isHovered && isEnabled ? (contrast == .increased ? 0.3 : 0.08) : 0),
+                            lineWidth: 1
+                        )
+                        .allowsHitTesting(false)
+                }
+                .contentShape(.rect(cornerRadius: 8))
+                .scaleEffect(configuration.isPressed && isEnabled && !reduceMotion ? 0.99 : 1)
+                .opacity(isEnabled ? 1 : 0.5)
+                .onHover { isHovered = $0 }
+                .animation(RayMotion.feedback(reduceMotion: reduceMotion), value: isHovered)
+                .animation(RayMotion.feedback(reduceMotion: reduceMotion), value: configuration.isPressed)
+        }
+    }
+}
+
 struct OpenRayMark: View {
     var size: CGFloat = 24
     var body: some View {

@@ -24,7 +24,7 @@ final class LauncherModel {
     let store: LibraryStore
     let applications = ApplicationCatalog()
     let files = FileSearchService()
-    let ai: AIChatModel
+    private(set) var ai: AIChatModel
     let pomodoro: PomodoroService
     let caffeinate: CaffeinateService
     let windows = WindowManager()
@@ -36,14 +36,21 @@ final class LauncherModel {
     @ObservationIgnored private var isStarted = false
     @ObservationIgnored private var isRecordingShortcut = false
     @ObservationIgnored private var commandBindingEditorCount = 0
+    @ObservationIgnored private let aiFactory: @MainActor () -> AIChatModel
+    @ObservationIgnored private var aiSessions: [AIAction: AIChatModel]
+    @ObservationIgnored private var aiReturnContext: (query: String, selectedID: String?)?
 
     init(
-        store: LibraryStore = LibraryStore(), ai: AIChatModel = AIChatModel(), pasteboard: NSPasteboard = .general,
-        caffeinate: CaffeinateService = CaffeinateService()
+        store: LibraryStore = LibraryStore(), ai: AIChatModel = AIChatModel(),
+        pasteboard: NSPasteboard = .general,
+        caffeinate: CaffeinateService = CaffeinateService(),
+        aiFactory: @escaping @MainActor () -> AIChatModel = { AIChatModel() }
     ) {
         self.store = store
         self.ai = ai
         self.caffeinate = caffeinate
+        self.aiFactory = aiFactory
+        aiSessions = [ai.action: ai]
         pomodoro = PomodoroService(store: store)
         clipboard = ClipboardService(store: store, pasteboard: pasteboard)
         snippets = SnippetExpander(store: store)
@@ -323,6 +330,7 @@ final class LauncherModel {
     }
 
     func navigate(to section: LauncherSection) {
+        aiReturnContext = nil
         destination = .search
         self.section = section
         query = ""
@@ -334,17 +342,112 @@ final class LauncherModel {
     }
 
     func openAI(_ action: AIAction = .chat) {
-        let switchingWhileBusy = ai.isGenerating && ai.action != action
-        ai.open(action)
+        guard !hasActiveTextComposition else { return }
+        aiReturnContext = nil
+        activateAIAction(action)
         destination = .ai
         files.stop()
-        message =
-            switchingWhileBusy
-            ? "Stop the current response or wait for it to finish before switching AI commands." : nil
         showActions = false
     }
 
+    /// Tab turns a search into an editable prompt; generating and importing text
+    /// from another app remain explicit actions.
+    @discardableResult
+    func quickAI() -> Bool {
+        guard destination == .search, section == .home, canSwitchAIWorkspace else { return false }
+        let context = (query: query, selectedID: selectedID)
+        let passage = isCommandQuery(query) ? "" : query
+        guard activateAIAction(.chat) else { return true }
+        aiReturnContext = context
+        destination = .ai
+        files.stop()
+        if !passage.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            if ai.draft.isEmpty {
+                ai.useText(passage)
+            } else if ai.draft != passage {
+                message = "Your previous draft is still here. Your search is preserved when you go back."
+            }
+        }
+        return true
+    }
+
+    @discardableResult
+    func cycleAIAction(_ delta: Int) -> Bool {
+        guard destination == .ai, canSwitchAIWorkspace else { return false }
+        let actions = AIAction.workspaceActions
+        let index = actions.firstIndex(of: ai.action) ?? 0
+        switchAIAction(actions[(index + delta % actions.count + actions.count) % actions.count])
+        return true
+    }
+
+    func switchAIAction(_ action: AIAction) {
+        guard destination == .ai, canSwitchAIWorkspace else { return }
+        activateAIAction(action)
+    }
+
+    /// Borderless hosting views cannot reliably refresh SwiftUI keyboard
+    /// equivalents when destinations change. Route workspace keys at the panel.
+    @discardableResult
+    func selectWorkspaceShortcut(_ index: Int) -> Bool {
+        guard (0..<6).contains(index), canSwitchAIWorkspace else { return false }
+        switch destination {
+        case .search:
+            if index == 5 {
+                openAI()
+            } else {
+                navigate(to: [LauncherSection.home, .applications, .files, .clipboard, .notes][index])
+            }
+        case .ai:
+            switchAIAction(AIAction.workspaceActions[index])
+        case .settings, .pomodoro, .caffeinate:
+            return false
+        }
+        return true
+    }
+
+    private var canSwitchAIWorkspace: Bool {
+        !showActions && editor == nil && !isRecordingShortcut && commandBindingEditorCount == 0
+            && !hasActiveTextComposition
+    }
+
+    private var hasActiveTextComposition: Bool {
+        (NSApp.keyWindow?.firstResponder as? NSTextView)?.hasMarkedText() == true
+    }
+
+    @discardableResult
+    private func activateAIAction(_ action: AIAction) -> Bool {
+        guard !ai.isGenerating || ai.action == action else {
+            message = "Stop the current response or wait for it to finish before switching AI commands."
+            return false
+        }
+        if ai.action != action {
+            if let session = aiSessions[action] {
+                ai = session
+            } else {
+                let draft = ai.draft
+                let session = aiFactory()
+                session.open(action)
+                if session.draft.isEmpty, session.messages.isEmpty, !draft.isEmpty { session.useText(draft) }
+                aiSessions[action] = session
+                ai = session
+            }
+        }
+        ai.open(action)
+        message = nil
+        focusRequest += 1
+        return true
+    }
+
+    private func isCommandQuery(_ query: String) -> Bool {
+        let query = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !query.isEmpty else { return true }
+        if store.database.aliasTarget(for: query) != nil { return true }
+        let commandNames = commandItems.map(\.title) + AIAction.workspaceActions.map(\.shortTitle) + ["AI", "Chat"]
+        return commandNames.contains { $0.caseInsensitiveCompare(query) == .orderedSame }
+    }
+
     func openSettings() {
+        aiReturnContext = nil
         destination = .settings
         files.stop()
         showActions = false
@@ -352,6 +455,7 @@ final class LauncherModel {
     }
 
     func openPomodoro(start: Bool = false) {
+        aiReturnContext = nil
         destination = .pomodoro
         files.stop()
         showActions = false
@@ -361,6 +465,7 @@ final class LauncherModel {
     }
 
     func openCaffeinate() {
+        aiReturnContext = nil
         destination = .caffeinate
         files.stop()
         showActions = false
@@ -371,6 +476,11 @@ final class LauncherModel {
     func goBack() {
         if showActions {
             showActions = false
+        } else if destination == .ai, let context = aiReturnContext {
+            navigate(to: .home)
+            query = context.query
+            selectedID = context.selectedID
+            synchronizeSelection()
         } else if destination != .search || section != .home {
             navigate(to: .home)
         } else if !query.isEmpty {
@@ -470,6 +580,7 @@ final class LauncherModel {
             store.recordUse(of: item.id)
             panel?.dismiss()
         } else {
+            aiReturnContext = nil
             destination = .caffeinate
             files.stop()
             message = caffeinate.errorMessage

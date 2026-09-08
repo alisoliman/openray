@@ -216,7 +216,8 @@ struct LibraryDatabase: Codable, Equatable, Sendable {
     var pomodoro = PomodoroData()
 
     private enum CodingKeys: String, CodingKey {
-        case schemaVersion, preferences, quicklinks, snippets, notes, clipboard, favoriteIDs, usage, commandBindings, pomodoro
+        case schemaVersion, preferences, quicklinks, snippets, notes, clipboard, favoriteIDs, usage, commandBindings,
+            pomodoro
     }
 
     /// Retired commands may have obsolete payloads. Ignore them before decoding

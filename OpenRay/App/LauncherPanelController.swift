@@ -4,9 +4,24 @@ import SwiftUI
 final class LauncherPanel: NSPanel {
     var onCancel: (() -> Void)?
     var escapeAction: (() -> Bool)?
+    var workspaceShortcutAction: ((Int) -> Bool)?
 
     override var canBecomeKey: Bool { true }
     override var canBecomeMain: Bool { true }
+
+    override func performKeyEquivalent(with event: NSEvent) -> Bool {
+        if handleWorkspaceShortcut(event) { return true }
+        return super.performKeyEquivalent(with: event)
+    }
+
+    func handleWorkspaceShortcut(_ event: NSEvent) -> Bool {
+        guard event.type == .keyDown,
+            event.modifierFlags.intersection([.command, .control, .option, .shift]) == .command,
+            attachedSheet == nil, (firstResponder as? NSTextView)?.hasMarkedText() != true,
+            let characters = event.charactersIgnoringModifiers, let number = Int(characters), (1...6).contains(number)
+        else { return false }
+        return workspaceShortcutAction?(number - 1) ?? false
+    }
 
     override func cancelOperation(_ sender: Any?) {
         guard attachedSheet == nil, !(firstResponder is NSTextView) else {
@@ -36,6 +51,7 @@ final class LauncherPanel: NSPanel {
 final class LauncherPanelController: NSObject, NSWindowDelegate {
     private let model: LauncherModel
     private var window: NSPanel?
+    private var revealTask: Task<Void, Never>?
 
     init(model: LauncherModel) {
         self.model = model
@@ -57,7 +73,9 @@ final class LauncherPanelController: NSObject, NSWindowDelegate {
         if let section { model.navigate(to: section) }
         if window == nil { createWindow() }
         guard let window else { return }
-        if !window.isVisible {
+        let isOpening = !window.isVisible
+        cancelReveal()
+        if isOpening {
             let screen = NSScreen.screens.first(where: { $0.frame.contains(NSEvent.mouseLocation) }) ?? NSScreen.main
             if let frame = screen?.visibleFrame {
                 window.setFrameOrigin(
@@ -70,17 +88,47 @@ final class LauncherPanelController: NSObject, NSWindowDelegate {
         model.store.pruneClipboard()
         model.pomodoro.refresh()
         model.caffeinate.refresh()
+        let shouldAnimate = isOpening && !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
+        window.alphaValue = shouldAnimate ? 0 : 1
         NSApp.activate()
         window.makeKeyAndOrderFront(nil)
+        if shouldAnimate { reveal(window) }
         model.resumeSearch()
         model.focusRequest += 1
     }
 
     func dismiss(restoreFocus: Bool = true) {
         model.showActions = false
+        cancelReveal()
         window?.orderOut(nil)
+        window?.alphaValue = 1
         model.files.stop()
         if restoreFocus { model.previousApplication?.activate() }
+    }
+
+    private func cancelReveal() {
+        revealTask?.cancel()
+        revealTask = nil
+    }
+
+    private func reveal(_ panel: NSPanel) {
+        // The window becomes key immediately; only its opacity changes. A
+        // cancelled reveal never orders it front or touches a later opening.
+        revealTask = Task { @MainActor [weak panel] in
+            let frames = 12
+            for frame in 1...frames {
+                do {
+                    try await Task.sleep(for: .seconds(RayMotion.panelRevealDuration / Double(frames)))
+                } catch { return }
+                guard !Task.isCancelled, let panel, panel.isVisible else { return }
+                if NSWorkspace.shared.accessibilityDisplayShouldReduceMotion {
+                    panel.alphaValue = 1
+                    return
+                }
+                let remaining = 1 - Double(frame) / Double(frames)
+                panel.alphaValue = 1 - remaining * remaining * remaining
+            }
+        }
     }
 
     func windowDidResignKey(_ notification: Notification) {
@@ -114,6 +162,7 @@ final class LauncherPanelController: NSObject, NSWindowDelegate {
         panel.hasShadow = true
         panel.isMovableByWindowBackground = false
         panel.onCancel = { [weak model] in model?.goBack() }
+        panel.workspaceShortcutAction = { [weak model] index in model?.selectWorkspaceShortcut(index) ?? false }
         panel.delegate = self
         panel.escapeAction = { [weak model] in
             guard let model,

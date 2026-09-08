@@ -35,9 +35,17 @@ struct OpenRayHelpView: View {
                     Text(
                         """
                         Search an app name, a filename, or a command such as Snippets or Fix \
-                        Spelling & Grammar. Use the Apps, Files, and Ask AI buttons to go straight \
-                        to a feature. Files uses Spotlight in your home folder; hidden files, \
+                        Spelling & Grammar. The feature bar opens All, Apps, Files, Clipboard, \
+                        Notes, Pomodoro, and AI. More opens Snippets, Quicklinks, Windows, and Calculator. \
+                        Files uses Spotlight in your home folder; hidden files, \
                         Library, and generated development folders are excluded.
+                        """)
+                    Text(
+                        """
+                        In All, type a question or passage and press Tab to carry it into the AI \
+                        workspace as an editable draft. Choose a tool, then press ⌘Return when \
+                        you are ready to send it. If Ask already has an unsent draft, it is \
+                        preserved; go Back to recover the new search text.
                         """)
                 }
 
@@ -49,7 +57,12 @@ struct OpenRayHelpView: View {
                             """
                             Open or copy the selected result; run a selected action
                             """)
-                        shortcut("⌘K", "Open or close actions for the selected result")
+                        shortcut("⌘K", "Open or close actions for the selected result or current AI tool")
+                        shortcut(
+                            "Tab", "From All, open AI with your search text; in the AI composer, select the next tool")
+                        shortcut("Shift-Tab", "In the AI composer, select the previous tool")
+                        shortcut("⌘1–⌘6", "In search: All, Apps, Files, Clipboard, Notes, AI")
+                        shortcut("⌘1–⌘6 in AI", "Ask, Rewrite, Summarize, Proofread, Shorten, Actions")
                         shortcut(
                             "⌘Return",
                             """
@@ -60,7 +73,7 @@ struct OpenRayHelpView: View {
                             "⌘N",
                             """
                             Create a note, snippet, or quicklink in its feature; start a new \
-                            conversation in AI
+                            conversation in the current AI tool
                             """)
                         shortcut("⌘S", "Save the current editor")
                         shortcut("⌘,", "Open Settings")
@@ -73,8 +86,8 @@ struct OpenRayHelpView: View {
                     }
                     Text(
                         """
-                        In a text editor, Escape belongs to the editor first. Use Back to leave \
-                        Settings while editing exclusions.
+                        In the AI composer, Escape goes back to search. Other text editors handle \
+                        Escape first. Use Back to leave Settings while editing exclusions.
                         """
                     )
                     .foregroundStyle(.secondary)
@@ -195,15 +208,18 @@ struct OpenRayHelpView: View {
                 section("Write with Apple Intelligence", symbol: "sparkles") {
                     Text(
                         """
-                        Ask AI for a conversation, or choose Summarize, Improve Writing, Fix \
-                        Spelling & Grammar, Make Shorter, or Extract Action Items. Enter the \
-                        source text for a writing command.
+                        Choose Ask for a conversation, or Rewrite, Summarize, Proofread, Shorten, \
+                        or Actions for a writing task. Actions extracts action items. Click a tool \
+                        or use Tab and Shift-Tab in the composer to cycle between them. ⌘1 through \
+                        ⌘6 jump directly to a tool. Enter the source text for a writing task.
                         """)
                     Text(
                         """
                         Return inserts a new line. ⌘Return sends. Stop ends a response and keeps \
-                        its partial text. Use Copy for the output, Save as Note to keep it, and \
-                        New Chat to start fresh. Input is limited to 6,000 characters.
+                        its partial text; stop before changing tools. Each tool keeps its own \
+                        draft and conversation while OpenRay is running. Switching tools does \
+                        not send your text. Use Copy for the output, Save as Note to keep it, and \
+                        ⌘N to start fresh in the current tool. Input is limited to 6,000 characters.
                         """)
                     Text(
                         """
@@ -245,7 +261,7 @@ struct OpenRayHelpView: View {
                     Text(
                         """
                         Clipboard and selected text enter AI only when you choose their import \
-                        buttons. Chats stay in memory; Save as Note is the explicit way to store a \
+                        buttons. AI drafts and chats stay in memory; Save as Note is the explicit way to store a \
                         response. Deleting library items or clearing history cannot be undone in \
                         OpenRay. Clearing clipboard history does not alter the current system \
                         clipboard or delete original copied files.

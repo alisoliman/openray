@@ -4,6 +4,9 @@ import SwiftUI
 struct LauncherSearchView: View {
     @Bindable var model: LauncherModel
     @State private var deletion: LauncherItem?
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @Namespace private var scopeSelection
+    @Namespace private var resultSelection
 
     var body: some View {
         let groups = model.groups
@@ -13,6 +16,9 @@ struct LauncherSearchView: View {
             searchHeader
             Divider().opacity(0.6)
             scopeBar
+            if model.section == .clipboard || [.snippets, .quicklinks, .notes].contains(model.section) {
+                sectionTools
+            }
             if let message = model.message ?? model.store.errorMessage ?? model.shortcutError {
                 StatusBanner(message: message) { model.message = nil }
             }
@@ -64,7 +70,8 @@ struct LauncherSearchView: View {
             LauncherSearchInput(
                 text: $model.query, placeholder: model.section.placeholder,
                 focusRequest: model.focusRequest, submit: model.performSelected,
-                move: model.moveSelection, cancel: model.goBack, paste: model.pasteSelected
+                move: model.moveSelection, cancel: model.goBack, paste: model.pasteSelected,
+                enterAI: model.quickAI
             )
             .frame(maxWidth: .infinity)
             if model.files.isSearching || model.applications.isLoading
@@ -75,53 +82,111 @@ struct LauncherSearchView: View {
                 Button("Clear search", systemImage: "xmark.circle.fill") { model.query = "" }
                     .labelStyle(.iconOnly).buttonStyle(.plain).foregroundStyle(.secondary)
             }
-            Keycap(text: "esc")
+            if model.section == .home {
+                Button {
+                    _ = model.quickAI()
+                } label: {
+                    HStack(spacing: 8) {
+                        Image(systemName: "sparkles")
+                        Text("Ask AI").fontWeight(.medium)
+                        Keycap(text: "⇥")
+                    }
+                    .font(.system(size: 12)).foregroundStyle(.purple)
+                    .padding(.leading, 10).padding(.trailing, 6).padding(.vertical, 6)
+                    .background(.purple.opacity(0.09), in: .rect(cornerRadius: 9))
+                    .overlay { RoundedRectangle(cornerRadius: 9).strokeBorder(.purple.opacity(0.13)) }
+                }
+                .buttonStyle(RayControlStyle()).help("Open AI with your search text (Tab)")
+                .accessibilityLabel("Open AI workspace, Tab").accessibilityIdentifier("launcher.quickAI")
+            } else {
+                Keycap(text: "esc")
+            }
         }.padding(.horizontal, 22).frame(height: 72)
     }
 
     private var scopeBar: some View {
-        HStack(spacing: 7) {
-            if model.section == .home {
-                scopeButton("All", symbol: "square.grid.2x2", selected: true) {}
-                scopeButton("Apps", symbol: "app") { model.navigate(to: .applications) }
-                scopeButton("Files", symbol: "folder") { model.navigate(to: .files) }
-                scopeButton("Ask AI", symbol: "sparkles") { model.openAI() }
-                scopeButton("Pomodoro", symbol: "timer") { model.openPomodoro() }
-            } else {
-                Label(model.section.title, systemImage: model.section.symbol)
-                    .font(.system(size: 12, weight: .medium)).foregroundStyle(.secondary)
-            }
+        HStack(spacing: 4) {
+            scopeButton("All", symbol: "square.grid.2x2", section: .home, shortcut: "1")
+            scopeButton("Apps", symbol: "app", section: .applications, shortcut: "2")
+            scopeButton("Files", symbol: "folder", section: .files, shortcut: "3")
+            scopeButton("Clipboard", symbol: "clipboard", section: .clipboard, shortcut: "4")
+            scopeButton("Notes", symbol: "note.text", section: .notes, shortcut: "5")
+            Menu {
+                ForEach([LauncherSection.snippets, .quicklinks, .windows, .calculator]) { section in
+                    Button(section.title, systemImage: section.symbol) { model.navigate(to: section) }
+                }
+            } label: {
+                HStack(spacing: 5) {
+                    Text(
+                        [.snippets, .quicklinks, .windows, .calculator].contains(model.section)
+                            ? model.section.title : "More")
+                    Image(systemName: "chevron.down").font(.system(size: 8, weight: .semibold))
+                }
+                .font(.system(size: 11, weight: .medium))
+                .padding(.horizontal, 9).padding(.vertical, 7)
+                .background(
+                    [.snippets, .quicklinks, .windows, .calculator].contains(model.section)
+                        ? Color.primary.opacity(0.075) : .clear, in: .rect(cornerRadius: 7))
+            }.menuStyle(.borderlessButton).menuIndicator(.hidden).fixedSize().foregroundStyle(.secondary)
+                .accessibilityIdentifier("launcher.moreFeatures")
+            Spacer(minLength: 8)
+            Button {
+                model.openPomodoro()
+            } label: {
+                Label("Pomodoro", systemImage: "timer").font(.system(size: 11, weight: .medium))
+                    .padding(.horizontal, 9).padding(.vertical, 7).foregroundStyle(.secondary)
+            }.buttonStyle(RayControlStyle()).help("Open Pomodoro")
+                .accessibilityIdentifier("launcher.pomodoro")
+            Button {
+                model.openAI()
+            } label: {
+                Label("AI", systemImage: "sparkles").font(.system(size: 11, weight: .medium))
+                    .padding(.horizontal, 9).padding(.vertical, 7).foregroundStyle(.purple)
+            }.buttonStyle(RayControlStyle()).help("AI workspace (⌘6)")
+        }
+        .padding(.horizontal, 14).frame(height: 46)
+        .animation(reduceMotion ? nil : .spring(response: 0.28, dampingFraction: 0.86), value: model.section)
+    }
+
+    private var sectionTools: some View {
+        HStack(spacing: 8) {
+            Text(model.section.title).font(.system(size: 11, weight: .medium)).foregroundStyle(.secondary)
             Spacer()
             if model.section == .clipboard {
                 Picker("Clipboard content type", selection: $model.clipboardFilter) {
                     ForEach(ClipboardFilter.allCases) { Text($0.title).tag($0) }
                 }.labelsHidden().fixedSize().controlSize(.small).accessibilityIdentifier("clipboard.filter")
-            }
-            if [.snippets, .quicklinks, .notes].contains(model.section) {
+            } else {
                 Button {
                     model.createItem()
                 } label: {
-                    Label("Create New", systemImage: "plus").font(.system(size: 12, weight: .medium))
-                }.buttonStyle(.plain).foregroundStyle(RayStyle.accent).accessibilityIdentifier("library.create")
-            } else {
-                HStack(spacing: 5) {
-                    Circle().fill(.green.opacity(0.8)).frame(width: 5, height: 5)
-                    Text("LOCAL & PRIVATE").font(.system(size: 11, weight: .semibold, design: .monospaced)).tracking(
-                        0.6)
-                }.foregroundStyle(.secondary).accessibilityLabel("Local and private")
+                    HStack(spacing: 6) {
+                        Label("Create New", systemImage: "plus")
+                        Keycap(text: "⌘ N")
+                    }.font(.system(size: 11, weight: .medium))
+                }.buttonStyle(RayControlStyle()).foregroundStyle(RayStyle.accent)
+                    .accessibilityIdentifier("library.create")
             }
-        }.padding(.horizontal, 18).frame(height: 44)
+        }.padding(.horizontal, 22).frame(height: 34)
     }
 
-    private func scopeButton(_ title: String, symbol: String, selected: Bool = false, action: @escaping () -> Void)
-        -> some View
-    {
-        Button(action: action) {
+    private func scopeButton(_ title: String, symbol: String, section: LauncherSection, shortcut: String) -> some View {
+        let selected = model.section == section
+        return Button {
+            model.navigate(to: section)
+        } label: {
             Label(title, systemImage: symbol).font(.system(size: 11, weight: .medium))
-                .padding(.horizontal, 10).padding(.vertical, 6)
+                .padding(.horizontal, 9).padding(.vertical, 7)
                 .foregroundStyle(selected ? Color.primary : .secondary)
-                .background(selected ? Color.primary.opacity(0.08) : .clear, in: .rect(cornerRadius: 6))
-        }.buttonStyle(.plain)
+                .background {
+                    if selected {
+                        RoundedRectangle(cornerRadius: 7).fill(.primary.opacity(0.075))
+                            .matchedGeometryEffect(id: "scope", in: scopeSelection)
+                    }
+                }
+        }.buttonStyle(RayControlStyle()).help("\(title) (⌘\(shortcut))")
+            .accessibilityAddTraits(selected ? .isSelected : [])
+            .accessibilityIdentifier("scope.\(section.id)")
     }
 
     @ViewBuilder private func content(groups: [LauncherResultGroup], selected: LauncherItem?) -> some View {
@@ -192,10 +257,20 @@ struct LauncherSearchView: View {
                 Text(item.badge).font(.system(size: 11)).foregroundStyle(.secondary).lineLimit(1)
                 if selected { Image(systemName: "return").font(.system(size: 11)).foregroundStyle(.secondary) }
             }.padding(.horizontal, 10).frame(height: 53)
-                .background(selected ? Color.primary.opacity(0.075) : .clear, in: .rect(cornerRadius: 8)).contentShape(
-                    .rect)
+                .background {
+                    if selected {
+                        RoundedRectangle(cornerRadius: 9)
+                            .fill(.primary.opacity(0.075))
+                            .overlay(alignment: .leading) {
+                                Capsule().fill(RayStyle.accent).frame(width: 3, height: 18).padding(.leading, 1)
+                            }
+                            .matchedGeometryEffect(id: "result", in: resultSelection)
+                    }
+                }
+                .contentShape(.rect)
+                .animation(reduceMotion ? nil : .spring(response: 0.23, dampingFraction: 0.9), value: model.selectedID)
         }
-        .buttonStyle(.plain).accessibilityLabel(item.accessibilityDescription)
+        .buttonStyle(RayControlStyle()).accessibilityLabel(item.accessibilityDescription)
         .accessibilityValue(item.subtitle).accessibilityHint(
             item.primaryActionTitle
         )
@@ -290,6 +365,10 @@ struct LauncherSearchView: View {
             OpenRayMark(size: 18)
             Text(model.clipboard.usesGeneralPasteboard ? "OpenRay" : "OpenRay · Verification")
                 .font(.system(size: 11, weight: .medium)).foregroundStyle(.secondary)
+            HStack(spacing: 3) {
+                Image(systemName: "arrow.up.arrow.down").font(.system(size: 9))
+                Text("Navigate").font(.system(size: 10))
+            }.foregroundStyle(.tertiary).padding(.leading, 8).accessibilityHidden(true)
             Spacer()
             if let item = selected {
                 Button {
