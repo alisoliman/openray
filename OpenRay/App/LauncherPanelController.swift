@@ -24,7 +24,7 @@ final class LauncherPanel: NSPanel {
     }
 
     override func cancelOperation(_ sender: Any?) {
-        guard attachedSheet == nil, !(firstResponder is NSTextView) else {
+        guard attachedSheet == nil, (firstResponder as? NSTextView)?.hasMarkedText() != true else {
             super.cancelOperation(sender)
             return
         }
@@ -41,7 +41,7 @@ final class LauncherPanel: NSPanel {
     func handleEscapeKey(_ event: NSEvent) -> Bool {
         guard event.type == .keyDown, event.keyCode == 53,
             event.modifierFlags.intersection([.command, .control, .option, .shift]).isEmpty,
-            attachedSheet == nil, !(firstResponder is NSTextView)
+            attachedSheet == nil, (firstResponder as? NSTextView)?.hasMarkedText() != true
         else { return false }
         return escapeAction?() ?? false
     }
@@ -66,14 +66,16 @@ final class LauncherPanelController: NSObject, NSWindowDelegate {
     }
 
     func show(section: LauncherSection? = nil) {
+        let isOpening = window?.isVisible != true
         let front = NSWorkspace.shared.frontmostApplication
         if let front, front.processIdentifier != ProcessInfo.processInfo.processIdentifier {
             model.previousApplication = front
+            if isOpening { model.captureSelection(from: front) }
         }
+        if isOpening { model.prepareToShow() }
         if let section { model.navigate(to: section) }
         if window == nil { createWindow() }
         guard let window else { return }
-        let isOpening = !window.isVisible
         cancelReveal()
         if isOpening {
             let screen = NSScreen.screens.first(where: { $0.frame.contains(NSEvent.mouseLocation) }) ?? NSScreen.main
@@ -98,6 +100,8 @@ final class LauncherPanelController: NSObject, NSWindowDelegate {
     }
 
     func dismiss(restoreFocus: Bool = true) {
+        guard window?.isVisible == true else { return }
+        model.didHide()
         model.showActions = false
         cancelReveal()
         window?.orderOut(nil)
@@ -161,15 +165,14 @@ final class LauncherPanelController: NSObject, NSWindowDelegate {
         panel.backgroundColor = .clear
         panel.hasShadow = true
         panel.isMovableByWindowBackground = false
-        panel.onCancel = { [weak model] in model?.goBack() }
+        panel.onCancel = { [weak model] in model?.hideLauncher() }
         panel.workspaceShortcutAction = { [weak model] index in model?.selectWorkspaceShortcut(index) ?? false }
         panel.delegate = self
         panel.escapeAction = { [weak model] in
             guard let model,
-                model.destination == .settings || model.destination == .pomodoro || model.destination == .caffeinate,
                 model.editor == nil
             else { return false }
-            model.goBack()
+            model.hideLauncher()
             return true
         }
         panel.contentView = NSHostingView(rootView: ContentView(model: model))

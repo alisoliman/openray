@@ -261,7 +261,10 @@ final class ClipboardService {
 enum SyntheticInput {
     static let marker: Int64 = 0x4F52_4159
 
-    static func paste(into application: NSRunningApplication, expectedChangeCount: Int) async throws {
+    static func paste(
+        into application: NSRunningApplication, expectedChangeCount: Int,
+        validateTarget: () throws -> Void = {}
+    ) async throws {
         guard AXIsProcessTrusted() else {
             throw LibraryValidationError(
                 "Copied to the clipboard. Enable Accessibility in Settings for direct paste, or press ⌘V in your app.")
@@ -274,6 +277,12 @@ enum SyntheticInput {
         guard NSWorkspace.shared.frontmostApplication?.processIdentifier == application.processIdentifier,
             NSPasteboard.general.changeCount == expectedChangeCount,
             !IsSecureEventInputEnabled()
+        else {
+            throw LibraryValidationError("The target app or clipboard changed. Your text is copied; paste it with ⌘V.")
+        }
+        try validateTarget()
+        guard NSWorkspace.shared.frontmostApplication?.processIdentifier == application.processIdentifier,
+            NSPasteboard.general.changeCount == expectedChangeCount, !IsSecureEventInputEnabled()
         else {
             throw LibraryValidationError("The target app or clipboard changed. Your text is copied; paste it with ⌘V.")
         }

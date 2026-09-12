@@ -12,29 +12,54 @@ struct FileSearchResult: Identifiable, Equatable, Sendable {
 @MainActor
 @Observable
 final class FileSearchService: NSObject {
+    private struct Request: Equatable {
+        let text: String
+        let showRecent: Bool
+    }
+
     private(set) var results: [FileSearchResult] = []
     private(set) var isSearching = false
     private(set) var errorMessage: String?
     @ObservationIgnored private var metadataQuery: NSMetadataQuery?
     @ObservationIgnored private var pendingSearch: Task<Void, Never>?
     @ObservationIgnored private var generation = UUID()
+    @ObservationIgnored private var lastRequest: Request?
+    @ObservationIgnored private let queryFactory: @MainActor () -> NSMetadataQuery
+    @ObservationIgnored private let debounce: Duration
 
-    func search(_ text: String, showRecent: Bool = false) {
-        stop()
-        results = []
-        errorMessage = nil
+    init(
+        queryFactory: @escaping @MainActor () -> NSMetadataQuery = { NSMetadataQuery() },
+        debounce: Duration = .milliseconds(180)
+    ) {
+        self.queryFactory = queryFactory
+        self.debounce = debounce
+        super.init()
+    }
+
+    func search(_ text: String, showRecent: Bool = false, preservingResults: Bool = false) {
         let text = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        let requestKey = Request(text: text, showRecent: showRecent)
+        let keepsResults = preservingResults && lastRequest == requestKey
+        stop()
+        // A resumed query can retain its selection while Spotlight refreshes.
+        // Different queries and modes must never expose the previous matches.
+        if !keepsResults { results = [] }
+        lastRequest = requestKey
+        errorMessage = nil
         guard text.count <= 512 else { return }
         guard text.count >= 2 || showRecent && text.isEmpty else { return }
         isSearching = true
         let request = UUID()
         generation = request
+        let delay = debounce
         pendingSearch = Task { [weak self] in
-            do { try await Task.sleep(for: .milliseconds(180)) } catch { return }
+            do { try await Task.sleep(for: delay) } catch { return }
             guard let self, !Task.isCancelled, self.generation == request else { return }
             self.startQuery(text)
         }
     }
+
+    func waitForPendingSearch() async { await pendingSearch?.value }
 
     func stop() {
         pendingSearch?.cancel()
@@ -49,7 +74,7 @@ final class FileSearchService: NSObject {
     }
 
     private func startQuery(_ text: String) {
-        let query = NSMetadataQuery()
+        let query = queryFactory()
         let home = FileManager.default.homeDirectoryForCurrentUser.path
         query.searchScopes = [home]
         var predicates = [
@@ -73,6 +98,7 @@ final class FileSearchService: NSObject {
             self, selector: #selector(didUpdate(_:)),
             name: .NSMetadataQueryDidUpdate, object: query)
         if !query.start() {
+            results = []
             isSearching = false
             errorMessage = "Spotlight could not start. Check that indexing is enabled for your home folder."
         }

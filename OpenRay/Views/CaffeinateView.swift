@@ -2,18 +2,16 @@ import SwiftUI
 
 struct CaffeinateView: View {
     let model: LauncherModel
-    @State private var duration: CaffeinateDuration? = .indefinitely
-    @State private var customMinutes = "60"
-    @State private var validationMessage: String?
 
     private var service: CaffeinateService { model.caffeinate }
+    private var draft: CaffeinateDraft { model.caffeinateDraft }
     private var statusColor: Color { service.isActive ? .orange : .secondary }
 
     var body: some View {
         VStack(spacing: 0) {
             header
             Divider().opacity(0.6)
-            if let error = validationMessage ?? service.errorMessage { StatusBanner(message: error) }
+            if let error = draft.validationMessage ?? service.errorMessage { StatusBanner(message: error) }
             ScrollView {
                 HStack(alignment: .top, spacing: 18) {
                     statusCard.frame(maxWidth: .infinity)
@@ -32,9 +30,9 @@ struct CaffeinateView: View {
             .font(.system(size: 11)).foregroundStyle(.secondary)
             .padding(.horizontal, 20).frame(height: 36)
         }
-        .onAppear(perform: loadDuration)
-        .onChange(of: duration) { _, _ in validationMessage = nil }
-        .onChange(of: customMinutes) { _, _ in validationMessage = nil }
+        .onAppear { draft.refresh(from: service) }
+        .onChange(of: service.isActive) { draft.refresh(from: service) }
+        .onChange(of: service.deadline) { draft.refresh(from: service) }
     }
 
     private var header: some View {
@@ -88,13 +86,14 @@ struct CaffeinateView: View {
     }
 
     private var durationCard: some View {
-        VStack(alignment: .leading, spacing: 18) {
+        @Bindable var draft = model.caffeinateDraft
+        return VStack(alignment: .leading, spacing: 18) {
             VStack(alignment: .leading, spacing: 6) {
                 Text("Keep awake for").font(.system(size: 13, weight: .semibold))
                 Text("Choose how long your Mac stays awake.")
                     .font(.system(size: 12)).foregroundStyle(.secondary)
             }
-            Picker("Duration", selection: $duration) {
+            Picker("Duration", selection: $draft.duration) {
                 ForEach(CaffeinateDuration.allCases) { duration in
                     Text(duration.title).tag(Optional(duration))
                 }
@@ -104,10 +103,10 @@ struct CaffeinateView: View {
             .accessibilityLabel("Caffeinate duration")
             .accessibilityIdentifier("caffeinate.duration")
 
-            if duration == nil {
+            if draft.duration == nil {
                 VStack(alignment: .leading, spacing: 6) {
                     HStack {
-                        TextField("Minutes", text: $customMinutes)
+                        TextField("Minutes", text: $draft.customMinutes)
                             .textFieldStyle(.roundedBorder)
                             .accessibilityLabel("Custom duration in minutes")
                             .accessibilityIdentifier("caffeinate.customMinutes")
@@ -129,7 +128,7 @@ struct CaffeinateView: View {
                 .accessibilityIdentifier("caffeinate.start")
                 if service.isActive {
                     Button("Stop Caffeinate", systemImage: "stop.circle") {
-                        validationMessage = nil
+                        draft.validationMessage = nil
                         service.stop()
                     }
                     .buttonStyle(.bordered).frame(maxWidth: .infinity)
@@ -160,26 +159,6 @@ struct CaffeinateView: View {
     }
 
     private func start() {
-        validationMessage = nil
-        if let duration {
-            service.start(for: duration)
-        } else if let minutes = Int(customMinutes.trimmingCharacters(in: .whitespacesAndNewlines)),
-            (1...1440).contains(minutes)
-        {
-            service.start(minutes: minutes)
-        } else {
-            validationMessage = "Enter a whole number of minutes from 1 to 1,440."
-        }
-    }
-
-    private func loadDuration() {
-        guard service.isActive, let seconds = service.remainingSeconds else { return }
-        let minutes = Int(ceil(Double(seconds) / 60))
-        if let preset = CaffeinateDuration.allCases.first(where: { $0.seconds == Double(minutes * 60) }) {
-            duration = preset
-        } else {
-            duration = nil
-            customMinutes = String(max(1, minutes))
-        }
+        draft.start(using: service)
     }
 }

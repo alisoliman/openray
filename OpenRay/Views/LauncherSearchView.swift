@@ -11,7 +11,7 @@ struct LauncherSearchView: View {
     var body: some View {
         let groups = model.groups
         let items = groups.flatMap(\.items)
-        let selected = items.first(where: { $0.id == model.selectedID }) ?? items.first
+        let selected = model.selectedItem
         return VStack(spacing: 0) {
             searchHeader
             Divider().opacity(0.6)
@@ -39,6 +39,7 @@ struct LauncherSearchView: View {
             footer(selected: selected)
         }
         .onChange(of: items.map(\.id), initial: true) { model.synchronizeSelection() }
+        .onChange(of: model.files.isSearching) { model.synchronizeSelection() }
         .background {
             Group {
                 Button("Actions") { model.showActions.toggle() }.keyboardShortcut("k")
@@ -63,14 +64,14 @@ struct LauncherSearchView: View {
     private var searchHeader: some View {
         HStack(spacing: 14) {
             if model.section != .home {
-                BackButton { model.navigate(to: .home) }
+                BackButton { model.goBack() }
             } else {
                 Image(systemName: "magnifyingglass").font(.system(size: 21)).foregroundStyle(.secondary)
             }
             LauncherSearchInput(
                 text: $model.query, placeholder: model.section.placeholder,
                 focusRequest: model.focusRequest, submit: model.performSelected,
-                move: model.moveSelection, cancel: model.goBack, paste: model.pasteSelected,
+                move: model.moveSelection, cancel: model.hideLauncher, paste: model.pasteSelected,
                 enterAI: model.quickAI
             )
             .frame(maxWidth: .infinity)
@@ -113,7 +114,7 @@ struct LauncherSearchView: View {
             scopeButton("Notes", symbol: "note.text", section: .notes, shortcut: "5")
             Menu {
                 ForEach([LauncherSection.snippets, .quicklinks, .windows, .calculator]) { section in
-                    Button(section.title, systemImage: section.symbol) { model.navigate(to: section) }
+                    Button(section.title, systemImage: section.symbol) { model.selectSearchScope(section) }
                 }
             } label: {
                 HStack(spacing: 5) {
@@ -173,7 +174,7 @@ struct LauncherSearchView: View {
     private func scopeButton(_ title: String, symbol: String, section: LauncherSection, shortcut: String) -> some View {
         let selected = model.section == section
         return Button {
-            model.navigate(to: section)
+            model.selectSearchScope(section)
         } label: {
             Label(title, systemImage: symbol).font(.system(size: 11, weight: .medium))
                 .padding(.horizontal, 9).padding(.vertical, 7)

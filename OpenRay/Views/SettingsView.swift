@@ -8,12 +8,19 @@ struct SettingsView: View {
     @Environment(\.scenePhase) private var scenePhase
     @Environment(\.openWindow) private var openWindow
     @State private var clearHistory = false
-    @State private var exclusions = ""
+    private var exclusions: Binding<String> {
+        Binding(
+            get: {
+                model.settingsExclusionsDraft
+                    ?? model.store.database.preferences.excludedClipboardBundleIDs.joined(separator: "\n")
+            },
+            set: { model.settingsExclusionsDraft = $0 })
+    }
 
     var body: some View {
         VStack(spacing: 0) {
             HStack(spacing: 12) {
-                if showsBackButton { BackButton { model.navigate(to: .home) } }
+                if showsBackButton { BackButton { model.goBack() } }
                 Text("Make OpenRay yours").font(.system(size: 17, weight: .semibold))
                 Spacer()
                 Button("Refresh Status", systemImage: "arrow.clockwise") { model.refreshPermissions() }
@@ -103,12 +110,12 @@ struct SettingsView: View {
                     .font(.system(size: 12)).foregroundStyle(.secondary)
                     VStack(alignment: .leading, spacing: 7) {
                         Text("Excluded apps (one bundle identifier per line)").font(.system(size: 12))
-                        TextEditor(text: $exclusions).font(.system(size: 12, design: .monospaced))
+                        TextEditor(text: exclusions).font(.system(size: 12, design: .monospaced))
                             .frame(height: 65).scrollContentBackground(.hidden)
                             .padding(6).background(.primary.opacity(0.035), in: .rect(cornerRadius: 5))
                             .accessibilityLabel("Excluded application bundle identifiers")
                         Button("Save Exclusions") {
-                            let values = exclusions.split(whereSeparator: \.isNewline)
+                            let values = exclusions.wrappedValue.split(whereSeparator: \.isNewline)
                                 .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }.filter { !$0.isEmpty }
                             if model.store.update({
                                 $0.preferences.excludedClipboardBundleIDs = Array(Set(values)).sorted()
@@ -135,7 +142,7 @@ struct SettingsView: View {
                     Label(model.ai.availability.title, systemImage: "sparkles").foregroundStyle(.purple)
                     Text(model.ai.availability.detail).font(.system(size: 12)).foregroundStyle(.secondary)
                     Text(
-                        "AI uses Apple’s Foundation Models framework. Clipboard and selected text are shared with the model only when you click their buttons. Chats are not saved automatically, and no cloud fallback is used."
+                        "AI uses Apple’s Foundation Models framework. Choosing a writing command can use the text highlighted when you opened OpenRay. Clipboard imports are explicit. Selections and chats stay in memory and are not saved automatically; no cloud fallback is used."
                     )
                     .font(.system(size: 12)).foregroundStyle(.secondary)
                     if !model.ai.availability.isAvailable {
@@ -163,7 +170,6 @@ struct SettingsView: View {
         .tint(RayStyle.accent)
         .appAppearance(model.store.database.preferences.appearance)
         .onAppear {
-            exclusions = model.store.database.preferences.excludedClipboardBundleIDs.joined(separator: "\n")
             model.refreshPermissions()
         }
         .onChange(of: scenePhase) { if scenePhase == .active { model.refreshPermissions() } }

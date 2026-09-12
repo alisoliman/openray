@@ -88,27 +88,73 @@ struct NativeInputTests {
         #expect(editor.string == "A question")
     }
 
-    @Test(arguments: [false, true]) func composerTabCyclesToolsInBothDirectionsWhenAccepted(accepts: Bool) {
-        var directions: [Int] = []
+    @Test func composerTabTraversesControlsWithoutChangingItsDraft() {
         var submissions = 0
         let input = AIComposerInput(
-            text: .constant("An unfinished draft"), focusRequest: 0, submit: { submissions += 1 },
-            cycleAction: {
-                directions.append($0)
-                return accepts
-            })
+            text: .constant("An unfinished draft"), focusRequest: 0, submit: { submissions += 1 })
         let coordinator = input.makeCoordinator()
-        let editor = NSTextView()
+        let window = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 400, height: 200), styleMask: .titled,
+            backing: .buffered, defer: false)
+        let editor = NSTextView(frame: NSRect(x: 0, y: 0, width: 200, height: 100))
+        let next = NSTextField(frame: NSRect(x: 0, y: 110, width: 200, height: 24))
+        let previous = NSTextField(frame: NSRect(x: 0, y: 140, width: 200, height: 24))
+        window.contentView?.addSubview(editor)
+        window.contentView?.addSubview(next)
+        window.contentView?.addSubview(previous)
         editor.string = "An unfinished draft"
+        editor.nextKeyView = next
+        next.nextKeyView = previous
+        previous.nextKeyView = editor
+        #expect(window.makeFirstResponder(editor))
 
-        #expect(coordinator.textView(editor, doCommandBy: #selector(NSResponder.insertTab(_:))) == accepts)
-        #expect(coordinator.textView(editor, doCommandBy: #selector(NSResponder.insertBacktab(_:))) == accepts)
-        #expect(directions == [1, -1])
+        #expect(coordinator.textView(editor, doCommandBy: #selector(NSResponder.insertTab(_:))))
+        #expect(next.currentEditor() === window.firstResponder)
+        #expect(window.makeFirstResponder(editor))
+        #expect(coordinator.textView(editor, doCommandBy: #selector(NSResponder.insertBacktab(_:))))
+        #expect(previous.currentEditor() === window.firstResponder)
         #expect(submissions == 0)
         #expect(editor.string == "An unfinished draft")
     }
 
-    @Test func composerReturnStillInsertsANewlineAndEscapeGoesBack() {
+    @Test func composerTabReachesAndActivatesASwiftUIButtonInAHostingView() async throws {
+        var activations = 0
+        let host = NSHostingView(
+            rootView: VStack {
+                AIComposerInput(text: .constant("An unfinished draft"), focusRequest: 0, submit: {})
+                    .frame(height: 80)
+                AIKeyboardButton("Next action") { activations += 1 }
+            }.frame(width: 400, height: 150))
+        let window = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 400, height: 150), styleMask: .titled,
+            backing: .buffered, defer: false)
+        window.contentView = host
+        window.makeKeyAndOrderFront(nil)
+        defer { window.orderOut(nil) }
+        host.layoutSubtreeIfNeeded()
+        await Task.yield()
+        let editor = try #require(findComposer(in: host))
+        window.recalculateKeyViewLoop()
+        #expect(window.makeFirstResponder(editor))
+
+        window.sendEvent(composerKeyEvent(keyCode: 48, characters: "\t", windowNumber: window.windowNumber))
+        await Task.yield()
+
+        #expect(window.firstResponder !== editor)
+        window.sendEvent(composerKeyEvent(keyCode: 49, characters: " ", windowNumber: window.windowNumber))
+        await Task.yield()
+        #expect(activations == 1)
+        window.sendEvent(composerReturnEvent(windowNumber: window.windowNumber))
+        await Task.yield()
+        #expect(activations == 2)
+        window.sendEvent(
+            composerKeyEvent(keyCode: 48, characters: "\t", modifiers: .shift, windowNumber: window.windowNumber))
+        await Task.yield()
+        #expect(window.firstResponder === editor)
+        #expect(editor.string == "An unfinished draft")
+    }
+
+    @Test func composerReturnSendsAndEscapeGoesBack() {
         var submissions = 0
         var cancellations = 0
         let input = AIComposerInput(
@@ -117,51 +163,86 @@ struct NativeInputTests {
         let coordinator = input.makeCoordinator()
         let editor = NSTextView()
 
-        #expect(!coordinator.textView(editor, doCommandBy: #selector(NSResponder.insertNewline(_:))))
-        #expect(submissions == 0)
+        #expect(coordinator.textView(editor, doCommandBy: #selector(NSResponder.insertNewline(_:))))
+        #expect(submissions == 1)
         #expect(coordinator.textView(editor, doCommandBy: #selector(NSResponder.cancelOperation(_:))))
         #expect(cancellations == 1)
     }
 
-    @Test func composerSwitchesTheLiveDraftBeforeTheNextNativeKeystroke() {
-        var session = "ask"
-        var drafts = ["ask": "An Ask draft 🍎", "rewrite": "A Rewrite draft 🍇"]
+    @Test(arguments: [UInt16(36), UInt16(76)])
+    func nativeReturnSendsAndSynchronizesBeforeTheNextKeystroke(keyCode: UInt16) {
+        var draft = "Please improve this 🍎"
+        var sent: [String] = []
         let input = AIComposerInput(
-            text: Binding(get: { drafts[session] ?? "" }, set: { drafts[session] = $0 }),
-            focusRequest: 0, submit: {},
-            cycleAction: { direction in
-                session = direction == 1 ? "rewrite" : "ask"
-                return true
-            }, sessionIdentity: { session })
+            text: Binding(get: { draft }, set: { draft = $0 }), focusRequest: 0,
+            submit: {
+                sent.append(draft)
+                draft = ""
+            })
         let coordinator = input.makeCoordinator()
-        let editor = NSTextView()
+        let editor = FocusedComposerTextView()
         editor.delegate = coordinator
-        editor.string = drafts[session] ?? ""
+        editor.prepareForInput = { [weak editor] in
+            if let editor { coordinator.synchronizeEditor(editor) }
+        }
+        coordinator.synchronizeEditor(editor)
 
-        #expect(coordinator.textView(editor, doCommandBy: #selector(NSResponder.insertTab(_:))))
-        #expect(editor.string == "A Rewrite draft 🍇")
-        #expect(editor.selectedRange() == NSRange(location: editor.string.utf16.count, length: 0))
-        editor.insertText(" now", replacementRange: editor.selectedRange())
-        #expect(drafts["rewrite"] == "A Rewrite draft 🍇 now")
-        #expect(drafts["ask"] == "An Ask draft 🍎")
+        editor.keyDown(with: composerReturnEvent(keyCode: keyCode))
 
-        #expect(coordinator.textView(editor, doCommandBy: #selector(NSResponder.insertBacktab(_:))))
-        #expect(editor.string == "An Ask draft 🍎")
-        editor.insertText(" again", replacementRange: editor.selectedRange())
-        #expect(drafts["ask"] == "An Ask draft 🍎 again")
-        #expect(drafts["rewrite"] == "A Rewrite draft 🍇 now")
+        #expect(sent == ["Please improve this 🍎"])
+        #expect(draft.isEmpty)
+        #expect(editor.string.isEmpty)
+        editor.keyDown(with: composerReturnEvent(keyCode: keyCode, isARepeat: true))
+        #expect(sent.count == 1)
+        #expect(editor.string.isEmpty)
+        editor.insertText("Make it shorter", replacementRange: editor.selectedRange())
+        #expect(draft == "Make it shorter")
+        #expect(editor.string == "Make it shorter")
     }
 
-    @Test func switchingComposerSessionsClearsUndoEvenWhenTheirTextMatches() {
-        var session = "ask"
-        var drafts = ["ask": "A passage", "rewrite": "A passage edited"]
+    @Test(arguments: [false, true])
+    func nativeCommandReturnInsertsANewlineWithoutSending(asKeyEquivalent: Bool) {
+        var draft = "First Second"
+        var submissions = 0
         let input = AIComposerInput(
-            text: Binding(get: { drafts[session] ?? "" }, set: { drafts[session] = $0 }),
-            focusRequest: 0, submit: {},
-            cycleAction: { _ in
-                session = "rewrite"
-                return true
-            }, sessionIdentity: { session })
+            text: Binding(get: { draft }, set: { draft = $0 }), focusRequest: 0,
+            submit: { submissions += 1 })
+        let coordinator = input.makeCoordinator()
+        let editor = FocusedComposerTextView()
+        editor.delegate = coordinator
+        editor.isRichText = false
+        editor.allowsUndo = true
+        let window = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 300, height: 100), styleMask: .titled,
+            backing: .buffered, defer: false)
+        window.contentView = editor
+        coordinator.synchronizeEditor(editor)
+        editor.setSelectedRange(NSRange(location: 5, length: 1))
+        let event = composerReturnEvent(modifiers: .command)
+
+        editor.undoManager?.beginUndoGrouping()
+        if asKeyEquivalent {
+            #expect(editor.performKeyEquivalent(with: event))
+        } else {
+            editor.keyDown(with: event)
+        }
+        editor.undoManager?.endUndoGrouping()
+
+        #expect(draft == "First\nSecond")
+        #expect(editor.string == "First\nSecond")
+        #expect(editor.selectedRange() == NSRange(location: 6, length: 0))
+        #expect(submissions == 0)
+        #expect(editor.undoManager?.canUndo == true)
+        editor.undoManager?.undo()
+        #expect(editor.string == "First Second")
+        #expect(draft == "First Second")
+    }
+
+    @Test func submittingClearsPreviousDraftUndoBeforeTheNextNativeEdit() {
+        var draft = "A passage"
+        let input = AIComposerInput(
+            text: Binding(get: { draft }, set: { draft = $0 }), focusRequest: 0,
+            submit: { draft = "" })
         let coordinator = input.makeCoordinator()
         let editor = UndoableInputTextView()
         editor.delegate = coordinator
@@ -172,31 +253,111 @@ struct NativeInputTests {
         editor.insertText(" edited", replacementRange: editor.selectedRange())
         editor.history.endUndoGrouping()
         #expect(editor.history.canUndo)
-        #expect(drafts["ask"] == "A passage edited")
 
-        #expect(coordinator.textView(editor, doCommandBy: #selector(NSResponder.insertTab(_:))))
+        #expect(coordinator.textView(editor, doCommandBy: #selector(NSResponder.insertNewline(_:))))
+
+        #expect(editor.string.isEmpty)
+        #expect(draft.isEmpty)
+        #expect(!editor.history.canUndo)
+        editor.history.beginUndoGrouping()
+        editor.insertText("A follow-up", replacementRange: editor.selectedRange())
+        editor.history.endUndoGrouping()
+        editor.history.undo()
+        #expect(editor.string.isEmpty)
+        #expect(draft.isEmpty)
+    }
+
+    @Test func nativeReturnDuringInputMethodCompositionDoesNotSend() {
+        var draft = "Original "
+        var submissions = 0
+        let input = AIComposerInput(
+            text: Binding(get: { draft }, set: { draft = $0 }), focusRequest: 0,
+            submit: { submissions += 1 })
+        let coordinator = input.makeCoordinator()
+        let editor = FocusedComposerTextView()
+        editor.delegate = coordinator
+        editor.prepareForInput = { [weak editor] in
+            if let editor { coordinator.synchronizeEditor(editor) }
+        }
+        coordinator.synchronizeEditor(editor)
+        editor.setMarkedText(
+            "に", selectedRange: NSRange(location: 1, length: 0), replacementRange: editor.selectedRange())
+        #expect(editor.hasMarkedText())
+
+        editor.keyDown(with: composerReturnEvent())
+
+        #expect(submissions == 0)
+        // Synchronization must not restore the pre-composition binding while
+        // AppKit handles Return and may have already cleared its marked range.
+        #expect(editor.string == "Original に")
+    }
+
+    @Test func composerSwitchesTheLiveDraftBeforeTheNextNativeKeystroke() {
+        let state = ComposerDraftState(["ask": "An Ask draft 🍎", "rewrite": "A Rewrite draft 🍇"])
+        let input = AIComposerInput(
+            text: Binding(get: { state.drafts[state.session] ?? "" }, set: { state.drafts[state.session] = $0 }),
+            focusRequest: 0, submit: {}, sessionIdentity: { state.session })
+        let coordinator = input.makeCoordinator()
+        let editor = NSTextView()
+        editor.delegate = coordinator
+        editor.string = state.drafts[state.session] ?? ""
+
+        state.session = "rewrite"
+        coordinator.synchronizeEditor(editor)
+        #expect(editor.string == "A Rewrite draft 🍇")
+        #expect(editor.selectedRange() == NSRange(location: editor.string.utf16.count, length: 0))
+        editor.insertText(" now", replacementRange: editor.selectedRange())
+        #expect(state.drafts["rewrite"] == "A Rewrite draft 🍇 now")
+        #expect(state.drafts["ask"] == "An Ask draft 🍎")
+
+        state.session = "ask"
+        coordinator.synchronizeEditor(editor)
+        #expect(editor.string == "An Ask draft 🍎")
+        editor.insertText(" again", replacementRange: editor.selectedRange())
+        #expect(state.drafts["ask"] == "An Ask draft 🍎 again")
+        #expect(state.drafts["rewrite"] == "A Rewrite draft 🍇 now")
+    }
+
+    @Test func switchingComposerSessionsClearsUndoEvenWhenTheirTextMatches() {
+        let state = ComposerDraftState(["ask": "A passage", "rewrite": "A passage edited"])
+        let input = AIComposerInput(
+            text: Binding(get: { state.drafts[state.session] ?? "" }, set: { state.drafts[state.session] = $0 }),
+            focusRequest: 0, submit: {}, sessionIdentity: { state.session })
+        let coordinator = input.makeCoordinator()
+        let editor = UndoableInputTextView()
+        editor.delegate = coordinator
+        editor.isRichText = false
+        editor.allowsUndo = true
+        coordinator.synchronizeEditor(editor)
+        editor.history.beginUndoGrouping()
+        editor.insertText(" edited", replacementRange: editor.selectedRange())
+        editor.history.endUndoGrouping()
+        #expect(editor.history.canUndo)
+        #expect(state.drafts["ask"] == "A passage edited")
+
+        state.session = "rewrite"
+        coordinator.synchronizeEditor(editor)
         #expect(editor.string == "A passage edited")
         #expect(!editor.history.canUndo)
         editor.history.beginUndoGrouping()
         editor.insertText(" in Rewrite", replacementRange: editor.selectedRange())
         editor.history.endUndoGrouping()
-        #expect(drafts["rewrite"] == "A passage edited in Rewrite")
+        #expect(state.drafts["rewrite"] == "A passage edited in Rewrite")
         editor.history.undo()
         #expect(editor.string == "A passage edited")
-        #expect(drafts["rewrite"] == "A passage edited")
-        #expect(drafts["ask"] == "A passage edited")
+        #expect(state.drafts["rewrite"] == "A passage edited")
+        #expect(state.drafts["ask"] == "A passage edited")
         editor.history.redo()
         #expect(editor.string == "A passage edited in Rewrite")
-        #expect(drafts["rewrite"] == "A passage edited in Rewrite")
-        #expect(drafts["ask"] == "A passage edited")
+        #expect(state.drafts["rewrite"] == "A passage edited in Rewrite")
+        #expect(state.drafts["ask"] == "A passage edited")
     }
 
     @Test func nativeInsertionSynchronizesAnExternallySelectedComposerSession() {
-        var session = "ask"
-        var drafts = ["ask": "A long Ask draft", "rewrite": "Rewrite"]
+        let state = ComposerDraftState(["ask": "A long Ask draft", "rewrite": "Rewrite"])
         let input = AIComposerInput(
-            text: Binding(get: { drafts[session] ?? "" }, set: { drafts[session] = $0 }),
-            focusRequest: 0, submit: {}, sessionIdentity: { session })
+            text: Binding(get: { state.drafts[state.session] ?? "" }, set: { state.drafts[state.session] = $0 }),
+            focusRequest: 0, submit: {}, sessionIdentity: { state.session })
         let coordinator = input.makeCoordinator()
         let editor = FocusedComposerTextView()
         editor.delegate = coordinator
@@ -205,12 +366,12 @@ struct NativeInputTests {
         }
         coordinator.synchronizeEditor(editor)
 
-        session = "rewrite"
+        state.session = "rewrite"
         editor.insertText(" now", replacementRange: NSRange(location: NSNotFound, length: 0))
 
         #expect(editor.string == "Rewrite now")
-        #expect(drafts["rewrite"] == "Rewrite now")
-        #expect(drafts["ask"] == "A long Ask draft")
+        #expect(state.drafts["rewrite"] == "Rewrite now")
+        #expect(state.drafts["ask"] == "A long Ask draft")
     }
 
     @Test func synchronizingTypingWithinOneComposerSessionPreservesNativeUndo() {
@@ -272,10 +433,7 @@ struct NativeInputTests {
         var actions: [String] = []
         let input = AIComposerInput(
             text: .constant(""), focusRequest: 0, submit: { actions.append("submit") },
-            cycleAction: { _ in
-                actions.append("cycle")
-                return true
-            }, cancel: { actions.append("cancel") })
+            cancel: { actions.append("cancel") })
         let coordinator = input.makeCoordinator()
         let editor = NSTextView()
         editor.setMarkedText(
@@ -327,7 +485,7 @@ struct NativeInputTests {
         #expect(cancellations == 1)
     }
 
-    @Test func panelCancelLeavesAnActiveTextEditorInPlace() {
+    @Test func panelCancelHidesFromAnOrdinaryTextEditor() {
         let panel = LauncherPanel()
         let editor = NSTextView(frame: NSRect(x: 0, y: 0, width: 200, height: 100))
         panel.contentView = editor
@@ -335,7 +493,24 @@ struct NativeInputTests {
         var cancellations = 0
         panel.onCancel = { cancellations += 1 }
         panel.cancelOperation(nil)
+        #expect(cancellations == 1)
+    }
+
+    @Test func panelCancelPreservesInputMethodComposition() {
+        let panel = LauncherPanel()
+        let editor = NSTextView(frame: NSRect(x: 0, y: 0, width: 200, height: 100))
+        panel.contentView = editor
+        #expect(panel.makeFirstResponder(editor))
+        editor.setMarkedText(
+            "に", selectedRange: NSRange(location: 1, length: 0), replacementRange: editor.selectedRange())
+        #expect(editor.hasMarkedText())
+        var cancellations = 0
+        panel.onCancel = { cancellations += 1 }
+
+        panel.cancelOperation(nil)
+
         #expect(cancellations == 0)
+        #expect(editor.string == "に")
     }
 
     @Test func assistantMarkdownKeepsParagraphsAndListMarkersAndRendersEmphasis() {
@@ -360,4 +535,38 @@ struct NativeInputTests {
 private final class UndoableInputTextView: NSTextView {
     let history = UndoManager()
     override var undoManager: UndoManager? { history }
+}
+
+@MainActor
+private func composerReturnEvent(
+    keyCode: UInt16 = 36, modifiers: NSEvent.ModifierFlags = [], isARepeat: Bool = false, windowNumber: Int = 0
+) -> NSEvent {
+    NSEvent.keyEvent(
+        with: .keyDown, location: .zero, modifierFlags: modifiers, timestamp: 0, windowNumber: windowNumber,
+        context: nil, characters: "\r", charactersIgnoringModifiers: "\r", isARepeat: isARepeat,
+        keyCode: keyCode)!
+}
+
+@MainActor
+private func composerKeyEvent(
+    keyCode: UInt16, characters: String, modifiers: NSEvent.ModifierFlags = [], windowNumber: Int = 0
+) -> NSEvent {
+    NSEvent.keyEvent(
+        with: .keyDown, location: .zero, modifierFlags: modifiers, timestamp: 0, windowNumber: windowNumber,
+        context: nil, characters: characters, charactersIgnoringModifiers: characters, isARepeat: false,
+        keyCode: keyCode)!
+}
+
+@MainActor
+private func findComposer(in view: NSView) -> FocusedComposerTextView? {
+    if let editor = view as? FocusedComposerTextView { return editor }
+    return view.subviews.lazy.compactMap { findComposer(in: $0) }.first
+}
+
+@MainActor
+private final class ComposerDraftState {
+    var session = "ask"
+    var drafts: [String: String]
+
+    init(_ drafts: [String: String]) { self.drafts = drafts }
 }

@@ -7,7 +7,7 @@ struct OpenRayApp: App {
     var body: some Scene {
         MenuBarExtra {
             Button("Open OpenRay    \(delegate.model.store.database.preferences.hotKey.title)") {
-                delegate.model.panel?.show(section: .home)
+                delegate.model.panel?.show()
             }
             Button("Ask AI") {
                 delegate.model.openAI()

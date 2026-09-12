@@ -239,7 +239,7 @@ struct AIWorkspaceTests {
         #expect(model.query == "A new question from search")
     }
 
-    @Test func directNavigationClearsTheQuickEntryReturnContext() {
+    @Test func changingAIToolsPreservesTheQuickEntrySearchOrigin() {
         let model = model()
         defer { model.stop() }
         model.query = "Keep this query only for this visit"
@@ -247,16 +247,17 @@ struct AIWorkspaceTests {
         model.openAI(.rewrite)
         model.goBack()
         #expect(model.destination == .search)
-        #expect(model.query.isEmpty)
+        #expect(model.query == "Keep this query only for this visit")
         model.query = "Another question"
         #expect(model.quickAI())
         model.navigate(to: .notes)
         model.openAI()
         model.goBack()
+        #expect(model.section == .notes)
         #expect(model.query.isEmpty)
     }
 
-    @Test func pomodoroNavigationPreservesAIDraftsWithoutRestoringAnEarlierQuickEntrySearch() {
+    @Test func pomodoroBackRestoresTheAIWorkspaceAndItsDraft() {
         let model = model()
         defer { model.stop() }
         model.query = "An earlier question"
@@ -272,8 +273,8 @@ struct AIWorkspaceTests {
         #expect(!model.cycleAIAction(1))
         #expect(model.ai === rewrite)
         model.goBack()
-        #expect(model.destination == .search)
-        #expect(model.query.isEmpty)
+        #expect(model.destination == .ai)
+        #expect(model.ai.draft == "A rewrite in progress")
 
         model.openAI(.rewrite)
         #expect(model.ai === rewrite)
@@ -282,6 +283,6 @@ struct AIWorkspaceTests {
         #expect(model.ai === chat)
         #expect(model.ai.draft == "An earlier question")
         model.goBack()
-        #expect(model.query.isEmpty)
+        #expect(model.query == "An earlier question")
     }
 }

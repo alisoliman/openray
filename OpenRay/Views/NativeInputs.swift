@@ -128,9 +128,9 @@ final class FocusedSearchField: NSTextField {
 
 struct AIComposerInput: NSViewRepresentable {
     @Binding var text: String
+    var placeholder: String = ""
     var focusRequest: Int
     var submit: () -> Void
-    var cycleAction: (Int) -> Bool = { _ in false }
     var cancel: () -> Void = {}
     var sessionIdentity: () -> String = { "composer" }
 
@@ -147,6 +147,7 @@ struct AIComposerInput: NSViewRepresentable {
             if let editor { coordinator?.synchronizeEditor(editor) }
         }
         editor.isRichText = false
+        editor.placeholder = placeholder
         editor.allowsUndo = true
         editor.drawsBackground = false
         editor.font = .systemFont(ofSize: 13)
@@ -172,6 +173,7 @@ struct AIComposerInput: NSViewRepresentable {
     func updateNSView(_ scroll: NSScrollView, context: Context) {
         context.coordinator.parent = self
         guard let editor = scroll.documentView as? FocusedComposerTextView else { return }
+        editor.placeholder = placeholder
         context.coordinator.synchronizeEditor(editor)
         if editor.focusRequest != focusRequest {
             editor.focusRequest = focusRequest
@@ -193,7 +195,9 @@ struct AIComposerInput: NSViewRepresentable {
         func synchronizeEditor(_ editor: NSTextView) {
             self.editor = editor
             observeUndoManager(editor.undoManager)
-            guard !editor.hasMarkedText() else { return }
+            guard !editor.hasMarkedText(), (editor as? FocusedComposerTextView)?.isHandlingMarkedText != true else {
+                return
+            }
             let identity = parent.sessionIdentity()
             let text = parent.text
             if sessionID != identity || editor.string != text {
@@ -237,28 +241,28 @@ struct AIComposerInput: NSViewRepresentable {
 
         func textView(_ textView: NSTextView, doCommandBy commandSelector: Selector) -> Bool {
             guard !textView.hasMarkedText() else { return false }
+            guard (textView as? FocusedComposerTextView)?.isHandlingMarkedText != true else { return false }
             if commandSelector == #selector(NSResponder.insertTab(_:)) {
                 guard (NSApp.currentEvent?.modifierFlags ?? []).intersection([.command, .control, .option]).isEmpty
                 else { return false }
-                guard parent.cycleAction(1) else { return false }
-                synchronizeEditor(textView)
+                textView.window?.selectNextKeyView(textView)
                 return true
             }
             if commandSelector == #selector(NSResponder.insertBacktab(_:)) {
                 guard (NSApp.currentEvent?.modifierFlags ?? []).intersection([.command, .control, .option]).isEmpty
                 else { return false }
-                guard parent.cycleAction(-1) else { return false }
-                synchronizeEditor(textView)
+                textView.window?.selectPreviousKeyView(textView)
                 return true
             }
             if commandSelector == #selector(NSResponder.cancelOperation(_:)) {
                 parent.cancel()
                 return true
             }
-            if commandSelector == #selector(NSResponder.insertNewline(_:)),
-                NSApp.currentEvent?.modifierFlags.contains(.command) == true
-            {
+            if commandSelector == #selector(NSResponder.insertNewline(_:)) {
                 parent.submit()
+                // Submission may clear or replace the bound draft before SwiftUI
+                // renders. Publish it to the live editor before another key or undo.
+                synchronizeEditor(textView)
                 return true
             }
             return false
@@ -267,17 +271,65 @@ struct AIComposerInput: NSViewRepresentable {
 }
 
 final class FocusedComposerTextView: NSTextView {
+    var placeholder = "" {
+        didSet {
+            guard placeholder != oldValue else { return }
+            setAccessibilityPlaceholderValue(placeholder)
+            needsDisplay = true
+        }
+    }
     var focusRequest = -1
     var prepareForInput: (() -> Void)?
+    private(set) var isHandlingMarkedText = false
+
+    override func draw(_ dirtyRect: NSRect) {
+        super.draw(dirtyRect)
+        guard string.isEmpty, !placeholder.isEmpty else { return }
+        let padding = textContainer?.lineFragmentPadding ?? 0
+        let origin = textContainerOrigin
+        let bounds = NSRect(
+            x: origin.x + padding, y: origin.y,
+            width: max(0, (textContainer?.containerSize.width ?? frame.width) - padding * 2),
+            height: max(0, frame.height - origin.y))
+        var attributes: [NSAttributedString.Key: Any] = [
+            .font: font ?? NSFont.systemFont(ofSize: 13),
+            .foregroundColor: NSColor.placeholderTextColor,
+        ]
+        if let defaultParagraphStyle { attributes[.paragraphStyle] = defaultParagraphStyle }
+        (placeholder as NSString).draw(in: bounds, withAttributes: attributes)
+    }
+
+    override func didChangeText() {
+        super.didChangeText()
+        needsDisplay = true
+    }
 
     override func keyDown(with event: NSEvent) {
+        isHandlingMarkedText = hasMarkedText()
+        defer { isHandlingMarkedText = false }
         prepareForInput?()
+        if handleReturn(event) { return }
         super.keyDown(with: event)
     }
 
     override func performKeyEquivalent(with event: NSEvent) -> Bool {
         prepareForInput?()
+        if event.modifierFlags.contains(.command), handleReturn(event) { return true }
         return super.performKeyEquivalent(with: event)
+    }
+
+    private func handleReturn(_ event: NSEvent) -> Bool {
+        guard event.type == .keyDown, event.keyCode == 36 || event.keyCode == 76,
+            !hasMarkedText(), !isHandlingMarkedText
+        else { return false }
+        if event.modifierFlags.contains(.command) {
+            // Use NSTextView's insertion path so selection replacement and undo
+            // behave exactly like typing; a key equivalent must not send the draft.
+            insertText("\n", replacementRange: selectedRange())
+        } else if !event.isARepeat {
+            doCommand(by: #selector(NSResponder.insertNewline(_:)))
+        }
+        return true
     }
 
     override func insertText(_ insertString: Any, replacementRange: NSRange) {
@@ -305,4 +357,39 @@ final class FocusedComposerTextView: NSTextView {
     }
 
     @objc private func windowBecameKey(_ notification: Notification) { focusIfNeeded() }
+}
+
+/// The launcher is operated from the keyboard even when macOS's optional
+/// system-wide button navigation is off. An explicit editing focus target keeps
+/// its controls in SwiftUI's focus loop in both settings.
+struct AIKeyboardButton<Content: View>: View {
+    @Environment(\.isEnabled) private var isEnabled
+    let action: () -> Void
+    @ViewBuilder let label: () -> Content
+
+    var body: some View {
+        Button(action: action, label: label)
+            .focusable(isEnabled, interactions: .edit)
+            .onKeyPress(keys: [.return, .space], phases: .down) { event in
+                guard isEnabled, event.modifiers.intersection([.command, .option, .control]).isEmpty else {
+                    return .ignored
+                }
+                action()
+                return .handled
+            }
+    }
+}
+
+extension AIKeyboardButton where Content == Text {
+    init(_ title: String, action: @escaping () -> Void) {
+        self.action = action
+        label = { Text(title) }
+    }
+}
+
+extension AIKeyboardButton where Content == Label<Text, Image> {
+    init(_ title: String, systemImage: String, action: @escaping () -> Void) {
+        self.action = action
+        label = { Label(title, systemImage: systemImage) }
+    }
 }

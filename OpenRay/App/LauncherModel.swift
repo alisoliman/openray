@@ -10,11 +10,28 @@ final class LauncherModel {
     private(set) var section: LauncherSection = .home
     var query = "" { didSet { if query != oldValue { searchChanged() } } }
     var selectedID: String?
+    private var restoringFileSelection = false
     var clipboardFilter: ClipboardFilter = .all { didSet { if clipboardFilter != oldValue { selectedID = nil } } }
     var editor: LibraryEditor?
     var showActions = false
     var message: String?
     var focusRequest = 0
+    static let resumeInterval: TimeInterval = 5 * 60
+    private(set) var hiddenAt: Date?
+    private(set) var selectedTextContext: SelectedTextContext?
+    private(set) var isPastingAIResponse = false
+    private var aiSources: [UUID: SelectedTextContext] = [:]
+    private var acceptedAIResponses: [UUID: String] = [:]
+    var settingsExclusionsDraft: String?
+    private struct NavigationContext {
+        let destination: Destination
+        let section: LauncherSection
+        let query: String
+        let selectedID: String?
+        let aiReturnContext: (query: String, selectedID: String?)?
+        let ai: AIChatModel
+    }
+    private var navigationHistory: [NavigationContext] = []
     private(set) var shortcutError: String?
     private(set) var commandShortcutErrors: [String: String] = [:]
     private(set) var accessibilityAllowed = false
@@ -27,6 +44,7 @@ final class LauncherModel {
     private(set) var ai: AIChatModel
     let pomodoro: PomodoroService
     let caffeinate: CaffeinateService
+    let caffeinateDraft = CaffeinateDraft()
     let windows = WindowManager()
     @ObservationIgnored let clipboard: ClipboardService
     @ObservationIgnored let snippets: SnippetExpander
@@ -147,7 +165,11 @@ final class LauncherModel {
     }
 
     var orderedResults: [LauncherItem] { groups.flatMap(\.items) }
-    var selectedItem: LauncherItem? { orderedResults.first(where: { $0.id == selectedID }) ?? orderedResults.first }
+    var selectedItem: LauncherItem? {
+        let items = orderedResults
+        if let selected = items.first(where: { $0.id == selectedID }) { return selected }
+        return restoringFileSelection ? nil : items.first
+    }
 
     func start() async {
         guard !isStarted else { return }
@@ -165,7 +187,7 @@ final class LauncherModel {
         clipboard.stop()
         snippets.stop()
         files.stop()
-        ai.cancel()
+        for session in aiSessions.values { session.cancel() }
         pomodoro.stopMonitoring()
         caffeinate.shutdown()
     }
@@ -295,9 +317,11 @@ final class LauncherModel {
             panel?.show()
             return
         }
+        prepareToShow()
         let front = NSWorkspace.shared.frontmostApplication
         if let front, front.processIdentifier != ProcessInfo.processInfo.processIdentifier {
             previousApplication = front
+            captureSelection(from: front)
         }
         perform(command)
         switch command.action {
@@ -330,6 +354,8 @@ final class LauncherModel {
     }
 
     func navigate(to section: LauncherSection) {
+        hiddenAt = nil
+        navigationHistory = []
         aiReturnContext = nil
         destination = .search
         self.section = section
@@ -341,13 +367,36 @@ final class LauncherModel {
         focusRequest += 1
     }
 
+    /// Scope buttons narrow the current search; running a feature command uses
+    /// navigate(to:) to open that feature with a fresh query.
+    func selectSearchScope(_ section: LauncherSection) {
+        guard destination != .search || self.section != section else { return }
+        hiddenAt = nil
+        navigationHistory.append(
+            NavigationContext(
+                destination: destination, section: self.section, query: query, selectedID: selectedID,
+                aiReturnContext: aiReturnContext, ai: ai))
+        destination = .search
+        self.section = section
+        showActions = false
+        message = nil
+        selectedID = nil
+        searchChanged()
+        synchronizeSelection()
+        focusRequest += 1
+    }
+
     func openAI(_ action: AIAction = .chat) {
         guard !hasActiveTextComposition else { return }
+        let previousAI = ai
+        guard activateAIAction(action) else { return }
+        hiddenAt = nil
+        rememberNavigation(before: .ai, ai: previousAI)
         aiReturnContext = nil
-        activateAIAction(action)
         destination = .ai
         files.stop()
         showActions = false
+        startCapturedSelectionIfReady(explicitCommand: true)
     }
 
     /// Tab turns a search into an editable prompt; generating and importing text
@@ -357,7 +406,9 @@ final class LauncherModel {
         guard destination == .search, section == .home, canSwitchAIWorkspace else { return false }
         let context = (query: query, selectedID: selectedID)
         let passage = isCommandQuery(query) ? "" : query
+        let previousAI = ai
         guard activateAIAction(.chat) else { return true }
+        rememberNavigation(before: .ai, ai: previousAI)
         aiReturnContext = context
         destination = .ai
         files.stop()
@@ -382,7 +433,7 @@ final class LauncherModel {
 
     func switchAIAction(_ action: AIAction) {
         guard destination == .ai, canSwitchAIWorkspace else { return }
-        activateAIAction(action)
+        if activateAIAction(action) { startCapturedSelectionIfReady(explicitCommand: false) }
     }
 
     /// Borderless hosting views cannot reliably refresh SwiftUI keyboard
@@ -395,7 +446,7 @@ final class LauncherModel {
             if index == 5 {
                 openAI()
             } else {
-                navigate(to: [LauncherSection.home, .applications, .files, .clipboard, .notes][index])
+                selectSearchScope([LauncherSection.home, .applications, .files, .clipboard, .notes][index])
             }
         case .ai:
             switchAIAction(AIAction.workspaceActions[index])
@@ -427,7 +478,11 @@ final class LauncherModel {
                 let draft = ai.draft
                 let session = aiFactory()
                 session.open(action)
-                if session.draft.isEmpty, session.messages.isEmpty, !draft.isEmpty { session.useText(draft) }
+                if session.draft.isEmpty, session.messages.isEmpty, !draft.isEmpty,
+                    action == .chat || selectedTextContext == nil
+                {
+                    session.useText(draft)
+                }
                 aiSessions[action] = session
                 ai = session
             }
@@ -447,6 +502,8 @@ final class LauncherModel {
     }
 
     func openSettings() {
+        hiddenAt = nil
+        rememberNavigation(before: .settings)
         aiReturnContext = nil
         destination = .settings
         files.stop()
@@ -455,6 +512,8 @@ final class LauncherModel {
     }
 
     func openPomodoro(start: Bool = false) {
+        hiddenAt = nil
+        rememberNavigation(before: .pomodoro)
         aiReturnContext = nil
         destination = .pomodoro
         files.stop()
@@ -465,6 +524,8 @@ final class LauncherModel {
     }
 
     func openCaffeinate() {
+        hiddenAt = nil
+        rememberNavigation(before: .caffeinate)
         aiReturnContext = nil
         destination = .caffeinate
         files.stop()
@@ -474,8 +535,21 @@ final class LauncherModel {
     }
 
     func goBack() {
+        guard editor == nil, !hasActiveTextComposition else { return }
         if showActions {
             showActions = false
+        } else if let context = navigationHistory.popLast() {
+            destination = context.destination
+            section = context.section
+            query = context.query
+            selectedID = context.selectedID
+            aiReturnContext = context.aiReturnContext
+            if destination == .ai { ai = context.ai }
+            message = nil
+            restoringFileSelection = destination == .search && selectedID?.hasPrefix("file.") == true
+            resumeSearch()
+            synchronizeSelection()
+            focusRequest += 1
         } else if destination == .ai, let context = aiReturnContext {
             navigate(to: .home)
             query = context.query
@@ -490,19 +564,185 @@ final class LauncherModel {
         }
     }
 
+    private func rememberNavigation(before destination: Destination, ai: AIChatModel? = nil) {
+        guard self.destination != destination else { return }
+        navigationHistory.append(
+            NavigationContext(
+                destination: self.destination, section: section, query: query, selectedID: selectedID,
+                aiReturnContext: aiReturnContext, ai: ai ?? self.ai))
+    }
+
+    func hideLauncher() {
+        if showActions {
+            showActions = false
+        } else if editor == nil {
+            panel?.dismiss()
+        }
+    }
+
+    func didHide(at date: Date = Date()) {
+        if hiddenAt == nil { hiddenAt = date }
+    }
+
+    func prepareToShow(at date: Date = Date()) {
+        if let hiddenAt, date.timeIntervalSince(hiddenAt) >= Self.resumeInterval,
+            editor == nil, !aiSessions.values.contains(where: { $0.isGenerating })
+        {
+            navigate(to: .home)
+        }
+        hiddenAt = nil
+    }
+
+    func captureSelection(from application: NSRunningApplication?) {
+        // Capture only the highlighted passage, before OpenRay takes focus. It
+        // stays in memory and is submitted only when a writing command is chosen.
+        selectedTextContext = try? SelectedTextContext.capture(from: application)
+    }
+
+    func setCapturedSelection(_ selection: SelectedTextContext?) {
+        selectedTextContext = selection
+    }
+
+    var aiSource: SelectedTextContext? { aiSources[ai.conversationID] }
+
+    var hasNewSelectedText: Bool {
+        guard ai.action != .chat, let selection = selectedTextContext else { return false }
+        return aiSource?.matches(selection) != true
+    }
+
+    private func startCapturedSelectionIfReady(explicitCommand: Bool) {
+        guard ai.action != .chat, ai.draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty, !ai.isGenerating,
+            selectedTextContext != nil
+        else { return }
+        let finishedPreviousPassage =
+            explicitCommand && hasNewSelectedText && ai.errorMessage == nil
+            && ai.messages.last?.role == .assistant && ai.messages.last?.isPartial == false
+        guard ai.messages.isEmpty || finishedPreviousPassage else { return }
+        useCapturedSelection(send: true)
+    }
+
+    func useCapturedSelection(send: Bool = false) {
+        guard !ai.isGenerating, let selection = selectedTextContext else { return }
+        if ai.action == .chat {
+            ai.useText(selection.text)
+            focusRequest += 1
+            return
+        }
+        guard ai.startWriting(selection.text) else { return }
+        let activeConversations = Set(aiSessions.values.map(\.conversationID))
+        aiSources = aiSources.filter { activeConversations.contains($0.key) }
+        acceptedAIResponses = acceptedAIResponses.filter { activeConversations.contains($0.key) }
+        aiSources[ai.conversationID] = selection
+        if send { ai.send() }
+        focusRequest += 1
+    }
+
+    func importAIText(_ text: String) {
+        guard !ai.isGenerating else { return }
+        if ai.action == .chat { ai.useText(text) } else { _ = ai.startWriting(text) }
+        pruneAISources()
+        focusRequest += 1
+    }
+
+    func newAIConversation() {
+        ai.newConversation()
+        pruneAISources()
+        focusRequest += 1
+    }
+
+    func continueAIFromResult() {
+        guard ai.action != .chat, !ai.isGenerating, let result = ai.latestCompletedResponse else { return }
+        let source = aiSource
+        guard ai.startWriting(result) else { return }
+        if let source { aiSources[ai.conversationID] = source }
+        pruneAISources()
+        focusRequest += 1
+    }
+
+    private func pruneAISources() {
+        let activeConversations = Set(aiSessions.values.map(\.conversationID))
+        aiSources = aiSources.filter { activeConversations.contains($0.key) }
+        acceptedAIResponses = acceptedAIResponses.filter { activeConversations.contains($0.key) }
+    }
+
+    var canAcceptAIResponse: Bool {
+        guard ai.action != .chat, !ai.isGenerating, !isPastingAIResponse,
+            ai.draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+            ai.messages.last?.role == .assistant, ai.messages.last?.isPartial == false,
+            let response = ai.latestCompletedResponse
+        else { return false }
+        return acceptedAIResponses[ai.conversationID] != response
+    }
+
+    var aiAcceptTitle: String {
+        if let source = aiSource { return "Replace in \(source.sourceName)" }
+        return "Copy result"
+    }
+
+    func submitAI() {
+        if !ai.draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            ai.send()
+        } else if canAcceptAIResponse {
+            acceptAIResponse()
+        }
+    }
+
+    func acceptAIResponse() {
+        guard canAcceptAIResponse, let response = ai.latestCompletedResponse else { return }
+        let conversationID = ai.conversationID
+        guard let source = aiSource else {
+            copy(response)
+            return
+        }
+        guard clipboard.copy(response) else {
+            message = "Could not copy the result. Try again."
+            return
+        }
+        guard clipboard.usesGeneralPasteboard else {
+            message = "Copied to the isolated verification pasteboard. Cross-app paste is disabled in this mode."
+            return
+        }
+        guard let target = source.application, !target.isTerminated, windows.hasPermission else {
+            message =
+                "Copied. Open \(source.sourceName) and press ⌘V, or enable Accessibility in Settings for direct paste."
+            return
+        }
+        let changeCount = clipboard.changeCount
+        isPastingAIResponse = true
+        panel?.dismiss(restoreFocus: false)
+        Task {
+            defer { isPastingAIResponse = false }
+            do {
+                try await SyntheticInput.paste(
+                    into: target, expectedChangeCount: changeCount, validateTarget: source.validateForPaste)
+                acceptedAIResponses[conversationID] = response
+                aiSources.removeValue(forKey: conversationID)
+                if selectedTextContext?.matches(source) == true { selectedTextContext = nil }
+                message =
+                    "Inserted in \(source.sourceName). To replace it again, select the inserted text and reopen OpenRay."
+            } catch {
+                message = error.localizedDescription
+                panel?.show()
+            }
+        }
+    }
+
     func resumeSearch() {
         if destination == .search, section == .home || section == .files {
-            files.search(query, showRecent: section == .files)
+            files.search(query, showRecent: section == .files, preservingResults: true)
         }
     }
 
     func synchronizeSelection() {
         let items = orderedResults
+        if restoringFileSelection, files.isSearching, !items.contains(where: { $0.id == selectedID }) { return }
+        restoringFileSelection = false
         if !items.contains(where: { $0.id == selectedID }) { selectedID = items.first?.id }
     }
 
     func moveSelection(_ offset: Int) {
         guard !showActions else { return }
+        restoringFileSelection = false
         let items = orderedResults
         guard !items.isEmpty else { return }
         let index = items.firstIndex(where: { $0.id == selectedID }) ?? 0
@@ -515,6 +755,7 @@ final class LauncherModel {
     }
 
     func perform(_ item: LauncherItem) {
+        restoringFileSelection = false
         showActions = false
         message = nil
         switch item.action {
@@ -640,9 +881,16 @@ final class LauncherModel {
     }
 
     func useSelectionForAI() {
-        do { ai.useText(try windows.selectedText(in: previousApplication)) } catch {
-            message = error.localizedDescription
+        guard !ai.isGenerating else { return }
+        if selectedTextContext == nil { captureSelection(from: previousApplication) }
+        guard selectedTextContext != nil else {
+            message =
+                accessibilityAllowed
+                ? "Select a passage in your app, then reopen OpenRay. You can also use the clipboard."
+                : "Enable Accessibility in Settings to use selected text, or paste a passage here."
+            return
         }
+        useCapturedSelection()
     }
 
     func editSelected() {
@@ -691,6 +939,7 @@ final class LauncherModel {
     }
 
     private func searchChanged() {
+        restoringFileSelection = false
         selectedID = nil
         message = nil
         guard query.count <= 512 else {
