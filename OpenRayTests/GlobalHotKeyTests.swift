@@ -127,6 +127,7 @@ struct GlobalHotKeyTests {
         #expect(issues.map(\.targetID) == [GlobalHotKey.launcherTargetID])
         #expect(issues.first?.message.contains("⌥ Space remains active") == true)
         #expect(backend.identifier(for: LauncherHotKey.optionSpace.shortcut) == originalID)
+        #expect(!backend.unregisteredIDs.contains(originalID))
         #expect(backend.identifier(for: shortcut) != nil)
         backend.fire(originalID)
         #expect(launcherCount == 1)
@@ -135,6 +136,7 @@ struct GlobalHotKeyTests {
             registry.synchronize(launcher: .controlSpace, bindings: [], onLauncher: {}, onCommand: { _ in }).isEmpty)
         #expect(backend.identifier(for: LauncherHotKey.optionSpace.shortcut) == nil)
         #expect(backend.identifier(for: LauncherHotKey.controlSpace.shortcut) != nil)
+        #expect(backend.unregisteredIDs.filter { $0 == originalID }.count == 1)
         registry.unregister()
     }
 
@@ -312,6 +314,31 @@ struct GlobalHotKeyTests {
         backend.removeHandler()
         _ = try send(signature: 0x4F52_4159, identifier: 7_004)
         #expect(identifiers == [7_001, 7_003])
+    }
+
+    @Test func carbonRegistrationRequestsExclusiveOwnershipAndReportsConflicts() {
+        var attempts = 0
+        let backend = CarbonHotKeyBackend { keyCode, modifiers, identifier, options, reference in
+            attempts += 1
+            #expect(keyCode == shortcut.keyCode)
+            #expect(modifiers == shortcut.modifiers.carbonFlags)
+            #expect(identifier.id == 73)
+            #expect(identifier.signature == 0x4F52_4159)
+            #expect(options == OptionBits(kEventHotKeyExclusive))
+            #expect(reference == nil)
+            return OSStatus(eventHotKeyExistsErr)
+        }
+
+        do {
+            try backend.register(shortcut, identifier: 73)
+            Issue.record("A shortcut already owned by another app must remain inactive.")
+        } catch {
+            #expect(error is LibraryValidationError)
+            #expect(error.localizedDescription.contains(shortcut.title))
+            #expect(error.localizedDescription.contains("another app may use it"))
+            #expect(error.localizedDescription.contains(String(eventHotKeyExistsErr)))
+        }
+        #expect(attempts == 1)
     }
 }
 

@@ -43,7 +43,7 @@ struct OpenRayHelpView: View {
                     Text(
                         """
                         In All, type a question or passage and press Tab to carry it into the AI \
-                        workspace as an editable draft. Choose a tool, then press ⌘Return when \
+                        workspace as an editable draft. Choose a tool, then press Return when \
                         you are ready to send it. If Ask already has an unsent draft, it is \
                         preserved; go Back to recover the new search text.
                         """)
@@ -55,19 +55,18 @@ struct OpenRayHelpView: View {
                         shortcut(
                             "Return",
                             """
-                            Open or copy the selected result; run a selected action
+                            Open or copy the selected result; send an AI draft or accept a completed rewrite
                             """)
                         shortcut("⌘K", "Open or close actions for the selected result or current AI tool")
-                        shortcut(
-                            "Tab", "From All, open AI with your search text; in the AI composer, select the next tool")
-                        shortcut("Shift-Tab", "In the AI composer, select the previous tool")
+                        shortcut("Tab", "From All, open AI with your search text; in AI, move to the next control")
+                        shortcut("Shift-Tab", "In AI, move to the previous control")
                         shortcut("⌘1–⌘6", "In search: All, Apps, Files, Clipboard, Notes, AI")
                         shortcut("⌘1–⌘6 in AI", "Ask, Rewrite, Summarize, Proofread, Shorten, Actions")
                         shortcut(
                             "⌘Return",
                             """
                             Paste a clipboard item, snippet, calculation, or note into the \
-                            previously active app
+                            previously active app; insert a new line in the AI composer
                             """)
                         shortcut(
                             "⌘N",
@@ -77,17 +76,15 @@ struct OpenRayHelpView: View {
                             """)
                         shortcut("⌘S", "Save the current editor")
                         shortcut("⌘,", "Open Settings")
-                        shortcut(
-                            "Escape",
-                            """
-                            Close actions or an editor, go back from a feature, clear the root \
-                            search, then hide the launcher
-                            """)
+                        shortcut("Escape", "Hide the launcher and keep your place; close an open actions menu first")
+                        shortcut("⌘[", "Go back to the previous workspace")
                     }
                     Text(
                         """
-                        In the AI composer, Escape goes back to search. Other text editors handle \
-                        Escape first. Use Back to leave Settings while editing exclusions.
+                        Use Back or ⌘[ to navigate. Hiding with Escape, the launcher shortcut, or \
+                        another app keeps your workspace for five minutes. After a longer pause, \
+                        OpenRay opens All, while AI drafts, conversations, and unsaved library \
+                        editors remain available. Native dialogs handle Escape first.
                         """
                     )
                     .foregroundStyle(.secondary)
@@ -210,16 +207,36 @@ struct OpenRayHelpView: View {
                         """
                         Choose Ask for a conversation, or Rewrite, Summarize, Proofread, Shorten, \
                         or Actions for a writing task. Actions extracts action items. Click a tool \
-                        or use Tab and Shift-Tab in the composer to cycle between them. ⌘1 through \
-                        ⌘6 jump directly to a tool. Enter the source text for a writing task.
+                        or use ⌘1 through ⌘6 to jump directly to it. Tab and Shift-Tab move keyboard \
+                        focus between controls.
                         """)
                     Text(
                         """
-                        Return inserts a new line. ⌘Return sends. Stop ends a response and keeps \
-                        its partial text; stop before changing tools. Each tool keeps its own \
-                        draft and conversation while OpenRay is running. Switching tools does \
-                        not send your text. Use Copy for the output, Save as Note to keep it, and \
-                        ⌘N to start fresh in the current tool. Input is limited to 6,000 characters.
+                        Select text in another app, open OpenRay, and choose Improve Writing or \
+                        another writing command. With Accessibility enabled, the command uses \
+                        your selection in an empty tool, or starts a new selection after a completed \
+                        result with no unsent draft or error. Drafts, ongoing responses, and stopped \
+                        or failed requests are kept; choose Use as new passage to replace that work. \
+                        Hiding, reopening, or browsing tools preserves a previous result. Run the \
+                        writing command again to begin another selection. Ask never imports a \
+                        selection automatically.
+                        """)
+                    Text(
+                        """
+                        Return sends your draft. ⌘Return inserts a new line. After a writing \
+                        response finishes, type a follow-up such as “Make it warmer” and press \
+                        Return to refine the result. With an empty composer, Return accepts the \
+                        latest completed result and replaces the original selection in its app. \
+                        If that selection has changed, OpenRay keeps the result available to copy \
+                        instead of replacing other text. Copy and Save as Note are also available.
+                        """)
+                    Text(
+                        """
+                        Stop ends a response and keeps its partial text; stop before changing \
+                        tools. Each tool keeps its own draft and conversation while OpenRay is \
+                        running. ⌘N starts fresh in the current tool. Input is limited to 6,000 \
+                        characters. In a writing tool, Use Clipboard and Use Selected Text start \
+                        work on a new source.
                         """)
                     Text(
                         """
@@ -260,8 +277,9 @@ struct OpenRayHelpView: View {
                         """)
                     Text(
                         """
-                        Clipboard and selected text enter AI only when you choose their import \
-                        buttons. AI drafts and chats stay in memory; Save as Note is the explicit way to store a \
+                        A writing command can use the selection from the app where you opened \
+                        OpenRay. Otherwise, clipboard and selected text enter AI when you choose \
+                        their import buttons. AI drafts and chats stay in memory; Save as Note is the explicit way to store a \
                         response. Deleting library items or clearing history cannot be undone in \
                         OpenRay. Clearing clipboard history does not alter the current system \
                         clipboard or delete original copied files.

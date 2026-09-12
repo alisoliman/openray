@@ -45,10 +45,11 @@ struct ContentView: View {
             guard model.editor == nil, model.destination != .settings, model.destination != .pomodoro,
                 model.destination != .caffeinate
             else { return }
-            model.goBack()
+            model.hideLauncher()
         }
         .background {
             Button("Open Settings") { model.openSettings() }.keyboardShortcut(",").hidden()
+            Button("Go Back") { model.goBack() }.keyboardShortcut("[").hidden()
         }
     }
 

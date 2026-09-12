@@ -9,6 +9,20 @@ struct AIWritingResult {
 }
 
 @Generable
+struct AIRevisionResult {
+    @Guide(
+        description:
+            "A brief list of the latest revision request's requirements, including requested tone, language, format, and sentence or word count. The latest request overrides conflicting earlier requirements."
+    )
+    var requirements: [String]
+    @Guide(
+        description:
+            "The complete revised text satisfying every listed requirement. Return the text only, without a preface or explanation."
+    )
+    var text: String
+}
+
+@Generable
 struct AIProofreadingResult {
     @Guide(
         description:
@@ -84,6 +98,11 @@ final class FoundationModelEngine: AIEngine {
     }
 
     func stream(_ prompt: String, action: AIAction, onSnapshot: @escaping @MainActor (String) -> Void) async throws {
+        try await stream(AIRequest(prompt: prompt), action: action, onSnapshot: onSnapshot)
+    }
+
+    func stream(_ request: AIRequest, action: AIAction, onSnapshot: @escaping @MainActor (String) -> Void) async throws
+    {
         guard availability.isAvailable else { throw AIServiceError.unavailable(availability) }
         if session == nil || sessionAction != action {
             session = LanguageModelSession(instructions: action.instructions)
@@ -91,52 +110,64 @@ final class FoundationModelEngine: AIEngine {
         }
         guard let session else { throw AIServiceError.unavailable(.unavailable) }
         do {
-            let request = Prompt(action.prompt(for: prompt))
-            switch action {
-            case .chat:
+            let prompt = Prompt(request.modelPrompt(for: action))
+            if request.isRevision {
+                // Follow-ups may change the format or tone of any writing result,
+                // so they must not be forced through the initial operation's schema.
                 let stream = session.streamResponse(
-                    to: request, options: GenerationOptions(temperature: 0.4, maximumResponseTokens: 900))
-                for try await snapshot in stream {
-                    try Task.checkCancellation()
-                    onSnapshot(snapshot.content)
-                }
-            case .proofread:
-                let stream = session.streamResponse(
-                    to: request, generating: AIProofreadingResult.self,
-                    options: GenerationOptions(sampling: .greedy, maximumResponseTokens: 1_500))
-                for try await snapshot in stream {
-                    try Task.checkCancellation()
-                    if snapshot.content.needsCorrections == false {
-                        onSnapshot(prompt)
-                    } else if let text = snapshot.content.text {
-                        onSnapshot(AIProofreadingResult.preservingUnchangedPassage(text, original: prompt))
-                    }
-                }
-            case .actionItems:
-                let stream = session.streamResponse(
-                    to: request, generating: AIActionItemsResult.self,
-                    options: GenerationOptions(sampling: .greedy, maximumResponseTokens: 900))
-                var finalItems: [String] = []
-                for try await snapshot in stream {
-                    try Task.checkCancellation()
-                    if snapshot.content.hasActionItems == true, let items = snapshot.content.items {
-                        finalItems = items
-                        if !items.isEmpty { onSnapshot(AIActionItemsResult.formatted(items)) }
-                    }
-                }
-                onSnapshot(AIActionItemsResult.formatted(finalItems))
-            default:
-                let stream = session.streamResponse(
-                    to: request, generating: AIWritingResult.self,
+                    to: prompt, generating: AIRevisionResult.self,
                     options: GenerationOptions(sampling: .greedy, maximumResponseTokens: 1_500))
                 for try await snapshot in stream {
                     try Task.checkCancellation()
                     if let text = snapshot.content.text { onSnapshot(text) }
                 }
+            } else {
+                switch action {
+                case .chat:
+                    let stream = session.streamResponse(
+                        to: prompt, options: GenerationOptions(temperature: 0.4, maximumResponseTokens: 900))
+                    for try await snapshot in stream {
+                        try Task.checkCancellation()
+                        onSnapshot(snapshot.content)
+                    }
+                case .proofread:
+                    let stream = session.streamResponse(
+                        to: prompt, generating: AIProofreadingResult.self,
+                        options: GenerationOptions(sampling: .greedy, maximumResponseTokens: 1_500))
+                    for try await snapshot in stream {
+                        try Task.checkCancellation()
+                        if snapshot.content.needsCorrections == false {
+                            onSnapshot(request.prompt)
+                        } else if let text = snapshot.content.text {
+                            onSnapshot(AIProofreadingResult.preservingUnchangedPassage(text, original: request.prompt))
+                        }
+                    }
+                case .actionItems:
+                    let stream = session.streamResponse(
+                        to: prompt, generating: AIActionItemsResult.self,
+                        options: GenerationOptions(sampling: .greedy, maximumResponseTokens: 900))
+                    var finalItems: [String] = []
+                    for try await snapshot in stream {
+                        try Task.checkCancellation()
+                        if snapshot.content.hasActionItems == true, let items = snapshot.content.items {
+                            finalItems = items
+                            if !items.isEmpty { onSnapshot(AIActionItemsResult.formatted(items)) }
+                        }
+                    }
+                    onSnapshot(AIActionItemsResult.formatted(finalItems))
+                default:
+                    let stream = session.streamResponse(
+                        to: prompt, generating: AIWritingResult.self,
+                        options: GenerationOptions(sampling: .greedy, maximumResponseTokens: 1_500))
+                    for try await snapshot in stream {
+                        try Task.checkCancellation()
+                        if let text = snapshot.content.text { onSnapshot(text) }
+                    }
+                }
             }
             try Task.checkCancellation()
-            // Writing commands transform each passage independently. Only chat
-            // carries conversational context into the next request.
+            // Writing revisions carry their explicit context in AIRequest. Avoid
+            // replaying redundant generated schemas and filling the model context.
             if action != .chat { reset() }
         } catch is CancellationError {
             reset()

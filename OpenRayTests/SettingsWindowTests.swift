@@ -35,7 +35,7 @@ struct SettingsWindowTests {
         model.files.stop()
     }
 
-    @Test func panelLeavesTextEditingAndModifiedEscapeToNativeResponders() throws {
+    @Test func panelHidesDuringOrdinaryEditingButLeavesIMEAndModifiedEscapeToNativeResponders() throws {
         let panel = LauncherPanel()
         var navigations = 0
         panel.escapeAction = {
@@ -47,8 +47,13 @@ struct SettingsWindowTests {
         let editor = NSTextView(frame: NSRect(x: 0, y: 0, width: 200, height: 100))
         panel.contentView = editor
         #expect(panel.makeFirstResponder(editor))
+        #expect(panel.handleEscapeKey(try keyEvent(code: 53)))
+        #expect(navigations == 1)
+        editor.setMarkedText(
+            "文", selectedRange: NSRange(location: 1, length: 0),
+            replacementRange: NSRange(location: NSNotFound, length: 0))
         #expect(!panel.handleEscapeKey(try keyEvent(code: 53)))
-        #expect(navigations == 0)
+        #expect(navigations == 1)
     }
 
     @Test func sharedAppearancePolicySupportsBothExplicitModesAndSystemFallback() {

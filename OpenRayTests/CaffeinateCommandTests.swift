@@ -12,11 +12,13 @@ struct CaffeinateCommandTests {
         (id: "caffeinate.toggle", title: "Toggle Caffeinate"),
     ]
 
-    private func model(assertions: CaffeinateCommandAssertions) -> LauncherModel {
+    private func model(
+        assertions: CaffeinateCommandAssertions, now: @escaping () -> Date = { .now }
+    ) -> LauncherModel {
         LauncherModel(
             store: LibraryStore(fileURL: nil), ai: AIChatModel(engine: TestAIEngine()),
             pasteboard: NSPasteboard.withUniqueName(),
-            caffeinate: CaffeinateService(assertions: assertions, automaticallyMonitors: false),
+            caffeinate: CaffeinateService(assertions: assertions, now: now, automaticallyMonitors: false),
             aiFactory: { AIChatModel(engine: TestAIEngine()) })
     }
 
@@ -233,6 +235,124 @@ struct CaffeinateCommandTests {
         #expect(assertions.activeIDs.isEmpty)
         #expect(Set(assertions.releasedIDs) == activeIDs)
         #expect(assertions.releaseAttempts.count == 1)
+    }
+
+    @Test(arguments: [false, true])
+    func pendingCustomDurationSurvivesNavigationAndHideWithoutStarting(settingsDetour: Bool) {
+        let assertions = CaffeinateCommandAssertions()
+        let model = model(assertions: assertions)
+        defer { model.stop() }
+        model.openCaffeinate()
+        model.caffeinateDraft.refresh(from: model.caffeinate)
+        model.caffeinateDraft.duration = nil
+        model.caffeinateDraft.customMinutes = "90"
+
+        if settingsDetour {
+            model.openSettings()
+            model.goBack()
+        } else {
+            model.goBack()
+            model.openCaffeinate()
+        }
+        // Recreated dashboards run this same appearance synchronization.
+        model.caffeinateDraft.refresh(from: model.caffeinate)
+        #expect(model.destination == .caffeinate)
+        #expect(model.caffeinateDraft.duration == nil)
+        #expect(model.caffeinateDraft.customMinutes == "90")
+
+        let hidden = Date(timeIntervalSince1970: 1_800_000_000)
+        model.didHide(at: hidden)
+        model.prepareToShow(at: hidden.addingTimeInterval(30))
+        model.caffeinate.refresh()
+        model.caffeinateDraft.refresh(from: model.caffeinate)
+
+        #expect(model.destination == .caffeinate)
+        #expect(model.caffeinateDraft.duration == nil)
+        #expect(model.caffeinateDraft.customMinutes == "90")
+        #expect(model.caffeinateDraft.hasPendingChanges)
+        #expect(!model.caffeinate.isActive)
+        #expect(model.caffeinate.deadline == nil)
+        #expect(assertions.createAttempts == 0)
+    }
+
+    @Test func pendingDurationIsIndependentOfActiveChangesUntilExplicitlyApplied() {
+        let assertions = CaffeinateCommandAssertions()
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+        let model = model(assertions: assertions, now: { now })
+        defer { model.stop() }
+        model.openCaffeinate()
+        model.caffeinateDraft.refresh(from: model.caffeinate)
+        model.caffeinateDraft.duration = nil
+        model.caffeinateDraft.customMinutes = "90"
+
+        #expect(model.caffeinate.start(minutes: 30))
+        model.openSettings()
+        model.goBack()
+        model.caffeinateDraft.refresh(from: model.caffeinate)
+
+        #expect(model.caffeinateDraft.customMinutes == "90")
+        #expect(model.caffeinateDraft.duration == nil)
+        #expect(model.caffeinateDraft.hasPendingChanges)
+        #expect(model.caffeinate.deadline == now.addingTimeInterval(1_800))
+        #expect(assertions.createAttempts == 1)
+
+        #expect(model.caffeinateDraft.start(using: model.caffeinate))
+        #expect(model.caffeinate.deadline == now.addingTimeInterval(5_400))
+        #expect(!model.caffeinateDraft.hasPendingChanges)
+        #expect(assertions.createAttempts == 1)
+        #expect(assertions.releaseAttempts.isEmpty)
+    }
+
+    @Test func untouchedControlsFollowExternalDurationBeforeSubmission() {
+        let assertions = CaffeinateCommandAssertions()
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+        let model = model(assertions: assertions, now: { now })
+        defer { model.stop() }
+        #expect(model.caffeinate.start(minutes: 30))
+        model.caffeinateDraft.refresh(from: model.caffeinate)
+        #expect(model.caffeinateDraft.duration?.seconds == 1_800)
+        #expect(!model.caffeinateDraft.hasPendingChanges)
+
+        #expect(model.caffeinate.start(minutes: 60))
+        // Submit before the view has processed the service's changed deadline.
+        #expect(model.caffeinateDraft.start(using: model.caffeinate))
+
+        #expect(model.caffeinateDraft.duration?.seconds == 3_600)
+        #expect(model.caffeinate.deadline == now.addingTimeInterval(3_600))
+        #expect(!model.caffeinateDraft.hasPendingChanges)
+        #expect(model.caffeinate.start())
+        model.caffeinateDraft.refresh(from: model.caffeinate)
+        #expect(model.caffeinateDraft.duration == .indefinitely)
+        #expect(model.caffeinate.deadline == nil)
+        #expect(assertions.createAttempts == 1)
+    }
+
+    @Test func invalidAndFailedSubmissionsKeepThePendingDurationForCorrectionAndRetry() {
+        let assertions = CaffeinateCommandAssertions()
+        let model = model(assertions: assertions)
+        defer { model.stop() }
+        let draft = model.caffeinateDraft
+        draft.duration = nil
+        draft.customMinutes = "0"
+        #expect(!draft.start(using: model.caffeinate))
+        #expect(draft.validationMessage != nil)
+        #expect(draft.hasPendingChanges)
+        #expect(assertions.createAttempts == 0)
+
+        draft.customMinutes = "90"
+        #expect(draft.validationMessage == nil)
+        assertions.failCreation = true
+        #expect(!draft.start(using: model.caffeinate))
+        draft.refresh(from: model.caffeinate)
+        #expect(draft.duration == nil)
+        #expect(draft.customMinutes == "90")
+        #expect(draft.hasPendingChanges)
+        #expect(!model.caffeinate.isActive)
+
+        assertions.failCreation = false
+        #expect(draft.start(using: model.caffeinate))
+        #expect(model.caffeinate.remainingSeconds == 5_400)
+        #expect(!draft.hasPendingChanges)
     }
 
     @Test func dashboardIgnoresWorkspaceNumbersAndSessionSurvivesAIReturnTransitions() throws {

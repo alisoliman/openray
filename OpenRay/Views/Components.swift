@@ -168,7 +168,7 @@ struct BackButton: View {
         Button(action: action) {
             Image(systemName: "chevron.left").font(.system(size: 12, weight: .semibold))
                 .frame(width: 28, height: 28).background(.primary.opacity(0.06), in: .rect(cornerRadius: 6))
-        }.buttonStyle(.plain).accessibilityLabel("Back to launcher").help("Back (Esc)")
+        }.buttonStyle(.plain).accessibilityLabel("Back").help("Back (⌘[) · Esc hides OpenRay")
     }
 }
 

@@ -41,11 +41,28 @@ Try `6 * 7`, `200 * 15%`, `sqrt(144)`, `10 km in mi`, `72 f in c`, or `web swift
 
 The feature bar gives you direct access to **All, Apps, Files, Clipboard, Notes, Pomodoro, and AI**. Open **More** for **Snippets, Quicklinks, Windows, and Calculator**.
 
-Type a question or passage in **All**, then press **Tab** to carry it into the AI workspace as an editable draft. Choose **Ask, Rewrite, Summarize, Proofread, Shorten, or Actions** from the tool bar, or press **Tab / Shift-Tab** in the composer to move between them. **Actions** extracts action items. Moving into AI or changing tools does not send your text; **⌘Return** runs the selected tool.
+Type a question or passage in **All**, then press **Tab** to carry it into the AI workspace as an editable draft. Choose **Ask, Rewrite, Summarize, Proofread, Shorten, or Actions** from the tool bar, or press **⌘1–⌘6** to move between them. **Actions** extracts action items. **Return** sends the draft; **⌘Return** adds a new line. Tab and Shift-Tab move focus between AI controls.
 
 If Ask already has an unsent draft, Tab keeps it and shows a reminder; go Back to recover the new search text.
 
 Each AI tool keeps its own draft and conversation while OpenRay is running. Switching tools preserves your work; **⌘N** starts fresh in the current tool. AI drafts and conversations stay in memory. Use **Save as Note** to keep a response after quitting.
+
+**Escape**, **⌥ Space**, or switching to another app hides the launcher and keeps your place for five minutes. Reopen it with the shortcut or **Open OpenRay** in the menu bar to resume the same workspace, search, and selection. File matches remain visible while the same search refreshes. After a longer pause, OpenRay opens All while retaining AI drafts, conversations, and unsaved library editors. Use **Back** or **⌘[** to navigate. All feature scopes, including those in **More**, preserve your query.
+
+### Rewrite text where you are working
+
+1. Highlight text in another app, press **⌥ Space**, and choose **Improve Writing** or another writing command.
+2. With Accessibility enabled, the command immediately uses your selection in an empty tool, or starts a new selection after a completed result with no unsent draft or error. Drafts, ongoing responses, and stopped or failed requests are kept; choose **Use as new passage** when you want to replace that work.
+3. Type a follow-up such as “Make it warmer” and press **Return** to refine the result.
+4. When the composer is empty, press **Return** to accept the latest completed result and replace the original selection in its app.
+
+The rewrite stays attached to its original app when you hide and resume OpenRay. If its selection has changed, OpenRay preserves the result for copying instead of replacing other text. **Copy** and **Save as Note** remain available. In writing tools, **Use Clipboard** and **Use Selected Text** start work on a new source; Ask does not import selected text automatically.
+
+Hiding, reopening, or browsing AI tools preserves a previous result. To start another selected passage after finishing, run the writing command again.
+
+After a successful insertion, select the inserted text and reopen OpenRay before replacing it again. Further refinements remain available to copy. **New Conversation** releases the previous writing session's target.
+
+If a response stops or fails, **Retry** recovers the request. A follow-up you have already typed is preserved and still refers to the original passage. For a long writing conversation, **Use Last Result** starts a fresh model session from the latest completed output while retaining the original app target; review the new draft before sending it. This action is also available as **Use Last Result as New Passage** in Actions.
 
 ## Keyboard shortcuts
 
@@ -53,18 +70,19 @@ Each AI tool keeps its own draft and conversation while OpenRay is running. Swit
 | --- | --- |
 | **⌥ Space** | Show or hide OpenRay; configurable in Settings. |
 | **↑ / ↓** | Select a result. |
-| **Return** | Open, run, or copy the selected result. |
+| **Return** | Open, run, or copy a search result; send an AI draft, or accept a completed writing result when the composer is empty. |
 | **⌘K** | Show actions for the selected result or current AI tool. |
-| **Tab** | From All, open AI with the search text as a draft; in the AI composer, select the next tool. |
-| **Shift-Tab** | In the AI composer, select the previous tool. |
+| **Tab** | From All, open AI with the search text as a draft; in AI, move focus to the next control. |
+| **Shift-Tab** | In AI, move focus to the previous control. |
 | **⌘1–⌘6** | In search: All, Apps, Files, Clipboard, Notes, AI. In AI: Ask, Rewrite, Summarize, Proofread, Shorten, Actions. |
-| **⌘Return** | Paste a supported result into the previously active app; send a message in AI. |
+| **⌘Return** | Paste a supported search result into the previously active app; add a new line in the AI composer. |
 | **⌘N** | Create an item in Snippets, Quicklinks, or Notes; start a new AI conversation. |
 | **⌘S** | Save an editor. |
 | **⌘,** | Open Settings. |
-| **Escape** | Close actions, go back, clear the search, or dismiss the launcher. |
+| **Escape** | Hide the launcher and keep your place; close an open actions menu first. Native dialogs handle Escape first. |
+| **⌘[** | Go back to the previous workspace. |
 
-In AI, **Return** inserts a newline. Use **Stop** to cancel a response before changing tools.
+Use **Stop** to cancel an AI response before changing tools. A partial or stopped response is never the default replacement.
 
 ### Command aliases and hotkeys
 
@@ -104,7 +122,7 @@ Clipboard history skips confidential/transient content markers, known password m
 
 History defaults to **7 days and 100 entries**, with a configurable maximum of 500 entries and a 64 MB content budget. Images are stored as PNGs up to 10 MB each. Copied files are references to the originals; clearing history never deletes those originals. Pausing capture keeps saved history available.
 
-AI runs on-device with no cloud fallback. Clipboard and selected text enter a conversation only through their explicit import buttons. Conversations are not saved automatically; **Save as Note** saves the chosen response. AI input is limited to 6,000 characters.
+AI runs on-device with no cloud fallback. Choosing a writing command can use the selection from the app where you opened OpenRay; Ask never imports it automatically. Clipboard content enters AI only through **Use Clipboard**. The captured selection and app target stay in memory for the writing session. Conversations are not saved automatically; **Save as Note** saves the chosen response. AI input is limited to 6,000 characters.
 
 ### Local data
 
