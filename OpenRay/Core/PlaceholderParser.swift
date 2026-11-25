@@ -9,8 +9,12 @@ import Foundation
 ///     value       := "…" | “…” | '…' | bare
 ///
 /// Double-quoted values accept `\"` and `\\`. Bare values run to the next space,
-/// `|` or `}`. A placeholder never spans lines. Unknown names are literal text;
-/// known names with bad syntax are literal too, and reported as `.invalid`.
+/// `|` or `}`. A placeholder never spans lines. Unknown names are literal text.
+/// A known name with bad syntax is reported as `.invalid` and kept literal: when
+/// its closing brace can be found (skipping quoted text), the whole span stays
+/// literal, so nothing quoted inside it expands. When it's never closed, or an
+/// unquoted `{` starts another token first, only the `{` is literal and parsing
+/// continues after it.
 struct PlaceholderParser {
     let source: String
     let context: PlaceholderContext
@@ -20,7 +24,8 @@ struct PlaceholderParser {
 
     private enum Outcome {
         case placeholder(Placeholder)
-        case invalid(String)
+        /// The text to report and, for a closed token, where its literal span ends.
+        case invalid(String, end: String.Index?)
         case notAPlaceholder
     }
 
@@ -61,10 +66,15 @@ struct PlaceholderParser {
                 flush()
                 segments.append(.placeholder(placeholder))
                 index = placeholder.range.upperBound
-            case .invalid(let text):
+            case .invalid(let text, let end):
                 issues.append(.invalid(text))
-                literal.append(character)
-                index = source.index(after: index)
+                if let end {
+                    literal += source[index..<end]
+                    index = end
+                } else {
+                    literal.append(character)
+                    index = source.index(after: index)
+                }
             case .notAPlaceholder:
                 literal.append(character)
                 index = source.index(after: index)
@@ -131,24 +141,52 @@ struct PlaceholderParser {
 
         if isLegacyArgument {
             // A legacy `{Name}` has no attributes. Anything else is ordinary text.
-            guard !failed else { return .notAPlaceholder }
+            guard !failed, modifiers.count <= PlaceholderModifier.maximumChain else { return .notAPlaceholder }
             let range = start..<cursor.index
             return .placeholder(
                 Placeholder(
                     token: .argument(PlaceholderArgument(id: .named(name))), modifiers: modifiers,
-                    source: String(source[range]), range: range))
+                    source: String(source[range]), range: range, isLegacyArgument: true))
         }
         guard let kind else { return .notAPlaceholder }
         guard !failed else {
-            // Report up to the closing brace on this line, if there is one.
-            return .invalid(Self.excerpt(of: source, from: start))
+            if let end = closingEnd(from: start) { return .invalid(String(source[start..<end]), end: end) }
+            return .invalid(Self.excerpt(of: source, from: start), end: nil)
         }
         let range = start..<cursor.index
         let text = String(source[range])
-        guard let token = Self.token(for: kind, attributes: attributes, modifiers: modifiers) else {
-            return .invalid(text)
+        guard modifiers.count <= PlaceholderModifier.maximumChain,
+            let token = Self.token(for: kind, attributes: attributes, modifiers: modifiers)
+        else {
+            return .invalid(text, end: range.upperBound)
         }
         return .placeholder(Placeholder(token: token, modifiers: modifiers, source: text, range: range))
+    }
+
+    /// The end of a malformed token, just past its closing brace, found by skipping
+    /// quoted text on the same line. Nil when unclosed or when an unquoted `{`
+    /// comes first; stopping there keeps the scan short on hostile input.
+    private func closingEnd(from start: String.Index) -> String.Index? {
+        var index = source.index(after: start)
+        var quote: Character?
+        var scanned = 0
+        while index < source.endIndex, scanned <= Self.maximumLength {
+            let character = source[index]
+            guard !character.isNewline else { return nil }
+            if let open = quote {
+                if character == open || (open == "\"" && (character == "”" || character == "“")) { quote = nil }
+            } else {
+                switch character {
+                case "\"", "“", "”", "'": quote = character == "'" ? "'" : "\""
+                case "{": return nil
+                case "}": return source.index(after: index)
+                default: break
+                }
+            }
+            index = source.index(after: index)
+            scanned += 1
+        }
+        return nil
     }
 
     private static func excerpt(of source: String, from start: String.Index) -> String {

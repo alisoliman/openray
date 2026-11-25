@@ -95,7 +95,8 @@ struct PlaceholderParsingTests {
         "{date format=\"yyyy\" locale=\"fr-FR\"}", "{date locale=\"en_US\"}", "{date locale=\"xx-YY\"}",
         "{date offset=\"+ 2d\"}", "{date offset=\"3x\"}", "{snippet}", "{snippet name=\"\"}", "{cursor | trim}",
         "{argument options=\",,\"}", "{selection x=1}", "{date offset=1d offset=2d}", "{calculator}",
-        "{argument name=\"unterminated}", "{uuid | }",
+        "{argument name=\"unterminated}", "{uuid | }", "{date offset=4h}", "{date offset=\"--2d\"}",
+        "{clipboard | trim | trim | trim | trim | trim | trim | trim | trim | trim}",
     ])
     func malformedKnownPlaceholdersStayLiteralAndAreReported(_ text: String) {
         let template = PlaceholderTemplate(text, context: .snippet)
@@ -105,13 +106,16 @@ struct PlaceholderParsingTests {
     }
 
     @Test func dateOffsetsParseSignsAndCaseSensitiveUnits() {
-        let offsets = PlaceholderDateOffset.parse("+2y +5M -3d 4h -30m")
+        let offsets = PlaceholderDateOffset.parse("+2y +5M -3d +4h -30m")
         #expect(
             offsets == [
                 .init(amount: 2, unit: .year), .init(amount: 5, unit: .month), .init(amount: -3, unit: .day),
                 .init(amount: 4, unit: .hour), .init(amount: -30, unit: .minute),
             ])
-        #expect(PlaceholderDateOffset.parse("+ 2d") == nil)
+        // The reference always writes a sign directly before the digits.
+        for malformed in ["+ 2d", "4h", "--2d", "+-2d", "-+2d", "+2", "+d", "+２d", "+2dd"] {
+            #expect(PlaceholderDateOffset.parse(malformed) == nil, "\(malformed)")
+        }
         #expect(PlaceholderDateOffset.parse("") == nil)
         #expect(PlaceholderDateOffset.parse("+2w") == nil)
         #expect(PlaceholderDateOffset.parse("+1234567d") == nil)
@@ -395,7 +399,7 @@ struct PlaceholderRenderingTests {
 
     @Test func aiCommandsQuoteContentButNotDates() {
         let source = values(clipboard: ["notes"], selection: "Hello")
-        #expect(render("Fix {selection}", .aiCommand, source).text == "Fix \"\"\"Hello\"\"\"")
+        #expect(render("Fix {selection}", .aiCommand, source).text == "Fix \"\"\"\nHello\n\"\"\"")
         #expect(render("Fix {selection | raw}", .aiCommand, source).text == "Fix Hello")
         #expect(render("{selection | json-stringify}", .aiCommand, source).text == "\"Hello\"")
         #expect(render("On {date format=\"yyyy\"}", .aiCommand, source).text == "On 2022")
@@ -418,11 +422,185 @@ struct PlaceholderRenderingTests {
         let issues: [PlaceholderIssue] = [
             .invalid("{date x}"), .tooManyArguments("{argument}"), .notHonored(.cursor), .unsupported(.browserTab),
             .duplicateCursor, .missingSnippet("A"), .nestedSnippet("B"), .missingArgument("C"),
-            .calculationFailed("1/0"), .unavailable(.selection),
+            .calculationFailed("1/0"), .unavailable(.selection), .outputTooLong,
         ]
         #expect(issues.allSatisfy { !$0.message.isEmpty && $0.message.hasSuffix(".") })
         #expect(Placeholder.Kind.suggested(in: .quicklink).contains(.cursor) == false)
         #expect(Placeholder.Kind.suggested(in: .snippet).contains(.cursor))
         #expect(Placeholder.Kind.allCases.allSatisfy { PlaceholderTemplate($0.insertionText, context: .snippet).hasPlaceholders || $0 == .snippet || $0 == .argument || $0 == .calculator })
+    }
+}
+
+/// Counts every value lookup, to prove planning reads nothing but snippets.
+private final class CountingSource: PlaceholderDataSource, @unchecked Sendable {
+    var reads: [String] = []
+    var snippets: [String: String] = [:]
+    var now: Date {
+        reads.append("clock")
+        return referenceDate
+    }
+    var calendar: Calendar { utcCalendar }
+    var locale: Locale { Locale(identifier: "en_US") }
+    func clipboardText(offset: Int) -> String? {
+        reads.append("clipboard \(offset)")
+        return "clip"
+    }
+    func selectedText() -> String? {
+        reads.append("selection")
+        return "sel"
+    }
+    func snippetText(named name: String) -> String? { snippets[name] }
+    func value(for argument: PlaceholderArgument) -> String? {
+        reads.append("argument \(argument.title)")
+        return nil
+    }
+    func calculate(_ expression: String) -> String? {
+        reads.append("calculate")
+        return "1"
+    }
+    func makeUUID() -> UUID {
+        reads.append("uuid")
+        return UUID()
+    }
+}
+
+struct PlaceholderReviewFixTests {
+    @Test func planningReadsOnlySnippetsAndFindsNestedRequirements() {
+        let source = CountingSource()
+        source.snippets = ["Quote": "> {selection} ({argument}) {clipboard offset=2}"]
+        let template = PlaceholderTemplate(
+            "{snippet name=\"Quote\"} {calculator expression=\"{uuid} + 1\"} {date} {argument}", context: .aiCommand)
+        let plan = template.plan(snippets: source.snippetText(named:))
+        #expect(source.reads.isEmpty)
+        #expect(plan.requirements.selection && plan.requirements.calculator && plan.requirements.uuid)
+        #expect(plan.requirements.clock)
+        #expect(plan.requirements.clipboardOffsets == [2])
+        #expect(plan.requirements.snippets == ["Quote"])
+        // Unnamed arguments of the template keep their numbers whatever snippets add.
+        #expect(plan.arguments.map(\.id) == [.snippetUnnamed(snippet: "Quote", index: 1), .unnamed(1)])
+        #expect(template.arguments.map(\.id) == [.unnamed(1)])
+        _ = template.arguments
+        _ = template.validationIssues
+        #expect(source.reads.isEmpty)
+    }
+
+    @Test func repeatedSnippetReferencesShareTheirArguments() {
+        let snippets = ["S": "<{argument}>"]
+        let plan = PlaceholderTemplate("{snippet name=\"S\"}{snippet name=\"S\"}", context: .snippet).plan(snippets: { snippets[$0] })
+        #expect(plan.arguments.map(\.id) == [.snippetUnnamed(snippet: "S", index: 1)])
+        #expect(plan.render(values(arguments: [.snippetUnnamed(snippet: "S", index: 1): "x"])).text == "<x><x>")
+    }
+
+    @Test(arguments: [
+        "{argument name=\"x\"}/{argument name=\"x\" default=\"d\"}",
+        "{argument name=\"x\" default=\"d\"}/{argument name=\"x\"}",
+    ])
+    func everyOccurrenceUsesTheFinalArgumentSpec(_ template: String) throws {
+        let rendered = render(template)
+        #expect(rendered.text == "d/d")
+        #expect(rendered.issues.isEmpty)
+        let link = try QuicklinkTemplate("https://x.com/" + template).resolve(using: values())
+        #expect(link.url.absoluteString == "https://x.com/d/d")
+    }
+
+    @Test func closedMalformedPlaceholdersNeverExpandWhatTheyContain() {
+        let source = CountingSource()
+        for text in ["{argument typo=\"{clipboard}\"}", "{date x=\"{selection}\" y='{uuid}'}", "{date | trim | nope \"{uuid}\"}"] {
+            let rendered = Placeholders.render(text, context: .text, source: source)
+            #expect(rendered.text == text)
+            #expect(rendered.issues == [.invalid(text)])
+        }
+        #expect(source.reads.isEmpty)
+        // An unclosed token is literal up to its brace only, so later placeholders still work.
+        let open = Placeholders.render("{date offset=1d hello {clipboard}", context: .text, source: source)
+        #expect(open.text == "{date offset=1d hello clip")
+        #expect(source.reads == ["clipboard 0"])
+        // An unquoted token inside a malformed one is a token of its own.
+        let nested = Placeholders.render("{snippet name=\"a\" {clipboard}}", context: .text, source: source)
+        #expect(nested.text == "{snippet name=\"a\" clip}")
+    }
+
+    @Test func nestedDiagnosticsAreCarriedAndBlock() throws {
+        let snippets = [
+            "Many": "{argument name=\"a\"}{argument name=\"b\"}{argument name=\"c\"}{argument name=\"d\"}",
+            "Typo": "{date x}",
+        ]
+        let many = PlaceholderTemplate("{snippet name=\"Many\"}", context: .quicklink).plan(snippets: { snippets[$0] })
+        #expect(many.issues == [.tooManyArguments("{argument name=\"d\"}")])
+        #expect(many.blockingIssues == many.issues)
+        let typo = PlaceholderTemplate("{snippet name=\"Typo\"}", context: .snippet).plan(snippets: { snippets[$0] })
+        #expect(typo.issues == [.invalid("{date x}")])
+        let source = PlaceholderValues(snippets: snippets, arguments: [.named("a"): "1", .named("b"): "2", .named("c"): "3"])
+        #expect(throws: LibraryValidationError.self) {
+            try QuicklinkTemplate("https://x.com/{snippet name=\"Many\"}").resolve(using: source)
+        }
+        #expect(throws: LibraryValidationError.self) {
+            try QuicklinkTemplate("https://x.com/{snippet name=\"Typo\"}").resolve(using: source)
+        }
+        let calculator = PlaceholderTemplate("{calculator expression=\"{date bad=1}\"}", context: .text).plan(snippets: { _ in nil })
+        #expect(calculator.issues.contains(.invalid("{date bad=1}")))
+    }
+
+    @Test func outputHasACumulativeBudget() {
+        let big = String(repeating: "x", count: 100_000)
+        let repeated = String(repeating: "{clipboard}", count: 40)
+        let rendered = PlaceholderTemplate(repeated, context: .snippet).render(
+            values(clipboard: [big]), options: .init(maximumOutputBytes: 1_000_000))
+        #expect(rendered.issues.contains(.outputTooLong))
+        #expect(rendered.blockingIssues == [.outputTooLong])
+        #expect(rendered.text.utf8.count <= 1_000_000)
+
+        let literal = PlaceholderTemplate(String(repeating: "a", count: 2_000), context: .text).render(
+            values(), options: .init(maximumOutputBytes: 1_000))
+        #expect(literal.issues == [.outputTooLong])
+    }
+
+    @Test func expandingModifierChainsStopBeforeAllocating() {
+        let chain = "{clipboard | json-stringify | json-stringify | json-stringify | json-stringify | json-stringify | json-stringify | json-stringify | json-stringify}"
+        let source = values(clipboard: [String(repeating: "\"", count: 50_000)])
+        let clock = ContinuousClock()
+        let start = clock.now
+        let rendered = Placeholders.render(chain, context: .text, source: source)
+        #expect(rendered.issues.contains(.outputTooLong))
+        #expect(clock.now - start < .seconds(2))
+        let encoded = Placeholders.render("{clipboard | percent-encode}", context: .text, source: source, options: .init(maximumOutputBytes: 100_000))
+        #expect(encoded.issues == [.outputTooLong])
+        #expect(PlaceholderEncoding.percentEncodedSize("a b/é") == PlaceholderEncoding.percentEncoded("a b/é").utf8.count)
+        #expect(PlaceholderEncoding.jsonStringSize("a\"\n\u{1}é") >= PlaceholderEncoding.jsonString("a\"\n\u{1}é").utf8.count)
+    }
+
+    @Test func negativeLimitsAreClamped() {
+        let options = PlaceholderRenderOptions(maximumValueLength: -5, maximumOutputBytes: -1)
+        #expect(options.maximumValueLength == 0 && options.maximumOutputBytes == 0)
+        let rendered = Placeholders.render("{clipboard}", context: .text, source: values(clipboard: ["x"]), options: .init(maximumValueLength: -1))
+        #expect(rendered.text == "")
+    }
+
+    @Test func aiFencesCannotBeClosedByTheirContent() {
+        for content in ["say \"\"\"hi\"\"\" now", "ends with quote\"", "\"\"\"\"\"", "plain"] {
+            let rendered = render("Fix {selection} please", .aiCommand, values(selection: content))
+            let fence = String(repeating: "\"", count: PlaceholderEncoding.fenceLength(for: content))
+            #expect(rendered.text == "Fix " + fence + "\n" + content + "\n" + fence + " please")
+            #expect(!content.contains(fence))
+            let substitution = rendered.substitutions.first
+            #expect(substitution?.kind == .selection && substitution?.value == content)
+            let inserted = substitution.map {
+                (rendered.text as NSString).substring(with: NSRange(location: $0.range.lowerBound, length: $0.range.count))
+            }
+            #expect(inserted == fence + "\n" + content + "\n" + fence)
+        }
+        #expect(PlaceholderEncoding.fenceLength(for: "a\"\"\"\"b") == 5)
+    }
+
+    @Test func blockingClassification() {
+        let blocking: [PlaceholderIssue] = [
+            .tooManyArguments("x"), .missingSnippet("x"), .nestedSnippet("x"), .missingArgument("x"),
+            .calculationFailed("x"), .outputTooLong,
+        ]
+        let benign: [PlaceholderIssue] = [
+            .invalid("x"), .notHonored(.cursor), .unsupported(.browserTab), .duplicateCursor, .unavailable(.clipboard),
+        ]
+        #expect(blocking.allSatisfy { $0.blocksExecution })
+        #expect(benign.allSatisfy { !$0.blocksExecution })
     }
 }

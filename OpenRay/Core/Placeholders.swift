@@ -13,15 +13,20 @@ import Foundation
 //     {clipboard | trim | uppercase}             modifiers chain left to right
 //
 // Text that doesn't form a placeholder stays literal, so code such as
-// `if x { return }` is never changed. A backslash directly before a placeholder
-// (`\{clipboard}`) keeps the placeholder as literal text and drops the backslash.
+// `if x { return }` is never changed. A closed but malformed placeholder stays
+// literal as one span, so nothing inside it is expanded. A backslash directly
+// before a placeholder (`\{clipboard}`) keeps it as literal text and drops the backslash.
 //
-// Usage:
+// Three steps, so nothing is read before it's needed:
 //
-//     let template = PlaceholderTemplate("Hi {argument name=\"who\"}", context: .snippet)
-//     template.arguments                    // ask the person for these
-//     let result = template.render(PlaceholderValues(arguments: [.named("who"): "Ann"]))
-//     result.text                           // "Hi Ann"
+//     let template = PlaceholderTemplate(text, context: .snippet)
+//     let plan = template.plan(snippets: { name in library.snippetText(named: name) })
+//     plan.arguments      // ask the person for these
+//     plan.requirements   // read only these: clipboard offsets, selection, …
+//     plan.issues         // show in an editor; `blocksExecution` ones stop a run
+//     let result = plan.render(PlaceholderValues(arguments: [.named("who"): "Ann"]))
+//
+// `template.render(source)` does all three at once when laziness doesn't matter.
 
 /// Where a template is rendered. The context decides the default formatting of
 /// inserted values and which placeholders are honored.
@@ -32,8 +37,9 @@ enum PlaceholderContext: String, CaseIterable, Sendable {
     /// `percent-encode`. `{query}` and bare `{Name}` act as named arguments, for
     /// templates written before arguments had their own syntax.
     case quicklink
-    /// Inserted content (clipboard, selection, arguments, snippets) is wrapped in
-    /// `"""` so a prompt can tell it apart from instructions, unless `raw` is used.
+    /// Inserted content (clipboard, selection, arguments, snippets) is fenced so a
+    /// prompt can tell it apart from instructions, unless `raw` is used. See
+    /// `PlaceholderEncoding.fenced(_:)`.
     case aiCommand
     /// Plain text: no encoding and no caret. Script commands and anything else.
     case text
@@ -45,8 +51,11 @@ enum PlaceholderModifier: String, CaseIterable, Hashable, Sendable {
     case percentEncode = "percent-encode"
     case jsonStringify = "json-stringify"
     /// Opts out of the context's default formatting (percent-encoding in
-    /// quicklinks, quoting in AI commands). It doesn't change the value.
+    /// quicklinks, fencing in AI commands). It doesn't change the value.
     case raw
+
+    /// The longest chain a placeholder may use; longer chains are invalid.
+    static let maximumChain = 8
 
     func apply(to value: String) -> String {
         switch self {
@@ -69,6 +78,16 @@ enum PlaceholderEncoding {
         value.addingPercentEncoding(withAllowedCharacters: unreserved) ?? ""
     }
 
+    /// The UTF-8 size of `percentEncoded(value)`, computed without allocating it.
+    static func percentEncodedSize(_ value: String) -> Int {
+        value.utf8.reduce(0) { size, byte in
+            let isUnreserved =
+                (48...57).contains(byte) || (65...90).contains(byte) || (97...122).contains(byte)
+                || byte == 45 || byte == 46 || byte == 95 || byte == 126
+            return size + (isUnreserved ? 1 : 3)
+        }
+    }
+
     /// A JSON string literal, including the surrounding quotes.
     static func jsonString(_ value: String) -> String {
         guard
@@ -78,10 +97,45 @@ enum PlaceholderEncoding {
         else { return "\"\"" }
         return string
     }
+
+    /// An upper bound on the UTF-8 size of `jsonString(value)`, computed without allocating it.
+    static func jsonStringSize(_ value: String) -> Int {
+        2
+            + value.unicodeScalars.reduce(0) { size, scalar in
+                switch scalar.value {
+                case 0x22, 0x5C, 0x08, 0x0C, 0x0A, 0x0D, 0x09: size + 2
+                case 0..<0x20, 0x2028, 0x2029, 0x7F: size + 6
+                default: size + String(scalar).utf8.count
+                }
+            }
+    }
+
+    /// Content between fences of double quotes on their own lines. The fence is
+    /// longer than any run of quotes inside, so the content can't close it early,
+    /// and the content itself is unchanged:
+    ///
+    ///     """
+    ///     the value
+    ///     """
+    static func fenced(_ value: String) -> String {
+        let fence = String(repeating: "\"", count: fenceLength(for: value))
+        return fence + "\n" + value + "\n" + fence
+    }
+
+    static func fenceLength(for value: String) -> Int {
+        var longest = 0
+        var run = 0
+        for scalar in value.unicodeScalars {
+            run = scalar == "\"" ? run + 1 : 0
+            longest = max(longest, run)
+        }
+        return max(3, longest + 1)
+    }
 }
 
 /// A date or time offset such as `+2y +5M -3d`. Units: `m` minutes, `h` hours,
-/// `d` days, `M` months, `y` years. There is no space between sign and number.
+/// `d` days, `M` months, `y` years. Each term needs a sign directly before its
+/// digits, as in the reference.
 struct PlaceholderDateOffset: Hashable, Sendable {
     enum Unit: Character, CaseIterable, Sendable {
         case minute = "m", hour = "h", day = "d", month = "M", year = "y"
@@ -106,17 +160,14 @@ struct PlaceholderDateOffset: Hashable, Sendable {
         guard !terms.isEmpty, terms.count <= 12 else { return nil }
         var result: [PlaceholderDateOffset] = []
         for term in terms {
-            guard let last = term.last, let unit = Unit(rawValue: last) else { return nil }
-            var digits = term.dropLast()
-            var sign = 1
-            if digits.first == "+" || digits.first == "-" {
-                sign = digits.first == "-" ? -1 : 1
-                digits = digits.dropFirst()
-            }
-            guard !digits.isEmpty, digits.count <= 6, digits.allSatisfy(\.isASCII), let value = Int(digits) else {
-                return nil
-            }
-            result.append(PlaceholderDateOffset(amount: sign * value, unit: unit))
+            guard let sign = term.first, sign == "+" || sign == "-", let last = term.last,
+                let unit = Unit(rawValue: last)
+            else { return nil }
+            let digits = term.dropFirst().dropLast()
+            guard (1...6).contains(digits.count), digits.allSatisfy({ $0.isASCII && $0.isNumber }),
+                let value = Int(digits)
+            else { return nil }
+            result.append(PlaceholderDateOffset(amount: sign == "-" ? -value : value, unit: unit))
         }
         return result
     }
@@ -127,11 +178,15 @@ struct PlaceholderArgument: Hashable, Sendable, Identifiable {
     enum ID: Hashable, Sendable {
         /// `{argument name="…"}`, `{query}` or a bare quicklink `{Name}`.
         case named(String)
-        /// Each `{argument}` without a name is its own input, numbered from 1.
+        /// Each `{argument}` without a name in the template itself, numbered from 1.
+        /// The numbering never depends on referenced snippets.
         case unnamed(Int)
+        /// An `{argument}` without a name inside the referenced snippet `snippet`,
+        /// numbered from 1 within that snippet.
+        case snippetUnnamed(snippet: String, index: Int)
     }
 
-    /// At most three distinct arguments per template.
+    /// At most three distinct arguments per template, including referenced snippets.
     static let limit = 3
 
     var id: ID
@@ -233,6 +288,9 @@ struct Placeholder: Hashable, Sendable {
             }
         }
 
+        /// Values an AI command fences as quoted content.
+        var isContent: Bool { [.clipboard, .selection, .argument, .snippet, .browserTab].contains(self) }
+
         /// Whether rendering in `context` produces a value. `{cursor}` only works in
         /// snippets, and `{browser-tab}` needs a browser integration OpenRay doesn't have.
         func isHonored(in context: PlaceholderContext) -> Bool {
@@ -255,15 +313,17 @@ struct Placeholder: Hashable, Sendable {
     var source: String
     /// Where the placeholder sits in the template's source text.
     var range: Range<String.Index>
+    /// A quicklink `{query}` or `{Name}` written before arguments had their own syntax.
+    var isLegacyArgument = false
 
     var kind: Kind { token.kind }
 }
 
-/// A problem found while parsing or rendering. Invalid placeholders stay in the
+/// A problem found while planning or rendering. Invalid placeholders stay in the
 /// output as literal text; an editor can show these next to the field.
 enum PlaceholderIssue: Hashable, Sendable {
     /// Text that names a placeholder but has bad syntax or attributes, e.g. an
-    /// unknown locale or both `format` and `locale`.
+    /// unknown locale or both `format` and `locale`. It stays literal.
     case invalid(String)
     /// More than three distinct arguments. Extra ones stay literal.
     case tooManyArguments(String)
@@ -279,8 +339,24 @@ enum PlaceholderIssue: Hashable, Sendable {
     /// A required argument without a value. It renders empty.
     case missingArgument(String)
     case calculationFailed(String)
-    /// Nothing was available for `{clipboard}` or `{selection}`. It renders empty.
+    /// Nothing was available for `{clipboard}` or `{selection}`. It renders empty,
+    /// as the reference documents for an empty clipboard.
     case unavailable(Placeholder.Kind)
+    /// The output passed `PlaceholderRenderOptions.maximumOutputBytes`. Rendering stopped.
+    case outputTooLong
+
+    /// Whether a command should refuse to run. Missing inputs it can't make up,
+    /// failed lookups and oversized output block. Invalid syntax stays literal and
+    /// doesn't block on its own, because code snippets often contain braces; a
+    /// consumer that can't accept literal braces, such as a URL, checks for it.
+    var blocksExecution: Bool {
+        switch self {
+        case .tooManyArguments, .missingSnippet, .nestedSnippet, .missingArgument, .calculationFailed, .outputTooLong:
+            true
+        case .invalid, .notHonored, .unsupported, .duplicateCursor, .unavailable:
+            false
+        }
+    }
 }
 
 extension PlaceholderIssue {
@@ -297,13 +373,14 @@ extension PlaceholderIssue {
         case .missingArgument(let title): "Enter a value for “\(title)”."
         case .calculationFailed(let expression): "“\(expression)” couldn't be calculated."
         case .unavailable(let kind): "\(kind.title) wasn't available."
+        case .outputTooLong: "The result is too long."
         }
     }
 }
 
 /// The values placeholders read. Every requirement has a default, so a source
-/// only implements what it can provide. Rendering calls each method only when the
-/// template needs it, so an expensive lookup such as the selection stays lazy.
+/// only implements what it can provide. A plan calls each method only when the
+/// template needs it; `PlaceholderPlan.requirements` says which ahead of time.
 protocol PlaceholderDataSource {
     var now: Date { get }
     /// The calendar for offsets and formatting. Its time zone is used for output.
@@ -312,7 +389,7 @@ protocol PlaceholderDataSource {
     /// Text copied `offset` entries ago; 0 is the current clipboard.
     func clipboardText(offset: Int) -> String?
     func selectedText() -> String?
-    /// The raw text of the snippet with this name.
+    /// The raw text of the snippet with this name. Planning calls only this.
     func snippetText(named name: String) -> String?
     func value(for argument: PlaceholderArgument) -> String?
     /// The result of a math expression, formatted for insertion.
@@ -332,22 +409,47 @@ extension PlaceholderDataSource {
     func makeUUID() -> UUID { UUID() }
 }
 
-/// A ready-made data source holding plain values. Tests and simple callers use it
-/// directly; the app can fill it from the clipboard history and snippet library.
+/// An immutable snapshot of placeholder values. Tests and simple callers use it
+/// directly; the app fills it from `PlaceholderPlan.requirements` at the moment
+/// a command runs.
 struct PlaceholderValues: PlaceholderDataSource, Sendable {
-    var now: Date = .now
-    var calendar: Calendar = .current
-    var locale: Locale = .current
-    /// Most recent first. Index 0 is `{clipboard}`.
-    var clipboard: [String] = []
+    var now: Date
+    var calendar: Calendar
+    var locale: Locale
+    /// What `{clipboard}` inserts. Nil when the clipboard holds no readable text.
+    var currentClipboard: String?
+    /// Earlier copies, newest first: `{clipboard offset=1}` is the first.
+    var clipboardHistory: [String]
     var selection: String?
     /// Snippet text by name. Lookup is exact first, then case-insensitive.
-    var snippets: [String: String] = [:]
-    var arguments: [PlaceholderArgument.ID: String] = [:]
+    var snippets: [String: String]
+    var arguments: [PlaceholderArgument.ID: String]
     var calculator: (@Sendable (String) -> String?)?
-    var uuid: @Sendable () -> UUID = { UUID() }
+    var uuid: @Sendable () -> UUID
 
-    func clipboardText(offset: Int) -> String? { clipboard.indices.contains(offset) ? clipboard[offset] : nil }
+    /// `clipboard` lists copies newest first: the current clipboard, then history.
+    init(
+        now: Date = .now, calendar: Calendar = .current, locale: Locale = .current, clipboard: [String] = [],
+        selection: String? = nil, snippets: [String: String] = [:], arguments: [PlaceholderArgument.ID: String] = [:],
+        calculator: (@Sendable (String) -> String?)? = nil, uuid: @escaping @Sendable () -> UUID = { UUID() }
+    ) {
+        self.now = now
+        self.calendar = calendar
+        self.locale = locale
+        currentClipboard = clipboard.first
+        clipboardHistory = Array(clipboard.dropFirst())
+        self.selection = selection
+        self.snippets = snippets
+        self.arguments = arguments
+        self.calculator = calculator
+        self.uuid = uuid
+    }
+
+    func clipboardText(offset: Int) -> String? {
+        if offset == 0 { return currentClipboard }
+        return clipboardHistory.indices.contains(offset - 1) ? clipboardHistory[offset - 1] : nil
+    }
+
     func selectedText() -> String? { selection }
 
     func snippetText(named name: String) -> String? {
@@ -360,31 +462,63 @@ struct PlaceholderValues: PlaceholderDataSource, Sendable {
     func makeUUID() -> UUID { uuid() }
 }
 
-/// The output of rendering a template.
+/// What a plan will read when it renders, including referenced snippets and
+/// calculator expressions. Gather exactly these before rendering.
+struct PlaceholderRequirements: Hashable, Sendable {
+    var clipboardOffsets: Set<Int> = []
+    var selection = false
+    var calculator = false
+    var uuid = false
+    /// Dates and times read the clock, calendar and locale.
+    var clock = false
+    /// Names of referenced snippets, resolved or not, in order.
+    var snippets: [String] = []
+
+    var clipboard: Bool { !clipboardOffsets.isEmpty }
+}
+
+/// Where one placeholder's value landed in the output, for callers that want
+/// structured content instead of the formatted text, e.g. an AI prompt builder.
+struct PlaceholderSubstitution: Equatable, Sendable {
+    var kind: Placeholder.Kind
+    /// UTF-16 offsets into `PlaceholderRendering.text`, after formatting.
+    var range: Range<Int>
+    /// The value after modifiers, before the context's default formatting.
+    var value: String
+}
+
+/// The output of rendering a plan.
 struct PlaceholderRendering: Equatable, Sendable {
     var text: String
     /// Where `{cursor}` was, as a UTF-16 offset into `text` (an `NSRange` location).
     var cursorUTF16Offset: Int?
-    /// Every argument the template needs, including those of referenced snippets,
-    /// in order of first appearance.
+    /// Every argument the plan needs, in order of first appearance.
     var arguments: [PlaceholderArgument]
     var issues: [PlaceholderIssue]
+    var substitutions: [PlaceholderSubstitution] = []
 
     /// The caret position in characters from the start of `text`.
     var cursorOffset: Int? {
         cursorIndex.map { text.distance(from: text.startIndex, to: $0) }
     }
 
-    /// How many characters follow the caret, i.e. how many times to press ← after
-    /// typing `text` to put the caret where `{cursor}` was.
+    /// How many characters follow the caret.
     var charactersAfterCursor: Int? {
         cursorIndex.map { text[$0...].count }
+    }
+
+    /// How many UTF-16 code units follow the caret.
+    var utf16AfterCursor: Int? {
+        cursorUTF16Offset.map { text.utf16.count - $0 }
     }
 
     var cursorIndex: String.Index? {
         guard let offset = cursorUTF16Offset, (0...text.utf16.count).contains(offset) else { return nil }
         return String.Index(utf16Offset: offset, in: text)
     }
+
+    /// Issues that should stop a command from using this text.
+    var blockingIssues: [PlaceholderIssue] { issues.filter(\.blocksExecution) }
 
     /// Required arguments that had no value.
     var missingArguments: [String] {
@@ -422,80 +556,54 @@ struct PlaceholderTemplate: Hashable, Sendable {
 
     var hasPlaceholders: Bool { !placeholders.isEmpty }
 
-    func contains(_ kind: Placeholder.Kind) -> Bool { placeholders.contains { $0.kind == kind } }
-
-    /// The arguments written directly in this template, deduplicated by name and
-    /// capped at three. Use `arguments(using:)` to include referenced snippets.
-    var arguments: [PlaceholderArgument] {
-        var collector = PlaceholderArgumentCollector()
-        for placeholder in placeholders {
-            switch placeholder.token {
-            case .argument(let argument): _ = collector.register(argument, source: placeholder.source)
-            case .calculator(let expression):
-                for nested in PlaceholderTemplate(expression, context: context).placeholders {
-                    if case .argument(let argument) = nested.token {
-                        _ = collector.register(argument, source: nested.source)
-                    }
-                }
-            default: break
-            }
-        }
-        return collector.arguments
+    /// Resolves referenced snippets with `snippets`, the only lookup planning does,
+    /// and works out arguments, issues and requirements without reading any value.
+    func plan(snippets: (String) -> String?) -> PlaceholderPlan {
+        PlaceholderPlan(template: self, snippets: snippets)
     }
 
-    /// The arguments this template needs, including those inside referenced snippets.
-    func arguments(using source: some PlaceholderDataSource) -> [PlaceholderArgument] {
-        render(source).arguments
-    }
+    /// The arguments written in this template and its calculator expressions.
+    /// IDs match a full plan's; referenced snippets add their own `.snippetUnnamed`
+    /// or named arguments, so use `plan(snippets:)` to see those too.
+    var arguments: [PlaceholderArgument] { plan(snippets: { _ in nil }).arguments }
 
-    /// Issues an editor should show before saving: bad syntax, too many arguments,
-    /// a second `{cursor}`, and placeholders this context ignores.
+    /// Issues an editor should show before saving: syntax, too many arguments, a
+    /// second `{cursor}` and placeholders this context ignores. Snippet references
+    /// aren't looked up; use `plan(snippets:).issues` for those.
     var validationIssues: [PlaceholderIssue] {
-        var issues = parseIssues
-        let argumentSources = placeholders.filter { $0.kind == .argument }
-        var collector = PlaceholderArgumentCollector()
-        for placeholder in argumentSources {
-            if case .argument(let argument) = placeholder.token, collector.register(argument, source: placeholder.source) == nil {
-                issues.append(.tooManyArguments(placeholder.source))
-            }
+        plan(snippets: { _ in nil }).issues.filter {
+            if case .missingSnippet = $0 { false } else { true }
         }
-        var sawCursor = false
-        for placeholder in placeholders {
-            if !placeholder.kind.isHonored(in: context) {
-                issues.append(
-                    placeholder.kind == .browserTab ? .unsupported(.browserTab) : .notHonored(placeholder.kind))
-            } else if placeholder.kind == .cursor {
-                if sawCursor { issues.append(.duplicateCursor) }
-                sawCursor = true
-            }
-        }
-        return issues
     }
 
+    /// Plans with `source`'s snippets, then renders from `source`.
     func render(_ source: some PlaceholderDataSource, options: PlaceholderRenderOptions = .init())
         -> PlaceholderRendering
     {
-        var renderer = PlaceholderRenderer(source: source, options: options)
-        return renderer.render(self)
+        plan(snippets: source.snippetText(named:)).render(source, options: options)
     }
 }
 
-/// Rendering switches that a caller may need beyond the context's defaults.
+/// Limits and switches for rendering.
 struct PlaceholderRenderOptions: Equatable, Sendable {
     /// Set to false to skip the context's default formatting, e.g. to render a
     /// quicklink file path whose values must not be percent-encoded.
-    var appliesContextFormatting = true
-    /// Values longer than this are cut, so a huge clipboard can't blow up a URL or prompt.
-    var maximumValueLength = 200_000
+    var appliesContextFormatting: Bool
+    /// Characters kept from each inserted value before modifiers.
+    var maximumValueLength: Int
+    /// The UTF-8 size the whole output may reach, counting literals, modifiers,
+    /// formatting and referenced snippets. Past it, rendering stops with `.outputTooLong`.
+    var maximumOutputBytes: Int
 
-    init(appliesContextFormatting: Bool = true, maximumValueLength: Int = 200_000) {
+    init(appliesContextFormatting: Bool = true, maximumValueLength: Int = 200_000, maximumOutputBytes: Int = 1_000_000) {
         self.appliesContextFormatting = appliesContextFormatting
-        self.maximumValueLength = maximumValueLength
+        self.maximumValueLength = max(0, maximumValueLength)
+        self.maximumOutputBytes = max(0, maximumOutputBytes)
     }
 }
 
 enum Placeholders {
-    /// Parses and renders in one step.
+    /// Parses, plans and renders in one step.
     static func render(
         _ template: String, context: PlaceholderContext, source: some PlaceholderDataSource,
         options: PlaceholderRenderOptions = .init()
@@ -504,29 +612,20 @@ enum Placeholders {
     }
 }
 
-/// Deduplicates arguments by name, numbers unnamed ones, and enforces the limit.
+/// Deduplicates arguments by ID, merges defaults and options across occurrences,
+/// and enforces the limit.
 struct PlaceholderArgumentCollector {
     private(set) var arguments: [PlaceholderArgument] = []
-    private var unnamedCount = 0
 
-    /// Returns the registered argument, with its final ID and merged default and
-    /// options, or nil when the template already has three distinct arguments.
-    mutating func register(_ argument: PlaceholderArgument, source: String) -> PlaceholderArgument? {
-        var argument = argument
-        if case .unnamed = argument.id {
-            guard arguments.count < PlaceholderArgument.limit else { return nil }
-            unnamedCount += 1
-            argument.id = .unnamed(unnamedCount)
-            arguments.append(argument)
-            return argument
-        }
+    /// Returns false when the template already has three distinct arguments.
+    mutating func register(_ argument: PlaceholderArgument) -> Bool {
         if let index = arguments.firstIndex(where: { $0.id == argument.id }) {
             if arguments[index].defaultValue == nil { arguments[index].defaultValue = argument.defaultValue }
             if arguments[index].options.isEmpty { arguments[index].options = argument.options }
-            return arguments[index]
+            return true
         }
-        guard arguments.count < PlaceholderArgument.limit else { return nil }
+        guard arguments.count < PlaceholderArgument.limit else { return false }
         arguments.append(argument)
-        return argument
+        return true
     }
 }
