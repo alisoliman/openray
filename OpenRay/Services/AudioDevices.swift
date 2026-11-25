@@ -63,6 +63,14 @@ protocol AudioDeviceControlling: AnyObject {
     func setMuted(_ muted: Bool, of device: AudioDevice, scope: AudioScope) throws
     func canSetVolume(of device: AudioDevice, scope: AudioScope) -> Bool
     func canMute(_ device: AudioDevice, scope: AudioScope) -> Bool
+    /// Gain controls that can silence the device: the main element when it has
+    /// one, else each channel that has its own.
+    func gainElements(of device: AudioDevice, scope: AudioScope) -> [UInt32]
+    /// True when `gainElements` covers every channel the device streams, so zero
+    /// gain on all of them is silence.
+    func gainCoversAllChannels(of device: AudioDevice, scope: AudioScope) -> Bool
+    func gain(of device: AudioDevice, scope: AudioScope, element: UInt32) -> Double?
+    func setGain(_ gain: Double, of device: AudioDevice, scope: AudioScope, element: UInt32) throws
 }
 
 // MARK: - Volume logic
@@ -111,49 +119,96 @@ struct VolumeControl {
     }
 }
 
-/// Toggle Microphone Mute. Uses the input's mute control, or turns its volume
-/// to zero and back when it has none.
+/// Toggle Microphone Mute, across every input so an app that picked another
+/// microphone directly is muted too. Each input uses its mute control; one
+/// without uses zero gain, but only when gain covers every channel and reads
+/// back as silent. Gains are remembered per device and channel, so unmuting
+/// restores each microphone's own levels.
 @MainActor
 final class MicrophoneMuteControl {
-    static let fallbackVolume = 0.75
+    struct Outcome: Equatable, Sendable {
+        /// The state every input was asked to take.
+        var muted: Bool
+        /// Inputs now in that state.
+        var changed: [String]
+        /// Inputs that couldn't change, by name.
+        var unchanged: [String]
+    }
 
     let audio: any AudioDeviceControlling
-    /// The level to return to when the microphone was muted by volume.
-    private(set) var restoreVolume: Double?
+    /// Device UID → channel element → gain before muting.
+    private(set) var savedGains: [String: [UInt32: Double]] = [:]
 
     init(audio: any AudioDeviceControlling) {
         self.audio = audio
     }
 
-    /// Returns whether the microphone is now muted.
-    func toggle() throws -> Bool {
-        guard let device = audio.defaultDevice(for: .input) else { throw AudioDeviceError.noDevice(.input) }
-        if audio.canMute(device, scope: .input), let muted = audio.isMuted(device, scope: .input) {
-            try audio.setMuted(!muted, of: device, scope: .input)
-            return !muted
+    /// Mutes every input when any of them is live; otherwise unmutes them all.
+    func toggle() throws -> Outcome {
+        let inputs = audio.devices(for: .input)
+        guard !inputs.isEmpty else { throw AudioDeviceError.noDevice(.input) }
+        let muting = inputs.contains { isLive($0) }
+        var outcome = Outcome(muted: muting, changed: [], unchanged: [])
+        for device in inputs {
+            let done = (try? set(device, muted: muting)) ?? false
+            if done { outcome.changed.append(device.name) } else { outcome.unchanged.append(device.name) }
         }
-        guard audio.canSetVolume(of: device, scope: .input), let level = audio.volume(of: device, scope: .input) else {
-            throw AudioDeviceError.noMuteControl
+        guard !outcome.changed.isEmpty else { throw AudioDeviceError.noMuteControl }
+        return outcome
+    }
+
+    /// Whether apps can hear this input: not muted, and not at zero gain on every channel.
+    func isLive(_ device: AudioDevice) -> Bool {
+        if audio.canMute(device, scope: .input), audio.isMuted(device, scope: .input) == true { return false }
+        if audio.gainCoversAllChannels(of: device, scope: .input), isSilentByGain(device) { return false }
+        return true
+    }
+
+    private func isSilentByGain(_ device: AudioDevice) -> Bool {
+        let elements = audio.gainElements(of: device, scope: .input)
+        return !elements.isEmpty
+            && elements.allSatisfy { audio.gain(of: device, scope: .input, element: $0) == 0 }
+    }
+
+    /// Returns whether the device ended up in the requested state.
+    private func set(_ device: AudioDevice, muted: Bool) throws -> Bool {
+        if audio.canMute(device, scope: .input) {
+            try audio.setMuted(muted, of: device, scope: .input)
+            return audio.isMuted(device, scope: .input) == muted
         }
-        if level > 0 {
-            try audio.setVolume(0, of: device, scope: .input)
-            restoreVolume = level
-            return true
+        guard audio.gainCoversAllChannels(of: device, scope: .input) else { return false }
+        let elements = audio.gainElements(of: device, scope: .input)
+        if muted {
+            var saved = savedGains[device.uid] ?? [:]
+            for element in elements {
+                if let gain = audio.gain(of: device, scope: .input, element: element), gain > 0 {
+                    saved[element] = gain
+                }
+            }
+            savedGains[device.uid] = saved
+            for element in elements { try audio.setGain(0, of: device, scope: .input, element: element) }
+            return isSilentByGain(device)
         }
-        try audio.setVolume(restoreVolume ?? Self.fallbackVolume, of: device, scope: .input)
-        restoreVolume = nil
-        return false
+        // Only levels this control saved come back; another microphone's never do.
+        guard let saved = savedGains[device.uid], !saved.isEmpty else { return !isSilentByGain(device) }
+        for (element, gain) in saved { try audio.setGain(gain, of: device, scope: .input, element: element) }
+        savedGains[device.uid] = nil
+        return !isSilentByGain(device)
     }
 }
 
 // MARK: - Core Audio
 
-/// The real sound devices. Reading is harmless; every change checks `SideEffectGuard`.
+/// The real sound devices. Reading is harmless; every change checks its `SideEffectGuard` first.
 @MainActor
 final class CoreAudioDevices: AudioDeviceControlling {
     private static let system = AudioObjectID(kAudioObjectSystemObject)
 
-    nonisolated init() {}
+    let sideEffects: SideEffectGuard
+
+    nonisolated init(sideEffects: SideEffectGuard = .current) {
+        self.sideEffects = sideEffects
+    }
 
     func devices(for scope: AudioScope) -> [AudioDevice] {
         var address = Self.address(kAudioHardwarePropertyDevices)
@@ -174,7 +229,7 @@ final class CoreAudioDevices: AudioDeviceControlling {
     }
 
     func setDefaultDevice(_ device: AudioDevice, for scope: AudioScope) throws {
-        try SideEffectGuard.check("changing the sound device")
+        try sideEffects.check("changing the sound device")
         if scope == .output {
             try write(Self.system, Self.address(kAudioHardwarePropertyDefaultOutputDevice), device.id)
             // Alerts follow the output, as when choosing it in Control Center.
@@ -193,7 +248,7 @@ final class CoreAudioDevices: AudioDeviceControlling {
     }
 
     func setVolume(_ volume: Double, of device: AudioDevice, scope: AudioScope) throws {
-        try SideEffectGuard.check("changing the volume")
+        try sideEffects.check("changing the volume")
         let elements = volumeElements(device.id, scope: scope)
         guard !elements.isEmpty else { throw AudioDeviceError.noVolumeControl }
         let value = Float32(min(max(volume, 0), 1))
@@ -208,7 +263,7 @@ final class CoreAudioDevices: AudioDeviceControlling {
     }
 
     func setMuted(_ muted: Bool, of device: AudioDevice, scope: AudioScope) throws {
-        try SideEffectGuard.check("muting a sound device")
+        try sideEffects.check("muting a sound device")
         try write(device.id, Self.address(kAudioDevicePropertyMute, scope: scope), UInt32(muted ? 1 : 0))
     }
 
@@ -218,6 +273,51 @@ final class CoreAudioDevices: AudioDeviceControlling {
 
     func canMute(_ device: AudioDevice, scope: AudioScope) -> Bool {
         isSettable(device.id, Self.address(kAudioDevicePropertyMute, scope: scope))
+    }
+
+    func gainElements(of device: AudioDevice, scope: AudioScope) -> [UInt32] {
+        let main = kAudioObjectPropertyElementMain
+        if isSettable(device.id, Self.address(kAudioDevicePropertyVolumeScalar, scope: scope, element: main)) {
+            return [main]
+        }
+        let count = channelCount(device.id, scope: scope)
+        guard count > 0 else { return [] }
+        return (1...UInt32(count)).filter {
+            isSettable(device.id, Self.address(kAudioDevicePropertyVolumeScalar, scope: scope, element: $0))
+        }
+    }
+
+    func gainCoversAllChannels(of device: AudioDevice, scope: AudioScope) -> Bool {
+        let elements = gainElements(of: device, scope: scope)
+        if elements == [kAudioObjectPropertyElementMain] { return true }
+        let count = channelCount(device.id, scope: scope)
+        return count > 0 && elements.count == count
+    }
+
+    func gain(of device: AudioDevice, scope: AudioScope, element: UInt32) -> Double? {
+        let value: Float32? = read(
+            device.id, Self.address(kAudioDevicePropertyVolumeScalar, scope: scope, element: element), initial: 0)
+        return value.map(Double.init)
+    }
+
+    func setGain(_ gain: Double, of device: AudioDevice, scope: AudioScope, element: UInt32) throws {
+        try sideEffects.check("changing a microphone's level")
+        try write(
+            device.id, Self.address(kAudioDevicePropertyVolumeScalar, scope: scope, element: element),
+            Float32(min(max(gain, 0), 1)))
+    }
+
+    /// Channels across the device's streams in this direction.
+    private func channelCount(_ id: AudioObjectID, scope: AudioScope) -> Int {
+        var address = Self.address(kAudioDevicePropertyStreamConfiguration, scope: scope)
+        var size: UInt32 = 0
+        guard AudioObjectGetPropertyDataSize(id, &address, 0, nil, &size) == noErr, size > 0 else { return 0 }
+        let raw = UnsafeMutableRawPointer.allocate(
+            byteCount: Int(size), alignment: MemoryLayout<AudioBufferList>.alignment)
+        defer { raw.deallocate() }
+        guard AudioObjectGetPropertyData(id, &address, 0, nil, &size, raw) == noErr else { return 0 }
+        let list = UnsafeMutableAudioBufferListPointer(raw.assumingMemoryBound(to: AudioBufferList.self))
+        return list.reduce(0) { $0 + Int($1.mNumberChannels) }
     }
 
     // MARK: Helpers
@@ -318,5 +418,42 @@ final class CoreAudioDevices: AudioDeviceControlling {
         let status = withUnsafeMutablePointer(to: &value) { AudioObjectGetPropertyData(id, &address, 0, nil, &size, $0) }
         guard status == noErr, let value else { return nil }
         return value.takeRetainedValue() as String
+    }
+}
+
+// MARK: - Defaults
+
+enum AudioDeviceEnvironment {
+    /// Core Audio in a normal launch; no devices and no changes in inert launches.
+    static func makeDefault(sideEffects: SideEffectGuard = .current) -> any AudioDeviceControlling {
+        sideEffects.isInert ? InertAudioDevices(sideEffects: sideEffects) : CoreAudioDevices(sideEffects: sideEffects)
+    }
+}
+
+/// Lists nothing and refuses every change. The default in inert launches.
+@MainActor
+final class InertAudioDevices: AudioDeviceControlling {
+    let sideEffects: SideEffectGuard
+
+    nonisolated init(sideEffects: SideEffectGuard = .current) {
+        self.sideEffects = sideEffects
+    }
+
+    func devices(for scope: AudioScope) -> [AudioDevice] { [] }
+    func defaultDevice(for scope: AudioScope) -> AudioDevice? { nil }
+    func setDefaultDevice(_ device: AudioDevice, for scope: AudioScope) throws { try refuse() }
+    func volume(of device: AudioDevice, scope: AudioScope) -> Double? { nil }
+    func setVolume(_ volume: Double, of device: AudioDevice, scope: AudioScope) throws { try refuse() }
+    func isMuted(_ device: AudioDevice, scope: AudioScope) -> Bool? { nil }
+    func setMuted(_ muted: Bool, of device: AudioDevice, scope: AudioScope) throws { try refuse() }
+    func canSetVolume(of device: AudioDevice, scope: AudioScope) -> Bool { false }
+    func canMute(_ device: AudioDevice, scope: AudioScope) -> Bool { false }
+    func gainElements(of device: AudioDevice, scope: AudioScope) -> [UInt32] { [] }
+    func gainCoversAllChannels(of device: AudioDevice, scope: AudioScope) -> Bool { false }
+    func gain(of device: AudioDevice, scope: AudioScope, element: UInt32) -> Double? { nil }
+    func setGain(_ gain: Double, of device: AudioDevice, scope: AudioScope, element: UInt32) throws { try refuse() }
+
+    private func refuse() throws {
+        throw SideEffectGuard.Blocked(what: "changing sound settings", mode: sideEffects.mode)
     }
 }

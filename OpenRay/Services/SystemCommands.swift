@@ -4,28 +4,6 @@ import CoreWLAN
 import IOKit
 import IOKit.pwr_mgt
 
-// MARK: - Safety
-
-/// Keeps the unit-test host from touching the user's Mac. Every real executor
-/// (system actions, window moves, audio changes, menu presses) checks it first,
-/// and the default executor in the test host is inert.
-enum SideEffectGuard {
-    static let isTestHost: Bool = {
-        let environment = ProcessInfo.processInfo.environment
-        return environment["XCTestConfigurationFilePath"] != nil || environment["XCTestBundlePath"] != nil
-            || environment["XCTestSessionIdentifier"] != nil || NSClassFromString("XCTestCase") != nil
-    }()
-
-    struct Blocked: LocalizedError, Equatable {
-        var action: String
-        var errorDescription: String? { "OpenRay doesn't allow \(action) while tests run." }
-    }
-
-    static func check(_ action: String) throws {
-        if isTestHost { throw Blocked(action: action) }
-    }
-}
-
 // MARK: - Catalog
 
 /// A command that runs at once with no view, such as Lock Screen or Empty Trash.
@@ -179,7 +157,7 @@ struct SystemCommand: Identifiable, Sendable {
             .setVolume100, "Set Volume to 100%", "Set the output volume to full", symbol: "speaker.wave.3.fill",
             keywords: "volume full max sound", group: .media),
         .init(
-            .toggleMicrophoneMute, "Toggle Microphone Mute", "Mute or unmute the default microphone",
+            .toggleMicrophoneMute, "Toggle Microphone Mute", "Mute or unmute every microphone",
             symbol: "mic.slash.fill", keywords: "microphone mic mute unmute input", group: .media),
         .init(
             .showDesktop, "Show Desktop", "Move windows aside to show the desktop", symbol: "menubar.dock.rectangle",
@@ -230,7 +208,10 @@ struct SystemCommand: Identifiable, Sendable {
         ),
         .init(
             .toggleWiFi, "Toggle Wi-Fi", "Turn Wi-Fi on or off", symbol: "wifi", keywords: "wifi wi-fi wireless network",
-            group: .connectivity),
+            group: .connectivity,
+            limitation:
+                "Needs an administrator when Wi-Fi settings require one to turn Wi-Fi on or off (System Settings → Wi-Fi → Advanced)."
+        ),
     ]
 
     static let loginWindow = "com.apple.loginwindow"
@@ -239,7 +220,18 @@ struct SystemCommand: Identifiable, Sendable {
 
     // MARK: Running
 
+    /// The confirmation to show for this run. Quit Others names the app it keeps.
+    func confirmation(for context: SystemCommandContext) -> Confirmation? {
+        guard var confirmation else { return nil }
+        if id == .quitAllAppsExceptFrontmost, let keep = context.foregroundApplication {
+            confirmation.title = "Quit every app except \(keep.name)?"
+        }
+        return confirmation
+    }
+
     /// The action to perform, given the typed argument and the app you came from.
+    /// Commands that keep or restart "the app you were using" need a live,
+    /// external foreground app; they never fall back to acting on every app.
     func action(argument: String? = nil, context: SystemCommandContext = .init()) throws -> SystemAction {
         switch id {
         case .lockScreen: return .lockScreen
@@ -268,16 +260,16 @@ struct SystemCommand: Identifiable, Sendable {
         case .emptyTrash: return .emptyTrash
         case .ejectAllDisks: return .ejectAllDisks
         case .toggleHiddenFiles: return .toggleHiddenFiles
-        case .hideOtherApps: return .hideApps(keeping: context.frontmostPID)
+        case .hideOtherApps:
+            return .hideOtherApps(keeping: try context.requireForeground("the app you want to keep"))
         case .unhideAllApps: return .unhideApps
-        case .quitAllApps: return .quitApps(keeping: nil, excluded: context.excludedBundleIdentifiers)
+        case .quitAllApps: return .quitAllApps(excluded: context.excludedBundleIdentifiers)
         case .quitAllAppsExceptFrontmost:
-            return .quitApps(keeping: context.frontmostPID, excluded: context.excludedBundleIdentifiers)
+            return .quitOtherApps(
+                keeping: try context.requireForeground("the app you want to keep"),
+                excluded: context.excludedBundleIdentifiers)
         case .restartFrontmostApp:
-            guard let pid = context.frontmostPID else {
-                throw LibraryValidationError("Open OpenRay from the app you want to restart.")
-            }
-            return .restartApp(pid)
+            return .restartApp(try context.requireForeground("the app you want to restart"))
         case .dismissNotifications: return .dismissNotifications
         case .toggleWiFi: return .toggleWiFi
         }
@@ -298,10 +290,17 @@ struct SystemCommand: Identifiable, Sendable {
         case .muted(let muted):
             return muted
                 ? HUDMessage("Muted", symbol: "speaker.slash.fill") : HUDMessage("Unmuted", symbol: "speaker.wave.2.fill")
-        case .microphoneMuted(let muted):
-            return muted
-                ? HUDMessage("Microphone muted", symbol: "mic.slash.fill")
-                : HUDMessage("Microphone on", symbol: "mic.fill")
+        case .microphones(let muted, let changed, let unchanged):
+            let symbol = muted ? "mic.slash.fill" : "mic.fill"
+            if unchanged.isEmpty {
+                if changed == 1 { return HUDMessage(muted ? "Microphone muted" : "Microphone on", symbol: symbol) }
+                return HUDMessage(muted ? "\(changed) microphones muted" : "\(changed) microphones on", symbol: symbol)
+            }
+            let names = unchanged.joined(separator: ", ")
+            return HUDMessage(
+                muted ? "Muted \(changed) of \(changed + unchanged.count) microphones. \(names) is still on"
+                    : "Turned on \(changed) of \(changed + unchanged.count) microphones. \(names) is still off",
+                symbol: "exclamationmark.triangle.fill", style: .warning)
         case .appearance(let dark):
             return dark
                 ? HUDMessage("Dark appearance", symbol: "moon.fill") : HUDMessage("Light appearance", symbol: "sun.max.fill")
@@ -365,12 +364,51 @@ struct SystemCommand: Identifiable, Sendable {
     }
 }
 
+/// A running app, pinned by more than its process ID so a reused PID never
+/// stands in for the app the person meant.
+struct AppIdentity: Equatable, Sendable {
+    var pid: pid_t
+    var bundleIdentifier: String?
+    var name: String
+    var launchDate: Date?
+
+    init(pid: pid_t, bundleIdentifier: String?, name: String, launchDate: Date?) {
+        self.pid = pid
+        self.bundleIdentifier = bundleIdentifier
+        self.name = name
+        self.launchDate = launchDate
+    }
+
+    @MainActor
+    init(_ application: NSRunningApplication) {
+        self.init(
+            pid: application.processIdentifier, bundleIdentifier: application.bundleIdentifier,
+            name: application.localizedName ?? "the app", launchDate: application.launchDate)
+    }
+
+    /// The same app is still running under this PID.
+    func matches(_ app: RunningAppInfo) -> Bool {
+        app.pid == pid && app.bundleIdentifier == bundleIdentifier && (launchDate == nil || app.launchDate == launchDate)
+    }
+}
+
 /// What a system command knows about where it was run from.
 struct SystemCommandContext: Equatable, Sendable {
-    /// The app you came from.
-    var frontmostPID: pid_t?
+    /// The app that was frontmost when the launcher opened. Capture it when the
+    /// launcher opens; a window chosen with the target chip must never replace it.
+    var foregroundApplication: AppIdentity?
     /// Apps that Quit All Apps leaves running.
     var excludedBundleIdentifiers: Set<String> = []
+
+    /// The foreground app, which must be another app than OpenRay.
+    func requireForeground(_ role: String, ownPID: pid_t = ProcessInfo.processInfo.processIdentifier) throws
+        -> AppIdentity
+    {
+        guard let app = foregroundApplication, app.pid != ownPID, app.pid > 0 else {
+            throw LibraryValidationError("Open OpenRay from \(role), then try again.")
+        }
+        return app
+    }
 }
 
 // MARK: - Actions
@@ -395,10 +433,11 @@ enum SystemAction: Equatable, Sendable {
     case media(MediaKey)
     case volume(VolumeChange)
     case toggleMicrophoneMute
-    case hideApps(keeping: pid_t?)
+    case hideOtherApps(keeping: AppIdentity)
     case unhideApps
-    case quitApps(keeping: pid_t?, excluded: Set<String>)
-    case restartApp(pid_t)
+    case quitAllApps(excluded: Set<String>)
+    case quitOtherApps(keeping: AppIdentity, excluded: Set<String>)
+    case restartApp(AppIdentity)
     case dismissNotifications
     case toggleWiFi
 }
@@ -407,7 +446,8 @@ enum SystemActionResult: Equatable, Sendable {
     case done
     case volume(Double, muted: Bool)
     case muted(Bool)
-    case microphoneMuted(Bool)
+    /// Every input was asked to change; `unchanged` names the ones that couldn't.
+    case microphones(muted: Bool, changed: Int, unchanged: [String])
     case appearance(dark: Bool)
     case hiddenFiles(visible: Bool)
     case ejected(count: Int, failed: [String])
@@ -418,25 +458,32 @@ enum SystemActionResult: Equatable, Sendable {
 }
 
 /// Carries out system actions. `LiveSystemActions` is the real one; tests use a
-/// recording fake, and the test host's default is `InertSystemActions`.
+/// recording fake, and inert launches get `InertSystemActions`.
 @MainActor
 protocol SystemActionPerforming: AnyObject {
     func perform(_ action: SystemAction) async throws -> SystemActionResult
 }
 
 enum SystemActionEnvironment {
-    /// The live executor in the app, an inert one in the unit-test host.
+    /// The live executor in a normal launch; an inert one in the test host and in
+    /// isolated verification mode.
     @MainActor
-    static func makeDefault() -> any SystemActionPerforming {
-        SideEffectGuard.isTestHost ? InertSystemActions() : LiveSystemActions()
+    static func makeDefault(sideEffects: SideEffectGuard = .current) -> any SystemActionPerforming {
+        sideEffects.isInert ? InertSystemActions(sideEffects: sideEffects) : LiveSystemActions(sideEffects: sideEffects)
     }
 }
 
-/// Refuses every action. The default executor while tests run.
+/// Refuses every action. The default executor in inert launches.
 @MainActor
 final class InertSystemActions: SystemActionPerforming {
+    let sideEffects: SideEffectGuard
+
+    init(sideEffects: SideEffectGuard = .current) {
+        self.sideEffects = sideEffects
+    }
+
     func perform(_ action: SystemAction) async throws -> SystemActionResult {
-        throw SideEffectGuard.Blocked(action: "system commands")
+        throw SideEffectGuard.Blocked(what: "system commands", mode: sideEffects.mode)
     }
 }
 
@@ -461,25 +508,37 @@ struct RunningAppInfo: Equatable, Sendable {
     /// A regular app with a Dock icon, not an agent or a background helper.
     var isRegular: Bool
     var isHidden: Bool
+    var launchDate: Date? = nil
 }
 
 enum AppSelection {
     /// Finder relaunches itself; quitting it only flashes the desktop.
     static let neverQuit: Set<String> = [SystemCommand.finder]
 
-    static func hideTargets(_ apps: [RunningAppInfo], keeping: pid_t?, ownPID: pid_t) -> [RunningAppInfo] {
-        apps.filter { $0.isRegular && !$0.isHidden && $0.pid != ownPID && $0.pid != keeping }
+    /// Confirms the app to keep is still the same running app. Throws when it
+    /// has quit, when its PID now belongs to another app, or when it is OpenRay.
+    static func verify(_ keep: AppIdentity, in apps: [RunningAppInfo], ownPID: pid_t) throws {
+        guard keep.pid != ownPID, apps.contains(where: keep.matches) else {
+            throw LibraryValidationError("\(keep.name) has quit, so OpenRay didn't change any other app.")
+        }
+    }
+
+    static func hideTargets(_ apps: [RunningAppInfo], keeping: AppIdentity, ownPID: pid_t) throws -> [RunningAppInfo] {
+        try verify(keeping, in: apps, ownPID: ownPID)
+        return apps.filter { $0.isRegular && !$0.isHidden && $0.pid != ownPID && $0.pid != keeping.pid }
     }
 
     static func unhideTargets(_ apps: [RunningAppInfo], ownPID: pid_t) -> [RunningAppInfo] {
         apps.filter { $0.isRegular && $0.isHidden && $0.pid != ownPID }
     }
 
+    /// Quit All passes no app to keep; Quit Others passes the verified foreground app.
     static func quitTargets(
-        _ apps: [RunningAppInfo], keeping: pid_t?, excluded: Set<String>, ownPID: pid_t
-    ) -> [RunningAppInfo] {
-        apps.filter { app in
-            guard app.isRegular, app.pid != ownPID, app.pid != keeping else { return false }
+        _ apps: [RunningAppInfo], keeping: AppIdentity?, excluded: Set<String>, ownPID: pid_t
+    ) throws -> [RunningAppInfo] {
+        if let keeping { try verify(keeping, in: apps, ownPID: ownPID) }
+        return apps.filter { app in
+            guard app.isRegular, app.pid != ownPID, app.pid != keeping?.pid else { return false }
             guard let bundleIdentifier = app.bundleIdentifier else { return true }
             return !excluded.contains(bundleIdentifier) && !neverQuit.contains(bundleIdentifier)
         }
@@ -535,27 +594,64 @@ enum NotificationDismissal {
     }
 }
 
+/// How a helper tool (pmset, Mission Control) finished.
+enum HelperExit: Equatable, Sendable {
+    case exited(Int32)
+    case signaled(Int32)
+    /// Still running when the wait ended.
+    case timedOut
+
+    /// Success only when the tool exited with status 0, or when it is allowed to keep running.
+    func check(tool: String, acceptsTimeout: Bool) throws {
+        switch self {
+        case .exited(0): return
+        case .timedOut where acceptsTimeout: return
+        case .exited(let status):
+            throw LibraryValidationError("macOS refused the request (\(tool) exited with status \(status)).")
+        case .signaled:
+            throw LibraryValidationError("\(tool) stopped before finishing the request.")
+        case .timedOut:
+            throw LibraryValidationError("\(tool) didn't respond. Try again.")
+        }
+    }
+}
+
+enum WiFiPowerError {
+    /// CoreWLAN's kCWOperationNotPermittedErr: Wi-Fi settings require an administrator.
+    static let notPermitted = -3_930
+
+    static func message(for error: NSError, turningOn: Bool) -> String {
+        if error.code == notPermitted {
+            return "Turning Wi-Fi \(turningOn ? "on" : "off") needs an administrator on this Mac. Change it in System Settings → Wi-Fi."
+        }
+        return "macOS didn't allow OpenRay to turn Wi-Fi \(turningOn ? "on" : "off")."
+    }
+}
+
 // MARK: - Live executor
 
 /// Runs system actions for real. Public APIs first (NSWorkspace, CoreAudio, IOKit,
 /// CoreWLAN, CGEvent), Apple events only where nothing else exists. Never
-/// constructed by tests; every action also checks `SideEffectGuard`.
+/// constructed by tests; every action also checks its `SideEffectGuard` first.
 @MainActor
 final class LiveSystemActions: SystemActionPerforming {
     /// Tests assert this stays zero.
     private(set) static var instanceCount = 0
 
+    let sideEffects: SideEffectGuard
     private let volume: VolumeControl
     private let microphone: MicrophoneMuteControl
 
-    init(audio: any AudioDeviceControlling = CoreAudioDevices()) {
+    init(sideEffects: SideEffectGuard = .current, audio: (any AudioDeviceControlling)? = nil) {
         Self.instanceCount += 1
+        self.sideEffects = sideEffects
+        let audio = audio ?? CoreAudioDevices(sideEffects: sideEffects)
         volume = VolumeControl(audio: audio)
         microphone = MicrophoneMuteControl(audio: audio)
     }
 
     func perform(_ action: SystemAction) async throws -> SystemActionResult {
-        try SideEffectGuard.check("system commands")
+        try sideEffects.check("system commands")
         switch action {
         case .lockScreen:
             // ⌃⌘Q, the system Lock Screen shortcut. kVK_ANSI_Q is 12.
@@ -570,7 +666,7 @@ final class LiveSystemActions: SystemActionPerforming {
             }
             return .done
         case .sleepDisplays:
-            try runTool("/usr/bin/pmset", ["displaysleepnow"])
+            try await runTool("/usr/bin/pmset", ["displaysleepnow"], name: "pmset", acceptsTimeout: false)
             return .done
         case .restart:
             try sendLoginWindowEvent("rest")
@@ -586,8 +682,11 @@ final class LiveSystemActions: SystemActionPerforming {
             try await openApplication(at: URL(fileURLWithPath: "/System/Library/CoreServices/ScreenSaverEngine.app"))
             return .done
         case .showDesktop:
-            // Mission Control's executable shows the desktop when passed "1".
-            try runTool("/System/Applications/Mission Control.app/Contents/MacOS/Mission Control", ["1"])
+            // Mission Control's executable shows the desktop when passed "1". It may
+            // stay running while the desktop shows, so only an error exit fails.
+            try await runTool(
+                "/System/Applications/Mission Control.app/Contents/MacOS/Mission Control", ["1"],
+                name: "Mission Control", acceptsTimeout: true)
             return .done
         case .toggleAppearance:
             let result = try runAppleScript(
@@ -618,9 +717,10 @@ final class LiveSystemActions: SystemActionPerforming {
         case .volume(let change):
             return try volume.apply(change)
         case .toggleMicrophoneMute:
-            return .microphoneMuted(try microphone.toggle())
-        case .hideApps(let keeping):
-            let targets = AppSelection.hideTargets(runningApps(), keeping: keeping, ownPID: ownPID)
+            let outcome = try microphone.toggle()
+            return .microphones(muted: outcome.muted, changed: outcome.changed.count, unchanged: outcome.unchanged)
+        case .hideOtherApps(let keeping):
+            let targets = try AppSelection.hideTargets(runningApps(), keeping: keeping, ownPID: ownPID)
             var count = 0
             for app in targets where NSRunningApplication(processIdentifier: app.pid)?.hide() == true { count += 1 }
             return .apps(count: count)
@@ -629,15 +729,14 @@ final class LiveSystemActions: SystemActionPerforming {
             var count = 0
             for app in targets where NSRunningApplication(processIdentifier: app.pid)?.unhide() == true { count += 1 }
             return .apps(count: count)
-        case .quitApps(let keeping, let excluded):
-            let targets = AppSelection.quitTargets(runningApps(), keeping: keeping, excluded: excluded, ownPID: ownPID)
-            var count = 0
-            for app in targets where NSRunningApplication(processIdentifier: app.pid)?.terminate() == true {
-                count += 1
-            }
-            return .apps(count: count)
-        case .restartApp(let pid):
-            return try await restartApp(pid)
+        case .quitAllApps(let excluded):
+            return .apps(count: quit(try AppSelection.quitTargets(
+                runningApps(), keeping: nil, excluded: excluded, ownPID: ownPID)))
+        case .quitOtherApps(let keeping, let excluded):
+            return .apps(count: quit(try AppSelection.quitTargets(
+                runningApps(), keeping: keeping, excluded: excluded, ownPID: ownPID)))
+        case .restartApp(let identity):
+            return try await restartApp(identity)
         case .dismissNotifications:
             return .notifications(count: try dismissNotifications())
         case .toggleWiFi:
@@ -646,7 +745,7 @@ final class LiveSystemActions: SystemActionPerforming {
             }
             let on = !interface.powerOn()
             do { try interface.setPower(on) } catch {
-                throw LibraryValidationError("macOS didn't allow OpenRay to turn Wi-Fi \(on ? "on" : "off").")
+                throw LibraryValidationError(WiFiPowerError.message(for: error as NSError, turningOn: on))
             }
             return .wifi(on: on)
         }
@@ -658,8 +757,14 @@ final class LiveSystemActions: SystemActionPerforming {
         NSWorkspace.shared.runningApplications.filter { !$0.isTerminated }.map {
             RunningAppInfo(
                 pid: $0.processIdentifier, bundleIdentifier: $0.bundleIdentifier, name: $0.localizedName ?? "App",
-                isRegular: $0.activationPolicy == .regular, isHidden: $0.isHidden)
+                isRegular: $0.activationPolicy == .regular, isHidden: $0.isHidden, launchDate: $0.launchDate)
         }
+    }
+
+    private func quit(_ targets: [RunningAppInfo]) -> Int {
+        var count = 0
+        for app in targets where NSRunningApplication(processIdentifier: app.pid)?.terminate() == true { count += 1 }
+        return count
     }
 
     private func requireAccessibility() throws {
@@ -696,14 +801,30 @@ final class LiveSystemActions: SystemActionPerforming {
         }
     }
 
-    private func runTool(_ path: String, _ arguments: [String]) throws {
+    /// Runs a helper and waits for it, so a refused request fails instead of looking done.
+    private func runTool(
+        _ path: String, _ arguments: [String], name: String, acceptsTimeout: Bool, timeout: Duration = .seconds(5)
+    ) async throws {
         guard FileManager.default.isExecutableFile(atPath: path) else {
             throw LibraryValidationError("This version of macOS doesn't support this command.")
         }
         let process = Process()
         process.executableURL = URL(fileURLWithPath: path)
         process.arguments = arguments
+        process.standardOutput = FileHandle.nullDevice
+        process.standardError = FileHandle.nullDevice
         try process.run()
+        var waited = Duration.zero
+        while process.isRunning && waited < timeout {
+            try await Task.sleep(for: .milliseconds(50))
+            waited += .milliseconds(50)
+        }
+        let exit: HelperExit =
+            process.isRunning
+            ? .timedOut
+            : process.terminationReason == .uncaughtSignal
+                ? .signaled(process.terminationStatus) : .exited(process.terminationStatus)
+        try exit.check(tool: name, acceptsTimeout: acceptsTimeout)
     }
 
     private func sendLoginWindowEvent(_ eventID: String) throws {
@@ -797,11 +918,12 @@ final class LiveSystemActions: SystemActionPerforming {
         return .hiddenFiles(visible: visible)
     }
 
-    private func restartApp(_ pid: pid_t) async throws -> SystemActionResult {
-        guard pid != ownPID, let app = NSRunningApplication(processIdentifier: pid), !app.isTerminated,
+    private func restartApp(_ identity: AppIdentity) async throws -> SystemActionResult {
+        try AppSelection.verify(identity, in: runningApps(), ownPID: ownPID)
+        guard let app = NSRunningApplication(processIdentifier: identity.pid), !app.isTerminated,
             let url = app.bundleURL
-        else { throw LibraryValidationError("That app has already quit.") }
-        let name = app.localizedName ?? "the app"
+        else { throw LibraryValidationError("\(identity.name) has already quit.") }
+        let name = app.localizedName ?? identity.name
         guard app.terminate() else { throw LibraryValidationError("\(name) didn't quit.") }
         try await waitUntilTerminated(
             [app], timeout: .seconds(10), failure: "\(name) didn't quit. It may be waiting for you to save changes.")
