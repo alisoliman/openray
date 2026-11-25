@@ -132,6 +132,16 @@ enum LibraryImport {
         try encoder.encode(snippets)
     }
 
+    /// A Text Replacements property list (`phrase`, `shortcut`), in the format
+    /// `textReplacements(from:)` reads. A replacement needs a shortcut, so
+    /// snippets without a keyword are left out.
+    static func exportTextReplacements(_ snippets: [ImportedSnippet]) throws -> Data {
+        let entries = snippets.compactMap { snippet in
+            snippet.keyword.map { ["phrase": snippet.text, "shortcut": $0] }
+        }
+        return try PropertyListSerialization.data(fromPropertyList: entries, format: .xml, options: 0)
+    }
+
     // MARK: Quicklinks
 
     static func quicklinks(from data: Data, fileName: String? = nil) throws -> LibraryImportFile<ImportedQuicklink> {
@@ -265,7 +275,9 @@ struct QuicklinkImportPlan: Equatable, Sendable {
 
 extension LibraryImport {
     /// Decides what happens to each imported snippet. Keywords match exactly, as
-    /// expansion does.
+    /// expansion does. Duplicates are found after a keyword is dropped, so the
+    /// same conflicting snippet imported twice, in one file or in two imports,
+    /// is added once.
     static func plan(
         snippets incoming: [ImportedSnippet], existing: [Snippet],
         policy: ImportKeywordConflictPolicy = .dropKeyword, maximumTextLength: Int = 32_000,
@@ -276,8 +288,14 @@ extension LibraryImport {
             a.name == b.name && a.text == b.text && (a.keyword ?? "") == (b.keyword ?? "")
         }
         let library = existing.map(ImportedSnippet.init)
+        func isDuplicate(_ candidate: ImportedSnippet) -> Bool {
+            library.contains { same($0, candidate) } || plan.additions.contains { same($0, candidate) }
+                || plan.replacements.contains { same($0.snippet, candidate) }
+        }
         var holders: [String: UUID] = [:]
-        for snippet in existing where !snippet.keyword.isEmpty { holders[snippet.keyword] = holders[snippet.keyword] ?? snippet.id }
+        for snippet in existing where !snippet.keyword.isEmpty {
+            holders[snippet.keyword] = holders[snippet.keyword] ?? snippet.id
+        }
         // Keywords taken by earlier snippets in the same file, mapped to their position in `additions`.
         var claimed: [String: Int] = [:]
 
@@ -288,7 +306,7 @@ extension LibraryImport {
                 plan.invalid.append(item)
                 continue
             }
-            if library.contains(where: { same($0, item) }) || plan.additions.contains(where: { same($0, item) }) {
+            guard !isDuplicate(item) else {
                 plan.duplicates.append(item)
                 continue
             }
@@ -296,9 +314,14 @@ extension LibraryImport {
                 plan.additions.append(item)
                 continue
             }
+            let withoutKeyword = ImportedSnippet(name: item.name, text: item.text)
             guard isValidKeyword(keyword) else {
-                plan.keywordsDropped.append(item)
-                plan.additions.append(ImportedSnippet(name: item.name, text: item.text))
+                if isDuplicate(withoutKeyword) {
+                    plan.duplicates.append(item)
+                } else {
+                    plan.keywordsDropped.append(item)
+                    plan.additions.append(withoutKeyword)
+                }
                 continue
             }
             let holder = holders[keyword]
@@ -308,14 +331,20 @@ extension LibraryImport {
                 plan.additions.append(item)
                 continue
             }
-            plan.keywordConflicts.append(item)
             switch policy {
             case .dropKeyword:
-                plan.keywordsDropped.append(item)
-                plan.additions.append(ImportedSnippet(name: item.name, text: item.text))
+                if isDuplicate(withoutKeyword) {
+                    plan.duplicates.append(item)
+                } else {
+                    plan.keywordConflicts.append(item)
+                    plan.keywordsDropped.append(item)
+                    plan.additions.append(withoutKeyword)
+                }
             case .skip:
+                plan.keywordConflicts.append(item)
                 plan.skippedConflicts.append(item)
             case .replaceExisting:
+                plan.keywordConflicts.append(item)
                 if let holder {
                     plan.replacements.removeAll { $0.existingID == holder }
                     plan.replacements.append(.init(existingID: holder, snippet: item))

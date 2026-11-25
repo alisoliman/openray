@@ -202,3 +202,36 @@ struct LibraryImportTests {
         #expect(plan.summary == "1 added, 2 duplicates skipped, 2 invalid skipped")
     }
 }
+
+struct LibraryImportReviewFixTests {
+    @Test func aConflictingSnippetImportedTwiceIsAddedOnce() {
+        let existing = [Snippet(name: "Key", keyword: ";key", content: "mine")]
+        let other = ImportedSnippet(name: "Other", text: "theirs", keyword: ";key")
+        let invalid = ImportedSnippet(name: "Spaced", text: "x", keyword: "has space")
+        let first = LibraryImport.plan(snippets: [other, other, invalid, invalid], existing: existing)
+        #expect(first.additions == [ImportedSnippet(name: "Other", text: "theirs"), ImportedSnippet(name: "Spaced", text: "x")])
+        #expect(first.duplicates == [other, invalid])
+        #expect(first.keywordsDropped == [other, invalid])
+
+        // Apply the first plan, then import the same file again.
+        let library = existing + first.additions.map { Snippet(name: $0.name, keyword: $0.keyword ?? "", content: $0.text) }
+        let second = LibraryImport.plan(snippets: [other, invalid], existing: library)
+        #expect(second.additions.isEmpty)
+        #expect(second.duplicates == [other, invalid])
+        #expect(second.summary == "0 added, 2 skipped")
+    }
+
+    @Test func textReplacementsRoundTrip() throws {
+        let snippets = [
+            ImportedSnippet(name: "On my way!", text: "On my way!", keyword: "omw"),
+            ImportedSnippet(name: "No keyword", text: "skipped"),
+            ImportedSnippet(name: "Kind regards,", text: "Kind regards,\nAnn", keyword: "kr"),
+        ]
+        let data = try LibraryImport.exportTextReplacements(snippets)
+        #expect(String(decoding: data.prefix(5), as: UTF8.self) == "<?xml")
+        let list = try #require(try PropertyListSerialization.propertyList(from: data, format: nil) as? [[String: String]])
+        #expect(list == [["phrase": "On my way!", "shortcut": "omw"], ["phrase": "Kind regards,\nAnn", "shortcut": "kr"]])
+        let file = try LibraryImport.snippets(from: data, fileName: "property list.plist")
+        #expect(file.items == [snippets[0], snippets[2]])
+    }
+}
