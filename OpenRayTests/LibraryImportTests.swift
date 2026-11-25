@@ -66,7 +66,7 @@ struct LibraryImportTests {
             ["shortcut": "nophrase"],
         ]
         let data = try PropertyListSerialization.data(fromPropertyList: entries, format: format, options: 0)
-        let file = try LibraryImport.snippets(from: data, fileName: "Text Substitutions.plist")
+        let file = try LibraryImport.snippets(from: data, fileName: "property list.plist")
         #expect(file.items.map(\.keyword) == ["omw", nil, "lng"])
         #expect(file.items.map(\.name).prefix(2) == ["On my way!", "Kind regards,"])
         #expect(file.items[2].name.count == 60 && file.items[2].name.hasSuffix("…"))

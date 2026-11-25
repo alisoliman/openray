@@ -10,11 +10,12 @@ import Foundation
 //   array of objects with `name` and `link` (required) and `iconName` and
 //   `openWith` (optional). `openWith` is an app name such as "Finder" or a
 //   bundle identifier.
-// - macOS Text Replacements: selecting replacements in System Settings >
-//   Keyboard > Text Replacements and dragging them to the Finder writes
-//   "Text Substitutions.plist", a property list array of dictionaries with the
-//   string keys `phrase` (the replacement) and `shortcut` (what you type). See
-//   Apple's "Replace text and punctuation in documents on Mac" support article.
+// - macOS Text Replacements: Apple's "Back up and share text replacements"
+//   guide (support.apple.com/guide/mac-help/mchl2a7bd795) says dragging
+//   replacements from the Text Replacements window to the desktop creates
+//   "property list.plist". The guide doesn't list its keys; this reader expects
+//   an array of dictionaries with the string keys `phrase` (the replacement)
+//   and `shortcut` (what you type), XML or binary.
 //
 // Encrypted `.rayconfig` archives are refused and never parsed.
 
