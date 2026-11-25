@@ -318,12 +318,24 @@ enum SyntheticInput {
         try key(CGKeyCode(kVK_ANSI_V), flags: .maskCommand)
     }
 
-    static func replace(keyword: String, with text: String, in pid: pid_t) throws {
-        guard AXIsProcessTrusted(), !IsSecureEventInputEnabled(),
-            NSWorkspace.shared.frontmostApplication?.processIdentifier == pid
-        else { return }
-        // This path never touches the clipboard. Keywords are validated as ASCII.
-        for _ in keyword { try key(CGKeyCode(kVK_Delete)) }
+    /// Deletes `count` characters before the caret, types `text`, then moves the
+    /// caret left `caretLeft` times. Before typing and again before moving the
+    /// caret, it checks that the target app is frontmost and no secure field has focus.
+    static func replace(deleting count: Int, with text: String, caretLeft: Int, in pid: pid_t) throws {
+        guard canType(into: pid) else { return }
+        // This path never touches the clipboard. One backspace removes one typed character.
+        for _ in 0..<max(0, count) { try key(CGKeyCode(kVK_Delete)) }
+        try type(text)
+        guard caretLeft > 0, canType(into: pid) else { return }
+        for _ in 0..<min(caretLeft, 65_536) { try key(CGKeyCode(kVK_LeftArrow)) }
+    }
+
+    private static func canType(into pid: pid_t) -> Bool {
+        AXIsProcessTrusted() && !IsSecureEventInputEnabled()
+            && NSWorkspace.shared.frontmostApplication?.processIdentifier == pid
+    }
+
+    private static func type(_ text: String) throws {
         for chunk in unicodeChunks(text) {
             guard let down = CGEvent(keyboardEventSource: nil, virtualKey: 0, keyDown: true),
                 let up = CGEvent(keyboardEventSource: nil, virtualKey: 0, keyDown: false)
