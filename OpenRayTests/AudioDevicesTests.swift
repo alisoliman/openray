@@ -62,38 +62,87 @@ struct AudioDevicesTests {
         #expect(audio.changes.isEmpty)
     }
 
-    @Test func microphoneMuteUsesTheMuteControlWhenThereIsOne() throws {
+    // MARK: Microphones
+
+    @Test func microphoneMuteCoversEveryInputNotJustTheDefault() throws {
         let audio = FakeAudioDevices()
-        audio.unmutable = []
-        let microphone = MicrophoneMuteControl(audio: audio)
-        #expect(try microphone.toggle())
-        #expect(try !microphone.toggle())
-        #expect(audio.changes == ["mute.mic.input=true", "mute.mic.input=false"])
-        #expect(audio.volumes["mic.input"] == 0.6)
+        audio.inputs = [FakeAudioDevices.microphone, FakeAudioDevices.usbMicrophone]
+        let microphones = MicrophoneMuteControl(audio: audio)
+        let muted = try microphones.toggle()
+        #expect(muted == .init(muted: true, changed: ["MacBook Microphone", "USB Microphone"], unchanged: []))
+        #expect(audio.mutes["mic.input"] == true && audio.mutes["usb.input"] == true)
+        // Switching the default input afterwards still leaves every microphone muted.
+        audio.defaults[.input] = FakeAudioDevices.usbMicrophone
+        #expect(!microphones.isLive(FakeAudioDevices.usbMicrophone))
+        let unmuted = try microphones.toggle()
+        #expect(unmuted.muted == false && unmuted.unchanged.isEmpty)
+        #expect(audio.mutes["mic.input"] == false && audio.mutes["usb.input"] == false)
     }
 
-    @Test func microphoneWithoutAMuteControlIsMutedByVolumeAndRestored() throws {
+    @Test func anyLiveInputMeansMuteRatherThanUnmute() throws {
         let audio = FakeAudioDevices()
-        let microphone = MicrophoneMuteControl(audio: audio)
-        #expect(try microphone.toggle())
-        #expect(audio.volumes["mic.input"] == 0)
-        #expect(microphone.restoreVolume == 0.6)
-        #expect(try !microphone.toggle())
-        #expect(audio.volumes["mic.input"] == 0.6)
-        #expect(microphone.restoreVolume == nil)
-        // Already at zero with nothing remembered: back to a usable level.
-        audio.volumes["mic.input"] = 0
-        #expect(try !microphone.toggle())
-        #expect(audio.volumes["mic.input"] == MicrophoneMuteControl.fallbackVolume)
+        audio.inputs = [FakeAudioDevices.microphone, FakeAudioDevices.usbMicrophone]
+        audio.mutes["mic.input"] = true
+        let outcome = try MicrophoneMuteControl(audio: audio).toggle()
+        #expect(outcome.muted)
+        #expect(audio.mutes["mic.input"] == true && audio.mutes["usb.input"] == true)
     }
 
-    @Test func microphoneErrorsWithoutAnInputOrAnyControl() {
+    @Test func gainFallbackSilencesEveryChannelAndRestoresEachMicrophonesOwnLevels() throws {
         let audio = FakeAudioDevices()
-        audio.volumeless = ["mic.input"]
+        audio.inputs = [FakeAudioDevices.microphone, FakeAudioDevices.usbMicrophone]
+        audio.unmutable = ["usb.input"]
+        audio.gains["usb.input"] = [1: 0.6, 2: 0.4]
+        let microphones = MicrophoneMuteControl(audio: audio)
+        #expect(try microphones.toggle().muted)
+        #expect(audio.gains["usb.input"] == [1: 0, 2: 0])
+        #expect(microphones.savedGains["usb"] == [1: 0.6, 2: 0.4])
+        #expect(try !microphones.toggle().muted)
+        #expect(audio.gains["usb.input"] == [1: 0.6, 2: 0.4])
+        #expect(microphones.savedGains["usb"] == nil)
+    }
+
+    @Test func oneMicrophonesLevelNeverMovesToAnother() throws {
+        let quiet = AudioDevice(id: 22, uid: "quiet", name: "Quiet Microphone", transport: .usb)
+        let audio = FakeAudioDevices()
+        audio.inputs = [FakeAudioDevices.usbMicrophone, quiet]
+        audio.unmutable = ["usb.input", "quiet.input"]
+        audio.gains["usb.input"] = [1: 0.8]
+        audio.gains["quiet.input"] = [1: 0]
+        let microphones = MicrophoneMuteControl(audio: audio)
+        #expect(try microphones.toggle().muted)
+        let outcome = try microphones.toggle()
+        #expect(outcome == .init(muted: false, changed: ["USB Microphone"], unchanged: ["Quiet Microphone"]))
+        #expect(audio.gains["usb.input"] == [1: 0.8])
+        // The microphone that was already silent stays as it was.
+        #expect(audio.gains["quiet.input"] == [1: 0])
+    }
+
+    @Test func inputsThatCantBeSilencedAreReportedNotHidden() throws {
+        let audio = FakeAudioDevices()
+        audio.inputs = [FakeAudioDevices.microphone, FakeAudioDevices.usbMicrophone]
+        audio.unmutable = ["usb.input"]
+        audio.gains["usb.input"] = [1: 0.5]
+        audio.partialGain = ["usb.input"]
+        let outcome = try MicrophoneMuteControl(audio: audio).toggle()
+        #expect(outcome == .init(muted: true, changed: ["MacBook Microphone"], unchanged: ["USB Microphone"]))
+        // Partial gain coverage isn't touched: zeroing some channels wouldn't silence it.
+        #expect(audio.gains["usb.input"] == [1: 0.5])
+    }
+
+    @Test func aMuteThatDoesntTakeEffectIsNotReportedAsDone() {
+        let audio = FakeAudioDevices()
+        audio.ignoresChanges = ["mic.input"]
         #expect(throws: AudioDeviceError.noMuteControl) { try MicrophoneMuteControl(audio: audio).toggle() }
-        audio.defaults[.input] = nil
+    }
+
+    @Test func microphoneErrorsWithoutAnInput() {
+        let audio = FakeAudioDevices()
+        audio.inputs = []
         #expect(throws: AudioDeviceError.noDevice(.input)) { try MicrophoneMuteControl(audio: audio).toggle() }
     }
+
+    // MARK: Devices
 
     @Test func devicesDescribeThemselves() {
         #expect(FakeAudioDevices.headphones.symbol(for: .output) == "headphones")
@@ -112,5 +161,23 @@ struct AudioDevicesTests {
         #expect(audio.defaultDevice(for: .output) == FakeAudioDevices.headphones)
         #expect(audio.devices(for: .output).count == 2)
         #expect(audio.devices(for: .input) == [FakeAudioDevices.microphone])
+    }
+
+    @Test(arguments: [SideEffectGuard.Mode.testHost, .verification])
+    func inertLaunchesGetNoSoundDevicesAndChangeNothing(_ mode: SideEffectGuard.Mode) {
+        let sideEffects = SideEffectGuard(mode: mode)
+        let audio = AudioDeviceEnvironment.makeDefault(sideEffects: sideEffects)
+        #expect(audio is InertAudioDevices)
+        #expect(audio.devices(for: .output).isEmpty && audio.defaultDevice(for: .input) == nil)
+        #expect(throws: SideEffectGuard.Blocked.self) {
+            try audio.setVolume(0.5, of: FakeAudioDevices.speakers, scope: .output)
+        }
+        // The Core Audio adapter refuses before touching a device. ID 0 is no device at all.
+        let coreAudio = CoreAudioDevices(sideEffects: sideEffects)
+        let nothing = AudioDevice(id: 0, uid: "none", name: "None", transport: .other)
+        #expect(throws: SideEffectGuard.Blocked.self) { try coreAudio.setVolume(0.5, of: nothing, scope: .output) }
+        #expect(throws: SideEffectGuard.Blocked.self) { try coreAudio.setMuted(true, of: nothing, scope: .input) }
+        #expect(throws: SideEffectGuard.Blocked.self) { try coreAudio.setGain(0, of: nothing, scope: .input, element: 0) }
+        #expect(throws: SideEffectGuard.Blocked.self) { try coreAudio.setDefaultDevice(nothing, for: .output) }
     }
 }

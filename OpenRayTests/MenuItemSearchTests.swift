@@ -1,15 +1,13 @@
-import ApplicationServices
 import Foundation
 import Testing
 
 @testable import OpenRay
 
-@MainActor
 struct MenuItemSearchTests {
-    private typealias M = FakeMenuElement
+    private typealias M = MenuSpec
 
     /// A small app: the Apple menu, File with a submenu, separators and a disabled item, and Edit.
-    private func menuBar() -> FakeMenuElement {
+    private static func menuBar() -> MenuSpec {
         M.bar([
             M.menu("Apple", [M.item("About This Mac"), M.item("Lock Screen", character: "q", modifiers: 4)]),
             M.menu(
@@ -35,8 +33,21 @@ struct MenuItemSearchTests {
         ])
     }
 
+    private func collect(
+        _ spec: MenuSpec, includeAppleMenu: Bool = false, limits: MenuItemCollector.Limits = .init(),
+        elapsed: () -> Duration = { .zero }
+    ) -> (MenuItemCollector.Result, FakeMenuTree) {
+        let tree = FakeMenuTree(bars: [42: spec])
+        let root = tree.menuBar(of: 42)!
+        let result = MenuItemCollector.collect(
+            from: tree, menuBar: root, includeAppleMenu: includeAppleMenu, limits: limits, elapsed: elapsed,
+            isCancelled: { false })
+        return (result, tree)
+    }
+
     @Test func flattensMenusIntoPathsAndSkipsTheAppleMenuAndSeparators() {
-        let items = MenuItemCollector.collect(menuBar: menuBar())
+        let (result, _) = collect(Self.menuBar())
+        let items = result.items
         #expect(
             items.map(\.pathText) == [
                 "File › New Document", "File › Export › PDF", "File › Export › PNG", "File › Close", "Edit › Copy",
@@ -47,35 +58,62 @@ struct MenuItemSearchTests {
         #expect(items[1].title == "PDF")
         #expect(items.map(\.isEnabled) == [true, true, true, false, true, true, true])
         #expect(Set(items.map(\.id)).count == items.count)
+        #expect(!result.truncated && !result.cancelled)
     }
 
-    @Test func theAppleMenuCanBeIncluded() {
-        let items = MenuItemCollector.collect(menuBar: menuBar(), includeAppleMenu: true)
-        #expect(items.first?.pathText == "Apple › About This Mac")
-        #expect(items.count == 9)
+    @Test func eachNodeIsReadOnceAndTheAppleMenuIsNeverRead() {
+        let (result, tree) = collect(Self.menuBar())
+        #expect(result.items.count == 7)
+        #expect(tree.maxReadsPerNode == 1)
+        let (withApple, _) = collect(Self.menuBar(), includeAppleMenu: true)
+        #expect(withApple.items.first?.pathText == "Apple › About This Mac")
+        #expect(withApple.items.count == 9)
     }
 
     @Test func shortcutsBecomeKeycapsInMenuOrder() {
-        let items = MenuItemCollector.collect(menuBar: menuBar())
+        let items = collect(Self.menuBar()).0.items
         #expect(items[0].shortcut == ["⌘", "N"])
         #expect(items[1].shortcut == ["⇧", "⌘", "E"])
         #expect(items[2].shortcut == nil)
     }
 
-    @Test func traversalStopsAtItsLimits() {
+    @Test func traversalStopsAtDepthItemVisitAndTimeLimits() {
         let deep = M.bar([
             M.menu("Apple", []),
             M.menu("A", [M.item("B", submenu: [M.item("C", submenu: [M.item("D")])])]),
         ])
-        #expect(MenuItemCollector.collect(menuBar: deep).map(\.pathText) == ["A › B › C › D"])
-        #expect(MenuItemCollector.collect(menuBar: deep, limits: .init(maxDepth: 2, maxItems: 10)).isEmpty)
+        #expect(collect(deep).0.items.map(\.pathText) == ["A › B › C › D"])
+        let shallow = collect(deep, limits: .init(maxDepth: 2))
+        #expect(shallow.0.items.isEmpty && shallow.0.truncated)
+
         let wide = M.bar([M.menu("Apple", []), M.menu("Many", (0..<50).map { M.item("Item \($0)") })])
-        #expect(MenuItemCollector.collect(menuBar: wide, limits: .init(maxDepth: 8, maxItems: 20)).count == 20)
+        let capped = collect(wide, limits: .init(maxItems: 20))
+        #expect(capped.0.items.count == 20 && capped.0.truncated)
+
+        let visited = collect(wide, limits: .init(maxVisitedNodes: 10))
+        #expect(visited.0.truncated)
+        #expect(visited.1.totalInfoReads <= 10)
+
+        var ticks = 0
+        let timed = collect(wide, limits: .init(timeBudget: .seconds(1))) {
+            ticks += 1
+            return .milliseconds(ticks * 100)
+        }
+        #expect(timed.0.truncated)
+        #expect(timed.0.items.count < 50)
     }
 
-    @Test func duplicatePathsAreListedOnce() {
-        let bar = M.bar([M.menu("Apple", []), M.menu("View", [M.item("Zoom"), M.item("Zoom")])])
-        #expect(MenuItemCollector.collect(menuBar: bar).count == 1)
+    @Test func itemsWithTheSameLabelStaySeparate() {
+        let bar = M.bar([
+            M.menu("Apple", []),
+            M.menu("Window", [M.item("Zoom", enabled: false), M.item("Zoom", character: "z", modifiers: 2)]),
+        ])
+        let items = collect(bar).0.items
+        #expect(items.count == 2)
+        #expect(items.map(\.isEnabled) == [false, true])
+        #expect(items[1].shortcut == ["⌥", "⌘", "Z"])
+        #expect(items[0].id != items[1].id)
+        #expect(MenuItemSearch.filter(items, query: "zoom").first?.isEnabled == true)
     }
 
     @Test(arguments: [
@@ -88,13 +126,15 @@ struct MenuItemSearchTests {
         #expect(MenuShortcutFormatter.caps(character: "x", modifiers: modifiers, glyph: nil, virtualKey: nil) == caps)
     }
 
-    @Test func glyphsAndSpecialCharactersGetReadableKeycaps() {
-        func caps(_ character: String?, glyph: Int? = nil, modifiers: Int? = nil) -> [String]? {
-            MenuShortcutFormatter.caps(character: character, modifiers: modifiers, glyph: glyph, virtualKey: nil)
+    @Test func glyphsSpecialCharactersAndVirtualKeysGetReadableKeycaps() {
+        func caps(_ character: String?, glyph: Int? = nil, key: Int? = nil, modifiers: Int? = nil) -> [String]? {
+            MenuShortcutFormatter.caps(character: character, modifiers: modifiers, glyph: glyph, virtualKey: key)
         }
         #expect(caps(nil, glyph: 0x17) == ["⌘", "⌫"])
         #expect(caps(nil, glyph: 0x73) == ["⌘", "F5"])
         #expect(caps(nil, glyph: 0x88, modifiers: MenuShortcutFormatter.noCommand) == ["F14"])
+        #expect(caps(nil, glyph: 0x8F) == ["⌘", "F16"])
+        #expect(caps(nil, glyph: 0x92) == ["⌘", "F19"])
         #expect(caps(nil, glyph: 0x64) == ["⌘", "←"])
         #expect(caps("\u{F704}") == ["⌘", "F1"])
         #expect(caps("\u{F700}") == ["⌘", "↑"])
@@ -102,57 +142,97 @@ struct MenuItemSearchTests {
         #expect(caps(" ") == ["⌘", "Space"])
         #expect(caps(",") == ["⌘", ","])
         #expect(caps("+") == ["⌘", "+"])
+        // No glyph and no printable character: the virtual key names the key.
+        #expect(caps(nil, key: 0x7A) == ["⌘", "F1"])
+        #expect(caps("", key: 0x33) == ["⌘", "⌫"])
+        #expect(caps(nil, key: 0x24, modifiers: MenuShortcutFormatter.shift) == ["⇧", "⌘", "↩"])
+        #expect(caps(nil, key: 0x40) == ["⌘", "F17"])
+        #expect(caps(nil, key: 0x7E) == ["⌘", "↑"])
+        // A printable character wins over the virtual key.
+        #expect(caps("k", key: 0x28) == ["⌘", "K"])
         #expect(caps(nil) == nil)
         #expect(caps("") == nil)
         #expect(caps("\u{1}") == nil)
+        #expect(caps(nil, key: 0x00) == nil)
         // A glyph the formatter doesn't know falls back to the character.
         #expect(caps("k", glyph: 0x200) == ["⌘", "K"])
     }
 
     @Test func searchRanksTitlesAbovePathsAndKeepsDisabledItemsLower() {
-        let items = MenuItemCollector.collect(menuBar: menuBar())
+        let items = collect(Self.menuBar()).0.items
         #expect(MenuItemSearch.filter(items, query: "pdf").first?.pathText == "File › Export › PDF")
         #expect(MenuItemSearch.filter(items, query: "export").map(\.title) == ["PDF", "PNG"])
         #expect(MenuItemSearch.filter(items, query: "find").prefix(2).map(\.title) == ["Find…", "Find Next"])
         #expect(MenuItemSearch.filter(items, query: "").count == items.count)
         #expect(MenuItemSearch.filter(items, query: "qqq").isEmpty)
-        let close = [
-            MenuBarItem(path: ["File"], title: "Close", shortcut: nil, isEnabled: false, element: M.item("Close")),
-            MenuBarItem(path: ["Window"], title: "Close", shortcut: nil, isEnabled: true, element: M.item("Close")),
-        ]
-        #expect(MenuItemSearch.filter(close, query: "close").map(\.isEnabled) == [true, false])
     }
 
-    @Test func pressingRunsOnlyEnabledItemsThroughTheirElement() throws {
-        let search = MenuItemSearch(provider: FakeMenuBarProvider())
-        let pdf = M.item("PDF")
-        try search.press(MenuBarItem(path: ["File"], title: "PDF", shortcut: nil, isEnabled: true, element: pdf))
-        #expect(pdf.pressCount == 1)
-        let close = M.item("Close", enabled: false)
-        #expect(throws: LibraryValidationError.self) {
-            try search.press(MenuBarItem(path: ["File"], title: "Close", shortcut: nil, isEnabled: false, element: close))
-        }
-        #expect(close.pressCount == 0)
+    // MARK: Reading off the main actor
+
+    @Test func searchReadsTheFrontmostAppsMenusInTheBackground() async throws {
+        let tree = FakeMenuTree(bars: [42: Self.menuBar()])
+        let search = MenuItemSearch(source: tree)
+        let snapshot = try await search.items(for: 42)
+        #expect(snapshot.items.count == 7)
+        #expect(snapshot.isComplete)
+        let limited = try await search.items(for: 42, limits: .init(maxItems: 3))
+        #expect(limited.items.count == 3 && !limited.isComplete)
     }
 
-    @Test func itemsComeFromTheFrontmostAppsMenuBar() throws {
-        let provider = FakeMenuBarProvider()
-        provider.bars[42] = menuBar()
-        let search = MenuItemSearch(provider: provider)
-        #expect(try search.items(for: 42).count == 7)
-        #expect(throws: LibraryValidationError.self) { try search.items(for: 43) }
-        #expect(throws: LibraryValidationError.self) { try search.items(for: nil) }
-        #expect(throws: LibraryValidationError.self) {
-            try search.items(for: ProcessInfo.processInfo.processIdentifier)
+    @Test func searchRefusesWithoutAccessOrATarget() async {
+        let tree = FakeMenuTree(bars: [42: Self.menuBar()])
+        let search = MenuItemSearch(source: tree)
+        await #expect(throws: LibraryValidationError.self) { try await search.items(for: 43) }
+        await #expect(throws: LibraryValidationError.self) { try await search.items(for: nil) }
+        await #expect(throws: LibraryValidationError.self) {
+            try await search.items(for: ProcessInfo.processInfo.processIdentifier)
         }
-        provider.isTrusted = false
-        #expect(!search.hasPermission)
-        #expect(throws: LibraryValidationError.self) { try search.items(for: 42) }
+        let untrusted = MenuItemSearch(source: FakeMenuTree(bars: [42: Self.menuBar()], trusted: false))
+        #expect(!untrusted.hasPermission)
+        await #expect(throws: LibraryValidationError.self) { try await untrusted.items(for: 42) }
     }
 
-    @Test func realMenuPressesAreBlockedInTests() {
-        #expect(throws: SideEffectGuard.Blocked.self) {
-            try AXMenuElement(AXUIElementCreateApplication(-1)).press()
+    @Test func cancellingAReadStopsIt() async throws {
+        let gate = DispatchSemaphore(value: 0)
+        let tree = FakeMenuTree(bars: [42: Self.menuBar()], gate: gate)
+        let search = MenuItemSearch(source: tree)
+        let read = Task { try await search.items(for: 42) }
+        // Wait until the reader is parked at the menu bar, then cancel and let it go.
+        var waited = 0
+        while !tree.hasEntered && waited < 500 {
+            try await Task.sleep(for: .milliseconds(10))
+            waited += 1
         }
+        #expect(tree.hasEntered)
+        read.cancel()
+        gate.signal()
+        await #expect(throws: CancellationError.self) { try await read.value }
+        #expect(tree.totalInfoReads == 0)
+    }
+
+    @Test func pressingRunsOnlyEnabledItemsThroughTheReader() async throws {
+        let tree = FakeMenuTree(bars: [42: Self.menuBar()])
+        let search = MenuItemSearch(source: tree)
+        let items = try await search.items(for: 42).items
+        let pdf = try #require(items.first { $0.title == "PDF" })
+        try await search.press(pdf)
+        #expect(tree.pressedTitles == ["PDF"])
+        let close = try #require(items.first { $0.title == "Close" })
+        await #expect(throws: LibraryValidationError.self) { try await search.press(close) }
+        #expect(tree.pressedTitles == ["PDF"])
+    }
+
+    @Test(arguments: [SideEffectGuard.Mode.testHost, .verification])
+    func realMenuPressesAreBlockedInInertLaunches(_ mode: SideEffectGuard.Mode) {
+        let sideEffects = SideEffectGuard(mode: mode)
+        // A token node has no element, and the guard runs before any Accessibility call.
+        #expect(throws: SideEffectGuard.Blocked(what: "pressing a menu item", mode: mode)) {
+            try AXMenuTreeSource(sideEffects: sideEffects).press(MenuNodeRef(token: 0))
+        }
+        let inert = MenuSearchEnvironment.makeSource(sideEffects: sideEffects)
+        #expect(inert is InertMenuTreeSource)
+        #expect(!inert.isTrusted)
+        #expect(inert.menuBar(of: 1) == nil)
+        #expect(throws: SideEffectGuard.Blocked.self) { try inert.press(MenuNodeRef(token: 0)) }
     }
 }

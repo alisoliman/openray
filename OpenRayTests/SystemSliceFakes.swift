@@ -26,11 +26,22 @@ enum WindowFixture {
 
     static func window(
         pid: pid_t = 100, token: Int, app: String = "Notes", bundle: String? = "com.example.notes",
-        title: String = "", frame: CGRect = CGRect(x: 100, y: 200, width: 600, height: 400), minimized: Bool = false
+        title: String = "", frame: CGRect? = CGRect(x: 100, y: 200, width: 600, height: 400), minimized: Bool = false
     ) -> WindowSnapshot {
         WindowSnapshot(
             handle: WindowHandle(pid: pid, token: token), appName: app, bundleIdentifier: bundle, bundleURL: nil,
             title: title, frame: frame, isMinimized: minimized)
+    }
+
+    /// Window-server entries for these windows, front to back in the given order.
+    static func entries(for windows: [WindowSnapshot], primaryHeight: CGFloat = 900) -> [WindowServerEntry] {
+        windows.compactMap { window in
+            window.frame.map {
+                WindowServerEntry(
+                    number: UInt32(window.handle.token), pid: window.pid,
+                    bounds: ScreenCoordinates.flip($0, primaryHeight: primaryHeight), layer: 0)
+            }
+        }
     }
 }
 
@@ -52,10 +63,20 @@ final class FakeWindowSystem: WindowSystem {
     var focusedWindows: [pid_t: WindowHandle] = [:]
     var runningPIDs: Set<pid_t> = []
     var fullScreen: [WindowHandle: Bool] = [:]
-    /// Windows whose frame can't change, like fixed-size panels.
+    /// Windows that refuse to move or resize at all.
     var lockedTokens: Set<Int> = []
+    /// Windows that can move but not resize.
+    var fixedSizeTokens: Set<Int> = []
+    /// Apps that accept a resize and then keep their own size.
+    var clampedSizes: [Int: CGSize] = [:]
+    /// Windows whose focus or close fails.
+    var focusFailures: Set<Int> = []
+    var closeFailures: Set<Int> = []
     private(set) var events: [Event] = []
     private(set) var trustRequests = 0
+    /// How many listings asked for frames, and how many for titles only.
+    private(set) var frameListings = 0
+    private(set) var titleListings = 0
 
     init(displays: [DisplaySnapshot] = [WindowFixture.laptop], windows: [WindowSnapshot] = []) {
         displayList = displays
@@ -65,8 +86,13 @@ final class FakeWindowSystem: WindowSystem {
     func requestTrust() { trustRequests += 1 }
     func displays() -> [DisplaySnapshot] { displayList }
 
-    func windows(includeMinimized: Bool) -> [WindowSnapshot] {
-        includeMinimized ? windowList : windowList.filter { !$0.isMinimized }
+    func windows(includeMinimized: Bool, readFrames: Bool) -> [WindowSnapshot] {
+        if readFrames { frameListings += 1 } else { titleListings += 1 }
+        return (includeMinimized ? windowList : windowList.filter { !$0.isMinimized }).map { window in
+            var window = window
+            if !readFrames { window.frame = nil }
+            return window
+        }
     }
 
     func focusedWindow(of pid: pid_t) -> WindowHandle? {
@@ -78,13 +104,21 @@ final class FakeWindowSystem: WindowSystem {
     func title(of window: WindowHandle) -> String? { windowList.first { $0.handle == window }?.title }
 
     func frame(of window: WindowHandle) throws -> CGRect {
-        windowList[try index(of: window)].frame
+        guard let frame = windowList[try index(of: window)].frame else {
+            throw LibraryValidationError("This window does not support positioning.")
+        }
+        return frame
     }
 
     func setFrame(_ frame: CGRect, of window: WindowHandle) throws {
         let index = try index(of: window)
-        guard !lockedTokens.contains(window.token) else { throw LibraryValidationError("Fixed size.") }
-        windowList[index].frame = frame
+        guard !lockedTokens.contains(window.token) else { throw LibraryValidationError("Fixed window.") }
+        if fixedSizeTokens.contains(window.token), windowList[index].frame?.size != frame.size {
+            throw LibraryValidationError("Fixed size.")
+        }
+        var applied = frame
+        if let clamped = clampedSizes[window.token] { applied.size = clamped }
+        windowList[index].frame = applied
         events.append(.setFrame(window.token, frame))
     }
 
@@ -104,11 +138,16 @@ final class FakeWindowSystem: WindowSystem {
 
     func focus(_ window: WindowHandle) throws {
         _ = try index(of: window)
+        guard !focusFailures.contains(window.token) else {
+            throw LibraryValidationError("The app didn't bring that window forward.")
+        }
         events.append(.focus(window.token))
     }
 
     func close(_ window: WindowHandle) throws {
-        windowList.remove(at: try index(of: window))
+        let index = try index(of: window)
+        guard !closeFailures.contains(window.token) else { throw LibraryValidationError("Can't close.") }
+        windowList.remove(at: index)
         events.append(.close(window.token))
     }
 
@@ -169,14 +208,21 @@ final class FakeAudioDevices: AudioDeviceControlling {
     static let speakers = AudioDevice(id: 10, uid: "speakers", name: "MacBook Speakers", transport: .builtIn)
     static let headphones = AudioDevice(id: 11, uid: "headphones", name: "Headphones", transport: .bluetooth)
     static let microphone = AudioDevice(id: 20, uid: "mic", name: "MacBook Microphone", transport: .builtIn)
+    static let usbMicrophone = AudioDevice(id: 21, uid: "usb", name: "USB Microphone", transport: .usb)
 
     var outputs = [speakers, headphones]
     var inputs = [microphone]
     var defaults: [AudioScope: AudioDevice] = [.output: speakers, .input: microphone]
-    var volumes: [String: Double] = ["speakers.output": 0.5, "headphones.output": 0.25, "mic.input": 0.6]
-    var mutes: [String: Bool] = ["speakers.output": false, "headphones.output": false]
+    var volumes: [String: Double] = ["speakers.output": 0.5, "headphones.output": 0.25]
+    var mutes: [String: Bool] = ["speakers.output": false, "headphones.output": false, "mic.input": false]
     var volumeless: Set<String> = []
-    var unmutable: Set<String> = ["mic.input"]
+    var unmutable: Set<String> = []
+    /// Per-channel gain for inputs: key → element → gain.
+    var gains: [String: [UInt32: Double]] = [:]
+    /// Inputs whose gain controls don't cover every channel.
+    var partialGain: Set<String> = []
+    /// Inputs that report success but don't actually change.
+    var ignoresChanges: Set<String> = []
     private(set) var changes: [String] = []
 
     func devices(for scope: AudioScope) -> [AudioDevice] { scope == .output ? outputs : inputs }
@@ -203,8 +249,8 @@ final class FakeAudioDevices: AudioDeviceControlling {
 
     func setMuted(_ muted: Bool, of device: AudioDevice, scope: AudioScope) throws {
         guard canMute(device, scope: scope) else { throw AudioDeviceError.noMuteControl }
-        mutes[key(device, scope)] = muted
         changes.append("mute.\(key(device, scope))=\(muted)")
+        if !ignoresChanges.contains(key(device, scope)) { mutes[key(device, scope)] = muted }
     }
 
     func canSetVolume(of device: AudioDevice, scope: AudioScope) -> Bool {
@@ -213,65 +259,121 @@ final class FakeAudioDevices: AudioDeviceControlling {
 
     func canMute(_ device: AudioDevice, scope: AudioScope) -> Bool { !unmutable.contains(key(device, scope)) }
 
+    func gainElements(of device: AudioDevice, scope: AudioScope) -> [UInt32] {
+        (gains[key(device, scope)] ?? [:]).keys.sorted()
+    }
+
+    func gainCoversAllChannels(of device: AudioDevice, scope: AudioScope) -> Bool {
+        !partialGain.contains(key(device, scope)) && !gainElements(of: device, scope: scope).isEmpty
+    }
+
+    func gain(of device: AudioDevice, scope: AudioScope, element: UInt32) -> Double? {
+        gains[key(device, scope)]?[element]
+    }
+
+    func setGain(_ gain: Double, of device: AudioDevice, scope: AudioScope, element: UInt32) throws {
+        changes.append("gain.\(key(device, scope)).\(element)=\(gain)")
+        if !ignoresChanges.contains(key(device, scope)) { gains[key(device, scope), default: [:]][element] = gain }
+    }
+
     private func key(_ device: AudioDevice, _ scope: AudioScope) -> String { "\(device.uid).\(scope.rawValue)" }
 }
 
 // MARK: - Menus
 
-@MainActor
-final class FakeMenuElement: MenuAXElement {
-    var role: String?
-    var title: String?
-    var isEnabled: Bool
-    var commandCharacter: String?
-    var commandModifiers: Int?
-    var commandGlyph: Int?
-    var commandVirtualKey: Int?
-    var children: [any MenuAXElement]
-    private(set) var pressCount = 0
+/// A menu tree described as values.
+struct MenuSpec {
+    var info: MenuNodeInfo
+    var children: [MenuSpec] = []
 
-    init(
-        role: String, title: String? = nil, enabled: Bool = true, character: String? = nil, modifiers: Int? = nil,
-        glyph: Int? = nil, children: [any MenuAXElement] = []
-    ) {
-        self.role = role
-        self.title = title
-        isEnabled = enabled
-        commandCharacter = character
-        commandModifiers = modifiers
-        commandGlyph = glyph
-        self.children = children
-    }
-
-    func press() throws { pressCount += 1 }
-
-    static func bar(_ menus: [FakeMenuElement]) -> FakeMenuElement {
-        FakeMenuElement(role: "AXMenuBar", children: menus)
-    }
+    static func bar(_ menus: [MenuSpec]) -> MenuSpec { MenuSpec(info: MenuNodeInfo(role: "AXMenuBar"), children: menus) }
 
     /// A top-level menu: an AXMenuBarItem holding an AXMenu.
-    static func menu(_ title: String, _ items: [FakeMenuElement]) -> FakeMenuElement {
-        FakeMenuElement(
-            role: "AXMenuBarItem", title: title, children: [FakeMenuElement(role: "AXMenu", children: items)])
+    static func menu(_ title: String, _ items: [MenuSpec]) -> MenuSpec {
+        MenuSpec(
+            info: MenuNodeInfo(role: "AXMenuBarItem", title: title),
+            children: [MenuSpec(info: MenuNodeInfo(role: "AXMenu"), children: items)])
     }
 
     static func item(
-        _ title: String, character: String? = nil, modifiers: Int? = nil, glyph: Int? = nil, enabled: Bool = true,
-        submenu: [FakeMenuElement]? = nil
-    ) -> FakeMenuElement {
-        FakeMenuElement(
-            role: "AXMenuItem", title: title, enabled: enabled, character: character, modifiers: modifiers,
-            glyph: glyph, children: submenu.map { [FakeMenuElement(role: "AXMenu", children: $0)] } ?? [])
+        _ title: String, character: String? = nil, modifiers: Int? = nil, glyph: Int? = nil,
+        virtualKey: Int? = nil, enabled: Bool = true, submenu: [MenuSpec]? = nil
+    ) -> MenuSpec {
+        MenuSpec(
+            info: MenuNodeInfo(
+                role: "AXMenuItem", title: title, isEnabled: enabled, commandCharacter: character,
+                commandModifiers: modifiers, commandGlyph: glyph, commandVirtualKey: virtualKey),
+            children: submenu.map { [MenuSpec(info: MenuNodeInfo(role: "AXMenu"), children: $0)] } ?? [])
     }
 
-    static func separator() -> FakeMenuElement { FakeMenuElement(role: "AXMenuItem", title: "") }
+    static func separator() -> MenuSpec { MenuSpec(info: MenuNodeInfo(role: "AXMenuItem", title: "")) }
 }
 
-@MainActor
-final class FakeMenuBarProvider: MenuBarProviding {
-    var isTrusted = true
-    var bars: [pid_t: FakeMenuElement] = [:]
-    func menuBar(of pid: pid_t) -> (any MenuAXElement)? { bars[pid] }
+/// A menu tree source over value specs. Counts reads, records presses, and can
+/// hold the reader at the menu bar until a test lets it go.
+final class FakeMenuTree: MenuTreeSource, @unchecked Sendable {
+    let isTrusted: Bool
+    private let lock = NSLock()
+    private var infos: [Int: MenuNodeInfo] = [:]
+    private var childTokens: [Int: [Int]] = [:]
+    private var roots: [pid_t: Int] = [:]
+    private var pressedTokens: [Int] = []
+    private var infoReadCounts: [Int: Int] = [:]
+    private var childReadCounts: [Int: Int] = [:]
+    private var entered = false
+    private let gate: DispatchSemaphore?
+
+    init(bars: [pid_t: MenuSpec], trusted: Bool = true, gate: DispatchSemaphore? = nil) {
+        isTrusted = trusted
+        self.gate = gate
+        var next = 1
+        var infos: [Int: MenuNodeInfo] = [:]
+        var childTokens: [Int: [Int]] = [:]
+        func add(_ spec: MenuSpec) -> Int {
+            let token = next
+            next += 1
+            infos[token] = spec.info
+            childTokens[token] = spec.children.map(add)
+            return token
+        }
+        var roots: [pid_t: Int] = [:]
+        for (pid, bar) in bars { roots[pid] = add(bar) }
+        self.infos = infos
+        self.childTokens = childTokens
+        self.roots = roots
+    }
+
+    var hasEntered: Bool { lock.withLock { entered } }
+    var pressedTitles: [String] { lock.withLock { pressedTokens.compactMap { infos[$0]?.title } } }
+    /// The most times any single node's attributes or children were read.
+    var maxReadsPerNode: Int {
+        lock.withLock { max(infoReadCounts.values.max() ?? 0, childReadCounts.values.max() ?? 0) }
+    }
+    var totalInfoReads: Int { lock.withLock { infoReadCounts.values.reduce(0, +) } }
+
+    func menuBar(of pid: pid_t) -> MenuNodeRef? {
+        lock.withLock { entered = true }
+        gate?.wait()
+        return lock.withLock { roots[pid] }.map(MenuNodeRef.init(token:))
+    }
+
+    func info(of node: MenuNodeRef) -> MenuNodeInfo {
+        lock.withLock {
+            infoReadCounts[node.token, default: 0] += 1
+            return infos[node.token] ?? MenuNodeInfo()
+        }
+    }
+
+    func children(of node: MenuNodeRef) -> [MenuNodeRef] {
+        lock.withLock {
+            childReadCounts[node.token, default: 0] += 1
+            return (childTokens[node.token] ?? []).map(MenuNodeRef.init(token:))
+        }
+    }
+
+    func press(_ node: MenuNodeRef) throws {
+        lock.withLock { pressedTokens.append(node.token) }
+    }
 }
 
 // MARK: - HUD

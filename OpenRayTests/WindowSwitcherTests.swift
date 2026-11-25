@@ -102,10 +102,36 @@ struct WindowSwitcherTests {
         try switcher.toggleFullScreen(docs)
         try switcher.hideApplication(of: docs)
         try switcher.close(docs)
+        // Fullscreen acts on the window where it is; it doesn't switch to it.
         #expect(
             system.events == [
-                .minimized(3, true), .fullScreen(3, true), .focus(3), .hide(200), .close(3),
+                .minimized(3, true), .fullScreen(3, true), .hide(200), .close(3),
             ])
+    }
+
+    @Test func focusFailuresAndClosedWindowsAreReported() throws {
+        let (switcher, system) = makeSwitcher()
+        let listed = switcher.windows()
+        let docs = try #require(listed.first { $0.handle.token == 3 })
+        system.focusFailures = [3]
+        #expect(throws: LibraryValidationError.self) { try switcher.focus(docs) }
+        // The window closed after the list was read, while its app keeps running.
+        system.windowList.removeAll { $0.handle.token == 1 }
+        system.runningPIDs = [100]
+        let closed = try #require(listed.first { $0.handle.token == 1 })
+        #expect(throws: LibraryValidationError.self) { try switcher.focus(closed) }
+        #expect(!system.events.contains(.focus(3)) && !system.events.contains(.focus(1)))
+    }
+
+    @Test func windowsWithoutAKnownFrameAreListedAfterOnScreenOnes() {
+        let ordered = WindowSwitcherOrdering.order(
+            [
+                WindowFixture.window(pid: 1, token: 1, frame: nil),
+                WindowFixture.window(pid: 1, token: 2, frame: editorFrame),
+            ],
+            entries: [entry(7, pid: 1, appKitFrame: editorFrame)], primaryHeight: 900)
+        #expect(ordered.map(\.handle.token) == [2, 1])
+        #expect(ordered.map(\.isOnScreen) == [true, false])
     }
 
     @Test func focusNextAndPreviousAppWindowCycleInAStableOrder() throws {

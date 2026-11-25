@@ -5,10 +5,18 @@ import Testing
 
 @MainActor
 struct SystemCommandsTests {
+    private let mail = AppIdentity(
+        pid: 4242, bundleIdentifier: "com.example.mail", name: "Mail", launchDate: Date(timeIntervalSince1970: 1_000))
+
+    private var context: SystemCommandContext {
+        SystemCommandContext(foregroundApplication: mail, excludedBundleIdentifiers: ["com.example.music"])
+    }
+
     // MARK: Safety
 
     @Test func theTestHostNeverGetsALiveExecutor() async {
         #expect(SideEffectGuard.isTestHost)
+        #expect(SideEffectGuard.isInert)
         let executor = SystemActionEnvironment.makeDefault()
         #expect(executor is InertSystemActions)
         #expect(!(executor is LiveSystemActions))
@@ -18,11 +26,13 @@ struct SystemCommandsTests {
         #expect(LiveSystemActions.instanceCount == 0)
     }
 
-    @Test func runningAnyCommandWithTheDefaultExecutorIsRefused() async {
-        let executor = SystemActionEnvironment.makeDefault()
+    @Test(arguments: [SideEffectGuard.Mode.testHost, .verification])
+    func everyValidCommandIsBlockedInInertLaunches(_ mode: SideEffectGuard.Mode) async {
+        let executor = SystemActionEnvironment.makeDefault(sideEffects: SideEffectGuard(mode: mode))
+        #expect(executor is InertSystemActions)
         for command in SystemCommand.all {
-            await #expect(throws: (any Error).self) {
-                _ = try await command.run(with: executor, argument: "50", context: .init(frontmostPID: 4242))
+            await #expect(throws: SideEffectGuard.Blocked(what: "system commands", mode: mode), "\(command.id)") {
+                _ = try await command.run(with: executor, argument: "50", context: context)
             }
         }
         #expect(LiveSystemActions.instanceCount == 0)
@@ -53,9 +63,14 @@ struct SystemCommandsTests {
             #expect(command.confirmation?.title.hasSuffix("?") == true)
             #expect(command.confirmation?.button.isEmpty == false)
         }
+        // Quit Others names the app it keeps.
+        #expect(
+            SystemCommand.command(.quitAllAppsExceptFrontmost).confirmation(for: context)?.title
+                == "Quit every app except Mail?")
+        #expect(SystemCommand.command(.lockScreen).confirmation(for: context) == nil)
     }
 
-    @Test func permissionsAreDeclared() {
+    @Test func permissionsAndLimitsAreDeclared() {
         func permission(_ id: SystemCommand.ID) -> SystemCommand.Permission { SystemCommand.command(id).permission }
         #expect(permission(.lockScreen) == .accessibility)
         #expect(permission(.playPause) == .accessibility)
@@ -67,13 +82,13 @@ struct SystemCommandsTests {
         #expect(permission(.volumeUp) == SystemCommand.Permission.none)
         #expect(SystemCommand.command(.dismissNotifications).limitation != nil)
         #expect(SystemCommand.command(.showDesktop).limitation != nil)
+        #expect(SystemCommand.command(.toggleWiFi).limitation?.contains("administrator") == true)
         #expect(SystemCommand.all.filter(\.takesArgument).map(\.id) == [.setVolume])
     }
 
     // MARK: Actions
 
     @Test func everyCommandMapsToItsAction() throws {
-        let context = SystemCommandContext(frontmostPID: 77, excludedBundleIdentifiers: ["com.example.music"])
         let expected: [SystemCommand.ID: SystemAction] = [
             .lockScreen: .lockScreen, .sleep: .sleep, .sleepDisplays: .sleepDisplays, .restart: .restart,
             .shutDown: .shutDown, .logOut: .logOut, .startScreenSaver: .startScreenSaver,
@@ -84,10 +99,10 @@ struct SystemCommandsTests {
             .toggleMicrophoneMute: .toggleMicrophoneMute, .showDesktop: .showDesktop,
             .toggleAppearance: .toggleAppearance, .openTrash: .openTrash, .emptyTrash: .emptyTrash,
             .ejectAllDisks: .ejectAllDisks, .toggleHiddenFiles: .toggleHiddenFiles,
-            .hideOtherApps: .hideApps(keeping: 77), .unhideAllApps: .unhideApps,
-            .quitAllApps: .quitApps(keeping: nil, excluded: ["com.example.music"]),
-            .quitAllAppsExceptFrontmost: .quitApps(keeping: 77, excluded: ["com.example.music"]),
-            .restartFrontmostApp: .restartApp(77), .dismissNotifications: .dismissNotifications,
+            .hideOtherApps: .hideOtherApps(keeping: mail), .unhideAllApps: .unhideApps,
+            .quitAllApps: .quitAllApps(excluded: ["com.example.music"]),
+            .quitAllAppsExceptFrontmost: .quitOtherApps(keeping: mail, excluded: ["com.example.music"]),
+            .restartFrontmostApp: .restartApp(mail), .dismissNotifications: .dismissNotifications,
             .toggleWiFi: .toggleWiFi,
         ]
         #expect(Set(expected.keys) == Set(SystemCommand.ID.allCases))
@@ -96,9 +111,16 @@ struct SystemCommandsTests {
         }
     }
 
-    @Test func restartingTheFrontmostAppNeedsOne() {
+    @Test(arguments: [SystemCommand.ID.hideOtherApps, .quitAllAppsExceptFrontmost, .restartFrontmostApp])
+    func commandsAboutTheFrontmostAppNeedOneThatIsNotOpenRay(_ id: SystemCommand.ID) {
+        let command = SystemCommand.command(id)
+        // No foreground app: never widened to every app.
+        #expect(throws: LibraryValidationError.self) { try command.action(context: .init()) }
+        let openRay = AppIdentity(
+            pid: ProcessInfo.processInfo.processIdentifier, bundleIdentifier: Bundle.main.bundleIdentifier,
+            name: "OpenRay", launchDate: nil)
         #expect(throws: LibraryValidationError.self) {
-            try SystemCommand.command(.restartFrontmostApp).action(context: .init())
+            try command.action(context: SystemCommandContext(foregroundApplication: openRay))
         }
     }
 
@@ -121,9 +143,12 @@ struct SystemCommandsTests {
         performer.result = .done
         #expect(try await SystemCommand.command(.lockScreen).run(with: performer) == nil)
         #expect(performer.actions.last == .lockScreen)
-        // A bad argument never reaches the executor.
+        // A bad argument or a missing foreground app never reaches the executor.
         await #expect(throws: LibraryValidationError.self) {
             _ = try await SystemCommand.command(.setVolume).run(with: performer, argument: "200")
+        }
+        await #expect(throws: LibraryValidationError.self) {
+            _ = try await SystemCommand.command(.quitAllAppsExceptFrontmost).run(with: performer)
         }
         #expect(performer.actions.count == 2)
     }
@@ -142,8 +167,15 @@ struct SystemCommandsTests {
         #expect(hud(.volumeDown, .volume(0.2, muted: true)) == "Muted")
         #expect(hud(.toggleMute, .muted(true)) == "Muted")
         #expect(hud(.toggleMute, .muted(false)) == "Unmuted")
-        #expect(hud(.toggleMicrophoneMute, .microphoneMuted(true)) == "Microphone muted")
-        #expect(hud(.toggleMicrophoneMute, .microphoneMuted(false)) == "Microphone on")
+        #expect(hud(.toggleMicrophoneMute, .microphones(muted: true, changed: 1, unchanged: [])) == "Microphone muted")
+        #expect(hud(.toggleMicrophoneMute, .microphones(muted: false, changed: 1, unchanged: [])) == "Microphone on")
+        #expect(hud(.toggleMicrophoneMute, .microphones(muted: true, changed: 2, unchanged: [])) == "2 microphones muted")
+        #expect(
+            hud(.toggleMicrophoneMute, .microphones(muted: true, changed: 1, unchanged: ["USB Microphone"]))
+                == "Muted 1 of 2 microphones. USB Microphone is still on")
+        #expect(
+            SystemCommand.command(.toggleMicrophoneMute).hud(
+                for: .microphones(muted: true, changed: 1, unchanged: ["USB Microphone"]))?.style == .warning)
         #expect(hud(.toggleAppearance, .appearance(dark: true)) == "Dark appearance")
         #expect(hud(.toggleAppearance, .appearance(dark: false)) == "Light appearance")
         #expect(hud(.toggleHiddenFiles, .hiddenFiles(visible: true)) == "Showing hidden files")
@@ -173,28 +205,67 @@ struct SystemCommandsTests {
         #expect(SystemCommand.volumeSymbol(0.9) == "speaker.wave.3.fill")
     }
 
-    // MARK: Pure helpers
+    // MARK: Which apps change
 
-    private let apps = [
-        RunningAppInfo(pid: 1, bundleIdentifier: "com.example.openray", name: "OpenRay", isRegular: true, isHidden: false),
-        RunningAppInfo(pid: 2, bundleIdentifier: "com.apple.finder", name: "Finder", isRegular: true, isHidden: false),
-        RunningAppInfo(pid: 3, bundleIdentifier: "com.example.mail", name: "Mail", isRegular: true, isHidden: false),
-        RunningAppInfo(pid: 4, bundleIdentifier: "com.example.music", name: "Music", isRegular: true, isHidden: true),
-        RunningAppInfo(pid: 5, bundleIdentifier: "com.example.helper", name: "Helper", isRegular: false, isHidden: false),
-        RunningAppInfo(pid: 6, bundleIdentifier: nil, name: "Tool", isRegular: true, isHidden: false),
-    ]
+    private var apps: [RunningAppInfo] {
+        [
+            RunningAppInfo(pid: 1, bundleIdentifier: "com.example.openray", name: "OpenRay", isRegular: true, isHidden: false),
+            RunningAppInfo(pid: 2, bundleIdentifier: "com.apple.finder", name: "Finder", isRegular: true, isHidden: false),
+            RunningAppInfo(
+                pid: 4242, bundleIdentifier: "com.example.mail", name: "Mail", isRegular: true, isHidden: false,
+                launchDate: Date(timeIntervalSince1970: 1_000)),
+            RunningAppInfo(pid: 4, bundleIdentifier: "com.example.music", name: "Music", isRegular: true, isHidden: true),
+            RunningAppInfo(pid: 5, bundleIdentifier: "com.example.helper", name: "Helper", isRegular: false, isHidden: false),
+            RunningAppInfo(pid: 6, bundleIdentifier: nil, name: "Tool", isRegular: true, isHidden: false),
+        ]
+    }
 
-    @Test func hideAndUnhideSkipOpenRayHelpersAndTheKeptApp() {
-        #expect(AppSelection.hideTargets(apps, keeping: 3, ownPID: 1).map(\.pid) == [2, 6])
-        #expect(AppSelection.hideTargets(apps, keeping: nil, ownPID: 1).map(\.pid) == [2, 3, 6])
+    @Test func hideAndUnhideSkipOpenRayHelpersAndTheKeptApp() throws {
+        #expect(try AppSelection.hideTargets(apps, keeping: mail, ownPID: 1).map(\.pid) == [2, 6])
         #expect(AppSelection.unhideTargets(apps, ownPID: 1).map(\.pid) == [4])
     }
 
-    @Test func quitSkipsOpenRayFinderExclusionsAndTheKeptApp() {
-        #expect(AppSelection.quitTargets(apps, keeping: nil, excluded: [], ownPID: 1).map(\.pid) == [3, 4, 6])
+    @Test func quitSkipsOpenRayFinderExclusionsAndTheKeptApp() throws {
+        #expect(try AppSelection.quitTargets(apps, keeping: nil, excluded: [], ownPID: 1).map(\.pid) == [4242, 4, 6])
         #expect(
-            AppSelection.quitTargets(apps, keeping: 3, excluded: ["com.example.music"], ownPID: 1).map(\.pid) == [6])
+            try AppSelection.quitTargets(apps, keeping: mail, excluded: ["com.example.music"], ownPID: 1).map(\.pid)
+                == [6])
     }
+
+    @Test func aStaleOrReusedTargetChangesNothing() {
+        // Mail quit and its PID now belongs to another app.
+        var reused = apps
+        reused[2] = RunningAppInfo(
+            pid: 4242, bundleIdentifier: "com.example.other", name: "Other", isRegular: true, isHidden: false)
+        #expect(throws: LibraryValidationError.self) {
+            try AppSelection.quitTargets(reused, keeping: mail, excluded: [], ownPID: 1)
+        }
+        #expect(throws: LibraryValidationError.self) { try AppSelection.hideTargets(reused, keeping: mail, ownPID: 1) }
+        // Mail quit and relaunched: same bundle, new launch.
+        var relaunched = apps
+        relaunched[2].launchDate = Date(timeIntervalSince1970: 2_000)
+        #expect(throws: LibraryValidationError.self) {
+            try AppSelection.quitTargets(relaunched, keeping: mail, excluded: [], ownPID: 1)
+        }
+        // Mail is gone entirely.
+        #expect(throws: LibraryValidationError.self) {
+            try AppSelection.hideTargets(apps.filter { $0.pid != 4242 }, keeping: mail, ownPID: 1)
+        }
+        // OpenRay itself can't be the app to keep.
+        let openRay = AppIdentity(pid: 1, bundleIdentifier: "com.example.openray", name: "OpenRay", launchDate: nil)
+        #expect(throws: LibraryValidationError.self) { try AppSelection.hideTargets(apps, keeping: openRay, ownPID: 1) }
+    }
+
+    @Test func aWindowTargetNeverReplacesTheForegroundApp() throws {
+        // The window chip may point at another app's window; the context only carries
+        // the app that was frontmost when the launcher opened.
+        let foreground = SystemCommandContext(foregroundApplication: mail)
+        let action = try SystemCommand.command(.quitAllAppsExceptFrontmost).action(context: foreground)
+        #expect(action == .quitOtherApps(keeping: mail, excluded: []))
+        #expect(try AppSelection.quitTargets(apps, keeping: mail, excluded: [], ownPID: 1).map(\.pid) == [4, 6])
+    }
+
+    // MARK: Pure helpers
 
     @Test func ejectingSelectsExternalImagesAndNetworkVolumesOnly() {
         func volume(
@@ -236,5 +307,24 @@ struct SystemCommandsTests {
         #expect(NotificationDismissal.dismissAction(in: ["AXPress", close, clearAll]) == clearAll)
         #expect(NotificationDismissal.dismissAction(in: ["AXPress", close]) == close)
         #expect(NotificationDismissal.dismissAction(in: ["AXPress", "Name:Show\nTarget:0x0"]) == nil)
+    }
+
+    @Test func helpersOnlySucceedWhenTheyExitCleanly() throws {
+        try HelperExit.exited(0).check(tool: "pmset", acceptsTimeout: false)
+        #expect(throws: LibraryValidationError.self) { try HelperExit.exited(1).check(tool: "pmset", acceptsTimeout: false) }
+        #expect(throws: LibraryValidationError.self) { try HelperExit.signaled(9).check(tool: "pmset", acceptsTimeout: true) }
+        #expect(throws: LibraryValidationError.self) { try HelperExit.timedOut.check(tool: "pmset", acceptsTimeout: false) }
+        // Mission Control may keep running while the desktop shows.
+        try HelperExit.timedOut.check(tool: "Mission Control", acceptsTimeout: true)
+        #expect(throws: LibraryValidationError.self) {
+            try HelperExit.exited(2).check(tool: "Mission Control", acceptsTimeout: true)
+        }
+    }
+
+    @Test func wiFiPermissionErrorsSayAnAdministratorIsNeeded() {
+        let denied = NSError(domain: "com.apple.coreWLAN.error", code: WiFiPowerError.notPermitted)
+        #expect(WiFiPowerError.message(for: denied, turningOn: false).contains("administrator"))
+        let other = NSError(domain: "com.apple.coreWLAN.error", code: -3_931)
+        #expect(WiFiPowerError.message(for: other, turningOn: true) == "macOS didn't allow OpenRay to turn Wi-Fi on.")
     }
 }

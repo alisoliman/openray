@@ -82,15 +82,29 @@ struct WindowManagerCommandTests {
         #expect(throws: LibraryValidationError.self) { try manager.perform(.restore, on: first) }
     }
 
-    @Test func displayMovesCenterTheWindowOnTheNeighbouringDisplay() throws {
+    @Test func displayMovesFollowTheSystemDisplayOrderAndCenterWithoutRounding() throws {
+        // System order is laptop, then the display on its left, then the one on its
+        // right: not reading order, which would go from the laptop to the right.
         let (manager, system) = makeManager(displays: [WindowFixture.laptop, WindowFixture.secondary, WindowFixture.portrait])
         try manager.perform(.nextDisplay, on: first)
-        // Reading order is secondary, laptop, portrait: next from the laptop is the portrait display.
+        #expect(system.frames.last == CGRect(x: -1260, y: 125, width: 600, height: 400))
+        try manager.perform(.nextDisplay, on: first)
         #expect(system.frames.last == CGRect(x: 1680, y: 245, width: 600, height: 400))
         try manager.perform(.nextDisplay, on: first)
-        #expect(system.frames.last == CGRect(x: -1260, y: 125, width: 600, height: 400))
+        #expect(system.frames.last == CGRect(x: 420, y: 276, width: 600, height: 400))
         try manager.perform(.previousDisplay, on: first)
         #expect(system.frames.last == CGRect(x: 1680, y: 245, width: 600, height: 400))
+    }
+
+    @Test func legacyNextDisplayKeepsOddSizesUnrounded() throws {
+        let odd = DisplaySnapshot(
+            id: 9, name: "Odd", frame: CGRect(x: 1440, y: 0, width: 1001, height: 701),
+            visibleFrame: CGRect(x: 1440, y: 0, width: 1001, height: 701))
+        let system = FakeWindowSystem(
+            displays: [WindowFixture.laptop, odd],
+            windows: [WindowFixture.window(pid: 100, token: 1, frame: CGRect(x: 100, y: 200, width: 600, height: 400))])
+        try WindowManager(system: system).perform(.nextDisplay, on: first)
+        #expect(system.frames == [CGRect(x: 1640.5, y: 150.5, width: 600, height: 400)])
     }
 
     @Test func displayMovesNeedASecondDisplay() {
@@ -115,6 +129,37 @@ struct WindowManagerCommandTests {
         #expect(system.frames == [CGRect(x: 100, y: 300, width: 500, height: 300)])
         try manager.perform(.restore, on: first)
         #expect(system.frames.last == original)
+    }
+
+    @Test func invalidOrOversizedExactCommandsFailBeforeAnythingMoves() {
+        let (manager, system) = makeManager()
+        let negative = CustomWindowCommand(name: "Bad", width: .points(-20), height: .points(300), anchor: .current)
+        #expect(throws: LibraryValidationError.self) { try manager.perform(negative, on: first) }
+        #expect(throws: LibraryValidationError.self) { try manager.perform(negative, focusedWindowOf: 100) }
+        let farOffset = CustomWindowCommand(name: "Far", anchor: .topLeft, xOffset: .percent(250))
+        #expect(throws: LibraryValidationError.self) { try manager.perform(farOffset, on: first) }
+        // 1920 points don't fit the laptop's 1440-point visible width: an error, not a smaller window.
+        #expect(throws: LibraryValidationError.self) {
+            try manager.perform(CustomWindowCommand.resize(width: 1920, height: 1080), on: first)
+        }
+        #expect(system.events.isEmpty)
+    }
+
+    @Test func exactMoveOfAFractionalFixedSizeWindowOnlyMovesIt() throws {
+        let fractional = CGRect(x: 100.5, y: 200.25, width: 600.5, height: 400.25)
+        let system = FakeWindowSystem(windows: [WindowFixture.window(pid: 100, token: 1, frame: fractional)])
+        system.fixedSizeTokens = [1]
+        try WindowManager(system: system).perform(CustomWindowCommand.move(x: 40, y: 30), on: first)
+        #expect(system.frames.map(\.size) == [fractional.size])
+    }
+
+    @Test func anAppThatClampsAnExactResizeIsReported() {
+        let (manager, system) = makeManager()
+        system.clampedSizes[1] = CGSize(width: 640, height: 300)
+        #expect(throws: LibraryValidationError.self) {
+            try manager.perform(CustomWindowCommand.resize(width: 900, height: 300), on: first)
+        }
+        #expect(system.frames == [CGRect(x: 100, y: 300, width: 900, height: 300)])
     }
 
     @Test func commandsRefuseWithoutAccessibilityAndForOpenRayItself() {
@@ -154,11 +199,34 @@ struct WindowManagerCommandTests {
         #expect(manager.focusedWindowTitle(of: nil) == nil)
     }
 
-    @Test func theDefaultSystemIsAccessibilityAndItsWritesAreBlockedInTests() {
-        #expect(SideEffectGuard.isTestHost)
-        let system = AXWindowSystem()
-        #expect(WindowManager().system is AXWindowSystem)
-        // A token handle has no element, and the guard rejects the write before it is even looked at.
+    @Test func theTargetChipListingReadsTitlesOnly() {
+        let (manager, system) = makeManager()
+        _ = manager.listWindows()
+        #expect(system.titleListings == 1)
+        #expect(system.frameListings == 0)
+    }
+
+    @Test(arguments: [SideEffectGuard.Mode.testHost, .verification])
+    func inertLaunchesGetAnInertWindowSystem(_ mode: SideEffectGuard.Mode) {
+        let sideEffects = SideEffectGuard(mode: mode)
+        let system = WindowSystemEnvironment.makeSystem(sideEffects: sideEffects)
+        #expect(system is InertWindowSystem)
+        #expect(!system.isTrusted)
+        #expect(system.windows(includeMinimized: true, readFrames: true).isEmpty)
+        #expect(WindowSystemEnvironment.makeListing(sideEffects: sideEffects) is InertWindowServerListing)
+        let handle = WindowHandle(pid: 0, token: 0)
+        #expect(throws: SideEffectGuard.Blocked(what: "moving a window", mode: mode)) {
+            try system.setFrame(.zero, of: handle)
+        }
+        // The hosted default is inert too, so no test reads the developer's real windows.
+        #expect(WindowManager().system is InertWindowSystem)
+        #expect(!WindowManager().hasPermission)
+    }
+
+    @Test(arguments: [SideEffectGuard.Mode.testHost, .verification])
+    func theAccessibilitySystemRefusesEveryChangeInInertLaunches(_ mode: SideEffectGuard.Mode) {
+        // Element-less handles: nothing could happen even if a guard were missing.
+        let system = AXWindowSystem(sideEffects: SideEffectGuard(mode: mode))
         let handle = WindowHandle(pid: 0, token: 0)
         #expect(throws: SideEffectGuard.Blocked.self) { try system.setFrame(.zero, of: handle) }
         #expect(throws: SideEffectGuard.Blocked.self) { try system.setMinimized(true, of: handle) }

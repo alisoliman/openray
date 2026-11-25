@@ -193,7 +193,7 @@ struct WindowGeometryTests {
     @Test func gapsAreClampedToASaneRange() {
         #expect(WindowGaps(uniform: 500).window == WindowGaps.maximum)
         #expect(WindowGaps(uniform: -4).screen == 0)
-        #expect(WindowGaps(window: .nan, screen: .infinity) == .none)
+        #expect(WindowGaps(window: .nan, screen: .infinity) == WindowGaps.zero)
         // A screen gap too large for a tiny display is ignored rather than inverting the frame.
         let tiny = CGRect(x: 0, y: 0, width: 200, height: 150)
         #expect(WindowGeometry.usableArea(tiny, gaps: WindowGaps(uniform: 60)) == tiny)
@@ -285,48 +285,70 @@ struct WindowGeometryTests {
 
     // MARK: Displays
 
-    @Test func displayArrangementFindsTheDisplayShowingMostOfAWindow() {
+    @Test func displayArrangementKeepsTheOriginalSelection() {
         let displays = [WindowFixture.laptop.frame, WindowFixture.secondary.frame, WindowFixture.portrait.frame]
         #expect(DisplayArrangement.index(of: current, in: displays) == 0)
         #expect(DisplayArrangement.index(of: CGRect(x: -400, y: 100, width: 600, height: 300), in: displays) == 1)
         #expect(DisplayArrangement.index(of: CGRect(x: 1500, y: -400, width: 300, height: 300), in: displays) == 2)
-        // Entirely off every display: the nearest one.
-        #expect(DisplayArrangement.index(of: CGRect(x: 5000, y: 0, width: 100, height: 100), in: displays) == 2)
+        // Off every display: the first display, as before.
+        #expect(DisplayArrangement.index(of: CGRect(x: 5000, y: 0, width: 100, height: 100), in: displays) == 0)
+        // Equal overlap: the first of them wins.
+        let straddling = CGRect(x: -100, y: 100, width: 200, height: 200)
+        #expect(DisplayArrangement.index(of: straddling, in: [displays[1], displays[0]]) == 0)
         #expect(DisplayArrangement.index(of: current, in: []) == nil)
     }
 
-    @Test func displaysAreOrderedLeftToRightThenTopToBottom() {
+    @Test func nextDisplayFollowsTheSystemDisplayOrder() {
+        #expect(DisplayArrangement.adjacent(to: 0, count: 3, forward: true) == 1)
+        #expect(DisplayArrangement.adjacent(to: 2, count: 3, forward: true) == 0)
+        #expect(DisplayArrangement.adjacent(to: 0, count: 3, forward: false) == 2)
+        #expect(DisplayArrangement.adjacent(to: 0, count: 1, forward: true) == nil)
+        #expect(DisplayArrangement.adjacent(to: 4, count: 3, forward: true) == nil)
+    }
+
+    @Test func savedLayoutsNameDisplaysInReadingOrder() {
         let displays = [WindowFixture.laptop.frame, WindowFixture.secondary.frame, WindowFixture.portrait.frame]
         #expect(DisplayArrangement.spatialOrder(displays) == [1, 0, 2])
-        #expect(DisplayArrangement.adjacent(to: 0, in: displays, forward: true) == 2)
-        #expect(DisplayArrangement.adjacent(to: 0, in: displays, forward: false) == 1)
-        #expect(DisplayArrangement.adjacent(to: 2, in: displays, forward: true) == 1)
-        #expect(DisplayArrangement.adjacent(to: 1, in: displays, forward: false) == 2)
-        #expect(DisplayArrangement.adjacent(to: 0, in: [WindowFixture.laptop.frame], forward: true) == nil)
         let stacked = [CGRect(x: 0, y: 0, width: 100, height: 100), CGRect(x: 0, y: 100, width: 100, height: 100)]
         #expect(DisplayArrangement.spatialOrder(stacked) == [1, 0])
     }
 
     // MARK: Custom commands
 
-    @Test func customCommandsResolvePointsPercentsAnchorsAndOffsets() {
+    @Test func customCommandsResolvePointsPercentsAnchorsAndOffsets() throws {
         #expect(
-            CustomWindowCommand.resize(width: 500, height: 300).frame(in: laptop, current: current)
+            try CustomWindowCommand.resize(width: 500, height: 300).frame(in: laptop, current: current)
                 == CGRect(x: 100, y: 300, width: 500, height: 300))
         #expect(
-            CustomWindowCommand.move(x: 50, y: 20).frame(in: laptop, current: current)
+            try CustomWindowCommand.move(x: 50, y: 20).frame(in: laptop, current: current)
                 == CGRect(x: 50, y: 456, width: 600, height: 400))
         let rightHalf = CustomWindowCommand(name: "Right", width: .percent(50), height: .percent(100), anchor: .right)
-        #expect(rightHalf.frame(in: laptop, current: current) == CGRect(x: 720, y: 76, width: 720, height: 800))
+        #expect(try rightHalf.frame(in: laptop, current: current) == CGRect(x: 720, y: 76, width: 720, height: 800))
         let nudged = CustomWindowCommand(
             name: "Nudged", width: .points(400), height: .points(200), anchor: .center, xOffset: .percent(10),
             yOffset: .percent(-10))
-        #expect(nudged.frame(in: laptop, current: current) == CGRect(x: 664, y: 456, width: 400, height: 200))
+        #expect(try nudged.frame(in: laptop, current: current) == CGRect(x: 664, y: 456, width: 400, height: 200))
         let bottomLeft = CustomWindowCommand(name: "Corner", anchor: .bottomLeft)
-        #expect(bottomLeft.frame(in: laptop, current: current) == CGRect(x: 0, y: 76, width: 600, height: 400))
-        let oversized = CustomWindowCommand(name: "Wide", width: .points(5000), anchor: .topLeft)
-        #expect(oversized.frame(in: laptop, current: current).width == 1440)
+        #expect(try bottomLeft.frame(in: laptop, current: current) == CGRect(x: 0, y: 76, width: 600, height: 400))
         #expect(Set(WindowAnchor.allCases.map(\.title)).count == WindowAnchor.allCases.count)
+    }
+
+    @Test func exactResizeNeverShrinksTheRequestToFit() throws {
+        let oversized = CustomWindowCommand.resize(width: 1920, height: 1080)
+        #expect(throws: LibraryValidationError.self) { try oversized.frame(in: laptop, current: current) }
+        let wide = CustomWindowCommand(name: "Wide", width: .points(5000), anchor: .topLeft)
+        #expect(throws: LibraryValidationError.self) { try wide.frame(in: laptop, current: current) }
+        // A size that fits passes through exactly, fractions included.
+        let fractional = CustomWindowCommand.resize(width: 800.5, height: 600.25)
+        #expect(try fractional.frame(in: laptop, current: current).size == CGSize(width: 800.5, height: 600.25))
+    }
+
+    @Test func exactMoveKeepsAFractionalSizeExactly() throws {
+        let window = CGRect(x: 100.5, y: 200.25, width: 600.5, height: 400.25)
+        let moved = try CustomWindowCommand.move(x: 40, y: 30).frame(in: laptop, current: window)
+        #expect(moved.size == window.size)
+        #expect(moved.origin == CGPoint(x: 40, y: (876 - 400.25 - 30).rounded()))
+        #expect(!WindowFramePlan(current: window, target: moved).changesSize)
     }
 
     @Test func customCommandValidationRejectsImpossibleValues() throws {
@@ -342,6 +364,8 @@ struct WindowGeometryTests {
         ]
         for command in invalid {
             #expect(throws: LibraryValidationError.self) { try command.validate() }
+            // Frame calculation validates too, so nothing invalid reaches a window.
+            #expect(throws: LibraryValidationError.self) { try command.frame(in: laptop, current: current) }
         }
     }
 
@@ -353,19 +377,49 @@ struct WindowGeometryTests {
         #expect(decoded == command)
     }
 
+    @Test func storedGapsAreClampedWhenDecoded() throws {
+        let decoded = try JSONDecoder().decode(WindowGaps.self, from: Data(#"{"window": 900, "screen": -5}"#.utf8))
+        #expect(decoded == WindowGaps(window: WindowGaps.maximum, screen: 0))
+        #expect(try JSONDecoder().decode(WindowGaps.self, from: Data("{}".utf8)) == WindowGaps.zero)
+    }
+
     // MARK: Catalog
 
     @Test func originalLayoutsMapToCommandsWithTheSameIdentifiers() {
         for layout in WindowLayout.allCases {
             #expect(layout.command.rawValue == layout.rawValue)
         }
-        // The original API returns the same frames as before.
-        for layout in WindowLayout.allCases where layout != .restore && layout != .nextDisplay {
-            #expect(
-                layout.frame(in: laptop, current: current)
-                    == WindowGeometry.frame(for: layout.command, in: laptop, current: current))
+    }
+
+    /// Independent fixtures for the original twelve on an odd-sized display: no
+    /// rounding, and Next Display's frame is the whole given screen, as before.
+    @Test func originalLayoutsKeepTheirExactGeometry() {
+        let odd = CGRect(x: 0, y: 75, width: 1441, height: 801)
+        let window = CGRect(x: 10, y: 100, width: 501, height: 301)
+        let expected: [WindowLayout: CGRect] = [
+            .leftHalf: CGRect(x: 0, y: 75, width: 720.5, height: 801),
+            .rightHalf: CGRect(x: 720.5, y: 75, width: 720.5, height: 801),
+            .topHalf: CGRect(x: 0, y: 475.5, width: 1441, height: 400.5),
+            .bottomHalf: CGRect(x: 0, y: 75, width: 1441, height: 400.5),
+            .topLeft: CGRect(x: 0, y: 475.5, width: 720.5, height: 400.5),
+            .topRight: CGRect(x: 720.5, y: 475.5, width: 720.5, height: 400.5),
+            .bottomLeft: CGRect(x: 0, y: 75, width: 720.5, height: 400.5),
+            .bottomRight: CGRect(x: 720.5, y: 75, width: 720.5, height: 400.5),
+            .maximize: odd,
+            .center: CGRect(x: 470, y: 325, width: 501, height: 301),
+            .nextDisplay: odd,
+            .restore: window,
+        ]
+        #expect(Set(expected.keys) == Set(WindowLayout.allCases))
+        for layout in WindowLayout.allCases {
+            #expect(layout.frame(in: odd, current: window) == expected[layout], "\(layout)")
+            if layout != .nextDisplay && layout != .restore {
+                // The command path uses the same original geometry with default settings.
+                #expect(
+                    WindowGeometry.frame(for: layout.command, in: odd, current: window) == expected[layout],
+                    "\(layout) command")
+            }
         }
-        #expect(WindowLayout.restore.frame(in: laptop, current: current) == current)
     }
 
     @Test func commandMetadataIsCompleteAndUnique() {
