@@ -6,10 +6,22 @@ extension LauncherModel {
     /// order. Settings, aliases, hotkey titles and hotkey registration all use this one list.
     var bindableCommands: [LauncherItem] {
         let registered = registry.bindableCommandItems(in: self)
+        // Built-in rows resolve by id. Provided rows count only through the registry's catalog, so
+        // a descriptor's `isBindable = false` holds even under one of the original twenty ids.
+        let builtIn = commandItems.filter { item in
+            if case .provided = item.action { return false }
+            return true
+        }
         let index = Dictionary(
-            (commandItems + registered).map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
+            (builtIn + registered).map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
         let curatedIDs = Set(CuratedCommand.targetIDs)
         return CuratedCommand.targetIDs.compactMap { index[$0] } + registered.filter { !curatedIDs.contains($0.id) }
+    }
+
+    /// Whether a row can hold an alias or hotkey right now: the one runtime check behind the
+    /// row's alias chip and shortcut, ⌘K's Assign entry, and Settings › Shortcuts.
+    func canBind(_ item: LauncherItem) -> Bool {
+        bindableCommands.contains { $0.id == item.id }
     }
 
     var applicationItems: [LauncherItem] {
@@ -208,12 +220,12 @@ extension LauncherModel {
         case .quicklink(let link, _)
         where item.id != argumentLink.map({ "argument.\($0.id)" }) && !item.id.hasPrefix("fallback."):
             link.keyword.isEmpty ? nil : link.keyword
-        default: store.database.binding(for: item.id)?.alias
+        default: store.database.binding(for: item.id).flatMap { canBind(item) ? $0.alias : nil }
         }
     }
 
     func boundShortcut(for item: LauncherItem) -> CommandShortcut? {
-        store.database.binding(for: item.id)?.shortcut
+        store.database.binding(for: item.id).flatMap { canBind(item) ? $0.shortcut : nil }
     }
 
     func isFavorite(_ item: LauncherItem) -> Bool { store.database.favoriteIDs.contains(item.id) }

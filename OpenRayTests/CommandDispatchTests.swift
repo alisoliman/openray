@@ -53,12 +53,14 @@ struct CommandDispatchTests {
         // The original twenty lead in their order; registered providers may add more after them.
         #expect(Array(model.bindableCommands.map(\.id).prefix(CuratedCommand.targetIDs.count)) == CuratedCommand.targetIDs)
         #expect(CuratedCommand.targetIDs.count == 20)
+        // Only the legacy registrations: later slices may make more ids bindable through their own.
+        let legacy = [AIWritingCommandProvider.registration]
         for action in AIAction.allCases where action != .chat {
-            #expect(CuratedCommand.supports("ai.\(action.id)"))
+            #expect(CuratedCommand.supports("ai.\(action.id)", registrations: legacy))
         }
-        #expect(!CuratedCommand.supports("window.nextDisplay"))
-        #expect(!CuratedCommand.supports("quicklink.any"))
-        #expect(!CuratedCommand.supports("clipboard.any"))
+        #expect(!CuratedCommand.supports("window.nextDisplay", registrations: legacy))
+        #expect(!CuratedCommand.supports("quicklink.any", registrations: legacy))
+        #expect(!CuratedCommand.supports("clipboard.any", registrations: legacy))
     }
 
     @Test func boundInvocationUsesSharedDispatchAndRemovedBindingsCannotRun() {

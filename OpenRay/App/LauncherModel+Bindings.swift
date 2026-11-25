@@ -11,7 +11,8 @@ extension LauncherModel {
         if shortcut == store.database.preferences.hotKey.shortcut {
             warnings.append("It opens OpenRay, so this command won't use it while the launcher does.")
         }
-        for other in store.database.commandBindings
+        // Only commands that exist now hold their shortcuts, so a missing command's saved one isn't a conflict.
+        for other in registrableCommandBindings
         where other.targetID != binding.targetID && other.shortcut == shortcut {
             let title = bindableCommands.first { $0.id == other.targetID }?.title ?? other.targetID
             warnings.append("It's also assigned to \(title), and only the first one saved can work.")

@@ -251,10 +251,11 @@ struct SearchActionBar: View {
         case .calculator:
             Text("Arithmetic and conversions")
         default:
-            if model.isQueryBlank {
-                Text("\(resultCount.formatted()) item\(resultCount == 1 ? "" : "s")")
-            } else if resultCount == 0, isSearching {
+            // A pending search outranks the count, so an empty scope that's still loading never says “0 items”.
+            if resultCount == 0, isSearching {
                 Text("Searching…")
+            } else if model.isQueryBlank {
+                Text("\(resultCount.formatted()) item\(resultCount == 1 ? "" : "s")")
             } else {
                 Text("\(resultCount.formatted()) result\(resultCount == 1 ? "" : "s")")
             }

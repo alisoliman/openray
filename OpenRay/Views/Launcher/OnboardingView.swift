@@ -23,9 +23,11 @@ struct OnboardingView: View {
             .id(step)
 
             ActionBar(
-                feedback: model.feedback, confirmation: nil,
+                feedback: model.feedback, confirmation: model.confirmation,
                 context: { StepDots(current: step.rawValue, count: LauncherModel.OnboardingStep.allCases.count) },
-                actions: { actions })
+                actions: { actions },
+                onCancelConfirmation: { model.confirmation = nil },
+                onConfirm: { if let confirmation = model.confirmation { model.confirm(confirmation) } })
         }
         .animation(OR.Motion.resolve(OR.Motion.standard, reduceMotion: reduceMotion), value: step)
         .background {

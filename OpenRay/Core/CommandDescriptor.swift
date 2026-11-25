@@ -87,6 +87,9 @@ struct ProvidedRef: Hashable, Sendable {
         static let edit = Traits(rawValue: 1 << 4)
         /// Dimmed in lists. The subtitle should say why.
         static let unavailable = Traits(rawValue: 1 << 5)
+        /// Set by `CommandDescriptor.item(provider:)`: the row stands for a catalog command, so
+        /// ↩ re-resolves the command and refuses when it no longer exists.
+        static let descriptor = Traits(rawValue: 1 << 6)
     }
 
     /// The owning provider's registration id.
@@ -166,7 +169,7 @@ struct CommandProviderRegistration: Sendable {
 extension CommandDescriptor {
     /// The command's row: a favorite-able command whose ↩ goes to its provider.
     func item(provider: String) -> LauncherItem {
-        var traits: ProvidedRef.Traits = [.command, .favorite]
+        var traits: ProvidedRef.Traits = [.command, .favorite, .descriptor]
         if isUnavailable { traits.insert(.unavailable) }
         return LauncherItem(
             id: id, title: title, subtitle: subtitle, symbol: symbol, kind: kind, badge: badge,

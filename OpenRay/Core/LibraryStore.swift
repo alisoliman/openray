@@ -12,7 +12,8 @@ final class LibraryStore {
     @ObservationIgnored var commandBindingsDidChange: (() -> Void)?
     @ObservationIgnored private let images: ClipboardImageStore
     /// Rows deleted from another store whose favorite and usage records a failed save left
-    /// behind. Every later save removes them too, until one succeeds.
+    /// behind. Every later save removes them first, until one succeeds. They're also written to
+    /// `pendingCleanupURL`, so quitting before that save doesn't lose them.
     @ObservationIgnored private(set) var pendingForgottenIDs: Set<String> = []
 
     init(fileURL: URL? = LibraryStore.defaultURL) {
@@ -26,6 +27,7 @@ final class LibraryStore {
             try decoded.validate()
             decoded.schemaVersion = LibraryDatabase.currentSchemaVersion
             database = decoded
+            pendingForgottenIDs = Self.readPendingCleanup(at: pendingCleanupURL)
         } catch {
             // Do not overwrite an unreadable or newer library with empty defaults.
             isReadOnly = true
@@ -41,6 +43,30 @@ final class LibraryStore {
             errorMessage =
                 "Your library was loaded, but some unused clipboard images could not be removed: \(error.localizedDescription)"
         }
+        // Favorites and recents of rows deleted elsewhere in an earlier session, if that save failed.
+        reconcilePendingCleanup()
+    }
+
+    /// Where cleanup that couldn't be saved waits for the next launch, beside the library.
+    var pendingCleanupURL: URL? {
+        fileURL?.deletingLastPathComponent().appending(path: "library-pending-cleanup.json")
+    }
+
+    private static func readPendingCleanup(at url: URL?) -> Set<String> {
+        guard let url, let data = try? Data(contentsOf: url),
+            let ids = try? JSONDecoder().decode(Set<String>.self, from: data)
+        else { return [] }
+        return ids
+    }
+
+    private func writePendingCleanup() {
+        guard let url = pendingCleanupURL else { return }
+        if pendingForgottenIDs.isEmpty {
+            try? FileManager.default.removeItem(at: url)
+        } else if let data = try? JSONEncoder().encode(pendingForgottenIDs) {
+            try? data.write(to: url, options: [.atomic])
+            try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: url.path)
+        }
     }
 
     static var defaultURL: URL {
@@ -54,6 +80,12 @@ final class LibraryStore {
         guard !isReadOnly else { return false }
         do {
             var next = database
+            // Stale records of rows deleted elsewhere go first, so a row restored under the same
+            // id in this mutation keeps the favorite or usage the mutation gives it.
+            if !pendingForgottenIDs.isEmpty {
+                next.favoriteIDs.subtract(pendingForgottenIDs)
+                next.usage.removeAll { pendingForgottenIDs.contains($0.id) }
+            }
             try mutation(&next)
             // Libraries from before Paused was stored infer it from saved history. Removing
             // that history, by pruning, Delete All or deleting entries, keeps capture Paused.
@@ -63,8 +95,6 @@ final class LibraryStore {
                 next.preferences.clipboardPaused = true
             }
             next.discardUnavailableCommandBindings()
-            next.favoriteIDs.subtract(pendingForgottenIDs)
-            next.usage.removeAll { pendingForgottenIDs.contains($0.id) }
             next.schemaVersion = LibraryDatabase.currentSchemaVersion
             let removedClipboardIDs = Set(database.clipboard.map { "clipboard.\($0.id)" })
                 .subtracting(next.clipboard.map { "clipboard.\($0.id)" })
@@ -87,7 +117,10 @@ final class LibraryStore {
                 .subtracting(next.clipboard.compactMap(\.image).map(\.id))
             let bindingsChanged = database.commandBindings != next.commandBindings
             database = next
-            pendingForgottenIDs = []
+            if !pendingForgottenIDs.isEmpty {
+                pendingForgottenIDs = []
+                writePendingCleanup()
+            }
             if bindingsChanged { commandBindingsDidChange?() }
             if !removedImages.isEmpty {
                 Task { await ClipboardImageProcessor.shared.forget(removedImages) }
@@ -113,7 +146,16 @@ final class LibraryStore {
         }
         guard !referenced.isEmpty else { return true }
         pendingForgottenIDs.formUnion(referenced)
-        return update { _ in }
+        if update({ _ in }) { return true }
+        if !isReadOnly { writePendingCleanup() }
+        return false
+    }
+
+    /// Applies cleanup left by an earlier session. Call once the app is running; a library that
+    /// still can't be saved keeps it for later.
+    func reconcilePendingCleanup() {
+        guard !pendingForgottenIDs.isEmpty else { return }
+        update { _ in }
     }
 
     @discardableResult

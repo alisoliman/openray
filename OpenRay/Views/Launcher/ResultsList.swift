@@ -29,6 +29,9 @@ struct ResultsList: View {
                     ForEach(groups) { group in
                         if let title = group.title {
                             SectionHeader(title: title, trailing: group.trailing, loading: group.isLoading)
+                        } else if group.isLoading, group.items.isEmpty {
+                            // An untitled group still loading shows that it is, rather than nothing.
+                            SectionHeader(title: "Searching…", loading: true)
                         }
                         groupBody(group)
                     }

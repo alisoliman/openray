@@ -9,8 +9,9 @@ final class LauncherPanel: NSPanel {
     /// only holds the shadow, so a click there closes the panel.
     var panelRect: (() -> CGRect)?
     var onClickOutside: (() -> Void)?
-    /// Return confirms a pending action-bar confirmation, even from a text editor.
-    var confirmAction: (() -> Bool)?
+    /// Return confirms a pending action-bar confirmation, even from a text editor. It gets
+    /// whether the key is an autorepeat, which never confirms, and returns whether it handled the key.
+    var confirmAction: ((_ isRepeat: Bool) -> Bool)?
     /// The file Quick Look previews. Quick Look finds its controller through the
     /// responder chain, which ends at this window, so the panel controls it.
     var quickLook: QuickLookPreview? {
@@ -41,7 +42,7 @@ final class LauncherPanel: NSPanel {
         if handleEscapeKey(event) { return }
         if event.type == .keyDown, [36, 76].contains(event.keyCode),
             event.modifierFlags.intersection([.command, .control, .option, .shift]).isEmpty,
-            !((firstResponder as? NSTextView)?.hasMarkedText() ?? false), confirmAction?() == true
+            !((firstResponder as? NSTextView)?.hasMarkedText() ?? false), confirmAction?(event.isARepeat) == true
         {
             return
         }
@@ -323,10 +324,8 @@ final class LauncherPanelController: NSObject, NSWindowDelegate {
         // The margin belongs to whatever is behind it, so focus goes back to that app.
         panel.onClickOutside = { [weak self] in self?.dismiss() }
         panel.onQuickLookEnd = { [weak self] in self?.quickLookDidEnd() }
-        panel.confirmAction = { [weak model] in
-            guard let model, let confirmation = model.confirmation else { return false }
-            model.confirm(confirmation)
-            return true
+        panel.confirmAction = { [weak model] isRepeat in
+            model?.confirmFromReturn(isRepeat: isRepeat) ?? false
         }
         let host = NSHostingView(rootView: LauncherRootView(model: model))
         host.sizingOptions = []

@@ -903,7 +903,11 @@ final class LauncherModel {
     var arrowsMoveSelection: Bool {
         guard destination == .search, argumentLink == nil, !showActions else { return false }
         if section == .windows || section.providedScope?.style == .grid { return true }
-        return section == .home && isQueryBlank
+        if section == .home && isQueryBlank { return true }
+        // Any grid the selection is in, such as a provider's grid group in a list scope.
+        let groups = groups
+        let selected = groups.first { group in group.items.contains { $0.id == selectedID } } ?? groups.first
+        return selected.flatMap { Self.columns(for: $0) } != nil
     }
 
     /// A group's grid width, shared by drawing and keyboard movement. Nil for lists.
@@ -970,7 +974,10 @@ final class LauncherModel {
             pendingLiveProviderIDs.insert(providerID)
             providedLiveTasks.append(
                 Task { [weak self] in
-                    guard let provider = self?.registry.provider(id: providerID), let model = self else { return }
+                    // A query that changed again before this task started never reaches the provider.
+                    guard !Task.isCancelled, let model = self, model.liveGeneration == generation,
+                        let provider = model.registry.provider(id: providerID)
+                    else { return }
                     let rows = await provider.liveItems(for: term, scope: scope, in: model)
                     guard let self, !Task.isCancelled, self.liveGeneration == generation else { return }
                     // Root-search rows never become the Top Hit; see searchGroups.

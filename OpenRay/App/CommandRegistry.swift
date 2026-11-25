@@ -228,7 +228,12 @@ final class CommandRegistry {
     /// group appears only with rows, so an empty scope shows its empty state.
     func scopeGroups(_ scope: ProvidedScope, items: [LauncherItem], in model: LauncherModel) -> [LauncherResultGroup] {
         if let groups = provider(id: scope.provider)?.scopeGroups(scope, items: items, in: model) {
-            return groups.filter { !$0.items.isEmpty || $0.isLoading }
+            // Provider grids never fall through to the window layout tiles.
+            return groups.filter { !$0.items.isEmpty || $0.isLoading }.map { group in
+                var group = group
+                if group.style == .grid, group.tile == nil { group.tile = .standard }
+                return group
+            }
         }
         var group = LauncherResultGroup(id: scope.id, title: nil, style: scope.style, items: items)
         if scope.style == .grid {
@@ -275,6 +280,12 @@ final class CommandRegistry {
             return
         }
         guard let descriptor = provider.commands(in: model).first(where: { $0.id == ref.id }) else {
+            // A command row from an older snapshot (⌘K, a favorite) whose command is gone must not
+            // run, and above all must not skip a confirmation it would have asked.
+            guard !ref.has(.descriptor) else {
+                model.feedback = .error("“\(item.title.truncatedForFeedback)” is no longer available.")
+                return
+            }
             provider.perform(item, ref: ref, in: model)
             return
         }
@@ -305,8 +316,22 @@ final class CommandRegistry {
             }
         }
         if let question = descriptor.confirmation {
+            // Approval re-checks the catalog: the command must still exist and still ask the same question.
+            let approve: @MainActor () -> Void = { [weak self, weak model] in
+                guard let self, let model else { return }
+                let current = self.provider(id: ref.provider)?.commands(in: model).first { $0.id == ref.id }
+                guard let current else {
+                    model.feedback = .error("“\(item.title.truncatedForFeedback)” is no longer available.")
+                    return
+                }
+                guard current.confirmation == question else {
+                    model.feedback = .warning("“\(item.title.truncatedForFeedback)” changed. Run it again to confirm.")
+                    return
+                }
+                run()
+            }
             model.selectedID = item.id
-            model.confirmation = .provided(ProvidedConfirmation(id: descriptor.id, question, perform: run))
+            model.presentConfirmation(.provided(ProvidedConfirmation(id: descriptor.id, question, perform: approve)))
         } else {
             run()
         }

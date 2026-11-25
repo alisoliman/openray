@@ -361,6 +361,25 @@ extension LauncherModel {
         confirmation = .delete(item)
     }
 
+    /// Asks a question in the action bar. Every screen that can hold one shows it (search,
+    /// scopes, the clipboard opt-in, onboarding, editors and AI), so the overlays that would
+    /// cover the bar close first.
+    func presentConfirmation(_ confirmation: ActionConfirmation) {
+        showActions = false
+        showShortcuts = false
+        showsAttachmentPreview = false
+        self.confirmation = confirmation
+    }
+
+    /// Return while a question is pending. Only a fresh press approves it: a held Return's
+    /// autorepeat is consumed, so the press that asked can't also answer. Returns whether the
+    /// key was handled, which is whenever a question is pending.
+    func confirmFromReturn(isRepeat: Bool) -> Bool {
+        guard let confirmation else { return false }
+        if !isRepeat { confirm(confirmation) }
+        return true
+    }
+
     func confirm(_ confirmation: ActionConfirmation) {
         self.confirmation = nil
         switch confirmation {
@@ -409,7 +428,8 @@ extension LauncherModel {
                 }
             }
             selectedID = next
-            synchronizeSelection()
+            // The deleted row may have been a command with a hotkey; release it now.
+            commandCatalogDidChange()
             return true
         }
         let deleted = store.update { database in
@@ -714,7 +734,7 @@ extension LauncherModel {
                         self?.edit(item)
                     })
             }
-            if CuratedCommand.supports(item.id) {
+            if canBind(item) {
                 entries.append(
                     ActionEntry(
                         id: "assign", title: "Assign Alias or Shortcut…", symbol: "keyboard", group: .organize
