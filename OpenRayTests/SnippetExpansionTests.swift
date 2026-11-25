@@ -6,7 +6,70 @@ import Testing
 @MainActor
 private final class RecordingInserter: SnippetInserting {
     var plans: [(SnippetExpansionPlan, pid_t)] = []
-    func insert(_ plan: SnippetExpansionPlan, into processID: pid_t) throws { plans.append((plan, processID)) }
+    var result = KeystrokeScript.Result.completed
+    func insert(_ plan: SnippetExpansionPlan, into processID: pid_t) throws -> KeystrokeScript.Result {
+        plans.append((plan, processID))
+        return result
+    }
+}
+
+/// A text field that records events and applies them to its own text, so tests
+/// can check where text and caret end up without sending any real input.
+@MainActor
+private final class FakeEditor: KeystrokeTarget {
+    enum Event: Equatable { case delete, type(String), left, setCaret(Int) }
+
+    var text: String
+    /// UTF-16 caret location.
+    var caret: Int
+    var events: [Event] = []
+    var reportsCaret = true
+    var allowsSettingCaret = true
+    /// The focus changes once this many events have been sent.
+    var focusLostAfter: Int?
+
+    init(text: String) {
+        self.text = text
+        caret = text.utf16.count
+    }
+
+    func isUnchanged() -> Bool { focusLostAfter.map { events.count < $0 } ?? true }
+
+    func pressDelete() throws {
+        events.append(.delete)
+        let units = Array(text.utf16)
+        let before = String(decoding: units[..<caret], as: UTF16.self)
+        let after = String(decoding: units[caret...], as: UTF16.self)
+        let trimmed = String(before.dropLast())
+        text = trimmed + after
+        caret = trimmed.utf16.count
+    }
+
+    func type(_ chunk: [UInt16]) throws {
+        let typed = String(decoding: chunk, as: UTF16.self)
+        events.append(.type(typed))
+        let units = Array(text.utf16)
+        text = String(decoding: units[..<caret], as: UTF16.self) + typed + String(decoding: units[caret...], as: UTF16.self)
+        caret += chunk.count
+    }
+
+    func pressLeftArrow() throws {
+        events.append(.left)
+        let before = String(decoding: Array(text.utf16)[..<caret], as: UTF16.self)
+        caret = String(before.dropLast()).utf16.count
+    }
+
+    func caretLocation() -> Int? { reportsCaret ? caret : nil }
+    func waitForCaret(at location: Int) -> Bool { reportsCaret && caret == location }
+
+    func setCaretLocation(_ location: Int) -> Bool {
+        guard allowsSettingCaret else { return false }
+        events.append(.setCaret(location))
+        caret = location
+        return true
+    }
+
+    var textBeforeCaret: String { String(decoding: Array(text.utf16)[..<caret], as: UTF16.self) }
 }
 
 private let greeting = Snippet(name: "Greeting", keyword: ";hi", content: "Hello!")
@@ -44,17 +107,29 @@ struct SnippetMatcherTests {
         }
     }
 
-    @Test func delimiterModeWaitsForADelimiter() {
+    @Test func delimiterModeWaitsForAPrintableDelimiter() {
         var matcher = SnippetMatcher(settings: .init(mode: .afterDelimiterKeeping))
         #expect(feed(&matcher, typing(";hi"), snippets: [greeting]) == nil)
         #expect(matcher.trigger(for: " ", snippets: [greeting]) == SnippetTrigger(snippet: greeting, delimiter: " "))
-        for delimiter in [".", ",", "!", "?", ";", ":", ")", "\t", "\r", "\n", "\""] {
+        for delimiter in [".", ",", "!", "?", ";", ":", ")", "\"", "]", "\u{A0}"] {
             var matcher = SnippetMatcher(settings: .init(mode: .afterDelimiterDiscarding))
             let trigger = feed(&matcher, typing(";hi") + [delimiter], snippets: [greeting])
             #expect(trigger?.delimiter == Character(delimiter), "\(delimiter.debugDescription)")
         }
         var noDelimiter = SnippetMatcher(settings: .init(mode: .afterDelimiterKeeping))
         #expect(feed(&noDelimiter, typing(";hix"), snippets: [greeting]) == nil)
+    }
+
+    @Test(arguments: ["\t", "\r", "\n", "\u{3}", "\u{1b}", "\u{F702}", "\u{F703}"])
+    func controlKeysNeverExpandAndEndTheWord(_ key: String) {
+        for mode in SnippetExpansionMode.allCases {
+            var matcher = SnippetMatcher(settings: .init(mode: mode))
+            #expect(feed(&matcher, typing(" ;h"), snippets: [greeting]) == nil)
+            if mode.waitsForDelimiter { _ = matcher.trigger(for: "i", snippets: [greeting]) }
+            #expect(matcher.trigger(for: key, snippets: [greeting]) == nil, "\(mode)")
+            #expect(matcher.buffer.isEmpty)
+        }
+        #expect(!SnippetKeywordRules.isDelimiter(Character(key)))
     }
 
     @Test func delimiterModeTellsSimilarKeywordsApart() {
@@ -64,25 +139,13 @@ struct SnippetMatcherTests {
         #expect(feed(&matcher, typing(";hi "), snippets: [greeting, high])?.snippet == greeting)
     }
 
-    @Test func keypadEnterActsAsReturn() {
-        var matcher = SnippetMatcher(settings: .init(mode: .afterDelimiterKeeping))
-        #expect(feed(&matcher, typing(";hi") + ["\u{3}"], snippets: [greeting])?.delimiter == "\r")
-    }
-
-    @Test func navigationKeysAndLineBreaksResetTheBuffer() {
+    @Test func navigationKeysResetTheBuffer() {
         var matcher = SnippetMatcher()
         _ = feed(&matcher, typing(" ;h"), snippets: [greeting])
         #expect(matcher.trigger(for: "\u{F702}", snippets: [greeting]) == nil)  // ←
         #expect(matcher.buffer.isEmpty)
-        _ = feed(&matcher, typing("x;h"), snippets: [greeting])
-        #expect(matcher.trigger(for: "\r", snippets: [greeting]) == nil)
-        #expect(matcher.buffer.isEmpty)
         // After a reset the next keyword starts a word.
         #expect(feed(&matcher, typing(";hi"), snippets: [greeting])?.snippet == greeting)
-
-        var delimited = SnippetMatcher(settings: .init(mode: .afterDelimiterKeeping))
-        #expect(feed(&delimited, typing("abc") + ["\r"], snippets: [greeting]) == nil)
-        #expect(delimited.buffer.isEmpty)
     }
 
     @Test func backspaceEditsTheBuffer() {
@@ -103,9 +166,11 @@ struct SnippetMatcherTests {
             trigger: .init(snippet: logger, delimiter: "."), rendering: rendering, mode: .afterDelimiterDiscarding)
         #expect(discarding == SnippetExpansionPlan(deleteCount: 5, text: "console.log();", caretLeft: 2))
 
-        let plain = Placeholders.render("Hello!", context: .snippet, source: PlaceholderValues())
-        let kept = SnippetExpansionPlan(trigger: .init(snippet: greeting, delimiter: "!"), rendering: plain, mode: .afterDelimiterKeeping)
-        #expect(kept == SnippetExpansionPlan(deleteCount: 4, text: "Hello!!", caretLeft: 0))
+        let emoji = Placeholders.render("😀{cursor}😀é", context: .snippet, source: PlaceholderValues())
+        let plan = SnippetExpansionPlan(trigger: .init(snippet: logger, delimiter: nil), rendering: emoji, mode: .immediately)
+        #expect(plan.caretLeft == 2 && plan.caretUTF16Left == 3)
+        #expect(!plan.hasRightToLeftText)
+        #expect(SnippetExpansionPlan(deleteCount: 0, text: "שלום", caretLeft: 0).hasRightToLeftText)
     }
 
     @Test(arguments: ["@@", ";;addr", "!email", "/sig", "€x", "a", "x+y=z", "ü1", String(repeating: "k", count: 32)])
@@ -126,69 +191,187 @@ struct SnippetMatcherTests {
 }
 
 @MainActor
+struct KeystrokeScriptTests {
+    @Test func typesInChunksAndUsesArrowsWhenTheEditorCantReportTheCaret() throws {
+        let editor = FakeEditor(text: "Say ;log")
+        editor.reportsCaret = false
+        let text = "console.log(" + String(repeating: "x", count: 30) + ");"
+        let plan = SnippetExpansionPlan(deleteCount: 4, text: text, caretLeft: 2)
+        #expect(try KeystrokeScript.run(plan, on: editor) == .completed)
+        #expect(editor.text == "Say " + text)
+        #expect(editor.textBeforeCaret == "Say " + text.dropLast(2))
+        #expect(editor.events.filter { $0 == .left }.count == 2)
+        #expect(editor.events.filter { if case .type = $0 { true } else { false } }.count == 3)
+    }
+
+    @Test func setsTheCaretByOffsetWhenTheEditorAllowsIt() throws {
+        let editor = FakeEditor(text: "x ;s")
+        let plan = SnippetExpansionPlan(deleteCount: 2, text: "<😀>", caretLeft: 2, caretUTF16Left: 3)
+        #expect(try KeystrokeScript.run(plan, on: editor) == .completed)
+        #expect(editor.text == "x <😀>")
+        #expect(editor.textBeforeCaret == "x <")
+        #expect(editor.events.last == .setCaret(3))
+        #expect(!editor.events.contains(.left))
+    }
+
+    @Test func rightToLeftTextNeverUsesArrows() throws {
+        let editor = FakeEditor(text: ";h")
+        editor.reportsCaret = false
+        let plan = SnippetExpansionPlan(deleteCount: 2, text: "שלום עולם", caretLeft: 4)
+        #expect(try KeystrokeScript.run(plan, on: editor) == .completed)
+        #expect(!editor.events.contains(.left))
+        #expect(editor.caret == editor.text.utf16.count)
+
+        let capable = FakeEditor(text: ";h")
+        #expect(try KeystrokeScript.run(plan, on: capable) == .completed)
+        #expect(capable.textBeforeCaret == "שלום ")
+    }
+
+    @Test func stopsAtTheFirstFocusChange() throws {
+        let editor = FakeEditor(text: ";hi")
+        editor.focusLostAfter = 2
+        let plan = SnippetExpansionPlan(deleteCount: 3, text: "Hello!", caretLeft: 0)
+        #expect(try KeystrokeScript.run(plan, on: editor) == .interrupted)
+        #expect(editor.events == [.delete, .delete])
+
+        let gone = FakeEditor(text: ";hi")
+        gone.focusLostAfter = 0
+        #expect(try KeystrokeScript.run(plan, on: gone) == .interrupted)
+        #expect(gone.events.isEmpty)
+
+        let midText = FakeEditor(text: ";hi")
+        midText.focusLostAfter = 4
+        let long = SnippetExpansionPlan(deleteCount: 3, text: String(repeating: "y", count: 100), caretLeft: 0)
+        #expect(try KeystrokeScript.run(long, on: midText) == .interrupted)
+        #expect(midText.events.count == 4)
+    }
+}
+
+@MainActor
 struct SnippetExpanderTests {
     private let now = Date(timeIntervalSince1970: 1_655_300_679)
 
     private func makeExpander(
-        snippets: [Snippet], clipboard: [String] = [], secure: Bool = false, enabled: Bool = true
-    ) -> (SnippetExpander, RecordingInserter, LibraryStore) {
+        snippets: [Snippet], history: [String] = [], current: String? = nil, captures: Bool = true,
+        secure: Bool = false, enabled: Bool = true
+    ) -> (SnippetExpander, RecordingInserter, Counter) {
         let store = LibraryStore(fileURL: nil)
         store.update {
             $0.preferences.snippetExpansionEnabled = enabled
             $0.snippets = snippets
             $0.preferences.clipboardEnabled = true
-            $0.clipboard = clipboard.enumerated().map { index, text in
+            $0.clipboard = history.enumerated().map { index, text in
                 ClipboardEntry(text: text, copiedAt: .now.addingTimeInterval(-Double(index)), sourceName: "F")
             }
+            $0.preferences.clipboardEnabled = captures
         }
         let inserter = RecordingInserter()
+        let counter = Counter()
         let now = now
         let expander = SnippetExpander(
             store: store, inserter: inserter, isSecureInputEnabled: { secure },
-            placeholderValues: { database in
-                var values = PlaceholderValues(library: database, now: now)
+            values: { database, requirements in
+                var values = PlaceholderValues.snapshot(library: database, requirements: requirements, currentClipboard: {
+                    counter.clipboardReads += 1
+                    return current
+                }, now: now)
                 values.calendar = Calendar(identifier: .gregorian)
                 values.calendar.timeZone = TimeZone(identifier: "UTC")!
                 values.locale = Locale(identifier: "en_US")
                 return values
-            })
-        return (expander, inserter, store)
+            },
+            failureFeedback: { counter.failures += 1 })
+        return (expander, inserter, counter)
+    }
+
+    @MainActor final class Counter {
+        var clipboardReads = 0
+        var failures = 0
     }
 
     private func type(_ text: String, into expander: SnippetExpander, pid: pid_t = 42, bundle: String? = "com.apple.TextEdit")
-        -> SnippetExpansionPlan?
+        -> SnippetExpansionOutcome?
     {
-        var last: SnippetExpansionPlan?
+        var last: SnippetExpansionOutcome?
         for character in text {
             last = expander.handle(SnippetKeyInput(characters: String(character), processID: pid, bundleIdentifier: bundle))
         }
         return last
     }
 
-    @Test func expandsThroughThePlaceholderEngine() {
+    @Test func expandsWithTheCurrentClipboardNotStaleHistory() {
         let snippet = Snippet(
             name: "Reply", keyword: ";re",
             content: "On {date format=\"yyyy-MM-dd\"} you wrote: {clipboard} / {snippet name=\"Sig\"}{cursor}!")
         let signature = Snippet(name: "Sig", keyword: "", content: "Ann")
-        let (expander, inserter, _) = makeExpander(snippets: [snippet, signature], clipboard: ["newest", "older"])
-        let plan = type(" ;re", into: expander)
-        #expect(plan == SnippetExpansionPlan(deleteCount: 3, text: "On 2022-06-15 you wrote: newest / Ann!", caretLeft: 1))
-        #expect(inserter.plans.count == 1)
-        #expect(inserter.plans.first?.1 == 42)
+        let (expander, inserter, counter) = makeExpander(snippets: [snippet, signature], history: ["stale"], current: "fresh")
+        #expect(
+            type(" ;re", into: expander)
+                == .inserted(SnippetExpansionPlan(deleteCount: 3, text: "On 2022-06-15 you wrote: fresh / Ann!", caretLeft: 1)))
+        #expect(inserter.plans.map(\.1) == [42])
+        #expect(counter.clipboardReads == 1)
+        #expect(counter.failures == 0)
+    }
+
+    @Test func theClipboardIsReadOnlyWhenNeeded() {
+        let (expander, _, counter) = makeExpander(snippets: [greeting], current: "fresh")
+        #expect(type(";hi", into: expander) == .inserted(SnippetExpansionPlan(deleteCount: 3, text: "Hello!", caretLeft: 0)))
+        #expect(counter.clipboardReads == 0)
+    }
+
+    @Test func clipboardOffsetsUseHistoryOnlyWhileCaptureIsOn() {
+        let snippet = Snippet(name: "Older", keyword: ";o", content: "[{clipboard offset=1}]")
+        // The newest history entry is the current clipboard, so offset 1 skips it.
+        let (on, _, _) = makeExpander(snippets: [snippet], history: ["now", "before"], current: "now")
+        #expect(type(";o", into: on) == .inserted(SnippetExpansionPlan(deleteCount: 2, text: "[before]", caretLeft: 0)))
+        // A copy not captured yet is still the current clipboard; history starts at offset 1.
+        let (pending, _, _) = makeExpander(snippets: [snippet], history: ["now", "before"], current: "newer")
+        #expect(type(";o", into: pending) == .inserted(SnippetExpansionPlan(deleteCount: 2, text: "[now]", caretLeft: 0)))
+        let (off, _, _) = makeExpander(snippets: [snippet], history: ["now", "before"], current: "now", captures: false)
+        #expect(type(";o", into: off) == .inserted(SnippetExpansionPlan(deleteCount: 2, text: "[]", caretLeft: 0)))
+    }
+
+    @Test func missingInputsRefuseBeforeAnythingIsDeleted() {
+        let required = Snippet(name: "Tone", keyword: ";t", content: "Feeling {argument name=\"mood\"}")
+        let calculation = Snippet(name: "Calc", keyword: ";c", content: "= {calculator expression=\"not math\"}")
+        let missing = Snippet(name: "Ref", keyword: ";r", content: "{snippet name=\"Gone\"}")
+        let (expander, inserter, counter) = makeExpander(snippets: [required, calculation, missing])
+        #expect(type(";t", into: expander) == .refused([.missingArgument("mood")]))
+        #expect(type(" ;c", into: expander) == .refused([.calculationFailed("not math")]))
+        #expect(type(" ;r", into: expander) == .refused([.missingSnippet("Gone")]))
+        #expect(inserter.plans.isEmpty)
+        #expect(counter.failures == 3)
+    }
+
+    @Test func optionalArgumentsAndTheAppCalculatorWork() {
+        let snippet = Snippet(
+            name: "Tone", keyword: ";t",
+            content: "Feeling {argument name=\"mood\" default=\"fine\"}, {calculator expression=\"2 * 21\"}")
+        let (expander, _, _) = makeExpander(snippets: [snippet])
+        #expect(type(";t", into: expander) == .inserted(SnippetExpansionPlan(deleteCount: 2, text: "Feeling fine, 42", caretLeft: 0)))
+    }
+
+    @Test func oversizedExpansionsAreRefused() {
+        let snippet = Snippet(name: "Big", keyword: ";b", content: String(repeating: "{clipboard}", count: 30))
+        let (expander, inserter, _) = makeExpander(snippets: [snippet], current: String(repeating: "x", count: 10_000))
+        #expect(type(";b", into: expander) == .refused([.outputTooLong]))
+        #expect(inserter.plans.isEmpty)
+    }
+
+    @Test func interruptedAndFailedInsertionsAreReported() {
+        let (expander, inserter, counter) = makeExpander(snippets: [greeting])
+        inserter.result = .interrupted
+        #expect(type(";hi", into: expander) == .interrupted(SnippetExpansionPlan(deleteCount: 3, text: "Hello!", caretLeft: 0)))
+        #expect(counter.failures == 1)
     }
 
     @Test func delimiterSettingsApply() {
         let (expander, inserter, _) = makeExpander(snippets: [greeting])
         expander.settings = SnippetExpansionSettings(mode: .afterDelimiterDiscarding, expandsWithinWords: true)
         #expect(type("abc;hi", into: expander) == nil)
-        #expect(type(".", into: expander) == SnippetExpansionPlan(deleteCount: 4, text: "Hello!", caretLeft: 0))
+        #expect(type(".", into: expander) == .inserted(SnippetExpansionPlan(deleteCount: 4, text: "Hello!", caretLeft: 0)))
+        #expect(type(";hi\t", into: expander) == nil)
         #expect(inserter.plans.count == 1)
-    }
-
-    @Test func argumentsTakeTheirDefaultsWhileTyping() {
-        let snippet = Snippet(name: "Tone", keyword: ";t", content: "Feeling {argument name=\"mood\" default=\"fine\"}{argument}")
-        let (expander, _, _) = makeExpander(snippets: [snippet])
-        #expect(type(";t", into: expander)?.text == "Feeling fine")
     }
 
     @Test func nothingExpandsWhenItMustNot() {
@@ -226,20 +409,52 @@ struct SnippetExpanderTests {
         #expect(inserter.plans.map(\.1) == [2])
     }
 
-    @Test func libraryValuesComeNewestFirst() {
+    @Test func theTestHostGetsInertDefaults() {
+        #expect(ClipEffectBoundary.isInert)
+        #expect(SnippetInserters.makeDefault() is InertSnippetInserter)
+        #expect(throws: ClipEffectBoundary.Blocked(action: "typing into other apps")) {
+            try InertSnippetInserter().insert(SnippetExpansionPlan(deleteCount: 1, text: "x", caretLeft: 0), into: 1)
+        }
+        // A default expander reaches only the inert inserter and never reads the real clipboard.
+        let store = LibraryStore(fileURL: nil)
+        store.update {
+            $0.preferences.snippetExpansionEnabled = true
+            $0.snippets = [Snippet(name: "Clip", keyword: ";c", content: "{clipboard}")]
+        }
+        let expander = SnippetExpander(store: store, isSecureInputEnabled: { false })
+        let outcome = expander.handle(SnippetKeyInput(characters: ";c", processID: 1, bundleIdentifier: "com.apple.TextEdit"))
+        #expect(
+            outcome
+                == .failed(
+                    SnippetExpansionPlan(deleteCount: 2, text: "", caretLeft: 0),
+                    ClipEffectBoundary.Blocked(action: "typing into other apps").localizedDescription))
+    }
+
+    @Test func snapshotsReadOnlyWhatThePlanNeeds() {
         var database = LibraryDatabase()
+        database.preferences.clipboardEnabled = true
         database.clipboard = [
             ClipboardEntry(text: "newest", sourceName: "F"),
             ClipboardEntry(content: .files([URL(fileURLWithPath: "/tmp/x")]), sourceName: "F"),
             ClipboardEntry(text: "older", sourceName: "F"),
         ]
-        database.snippets = [
-            Snippet(name: "Sig", keyword: "", content: "First"), Snippet(name: "Sig", keyword: "", content: "Second"),
-        ]
-        let values = PlaceholderValues(library: database)
-        #expect(values.clipboard == ["newest", "older"])
-        #expect(values.snippetText(named: "sig") == "First")
-        #expect(PlaceholderValues(library: database, currentClipboard: "live").clipboard == ["live", "newest", "older"])
-        #expect(PlaceholderValues(library: database, currentClipboard: "newest").clipboard == ["newest", "older"])
+        var reads = 0
+        let none = PlaceholderValues.snapshot(library: database, requirements: .init()) {
+            reads += 1
+            return "live"
+        }
+        #expect(reads == 0 && none.currentClipboard == nil && none.clipboardHistory.isEmpty && none.calculator == nil)
+        let both = PlaceholderValues.snapshot(library: database, requirements: .init(clipboardOffsets: [0, 2])) {
+            reads += 1
+            return "newest"
+        }
+        #expect(reads == 1)
+        #expect(both.clipboardText(offset: 0) == "newest" && both.clipboardText(offset: 1) == "older")
+        let currentOnly = PlaceholderValues.snapshot(library: database, requirements: .init(clipboardOffsets: [0])) { nil }
+        #expect(currentOnly.clipboardHistory.isEmpty && currentOnly.clipboardText(offset: 0) == nil)
+
+        database.snippets = [Snippet(name: "Sig", keyword: "", content: "First"), Snippet(name: "sig", keyword: "", content: "Second")]
+        let lookup = PlaceholderValues.snippetLookup(database)
+        #expect(lookup("sig") == "Second" && lookup("SIG") == "First" && lookup("none") == nil)
     }
 }
