@@ -38,8 +38,25 @@ enum WindowLayout: String, CaseIterable, Identifiable, Sendable {
     }
 
     /// Input and output are in AppKit's bottom-left screen coordinate system.
+    /// The original geometry, kept exactly: no rounding, and Next Display fills the given screen.
     func frame(in screen: CGRect, current: CGRect) -> CGRect {
-        WindowGeometry.frame(for: command, in: screen, current: current) ?? current
+        switch self {
+        case .leftHalf: CGRect(x: screen.minX, y: screen.minY, width: screen.width / 2, height: screen.height)
+        case .rightHalf: CGRect(x: screen.midX, y: screen.minY, width: screen.width / 2, height: screen.height)
+        case .topHalf: CGRect(x: screen.minX, y: screen.midY, width: screen.width, height: screen.height / 2)
+        case .bottomHalf: CGRect(x: screen.minX, y: screen.minY, width: screen.width, height: screen.height / 2)
+        case .topLeft: CGRect(x: screen.minX, y: screen.midY, width: screen.width / 2, height: screen.height / 2)
+        case .topRight: CGRect(x: screen.midX, y: screen.midY, width: screen.width / 2, height: screen.height / 2)
+        case .bottomLeft: CGRect(x: screen.minX, y: screen.minY, width: screen.width / 2, height: screen.height / 2)
+        case .bottomRight: CGRect(x: screen.midX, y: screen.minY, width: screen.width / 2, height: screen.height / 2)
+        case .maximize, .nextDisplay: screen
+        case .center:
+            CGRect(
+                x: screen.midX - min(current.width, screen.width) / 2,
+                y: screen.midY - min(current.height, screen.height) / 2,
+                width: min(current.width, screen.width), height: min(current.height, screen.height))
+        case .restore: current
+        }
     }
 }
 
@@ -112,15 +129,16 @@ struct WindowSnapshot: Equatable {
     var bundleIdentifier: String?
     var bundleURL: URL?
     var title: String
-    /// AppKit coordinates.
-    var frame: CGRect
+    /// AppKit coordinates. Nil when the listing skipped frames or the app didn't report one.
+    var frame: CGRect?
     var isMinimized: Bool
 
     var pid: pid_t { handle.pid }
 }
 
 /// Everything window commands, layouts and the window switcher do to other apps.
-/// `AXWindowSystem` is the real one; tests use a fake and never touch real windows.
+/// `AXWindowSystem` is the real one; inert launches get `InertWindowSystem`, and
+/// tests use a fake.
 @MainActor
 protocol WindowSystem: AnyObject {
     var isTrusted: Bool { get }
@@ -128,7 +146,8 @@ protocol WindowSystem: AnyObject {
     func requestTrust()
     func displays() -> [DisplaySnapshot]
     /// Standard windows of other running apps, grouped by app name and front to back within each app.
-    func windows(includeMinimized: Bool) -> [WindowSnapshot]
+    /// `readFrames: false` keeps title-only listings to one round trip per window.
+    func windows(includeMinimized: Bool, readFrames: Bool) -> [WindowSnapshot]
     func focusedWindow(of pid: pid_t) -> WindowHandle?
     func isRunning(_ pid: pid_t) -> Bool
     func title(of window: WindowHandle) -> String?
@@ -138,26 +157,75 @@ protocol WindowSystem: AnyObject {
     func isFullScreen(_ window: WindowHandle) -> Bool?
     func setFullScreen(_ fullScreen: Bool, of window: WindowHandle) throws
     func setMinimized(_ minimized: Bool, of window: WindowHandle) throws
-    /// Raises the window and activates its app.
+    /// Raises the window and activates its app. Throws when either doesn't happen.
     func focus(_ window: WindowHandle) throws
     func close(_ window: WindowHandle) throws
     func hideApplication(_ pid: pid_t) throws
 }
 
-/// The real window system, through the Accessibility API.
+enum WindowSystemEnvironment {
+    /// Accessibility in a normal launch; an inert system in the test host and in
+    /// isolated verification mode.
+    static func makeSystem(sideEffects: SideEffectGuard = .current) -> any WindowSystem {
+        sideEffects.isInert ? InertWindowSystem(sideEffects: sideEffects) : AXWindowSystem(sideEffects: sideEffects)
+    }
+
+    /// The window server's on-screen list in a normal launch; empty in inert launches.
+    static func makeListing(sideEffects: SideEffectGuard = .current) -> any WindowServerListing {
+        sideEffects.isInert ? InertWindowServerListing() : CGWindowServerListing()
+    }
+}
+
+/// Sees no windows and refuses every change. The default in inert launches.
+@MainActor
+final class InertWindowSystem: WindowSystem {
+    let sideEffects: SideEffectGuard
+
+    nonisolated init(sideEffects: SideEffectGuard = .current) {
+        self.sideEffects = sideEffects
+    }
+
+    var isTrusted: Bool { false }
+    var ownPID: pid_t { ProcessInfo.processInfo.processIdentifier }
+    func requestTrust() {}
+    func displays() -> [DisplaySnapshot] { [] }
+    func windows(includeMinimized: Bool, readFrames: Bool) -> [WindowSnapshot] { [] }
+    func focusedWindow(of pid: pid_t) -> WindowHandle? { nil }
+    func isRunning(_ pid: pid_t) -> Bool { false }
+    func title(of window: WindowHandle) -> String? { nil }
+    func frame(of window: WindowHandle) throws -> CGRect { throw refusal("reading other apps' windows") }
+    func setFrame(_ frame: CGRect, of window: WindowHandle) throws { throw refusal("moving a window") }
+    func isFullScreen(_ window: WindowHandle) -> Bool? { nil }
+    func setFullScreen(_ fullScreen: Bool, of window: WindowHandle) throws { throw refusal("changing full screen") }
+    func setMinimized(_ minimized: Bool, of window: WindowHandle) throws { throw refusal("minimizing a window") }
+    func focus(_ window: WindowHandle) throws { throw refusal("focusing a window") }
+    func close(_ window: WindowHandle) throws { throw refusal("closing a window") }
+    func hideApplication(_ pid: pid_t) throws { throw refusal("hiding an app") }
+
+    private func refusal(_ what: String) -> SideEffectGuard.Blocked {
+        SideEffectGuard.Blocked(what: what, mode: sideEffects.mode)
+    }
+}
+
+/// The real window system, through the Accessibility API. Every change checks
+/// its `SideEffectGuard` before touching the window.
 @MainActor
 final class AXWindowSystem: WindowSystem {
     /// Listing asks every app; one that's hung must not stall the launcher for AX's default six seconds.
     private static let listingTimeout: Float = 0.25
     private static let fullScreenAttribute = "AXFullScreen"
 
-    nonisolated init() {}
+    let sideEffects: SideEffectGuard
+
+    nonisolated init(sideEffects: SideEffectGuard = .current) {
+        self.sideEffects = sideEffects
+    }
 
     var isTrusted: Bool { AXIsProcessTrusted() }
     var ownPID: pid_t { ProcessInfo.processInfo.processIdentifier }
 
     func requestTrust() {
-        guard !SideEffectGuard.isTestHost else { return }
+        guard !sideEffects.isInert else { return }
         let options = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true] as CFDictionary
         _ = AXIsProcessTrustedWithOptions(options)
     }
@@ -171,7 +239,7 @@ final class AXWindowSystem: WindowSystem {
         }
     }
 
-    func windows(includeMinimized: Bool) -> [WindowSnapshot] {
+    func windows(includeMinimized: Bool, readFrames: Bool) -> [WindowSnapshot] {
         guard isTrusted else { return [] }
         let ownPID = ownPID
         let applications = NSWorkspace.shared.runningApplications.filter {
@@ -190,14 +258,14 @@ final class AXWindowSystem: WindowSystem {
                 }
                 let minimized = attribute(kAXMinimizedAttribute, of: window) as? Bool == true
                 if minimized && !includeMinimized { continue }
-                let axFrame = try? readFrame(window)
+                let axFrame = readFrames ? try? readFrame(window) : nil
                 windows.append(
                     WindowSnapshot(
                         handle: WindowHandle(pid: application.processIdentifier, element: window),
                         appName: application.localizedName ?? "App", bundleIdentifier: application.bundleIdentifier,
                         bundleURL: application.bundleURL,
                         title: attribute(kAXTitleAttribute, of: window) as? String ?? "",
-                        frame: axFrame.map { ScreenCoordinates.flip($0, primaryHeight: primaryHeight) } ?? .zero,
+                        frame: axFrame.map { ScreenCoordinates.flip($0, primaryHeight: primaryHeight) },
                         isMinimized: minimized))
             }
         }
@@ -230,7 +298,7 @@ final class AXWindowSystem: WindowSystem {
     }
 
     func setFrame(_ frame: CGRect, of window: WindowHandle) throws {
-        try SideEffectGuard.check("moving a window")
+        try sideEffects.check("moving a window")
         let element = try element(of: window)
         let current = try readFrame(element)
         try writeFrame(ScreenCoordinates.flip(frame, primaryHeight: Self.primaryHeight), from: current, to: element)
@@ -242,7 +310,7 @@ final class AXWindowSystem: WindowSystem {
     }
 
     func setFullScreen(_ fullScreen: Bool, of window: WindowHandle) throws {
-        try SideEffectGuard.check("changing full screen")
+        try sideEffects.check("changing full screen")
         let element = try element(of: window)
         var settable: DarwinBoolean = false
         guard AXUIElementIsAttributeSettable(element, Self.fullScreenAttribute as CFString, &settable) == .success,
@@ -256,7 +324,7 @@ final class AXWindowSystem: WindowSystem {
     }
 
     func setMinimized(_ minimized: Bool, of window: WindowHandle) throws {
-        try SideEffectGuard.check("minimizing a window")
+        try sideEffects.check("minimizing a window")
         let element = try element(of: window)
         guard
             AXUIElementSetAttributeValue(
@@ -266,18 +334,25 @@ final class AXWindowSystem: WindowSystem {
     }
 
     func focus(_ window: WindowHandle) throws {
-        try SideEffectGuard.check("focusing a window")
+        try sideEffects.check("focusing a window")
         let element = try element(of: window)
-        // A chosen window can sit behind the app's focused one; bring it forward with the app.
-        _ = AXUIElementPerformAction(element, kAXRaiseAction as CFString)
         guard let application = NSRunningApplication(processIdentifier: window.pid), !application.isTerminated else {
             throw LibraryValidationError("That window's app has quit. Choose another window and try again.")
         }
-        application.activate()
+        let name = application.localizedName ?? "The app"
+        // A chosen window can sit behind the app's focused one; bring it forward with the app.
+        switch AXUIElementPerformAction(element, kAXRaiseAction as CFString) {
+        case .success: break
+        case .invalidUIElement:
+            throw LibraryValidationError("This window has closed. Choose another window and try again.")
+        default:
+            throw LibraryValidationError("\(name) didn't bring that window forward.")
+        }
+        guard application.activate() else { throw LibraryValidationError("\(name) didn't come to the front.") }
     }
 
     func close(_ window: WindowHandle) throws {
-        try SideEffectGuard.check("closing a window")
+        try sideEffects.check("closing a window")
         let element = try element(of: window)
         guard let button = attribute(kAXCloseButtonAttribute, of: element),
             CFGetTypeID(button) == AXUIElementGetTypeID(),
@@ -287,7 +362,7 @@ final class AXWindowSystem: WindowSystem {
     }
 
     func hideApplication(_ pid: pid_t) throws {
-        try SideEffectGuard.check("hiding an app")
+        try sideEffects.check("hiding an app")
         guard let application = NSRunningApplication(processIdentifier: pid), !application.isTerminated else {
             throw LibraryValidationError("That app has quit.")
         }
@@ -383,18 +458,24 @@ final class WindowManager {
     }
 
     struct Settings: Equatable, Sendable {
-        var gaps = WindowGaps.none
+        var gaps = WindowGaps.zero
         /// Repeating a half command steps through 1/2, 2/3 and 1/3.
         var cyclesHalves = false
     }
 
     let system: any WindowSystem
+    /// The window server's on-screen list, to tell visible windows from hidden or off-Space ones.
+    let listing: any WindowServerListing
     var settings = Settings()
     /// Frames from before the first command, for Restore.
     private var originalFrames: [WindowHandle: CGRect] = [:]
 
-    init(system: any WindowSystem = AXWindowSystem()) {
+    init(
+        system: any WindowSystem = WindowSystemEnvironment.makeSystem(),
+        listing: any WindowServerListing = WindowSystemEnvironment.makeListing()
+    ) {
         self.system = system
+        self.listing = listing
     }
 
     var hasPermission: Bool { system.isTrusted }
@@ -403,9 +484,10 @@ final class WindowManager {
 
     /// Standard, unminimized windows of other running apps, grouped by app name
     /// and front to back within each app. Empty without Accessibility access.
+    /// Reads titles only, so it stays light.
     func listWindows() -> [TargetWindow] {
         guard hasPermission else { return [] }
-        return system.windows(includeMinimized: false).compactMap { window in
+        return system.windows(includeMinimized: false, readFrames: false).compactMap { window in
             guard let element = window.handle.element else { return nil }
             return TargetWindow(
                 pid: window.pid, appName: window.appName, bundleURL: window.bundleURL, element: element,
@@ -433,10 +515,12 @@ final class WindowManager {
     }
 
     func perform(_ custom: CustomWindowCommand, focusedWindowOf pid: pid_t?) throws {
+        try custom.validate()
         try perform(focusedWindowOf: pid) { try perform(custom, on: $0) }
     }
 
-    /// Runs a command on a specific window.
+    /// Runs a command on a specific window. With default settings the original
+    /// twelve commands keep their original geometry and display order.
     func perform(_ command: WindowCommand, on window: WindowHandle) throws {
         try requireWindow(window)
         switch command {
@@ -452,8 +536,7 @@ final class WindowManager {
         }
         let current = try system.frame(of: window)
         let displays = system.displays()
-        let frames = displays.map(\.frame)
-        guard let index = DisplayArrangement.index(of: current, in: frames) else {
+        guard let index = DisplayArrangement.index(of: current, in: displays.map(\.frame)) else {
             throw LibraryValidationError("No display is available.")
         }
         let screen = displays[index].visibleFrame
@@ -465,10 +548,15 @@ final class WindowManager {
             }
             desired = original
         case .nextDisplay, .previousDisplay:
-            guard let target = DisplayArrangement.adjacent(to: index, in: frames, forward: command == .nextDisplay)
+            guard
+                let target = DisplayArrangement.adjacent(
+                    to: index, count: displays.count, forward: command == .nextDisplay)
             else { throw LibraryValidationError("Connect another display to move this window.") }
-            desired = WindowGeometry.centered(
-                current.size, in: WindowGeometry.usableArea(displays[target].visibleFrame, gaps: settings.gaps))
+            let targetScreen = displays[target].visibleFrame
+            desired =
+                settings.gaps == WindowGaps.zero
+                ? WindowLayout.center.frame(in: targetScreen, current: current)
+                : WindowGeometry.centered(current.size, in: WindowGeometry.usableArea(targetScreen, gaps: settings.gaps))
         default:
             let cycled =
                 settings.cyclesHalves && command.cycles
@@ -482,15 +570,27 @@ final class WindowManager {
         try apply(desired, to: window, from: current, restoring: command == .restore)
     }
 
-    /// Runs a custom size-and-position command on a specific window.
+    /// Exact Move, Exact Resize and custom commands. Invalid input and sizes the
+    /// display can't hold fail before anything moves; an app that clamps the
+    /// request is reported instead of passing for success.
     func perform(_ custom: CustomWindowCommand, on window: WindowHandle) throws {
+        try custom.validate()
         try requireWindow(window)
         let current = try system.frame(of: window)
         let displays = system.displays()
         guard let index = DisplayArrangement.index(of: current, in: displays.map(\.frame)) else {
             throw LibraryValidationError("No display is available.")
         }
-        try apply(custom.frame(in: displays[index].visibleFrame, current: current), to: window, from: current)
+        let desired = try custom.frame(in: displays[index].visibleFrame, current: current)
+        try apply(desired, to: window, from: current)
+        let actual = try system.frame(of: window)
+        if abs(actual.width - desired.width) > 1 || abs(actual.height - desired.height) > 1 {
+            throw LibraryValidationError(
+                "The app limited the window to \(Int(actual.width.rounded())) × \(Int(actual.height.rounded())) points.")
+        }
+        if abs(actual.minX - desired.minX) > 1 || abs(actual.minY - desired.minY) > 1 {
+            throw LibraryValidationError("The app kept the window in a different position.")
+        }
     }
 
     /// The title of the window a layout will apply to, when Accessibility allows reading it.
@@ -504,66 +604,105 @@ final class WindowManager {
 
     // MARK: Layouts
 
-    /// Save Current Layout: the visible windows on every display, as a draft to name and edit.
+    /// Windows on screen right now, front to back: the Accessibility list checked
+    /// against the window server, so hidden apps and other Spaces drop out.
+    func visibleWindows() -> [WindowSnapshot] {
+        let primaryHeight = system.displays().first?.frame.maxY ?? 0
+        return WindowSwitcherOrdering.order(
+            system.windows(includeMinimized: false, readFrames: true), entries: listing.onScreenWindows(),
+            primaryHeight: primaryHeight
+        ).filter(\.isOnScreen).map(\.snapshot)
+    }
+
+    /// Save Current Layout: the windows on screen, front to back, as a draft to name and edit.
     func captureLayout(named name: String) throws -> SavedWindowLayout {
         try requirePermission()
-        let layout = WindowLayoutPlanner.capture(
-            named: name, displays: system.displays(), windows: system.windows(includeMinimized: false))
+        let layout = WindowLayoutPlanner.capture(named: name, displays: system.displays(), windows: visibleWindows())
         guard !layout.slots.isEmpty else { throw LibraryValidationError("There are no windows to save.") }
         return layout
     }
 
     /// Places every window a layout lists, launching apps that have no window yet
-    /// and waiting up to `launchTimeout` for their windows to appear.
+    /// and waiting up to `launchTimeout` for their windows. Cancellation stops it
+    /// before the next launch, wait or move. Other windows are minimized or closed
+    /// only on displays where a window was placed, and only when the window
+    /// server confirms they are on screen.
     func apply(
         _ layout: SavedWindowLayout, launcher: any ApplicationLaunching,
         launchTimeout: Duration = .seconds(6), pollInterval: Duration = .milliseconds(250),
-        sleep: @Sendable (Duration) async -> Void = { try? await Task.sleep(for: $0) }
+        sleep: @Sendable (Duration) async throws -> Void = { try await Task.sleep(for: $0) }
     ) async throws -> WindowLayoutOutcome {
         try requirePermission()
         try layout.validate()
+        try Task.checkCancellation()
         var plan = currentPlan(for: layout)
         if !plan.launches.isEmpty {
             for bundleIdentifier in plan.launches {
+                try Task.checkCancellation()
+                // A failed launch leaves its slots missing; the rest still apply.
                 try? await launcher.launch(bundleIdentifier: bundleIdentifier)
             }
             var waited = Duration.zero
             while !plan.unmatchedSlots.isEmpty && waited < launchTimeout {
-                await sleep(pollInterval)
+                try Task.checkCancellation()
+                try await sleep(pollInterval)
                 waited += pollInterval
                 plan = currentPlan(for: layout)
             }
         }
-        var placed = 0
+        try Task.checkCancellation()
+        let displays = system.displays()
+        var placed: [WindowLayoutPlan.Move] = []
+        var failedSlots = Set<UUID>()
         for move in plan.moves {
+            try Task.checkCancellation()
             do {
                 if move.unminimize { try system.setMinimized(false, of: move.window) }
                 let current = try system.frame(of: move.window)
                 try apply(move.frame, to: move.window, from: current, focus: false)
-                placed += 1
+                placed.append(move)
             } catch let error as SideEffectGuard.Blocked {
                 throw error
             } catch {
-                continue
+                failedSlots.insert(move.slotID)
             }
         }
-        for window in plan.others {
-            switch layout.otherWindows {
-            case .leave: break
-            case .minimize: try? system.setMinimized(true, of: window)
-            case .close: try? system.close(window)
+        var cleanupFailures = 0
+        if layout.otherWindows != .leave && !placed.isEmpty {
+            let targets = WindowLayoutPlanner.cleanupTargets(
+                visible: visibleWindows(), claimed: Set(plan.moves.map(\.window)), displays: displays,
+                placedDisplays: Set(placed.map(\.displayIndex)))
+            for window in targets {
+                do {
+                    switch layout.otherWindows {
+                    case .leave: break
+                    case .minimize: try system.setMinimized(true, of: window)
+                    case .close: try system.close(window)
+                    }
+                } catch {
+                    cleanupFailures += 1
+                }
             }
         }
         // The first slot is the frontmost, so raise the rest first.
-        for move in plan.moves.reversed() { try? system.focus(move.window) }
-        let missing = layout.slots.filter { plan.unmatchedSlots.contains($0.id) }.map(\.appName)
-        var unique: [String] = []
-        for name in missing where !unique.contains(name) { unique.append(name) }
-        return WindowLayoutOutcome(placed: placed, missing: unique)
+        for move in placed.reversed() { try? system.focus(move.window) }
+        let unmatched = Set(plan.unmatchedSlots)
+        return WindowLayoutOutcome(
+            requested: layout.slots.count, placed: placed.count,
+            missing: Self.uniqueNames(layout.slots.filter { unmatched.contains($0.id) }),
+            failed: Self.uniqueNames(layout.slots.filter { failedSlots.contains($0.id) }),
+            cleanupFailures: cleanupFailures)
     }
 
     private func currentPlan(for layout: SavedWindowLayout) -> WindowLayoutPlan {
-        WindowLayoutPlanner.plan(layout, displays: system.displays(), windows: system.windows(includeMinimized: true))
+        WindowLayoutPlanner.plan(
+            layout, displays: system.displays(), windows: system.windows(includeMinimized: true, readFrames: false))
+    }
+
+    private static func uniqueNames(_ slots: [SavedWindowLayout.Slot]) -> [String] {
+        var names: [String] = []
+        for slot in slots where !names.contains(slot.appName) { names.append(slot.appName) }
+        return names
     }
 
     // MARK: Text

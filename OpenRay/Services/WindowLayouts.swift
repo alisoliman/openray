@@ -224,7 +224,7 @@ struct UnitRect: Equatable, Codable, Sendable {
 /// Space between tiled windows and between windows and the display's edges.
 struct WindowGaps: Equatable, Codable, Sendable {
     static let maximum: Double = 64
-    static let none = WindowGaps()
+    static let zero = WindowGaps()
 
     /// Between neighbouring windows.
     var window: Double = 0
@@ -238,6 +238,14 @@ struct WindowGaps: Equatable, Codable, Sendable {
 
     /// One gap everywhere, as in a single "Window Gap" setting.
     init(uniform gap: Double) { self.init(window: gap, screen: gap) }
+
+    /// Stored values pass through the same clamp, so a damaged file can't set huge gaps.
+    init(from decoder: any Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        self.init(
+            window: try container.decodeIfPresent(Double.self, forKey: .window) ?? 0,
+            screen: try container.decodeIfPresent(Double.self, forKey: .screen) ?? 0)
+    }
 
     private static func clamp(_ value: Double) -> Double {
         value.isFinite ? min(max(value, 0), maximum) : 0
@@ -309,8 +317,14 @@ enum WindowGeometry {
     /// Previous Display, `screen` is the target display. Nil for commands that
     /// don't set a frame: Toggle Fullscreen, Minimize and Restore.
     static func frame(
-        for command: WindowCommand, in screen: CGRect, current: CGRect, gaps: WindowGaps = .none
+        for command: WindowCommand, in screen: CGRect, current: CGRect, gaps: WindowGaps = .zero
     ) -> CGRect? {
+        // The original twelve keep their original, unrounded geometry with default settings.
+        if gaps == WindowGaps.zero, let legacy = WindowLayout(rawValue: command.rawValue),
+            legacy != .nextDisplay, legacy != .restore
+        {
+            return legacy.frame(in: screen, current: current)
+        }
         let usable = usableArea(screen, gaps: gaps)
         if let region = region(command, portrait: screen.height > screen.width) {
             return place(region, in: screen, gaps: gaps)
@@ -375,7 +389,7 @@ enum WindowGeometry {
     /// A unit region on a display. Inner edges give up half the window gap each,
     /// so neighbours end up one full gap apart. Edges round to whole points so
     /// neighbouring tiles meet exactly.
-    static func place(_ region: UnitRect, in screen: CGRect, gaps: WindowGaps = .none) -> CGRect {
+    static func place(_ region: UnitRect, in screen: CGRect, gaps: WindowGaps = .zero) -> CGRect {
         let usable = usableArea(screen, gaps: gaps)
         let half = CGFloat(gaps.window) / 2
         let epsilon = 0.000_1
@@ -455,7 +469,7 @@ enum HalfCycling {
     /// The next size in the cycle: the step after the one the window already fills,
     /// or the half when it fills none of them.
     static func frame(
-        for command: WindowCommand, in screen: CGRect, current: CGRect, gaps: WindowGaps = .none
+        for command: WindowCommand, in screen: CGRect, current: CGRect, gaps: WindowGaps = .zero
     ) -> CGRect? {
         let frames = fractions.compactMap { region(command, fraction: $0) }.map {
             WindowGeometry.place($0, in: screen, gaps: gaps)
@@ -470,19 +484,32 @@ enum HalfCycling {
 
 /// Which display a window is on, and which one is next.
 enum DisplayArrangement {
-    /// The display showing most of `frame`, or the nearest one when it's on none.
+    /// The first display with the largest share of `frame`, as window commands
+    /// always chose. A window on no display counts as on the first one.
     static func index(of frame: CGRect, in displays: [CGRect]) -> Int? {
         guard !displays.isEmpty else { return nil }
-        let areas = displays.map { display -> CGFloat in
+        func area(_ display: CGRect) -> CGFloat {
             let overlap = display.intersection(frame)
             return overlap.isNull ? 0 : overlap.width * overlap.height
         }
-        if let best = areas.indices.max(by: { areas[$0] < areas[$1] }), areas[best] > 0 { return best }
-        let center = CGPoint(x: frame.midX, y: frame.midY)
-        return displays.indices.min { distance(center, displays[$0]) < distance(center, displays[$1]) }
+        var best = 0
+        var bestArea = area(displays[0])
+        for index in displays.indices.dropFirst() where area(displays[index]) > bestArea {
+            best = index
+            bestArea = area(displays[index])
+        }
+        return best
     }
 
-    /// Displays in reading order: left to right, then top to bottom.
+    /// The display after (or before) `index` in the system's display order, wrapping
+    /// around, as Next Display always moved. Nil with a single display.
+    static func adjacent(to index: Int, count: Int, forward: Bool) -> Int? {
+        guard count > 1, (0..<count).contains(index) else { return nil }
+        return (index + (forward ? 1 : count - 1)) % count
+    }
+
+    /// Displays in reading order (left to right, then top to bottom), so saved
+    /// layouts find "the second display" again after the system order changes.
     static func spatialOrder(_ displays: [CGRect]) -> [Int] {
         displays.indices.sorted { lhs, rhs in
             let a = displays[lhs]
@@ -491,22 +518,6 @@ enum DisplayArrangement {
             if a.maxY != b.maxY { return a.maxY > b.maxY }
             return lhs < rhs
         }
-    }
-
-    /// The display after (or before) `index` in reading order, wrapping around.
-    /// Nil with a single display.
-    static func adjacent(to index: Int, in displays: [CGRect], forward: Bool) -> Int? {
-        guard displays.count > 1, displays.indices.contains(index) else { return nil }
-        let order = spatialOrder(displays)
-        guard let position = order.firstIndex(of: index) else { return nil }
-        let next = (position + (forward ? 1 : order.count - 1)) % order.count
-        return order[next]
-    }
-
-    private static func distance(_ point: CGPoint, _ rect: CGRect) -> CGFloat {
-        let dx = max(rect.minX - point.x, 0, point.x - rect.maxX)
-        let dy = max(rect.minY - point.y, 0, point.y - rect.maxY)
-        return dx * dx + dy * dy
     }
 }
 
@@ -594,10 +605,19 @@ struct CustomWindowCommand: Codable, Equatable, Identifiable, Sendable {
         }
     }
 
-    /// The frame on a display's visible area, in AppKit coordinates.
-    func frame(in screen: CGRect, current: CGRect) -> CGRect {
-        let width = min(max(width?.resolve(against: screen.width) ?? current.width, 1), screen.width)
-        let height = min(max(height?.resolve(against: screen.height) ?? current.height, 1), screen.height)
+    /// The frame on a display's visible area, in AppKit coordinates. Sizes are
+    /// exact: a size the display can't hold throws instead of shrinking, and an
+    /// unchanged width or height stays exactly as it was. Only computed
+    /// positions round to whole points.
+    func frame(in screen: CGRect, current: CGRect) throws -> CGRect {
+        try validate()
+        let width = width?.resolve(against: screen.width) ?? current.width
+        let height = height?.resolve(against: screen.height) ?? current.height
+        guard width > 0, height > 0 else { throw LibraryValidationError("Sizes must be above zero.") }
+        guard width <= screen.width + 0.5, height <= screen.height + 0.5 else {
+            throw LibraryValidationError(
+                "This display has room for up to \(Int(screen.width)) × \(Int(screen.height)) points. Choose a smaller size.")
+        }
         let left = screen.minX
         let middle = screen.midX - width / 2
         let right = screen.maxX - width
@@ -617,11 +637,14 @@ struct CustomWindowCommand: Codable, Equatable, Identifiable, Sendable {
             case .bottom: CGPoint(x: middle, y: bottom)
             case .bottomRight: CGPoint(x: right, y: bottom)
             }
-        var x = origin.x
-        var y = origin.y
-        x += xOffset.resolve(against: screen.width)
-        y -= yOffset.resolve(against: screen.height)
-        return WindowGeometry.rounded(CGRect(x: x, y: y, width: width, height: height))
+        var x = origin.x + xOffset.resolve(against: screen.width)
+        var y = origin.y - yOffset.resolve(against: screen.height)
+        // Resize keeps the top-left corner exactly; computed positions snap to points.
+        if anchor != .current || xOffset != .points(0) || yOffset != .points(0) {
+            x.round()
+            y.round()
+        }
+        return CGRect(x: x, y: y, width: width, height: height)
     }
 }
 
@@ -687,6 +710,8 @@ struct WindowLayoutPlan: Equatable {
         var slotID: UUID
         var window: WindowHandle
         var frame: CGRect
+        /// Index into the displays the plan was made with.
+        var displayIndex: Int
         var unminimize: Bool
     }
 
@@ -694,13 +719,13 @@ struct WindowLayoutPlan: Equatable {
     /// Apps with a slot but no window: launch them, then plan again.
     var launches: [String] = []
     var unmatchedSlots: [UUID] = []
-    /// Windows to minimize or close under the layout's Other Windows setting.
-    var others: [WindowHandle] = []
 }
 
 enum WindowLayoutPlanner {
-    /// Matches slots to windows. Each slot takes the window with its saved title,
-    /// else the app's frontmost unclaimed window; visible windows go before minimized ones.
+    /// Matches slots to windows in two passes. First every slot with a saved
+    /// title claims its exact app-and-title match, so a missing document can't
+    /// take a window that another slot names. Then the remaining slots take the
+    /// app's frontmost unclaimed window, visible before minimized.
     static func plan(
         _ layout: SavedWindowLayout, displays: [DisplaySnapshot], windows: [WindowSnapshot]
     ) -> WindowLayoutPlan {
@@ -711,35 +736,53 @@ enum WindowLayoutPlanner {
         }
         let candidates = windows.filter { !$0.isMinimized } + windows.filter(\.isMinimized)
         var claimed = Set<WindowHandle>()
-        var usedDisplays = Set<Int>()
+        var assigned: [UUID: WindowSnapshot] = [:]
         for slot in layout.slots {
-            let displayIndex = self.displayIndex(for: slot, in: displays)
-            usedDisplays.insert(displayIndex)
-            let appWindows = candidates.filter {
-                $0.bundleIdentifier == slot.bundleIdentifier && !claimed.contains($0.handle)
-            }
-            let match =
-                slot.windowTitle.flatMap { title in appWindows.first { $0.title == title } } ?? appWindows.first
-            guard let match else {
+            guard let title = slot.windowTitle,
+                let match = candidates.first(where: {
+                    $0.bundleIdentifier == slot.bundleIdentifier && $0.title == title && !claimed.contains($0.handle)
+                })
+            else { continue }
+            claimed.insert(match.handle)
+            assigned[slot.id] = match
+        }
+        for slot in layout.slots where assigned[slot.id] == nil {
+            guard
+                let match = candidates.first(where: {
+                    $0.bundleIdentifier == slot.bundleIdentifier && !claimed.contains($0.handle)
+                })
+            else { continue }
+            claimed.insert(match.handle)
+            assigned[slot.id] = match
+        }
+        for slot in layout.slots {
+            guard let match = assigned[slot.id] else {
                 plan.unmatchedSlots.append(slot.id)
                 if !plan.launches.contains(slot.bundleIdentifier) { plan.launches.append(slot.bundleIdentifier) }
                 continue
             }
-            claimed.insert(match.handle)
+            let displayIndex = self.displayIndex(for: slot, in: displays)
             plan.moves.append(
                 .init(
                     slotID: slot.id, window: match.handle,
                     frame: WindowGeometry.place(slot.region, in: displays[displayIndex].visibleFrame),
-                    unminimize: match.isMinimized))
-        }
-        if layout.otherWindows != .leave {
-            let frames = displays.map(\.frame)
-            plan.others = windows.filter { window in
-                !window.isMinimized && !claimed.contains(window.handle)
-                    && DisplayArrangement.index(of: window.frame, in: frames).map(usedDisplays.contains) == true
-            }.map(\.handle)
+                    displayIndex: displayIndex, unminimize: match.isMinimized))
         }
         return plan
+    }
+
+    /// Other Windows: visible windows the layout didn't claim, on displays where
+    /// it actually placed a window. Windows without a known frame are left alone.
+    static func cleanupTargets(
+        visible: [WindowSnapshot], claimed: Set<WindowHandle>, displays: [DisplaySnapshot], placedDisplays: Set<Int>
+    ) -> [WindowHandle] {
+        let frames = displays.map(\.frame)
+        return visible.filter { window in
+            guard !window.isMinimized, !claimed.contains(window.handle), let frame = window.frame,
+                let index = DisplayArrangement.index(of: frame, in: frames)
+            else { return false }
+            return placedDisplays.contains(index) && !frames[index].intersection(frame).isNull
+        }.map(\.handle)
     }
 
     /// The display a slot belongs on: the one with its saved name, else the same
@@ -754,7 +797,8 @@ enum WindowLayoutPlanner {
         return 0
     }
 
-    /// Save Current Layout: the visible windows, front to back, up to eight per display.
+    /// Save Current Layout from on-screen windows given front to back: up to
+    /// eight per display, frontmost first. Windows without a frame are skipped.
     static func capture(
         named name: String, displays: [DisplaySnapshot], windows: [WindowSnapshot]
     ) -> SavedWindowLayout {
@@ -763,12 +807,13 @@ enum WindowLayoutPlanner {
         var perDisplay: [Int: Int] = [:]
         var slots: [SavedWindowLayout.Slot] = []
         for window in windows where !window.isMinimized {
-            guard let bundleIdentifier = window.bundleIdentifier, !bundleIdentifier.isEmpty,
-                let index = DisplayArrangement.index(of: window.frame, in: frames),
+            guard let frame = window.frame, let bundleIdentifier = window.bundleIdentifier, !bundleIdentifier.isEmpty,
+                let index = DisplayArrangement.index(of: frame, in: frames),
+                !frames[index].intersection(frame).isNull,
                 let position = order.firstIndex(of: index),
                 perDisplay[index, default: 0] < SavedWindowLayout.maximumWindowsPerDisplay
             else { continue }
-            let region = UnitRect(window.frame, in: displays[index].visibleFrame)
+            let region = UnitRect(frame, in: displays[index].visibleFrame)
             guard region.width > 0, region.height > 0 else { continue }
             perDisplay[index, default: 0] += 1
             slots.append(
@@ -789,8 +834,14 @@ protocol ApplicationLaunching: AnyObject {
 
 @MainActor
 final class WorkspaceApplicationLauncher: ApplicationLaunching {
+    let sideEffects: SideEffectGuard
+
+    nonisolated init(sideEffects: SideEffectGuard = .current) {
+        self.sideEffects = sideEffects
+    }
+
     func launch(bundleIdentifier: String) async throws {
-        try SideEffectGuard.check("launching \(bundleIdentifier)")
+        try sideEffects.check("launching \(bundleIdentifier)")
         guard let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: bundleIdentifier) else {
             throw LibraryValidationError("An app in this layout isn't installed.")
         }
@@ -804,14 +855,29 @@ final class WorkspaceApplicationLauncher: ApplicationLaunching {
     }
 }
 
-/// What applying a layout did.
+/// What applying a layout did, counted against the slots it asked for.
 struct WindowLayoutOutcome: Equatable, Sendable {
+    /// Slots in the layout.
+    var requested: Int
     var placed: Int
     /// Apps that had no window to place, by name.
-    var missing: [String]
+    var missing: [String] = []
+    /// Apps whose window refused to move or resize, by name.
+    var failed: [String] = []
+    /// Other windows that couldn't be minimized or closed.
+    var cleanupFailures: Int = 0
+
+    var isComplete: Bool { placed == requested && cleanupFailures == 0 }
 
     var message: String {
-        if missing.isEmpty { return placed == 1 ? "Arranged 1 window" : "Arranged \(placed) windows" }
-        return "Arranged \(placed) of \(placed + missing.count) windows. No window for \(missing.joined(separator: ", "))"
+        if isComplete { return placed == 1 ? "Arranged 1 window" : "Arranged \(placed) windows" }
+        var parts = ["Arranged \(placed) of \(requested) \(requested == 1 ? "window" : "windows")."]
+        if !missing.isEmpty { parts.append("No window for \(missing.joined(separator: ", ")).") }
+        if !failed.isEmpty { parts.append("\(failed.joined(separator: ", ")) didn't move.") }
+        if cleanupFailures > 0 {
+            parts.append(
+                cleanupFailures == 1 ? "1 other window stayed open." : "\(cleanupFailures) other windows stayed open.")
+        }
+        return parts.joined(separator: " ")
     }
 }

@@ -18,6 +18,13 @@ protocol WindowServerListing: AnyObject {
     func onScreenWindows() -> [WindowServerEntry]
 }
 
+/// Lists nothing. The default in inert launches, so tests never read the real window list.
+@MainActor
+final class InertWindowServerListing: WindowServerListing {
+    nonisolated init() {}
+    func onScreenWindows() -> [WindowServerEntry] { [] }
+}
+
 @MainActor
 final class CGWindowServerListing: WindowServerListing {
     nonisolated init() {}
@@ -76,10 +83,9 @@ enum WindowSwitcherOrdering {
         for entry in entries where entry.layer == 0 {
             guard
                 let index = remaining.firstIndex(where: { window in
-                    window.pid == entry.pid && !window.isMinimized
-                        && WindowGeometry.approximatelyEqual(
-                            ScreenCoordinates.flip(window.frame, primaryHeight: primaryHeight), entry.bounds,
-                            tolerance: 2)
+                    guard window.pid == entry.pid, !window.isMinimized, let frame = window.frame else { return false }
+                    return WindowGeometry.approximatelyEqual(
+                        ScreenCoordinates.flip(frame, primaryHeight: primaryHeight), entry.bounds, tolerance: 2)
                 })
             else { continue }
             onScreen.append(SwitchableWindow(snapshot: remaining.remove(at: index), windowNumber: entry.number))
@@ -116,7 +122,10 @@ final class WindowSwitcher {
     let system: any WindowSystem
     let listing: any WindowServerListing
 
-    init(system: any WindowSystem, listing: any WindowServerListing = CGWindowServerListing()) {
+    init(
+        system: any WindowSystem = WindowSystemEnvironment.makeSystem(),
+        listing: any WindowServerListing = WindowSystemEnvironment.makeListing()
+    ) {
         self.system = system
         self.listing = listing
     }
@@ -128,7 +137,8 @@ final class WindowSwitcher {
         guard system.isTrusted else { return [] }
         let primaryHeight = system.displays().first?.frame.maxY ?? 0
         return WindowSwitcherOrdering.order(
-            system.windows(includeMinimized: true), entries: listing.onScreenWindows(), primaryHeight: primaryHeight)
+            system.windows(includeMinimized: true, readFrames: true), entries: listing.onScreenWindows(),
+            primaryHeight: primaryHeight)
     }
 
     static func filter(_ windows: [SwitchableWindow], query: String) -> [SwitchableWindow] {
@@ -163,11 +173,11 @@ final class WindowSwitcher {
         try system.close(window.handle)
     }
 
+    /// Acts on the window where it is, without switching to it first.
     func toggleFullScreen(_ window: SwitchableWindow) throws {
         try requireOtherApp(window)
         if window.isMinimized { try system.setMinimized(false, of: window.handle) }
         try system.setFullScreen(!(system.isFullScreen(window.handle) ?? false), of: window.handle)
-        try system.focus(window.handle)
     }
 
     func hideApplication(of window: SwitchableWindow) throws {
