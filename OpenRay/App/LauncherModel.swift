@@ -82,6 +82,13 @@ final class LauncherModel {
     var actionSelection = 0
 
     let store: LibraryStore
+    /// The registered command providers. Rows with `.provided` actions dispatch through it.
+    let registry: CommandRegistry
+    /// Rows from providers' live searches, by provider id, for the current query and scope.
+    private(set) var providedLiveItems: [String: [LauncherItem]] = [:]
+    /// True while a provider's live search for the current query is running.
+    private(set) var isLoadingProvidedItems = false
+    @ObservationIgnored private var providedLiveTask: Task<Void, Never>?
     let applications = ApplicationCatalog()
     let files = FileSearchService()
     let ai: AIChatModel
@@ -112,8 +119,12 @@ final class LauncherModel {
     /// Stands in for the Accessibility read of the selected text. Tests set it.
     @ObservationIgnored var selectionReader: (() throws -> String)?
 
-    init(store: LibraryStore = LibraryStore(), ai: AIChatModel = AIChatModel(), pasteboard: NSPasteboard = .general) {
+    init(
+        store: LibraryStore = LibraryStore(), ai: AIChatModel = AIChatModel(), pasteboard: NSPasteboard = .general,
+        registry: CommandRegistry = CommandRegistry()
+    ) {
         self.store = store
+        self.registry = registry
         self.ai = ai
         clipboard = ClipboardService(store: store, pasteboard: pasteboard)
         snippets = SnippetExpander(store: store)
@@ -144,7 +155,9 @@ final class LauncherModel {
         case .home:
             items = commandItems + applicationItems + quicklinkItems + snippetItems + noteItems + savedFileItems
             items += clipboardItems.filter { store.database.favoriteIDs.contains($0.id) }
+            items += registry.rootItems(for: query.trimmingCharacters(in: .whitespacesAndNewlines), in: self)
             if query.count >= 2 { items += fileItems }
+            items += providedLiveItemsInOrder
         case .applications: items = applicationItems
         case .files: items = fileItems
         case .clipboard:
@@ -157,12 +170,15 @@ final class LauncherModel {
         case .notes: items = noteItems
         case .calculator: items = []
         case .windows: items = windowItems
+        case .provided(let scope):
+            items = registry.scopeItems(scope, query: query.trimmingCharacters(in: .whitespacesAndNewlines), in: self)
+            items += providedLiveItemsInOrder
         }
 
         var seenIDs = Set<String>()
         items = items.filter { seenIDs.insert($0.id).inserted }
         let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
-        if !trimmed.isEmpty {
+        if !trimmed.isEmpty, section.providedScope?.ranksItems ?? true {
             let now = Date.now
             let favorites = store.database.favoriteIDs
             let usage = Dictionary(store.database.usage.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
@@ -170,6 +186,8 @@ final class LauncherModel {
                 if case .quicklink(let link, let argument) = item.action, link.argument(in: trimmed) != nil {
                     return (item, argument.isEmpty ? 1_000 : 1_100)
                 }
+                // Provided rows that answer the query, such as a conversion, skip the matcher.
+                if case .provided(let ref) = item.action, let rank = ref.rank { return (item, rank) }
                 let titleScore = SearchMatcher.score(trimmed, in: item.title)
                 // Keywords match by word, prefix or substring only; scattered letters are noise there.
                 let keywordScore = SearchMatcher.score(trimmed, in: item.keywords).flatMap { $0 >= 450 ? $0 - 80 : nil }
@@ -244,6 +262,8 @@ final class LauncherModel {
                 LauncherResultGroup(
                     id: "files", title: isQueryBlank ? "Recent in \(fileScope.title)" : nil, items: results)
             ].filter { !$0.items.isEmpty }
+        case .provided(let scope):
+            return registry.scopeGroups(scope, items: results, in: self)
         default:
             return [LauncherResultGroup(id: section.rawValue, title: nil, items: results)].filter { !$0.items.isEmpty }
         }
@@ -260,7 +280,8 @@ final class LauncherModel {
         let index = Dictionary(
             (commandItems + applicationItems + quicklinkItems + snippetItems + noteItems + savedFileItems
                 + clipboardItems).map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
-        return store.database.orderedFavoriteIDs.compactMap { index[$0] }.prefix(16).map { $0 }
+        return store.database.orderedFavoriteIDs.compactMap { index[$0] ?? registry.item(withID: $0, in: self) }
+            .prefix(16).map { $0 }
     }
 
     private var homeGroups: [LauncherResultGroup] {
@@ -273,7 +294,7 @@ final class LauncherModel {
         // Clipboard entries stay out of Everything unless they are favorites.
         let recent = store.database.usage.sorted { $0.lastUsed > $1.lastUsed }
             .filter { !favoriteIDs.contains($0.id) && !$0.id.hasPrefix("clipboard.") }
-            .compactMap { index[$0.id] }.prefix(4)
+            .compactMap { index[$0.id] ?? registry.item(withID: $0.id, in: self) }.prefix(4)
         return [
             LauncherResultGroup(
                 id: "favorites", title: "Favorites", trailing: favorites.count > 1 ? "⌘1 – ⌘\(min(8, favorites.count))" : nil,
@@ -301,7 +322,10 @@ final class LauncherModel {
         groups.append(
             LauncherResultGroup(
                 id: "library", title: "Library", items: instant.filter { !isCommand($0) && !isApp($0) }))
-        let live = items.filter(\.isLiveResult)
+        let live = items.filter { item in
+            if case .provided = item.action { return false }
+            return item.isLiveResult
+        }
         let searching = files.isSearching && query.count >= 2
         // Files appears with its first rows. Until then the field's spinner and the bar's
         // “Searching…” show progress, and an empty header can't vanish and shift the rows below.
@@ -310,6 +334,14 @@ final class LauncherModel {
                 LauncherResultGroup(
                     id: "files", title: "Files", trailing: searching ? "Searching \(FileSearchScope.home.title.lowercased()) folder" : nil,
                     isLoading: searching, items: live))
+        }
+        // Each provider's live rows follow Files under the provider's own title.
+        for provider in registry.providers {
+            let rows = items.filter { item in
+                if case .provided(let ref) = item.action { return item.isLiveResult && ref.provider == provider.id }
+                return false
+            }
+            groups.append(LauncherResultGroup(id: "live.\(provider.id)", title: provider.liveGroupTitle, items: rows))
         }
         groups.append(
             LauncherResultGroup(
@@ -332,7 +364,7 @@ final class LauncherModel {
                     id: "fallback.web", title: web.name, subtitle: Self.siteName(for: web),
                     symbol: "globe", kind: .quicklink, badge: "Quicklink", action: .quicklink(web, trimmed)))
         }
-        return items
+        return items + registry.fallbackItems(for: trimmed, in: self)
     }
 
     private var webSearchLink: Quicklink? {
@@ -420,6 +452,8 @@ final class LauncherModel {
         clipboard.stop()
         snippets.stop()
         files.stop()
+        providedLiveTask?.cancel()
+        isLoadingProvidedItems = false
         ai.cancel()
     }
 
@@ -766,6 +800,7 @@ final class LauncherModel {
         if destination == .search, argumentLink == nil, section == .home || section == .files {
             files.search(query, showRecent: section == .files, scope: section == .files ? fileScope : .home)
         }
+        refreshProvidedLiveItems()
     }
 
     func synchronizeSelection() {
@@ -856,7 +891,7 @@ final class LauncherModel {
     /// Whether ← and → should move the selection rather than the caret.
     var arrowsMoveSelection: Bool {
         guard destination == .search, argumentLink == nil, !showActions else { return false }
-        if section == .windows { return true }
+        if section == .windows || section.providedScope?.style == .grid { return true }
         return section == .home && isQueryBlank
     }
 
@@ -891,6 +926,42 @@ final class LauncherModel {
             files.search(query, showRecent: section == .files, scope: section == .files ? fileScope : .home)
         } else {
             files.stop()
+        }
+        refreshProvidedLiveItems()
+    }
+
+    /// Live provider rows, in registration order, for `results`.
+    private var providedLiveItemsInOrder: [LauncherItem] {
+        guard !providedLiveItems.isEmpty else { return [] }
+        return registry.providers.flatMap { providedLiveItems[$0.id] ?? [] }
+    }
+
+    /// Starts the providers' live searches for the current query, replacing any still running.
+    /// Root search asks every provider with one once there's a query; a provided scope asks its owner.
+    func refreshProvidedLiveItems() {
+        providedLiveTask?.cancel()
+        providedLiveTask = nil
+        if !providedLiveItems.isEmpty { providedLiveItems = [:] }
+        isLoadingProvidedItems = false
+        let scope = section.providedScope
+        let term = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard destination == .search, argumentLink == nil, scope != nil || (section == .home && !term.isEmpty),
+            !registry.liveProviders(for: scope).isEmpty
+        else { return }
+        isLoadingProvidedItems = true
+        providedLiveTask = Task { [weak self] in
+            guard let self else { return }
+            for provider in self.registry.liveProviders(for: scope) {
+                let rows = await provider.liveItems(for: term, scope: scope, in: self)
+                guard !Task.isCancelled else { return }
+                // Root-search rows never become the Top Hit; see searchGroups.
+                self.providedLiveItems[provider.id] = rows.map { row in
+                    var row = row
+                    row.isLiveResult = scope == nil
+                    return row
+                }
+            }
+            self.isLoadingProvidedItems = false
         }
     }
 

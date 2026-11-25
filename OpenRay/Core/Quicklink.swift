@@ -8,6 +8,10 @@ struct Quicklink: Codable, Identifiable, Equatable, Sendable {
 
     var needsQuery: Bool { template.contains("{query}") }
 
+    /// The arguments this link asks for: today only `{query}`. Its value goes through
+    /// `resolvedURL(query:)`, which is still the path the launcher uses.
+    var argumentSpecs: [ArgumentSpec] { needsQuery ? [.query] : [] }
+
     func argument(in input: String) -> String? {
         guard !keyword.isEmpty else { return nil }
         let parts = input.trimmingCharacters(in: .whitespacesAndNewlines).split(

@@ -1,9 +1,37 @@
 import Foundation
 
-enum LauncherSection: String, CaseIterable, Identifiable, Sendable {
+/// Where the launcher is: Everything, a built-in scope, or a provider's own scope.
+enum LauncherSection: CaseIterable, Identifiable, Hashable, Sendable {
     case home, applications, files, clipboard, snippets, quicklinks, notes, calculator, windows
+    /// A list a registered provider pushes. Its scope supplies the title, symbol and the rest.
+    case provided(ProvidedScope)
+
+    /// The built-in scopes. Provided scopes are open-ended, so they aren't listed.
+    static let allCases: [LauncherSection] = [
+        .home, .applications, .files, .clipboard, .snippets, .quicklinks, .notes, .calculator, .windows,
+    ]
+
+    var rawValue: String {
+        switch self {
+        case .home: "home"
+        case .applications: "applications"
+        case .files: "files"
+        case .clipboard: "clipboard"
+        case .snippets: "snippets"
+        case .quicklinks: "quicklinks"
+        case .notes: "notes"
+        case .calculator: "calculator"
+        case .windows: "windows"
+        case .provided(let scope): scope.id
+        }
+    }
 
     var id: String { rawValue }
+
+    /// The provider's scope, when this is one.
+    var providedScope: ProvidedScope? {
+        if case .provided(let scope) = self { scope } else { nil }
+    }
 
     var title: String {
         switch self {
@@ -16,6 +44,7 @@ enum LauncherSection: String, CaseIterable, Identifiable, Sendable {
         case .notes: "Notes"
         case .calculator: "Calculator & Conversions"
         case .windows: "Window Management"
+        case .provided(let scope): scope.title
         }
     }
 
@@ -30,6 +59,7 @@ enum LauncherSection: String, CaseIterable, Identifiable, Sendable {
         case .notes: "note.text"
         case .calculator: "equal.square"
         case .windows: "rectangle.split.2x1"
+        case .provided(let scope): scope.symbol
         }
     }
 
@@ -44,6 +74,7 @@ enum LauncherSection: String, CaseIterable, Identifiable, Sendable {
         case .notes: "Search notes"
         case .calculator: "Type a calculation or conversion"
         case .windows: "Filter layouts"
+        case .provided(let scope): scope.placeholder
         }
     }
 
@@ -53,6 +84,7 @@ enum LauncherSection: String, CaseIterable, Identifiable, Sendable {
         case .clipboard: "Clipboard"
         case .calculator: "Calculator"
         case .windows: "Windows"
+        case .provided(let scope): scope.shortTitle ?? scope.title
         default: title
         }
     }
@@ -69,6 +101,7 @@ enum LauncherSection: String, CaseIterable, Identifiable, Sendable {
         case .notes: "Quick notes, saved on this Mac"
         case .calculator: "Arithmetic and unit conversions"
         case .windows: "Halves, quarters, center and more"
+        case .provided(let scope): scope.summary
         }
     }
 
@@ -83,6 +116,7 @@ enum LauncherSection: String, CaseIterable, Identifiable, Sendable {
         case .notes: .note
         case .calculator: .calculator
         case .windows: .window
+        case .provided(let scope): scope.kind
         }
     }
 
@@ -90,12 +124,13 @@ enum LauncherSection: String, CaseIterable, Identifiable, Sendable {
         switch self {
         case .applications: "square.grid.2x2"
         case .files: "folder"
+        case .provided(let scope): scope.symbol
         default: kind.symbol
         }
     }
 
     /// Scopes that show a preview pane beside a two-line list.
-    var showsPreview: Bool { [.clipboard, .snippets, .notes, .files, .quicklinks].contains(self) }
+    var showsPreview: Bool { providedScope?.showsPreview ?? [.clipboard, .snippets, .notes, .files, .quicklinks].contains(self) }
 
     /// Scopes whose items can be created from the panel.
     var createsItems: Bool { [.snippets, .quicklinks, .notes].contains(self) }
@@ -105,6 +140,7 @@ enum LauncherSection: String, CaseIterable, Identifiable, Sendable {
         case .snippets: "snippet"
         case .quicklinks: "quicklink"
         case .notes: "note"
+        case .provided(let scope): scope.itemNoun
         default: "item"
         }
     }

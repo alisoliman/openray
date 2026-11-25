@@ -13,6 +13,12 @@ struct ActionEntry: Identifiable {
     var modifiers: EventModifiers = []
     var group: Group
     var isDestructive = false
+    /// A titled section the entry belongs to, such as “Paste As”. Nil keeps it in its group's
+    /// untitled run. The panel doesn't draw section titles yet (Slice 1 does).
+    var section: String? = nil
+    /// A submenu. An entry with children opens them rather than performing; until the panel
+    /// draws submenus (Slice 1), it performs `perform`, so give such entries a sensible one.
+    var children: [ActionEntry] = []
     var perform: @MainActor () -> Void
 }
 
@@ -103,6 +109,8 @@ extension LauncherModel {
                 }
                 feedback = .error(error.localizedDescription)
             }
+        case .provided(let ref):
+            registry.perform(item, ref: ref, in: self)
         }
     }
 
@@ -284,6 +292,7 @@ extension LauncherModel {
             link.needsQuery && argument.isEmpty ? "Enter Search Term" : "Open in \(openerName(for: link))"
         case .window(let layout):
             accessibilityAllowed ? "Apply \(layout.title)" : "Enable Accessibility"
+        case .provided(let ref): registry.primaryTitle(for: item, ref: ref, in: self)
         default: item.primaryActionTitle
         }
     }
@@ -352,6 +361,17 @@ extension LauncherModel {
         let next = ordered.firstIndex(where: { $0.id == item.id }).flatMap { index in
             ordered.indices.contains(index + 1) ? ordered[index + 1].id : index > 0 ? ordered[index - 1].id : nil
         }
+        if case .provided(let ref) = item.action {
+            guard registry.delete(item, ref: ref, in: self) else { return false }
+            store.update { database in
+                database.favoriteIDs.remove(item.id)
+                database.favoriteOrder.removeAll { $0 == item.id }
+                database.usage.removeAll { $0.id == item.id }
+            }
+            selectedID = next
+            synchronizeSelection()
+            return true
+        }
         let deleted = store.update { database in
             switch item.action {
             case .quicklink(let link, _): database.quicklinks.removeAll { $0.id == link.id }
@@ -371,6 +391,12 @@ extension LauncherModel {
 
     /// Opens the inline editor for a quicklink, snippet or note.
     func edit(_ item: LauncherItem) {
+        if case .provided(let ref) = item.action {
+            guard item.canEdit else { return }
+            showActions = false
+            registry.edit(item, ref: ref, in: self)
+            return
+        }
         let target: LibraryEditor
         switch item.action {
         case .quicklink(let link, _): target = .quicklink(link)
@@ -604,6 +630,8 @@ extension LauncherModel {
                             group: .item
                         ) { [weak self] in self?.copy(quantity.copyValue) })
                 }
+            case .provided(let ref):
+                entries += registry.actions(for: item, ref: ref, in: self)
             case .snippet(let snippet):
                 entries.append(
                     ActionEntry(
@@ -667,6 +695,7 @@ extension LauncherModel {
                     case .clipboard: "Entry"
                     case .snippet: "Snippet"
                     case .quicklink: "Quicklink"
+                    case .provided(let ref): registry.itemNoun(for: ref)
                     default: "Note"
                     }
                 entries.append(
@@ -828,6 +857,7 @@ extension LauncherModel {
         case .ai, .askAI: "sparkles"
         case .note: "note.text"
         case .section: "arrow.right.circle"
+        case .provided(let ref): registry.primarySymbol(for: item, ref: ref, in: self)
         default: "arrow.up.forward.app"
         }
     }
@@ -844,6 +874,7 @@ extension LauncherModel {
     var isAwaitingResults: Bool {
         let filesPending = argumentLink == nil && files.isSearching && (section == .files || section == .home && query.count >= 2)
         return filesPending || section == .applications && applications.isLoading
+            || section.providedScope != nil && isLoadingProvidedItems
     }
 
     /// Clipboard History shows the opt-in screen until capture is on, paused, or history exists.

@@ -192,7 +192,7 @@ extension LauncherModel {
         if let front, front.processIdentifier != ProcessInfo.processInfo.processIdentifier {
             previousApplication = front
         }
-        if case .window = command.action {
+        if runsWithoutPanel(command) {
             perform(command)
             if let pending = feedback {
                 panel?.show()
@@ -201,6 +201,16 @@ extension LauncherModel {
         } else {
             panel?.show()
             perform(command)
+        }
+    }
+
+    /// Window layouts and provided commands with `mode: .noView` act on the app you're in,
+    /// so a hotkey runs them without showing the panel. The panel shows only to report a problem.
+    func runsWithoutPanel(_ command: LauncherItem) -> Bool {
+        switch command.action {
+        case .window: true
+        case .provided(let ref): registry.descriptor(for: ref, in: self)?.mode == .noView
+        default: false
         }
     }
 }

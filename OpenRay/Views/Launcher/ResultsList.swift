@@ -231,6 +231,7 @@ struct ResultRow: View {
     private var unavailable: Bool {
         if case .window = item.action { return !model.accessibilityAllowed }
         if case .ai(let action) = item.action, action != .chat { return !model.ai.availability.isAvailable }
+        if case .provided(let ref) = item.action { return ref.has(.unavailable) }
         return false
     }
 
