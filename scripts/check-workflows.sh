@@ -20,6 +20,8 @@ curl --fail --location --silent --show-error --retry 3 \
   tar -xzf "$OPENRAY_TOOL_FILE" actionlint
 )
 # GitHub added queue:max in May 2026; actionlint 1.7.12 predates that schema.
-# Ignore only that recognized-field gap, leaving other syntax diagnostics active.
+# GitHub's xcode-27 runner (its macOS 27 image) also postdates 1.7.12's label list.
+# Ignore only those two recognized gaps, leaving other syntax and label diagnostics active.
 "$OPENRAY_TOOL_DIR/actionlint" -color -shellcheck="" \
-  -ignore '^unexpected key "queue" for "concurrency" section\.' "$@"
+  -ignore '^unexpected key "queue" for "concurrency" section\.' \
+  -ignore '^label "xcode-27" is unknown\.' "$@"

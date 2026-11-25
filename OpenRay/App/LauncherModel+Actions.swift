@@ -1,0 +1,860 @@
+import AppKit
+import SwiftUI
+
+/// One row in the ⌘K action panel. Entries carry their shortcut, so the panel
+/// teaches you to skip it next time, and the same shortcut works without it.
+struct ActionEntry: Identifiable {
+    enum Group: Int { case item, organize, panel }
+    var id: String
+    var title: String
+    var symbol: String
+    var shortcut: KeyShortcut?
+    var key: KeyEquivalent?
+    var modifiers: EventModifiers = []
+    var group: Group
+    var isDestructive = false
+    var perform: @MainActor () -> Void
+}
+
+extension LauncherModel {
+    // MARK: - Perform
+
+    func performSelected() {
+        if let confirmation {
+            confirm(confirmation)
+            return
+        }
+        guard !showActions else { return }
+        if onboarding != nil {
+            advanceOnboarding()
+            return
+        }
+        if showsClipboardOptIn {
+            enableClipboardHistory()
+            return
+        }
+        // The collapsed bar hides the results, so ↩ has nothing visible to act on.
+        guard !isCollapsedToBar else { return }
+        if let selectedItem { perform(selectedItem) }
+    }
+
+    func perform(_ item: LauncherItem) {
+        showActions = false
+        confirmation = nil
+        feedback = nil
+        switch item.action {
+        case .application(let app):
+            Task {
+                do {
+                    _ = try await NSWorkspace.shared.openApplication(
+                        at: app.url, configuration: NSWorkspace.OpenConfiguration())
+                    store.recordUse(of: item.id)
+                    panel?.dismiss(restoreFocus: false)
+                } catch {
+                    feedback = .error("Couldn't open \(app.name). \(error.localizedDescription)")
+                }
+            }
+        case .file(let url): open(url, itemID: item.id)
+        case .section(let section):
+            store.recordUse(of: item.id)
+            navigate(to: section)
+        case .ai(let action):
+            store.recordUse(of: item.id)
+            openAI(action)
+        case .askAI(let prompt):
+            openAI(.chat, prompt: prompt)
+        case .settings:
+            store.recordUse(of: item.id)
+            openSettings()
+        case .quicklink(let link, let argument):
+            if link.needsQuery && argument.isEmpty {
+                beginArgument(link)
+            } else {
+                openQuicklink(link, query: argument)
+            }
+        case .clipboard(let entry):
+            if copy(entry) { store.recordUse(of: item.id) }
+        case .snippet(let snippet):
+            if copy(snippet.expanded(), label: snippet.name) { store.recordUse(of: item.id) }
+        case .calculation(let calculation): copy(calculation.value, label: calculation.value)
+        case .note(let note):
+            editor = .note(note)
+            store.recordUse(of: item.id)
+        case .window(let layout):
+            guard accessibilityAllowed || windows.hasPermission else {
+                windows.requestPermission()
+                SystemSettingsLink.open(.accessibility)
+                feedback = .info("Allow OpenRay in Accessibility, then try again.")
+                return
+            }
+            do {
+                if let target = targetWindow {
+                    try windows.arrange(layout, window: target.element, pid: target.pid)
+                } else {
+                    try windows.arrange(layout, application: previousApplication)
+                }
+                store.recordUse(of: item.id)
+                panel?.dismiss(restoreFocus: false)
+            } catch {
+                // A chosen window that has closed stops being the target.
+                if let target = targetWindow, !windows.listWindows().contains(where: { $0.id == target.id }) {
+                    targetWindow = nil
+                    refreshTargetWindow()
+                }
+                feedback = .error(error.localizedDescription)
+            }
+        }
+    }
+
+    /// ⌘1–⌘8: favorites, or retargeting a quicklink argument. A finished writing
+    /// result claims ⌘1–⌘3 for its views, so those numbers switch the view there.
+    func performNumber(_ number: Int) {
+        guard !showActions, confirmation == nil, editor == nil, onboarding == nil else { return }
+        if destination == .ai, (1...9).contains(number), let key = String(number).first,
+            let entry = aiActions().first(where: { $0.key?.character == key && $0.modifiers == .command })
+        {
+            entry.perform()
+            return
+        }
+        if argumentLink != nil {
+            let items = orderedResults
+            guard number >= 1, number <= min(8, items.count) else { return }
+            perform(items[number - 1])
+            return
+        }
+        let favorites = favoriteItems
+        guard number >= 1, number <= min(8, favorites.count) else { return }
+        selectedID = favorites[number - 1].id
+        perform(favorites[number - 1])
+    }
+
+    func openQuicklink(_ link: Quicklink, query: String) {
+        do { open(try link.resolvedURL(query: query), itemID: "quicklink.\(link.id)") } catch {
+            feedback = .error(error.localizedDescription)
+        }
+    }
+
+    @discardableResult
+    func copy(_ text: String, label: String? = nil) -> Bool {
+        if clipboard.copy(text) {
+            toast("Copied “\((label ?? text).truncatedForFeedback)”")
+            return true
+        }
+        feedback = .error("Couldn't write to the clipboard. Try again.")
+        return false
+    }
+
+    @discardableResult
+    func copy(_ entry: ClipboardEntry) -> Bool {
+        if clipboard.copy(entry) {
+            toast("Copied “\(entry.title.truncatedForFeedback)”")
+            return true
+        }
+        feedback = .error(clipboard.lastCopyError ?? "Couldn't write to the clipboard. Try again.")
+        return false
+    }
+
+    // MARK: - ⌘↩
+
+    var canPasteDirectly: Bool {
+        guard clipboard.usesGeneralPasteboard, windows.hasPermission, let target = previousApplication else {
+            return false
+        }
+        return !target.isTerminated
+    }
+
+    var targetAppName: String { previousApplicationName ?? "Your App" }
+
+    func pasteSelected() {
+        if confirmation != nil || showActions || isCollapsedToBar { return }
+        if destination == .ai {
+            pasteAIResponse()
+            return
+        }
+        // ⌘↩ only does something when the bar names it.
+        guard let item = selectedItem, secondaryTitle(for: item) != nil else { return }
+        paste(item)
+    }
+
+    /// Pastes an item into the app you came from, or copies it when that can't work.
+    func paste(_ item: LauncherItem) {
+        guard item.supportsPaste else { return }
+        switch item.action {
+        case .clipboard(let entry): finishPaste(copied: clipboard.copy(entry), label: entry.title)
+        case .file(let url):
+            let entry = ClipboardEntry(content: .files([url]), sourceName: "OpenRay")
+            finishPaste(copied: clipboard.copy(entry), label: url.lastPathComponent)
+        default:
+            if let text = item.copyText { paste(text, label: item.title) }
+        }
+        if case .clipboard = item.action { store.recordUse(of: item.id) }
+    }
+
+    func paste(_ text: String, label: String? = nil) {
+        finishPaste(copied: clipboard.copy(text), label: label ?? text)
+    }
+
+    private func finishPaste(copied: Bool, label: String) {
+        guard copied else {
+            feedback = .error(clipboard.lastCopyError ?? "Couldn't copy the content.")
+            return
+        }
+        guard clipboard.usesGeneralPasteboard else {
+            feedback = .info("Copied to the isolated verification pasteboard. Cross-app paste is disabled in this mode.")
+            return
+        }
+        guard let target = previousApplication, !target.isTerminated, windows.hasPermission else {
+            toast("Copied “\(label.truncatedForFeedback)”. Press ⌘V in \(previousApplicationName ?? "your app")")
+            return
+        }
+        let changeCount = clipboard.changeCount
+        panel?.dismiss(restoreFocus: false)
+        Task {
+            do { try await SyntheticInput.paste(into: target, expectedChangeCount: changeCount) } catch {
+                // Show first: showing can reset to Home, which clears feedback.
+                panel?.show()
+                feedback = .error(error.localizedDescription)
+            }
+        }
+    }
+
+    /// ⌘↩ in AI: replace the selection the text came from, or paste the reply.
+    func pasteAIResponse() {
+        guard let response = ai.latestResponse, !ai.isGenerating, !aiResultIsUnchanged else { return }
+        paste(response.text)
+    }
+
+    /// Whether ⌘↩ sends a writing result back to the app its selection came
+    /// from. Any other target gets Paste, which names that app instead.
+    var aiReplacesSource: Bool {
+        ai.action != .chat && ai.lastAttachment?.source == .selection
+            && ai.lastAttachment?.appName == previousApplicationName && canPasteDirectly
+    }
+
+    var aiPasteTitle: String {
+        if aiReplacesSource {
+            return "Replace in \(ai.lastAttachment?.appName ?? targetAppName)"
+        }
+        return canPasteDirectly || !clipboard.usesGeneralPasteboard
+            ? "Paste to \(targetAppName)" : "Copy · ⌘V in \(targetAppName)"
+    }
+
+    /// A result with nothing to paste back is a state, not something to paste:
+    /// proofreading that changed nothing, or action items that found none.
+    var aiResultIsUnchanged: Bool {
+        guard !ai.isGenerating, let response = ai.latestResponse else { return false }
+        switch ai.action {
+        case .proofread: return response.text == ai.lastSource
+        case .actionItems: return response.checklistItems.isEmpty
+        default: return false
+        }
+    }
+
+    func saveResponseAsNote() {
+        guard let response = ai.latestResponse else { return }
+        saveResponseAsNote(response)
+    }
+
+    /// Saves a reply as a note right away, titled by the message that asked
+    /// for it, or by the writing command that produced it.
+    func saveResponseAsNote(_ message: ChatMessage) {
+        let title: String
+        if ai.action == .chat {
+            let index = ai.messages.firstIndex { $0.id == message.id } ?? ai.messages.endIndex
+            let prompt = ai.messages[..<index].last(where: { $0.role == .user })
+            // With attachments, text is the wrapped prompt and displayText is what was typed.
+            let typed = prompt.map { $0.displayText ?? $0.text } ?? ""
+            title = QuickNote.derivedTitle(from: typed.isEmpty ? "AI response" : typed)
+        } else {
+            title = ai.action.title
+        }
+        editor = .note(QuickNote(title: title, content: message.text))
+        draft?.saveNote()
+    }
+
+    // MARK: - Labels
+
+    /// Names what Return does for the selection.
+    func primaryTitle(for item: LauncherItem) -> String {
+        switch item.action {
+        case .application: "Open Application"
+        case .file(let url): "Open in \(defaultAppName(for: url))"
+        case .section(let section): "Open \(section.title)"
+        case .quicklink(let link, let argument):
+            link.needsQuery && argument.isEmpty ? "Enter Search Term" : "Open in \(openerName(for: link))"
+        case .window(let layout):
+            accessibilityAllowed ? "Apply \(layout.title)" : "Enable Accessibility"
+        default: item.primaryActionTitle
+        }
+    }
+
+    /// The ⌘↩ label, when it applies. It says “Copy · ⌘V in …” when direct paste can't work.
+    func secondaryTitle(for item: LauncherItem) -> String? {
+        guard item.supportsPaste, !item.id.hasPrefix("argument."), !item.id.hasPrefix("fallback.") else { return nil }
+        if case .quicklink(let link, let argument) = item.action, link.needsQuery && argument.isEmpty { return nil }
+        let noun: String
+        switch item.action {
+        case .file: noun = "Paste File to"
+        case .quicklink: noun = "Paste Link to"
+        default: noun = "Paste to"
+        }
+        if canPasteDirectly || !clipboard.usesGeneralPasteboard { return "\(noun) \(targetAppName)" }
+        return "Copy · ⌘V in \(targetAppName)"
+    }
+
+    func defaultAppName(for url: URL) -> String {
+        if url.hasDirectoryPath { return "Finder" }
+        guard let app = NSWorkspace.shared.urlForApplication(toOpen: url) else { return "Default App" }
+        return FileManager.default.displayName(atPath: app.path).replacingOccurrences(of: ".app", with: "")
+    }
+
+    /// The app a quicklink opens in: the browser for web links, Finder for
+    /// folders, and the default app for files and other links such as mailto.
+    /// A {query} link is resolved with a sample term, so mailto:{query} names Mail too.
+    func openerName(for link: Quicklink) -> String {
+        guard let url = try? link.resolvedURL(query: link.needsQuery ? "x" : "") else { return defaultBrowserName }
+        switch url.scheme?.lowercased() {
+        case "http", "https": return defaultBrowserName
+        default: return defaultAppName(for: url)
+        }
+    }
+
+    // MARK: - Delete & confirm
+
+    func requestDelete(_ item: LauncherItem) {
+        guard item.canDelete else { return }
+        showActions = false
+        selectedID = item.id
+        confirmation = .delete(item)
+    }
+
+    func confirm(_ confirmation: ActionConfirmation) {
+        self.confirmation = nil
+        switch confirmation {
+        case .delete(let item):
+            if delete(item) {
+                toast("Deleted “\(item.title.truncatedForFeedback)”")
+            } else {
+                feedback = .error(store.errorMessage ?? "Couldn't delete the item.")
+            }
+        case .discardChanges:
+            closeEditor(force: true)
+        case .clearClipboardHistory:
+            if clipboard.clearHistory() { toast("Clipboard history deleted") }
+        }
+    }
+
+    /// Removes an item from the library. Returns false, with the selection
+    /// unchanged, when the library couldn't be saved.
+    @discardableResult
+    func delete(_ item: LauncherItem) -> Bool {
+        let ordered = orderedResults
+        let next = ordered.firstIndex(where: { $0.id == item.id }).flatMap { index in
+            ordered.indices.contains(index + 1) ? ordered[index + 1].id : index > 0 ? ordered[index - 1].id : nil
+        }
+        let deleted = store.update { database in
+            switch item.action {
+            case .quicklink(let link, _): database.quicklinks.removeAll { $0.id == link.id }
+            case .snippet(let snippet): database.snippets.removeAll { $0.id == snippet.id }
+            case .note(let note): database.notes.removeAll { $0.id == note.id }
+            case .clipboard(let entry): database.clipboard.removeAll { $0.id == entry.id }
+            default: return
+            }
+            database.favoriteIDs.remove(item.id)
+            database.usage.removeAll { $0.id == item.id }
+        }
+        guard deleted else { return false }
+        selectedID = next
+        synchronizeSelection()
+        return true
+    }
+
+    /// Opens the inline editor for a quicklink, snippet or note.
+    func edit(_ item: LauncherItem) {
+        let target: LibraryEditor
+        switch item.action {
+        case .quicklink(let link, _): target = .quicklink(link)
+        case .snippet(let snippet): target = .snippet(snippet)
+        case .note(let note): target = .note(note)
+        default: return
+        }
+        showActions = false
+        guard editor?.id != target.id else { return }
+        // Opening another item mustn't drop unsaved edits; notes save themselves.
+        if let draft, !draft.isNote, draft.isDirty {
+            confirmation = .discardChanges
+            return
+        }
+        editor = target
+    }
+
+    func togglePin(_ item: LauncherItem) {
+        guard case .clipboard(let entry) = item.action else { return }
+        if store.setPinned(!entry.isPinned, clipboardEntry: entry.id) {
+            toast(entry.isPinned ? "Unpinned" : "Pinned to top")
+        }
+    }
+
+    func toggleFavorite(_ item: LauncherItem) {
+        guard item.canFavorite else { return }
+        let adding = !isFavorite(item)
+        // Home shows sixteen favorites, so a seventeenth is saved but not shown.
+        let hidden = adding && favoriteItems.count >= 16
+        guard store.toggleFavorite(item.id) else {
+            feedback = .error(store.errorMessage ?? "Favorites couldn't be saved.")
+            return
+        }
+        if adding {
+            toast(hidden ? "Added to Favorites · Home shows the first 16" : "Added to Favorites")
+        } else {
+            toast("Removed from Favorites")
+        }
+    }
+
+    func setClipboardCapture(_ enabled: Bool) {
+        if store.update({
+            $0.preferences.clipboardEnabled = enabled
+            $0.preferences.clipboardPaused = !enabled
+        }) {
+            applyPreferences()
+            if enabled {
+                toast("Capture resumed")
+            } else if store.database.clipboard.isEmpty {
+                toast("Capture paused")
+            } else {
+                toast("Capture paused. Saved history is still here.")
+            }
+        }
+    }
+
+    /// Turns capture Off rather than Paused, as the first-run switch means it.
+    func turnOffClipboardHistory() {
+        if store.update({
+            $0.preferences.clipboardEnabled = false
+            $0.preferences.clipboardPaused = false
+        }) {
+            applyPreferences()
+        } else {
+            feedback = .error(store.errorMessage ?? "Clipboard history couldn't be turned off.")
+        }
+    }
+
+    /// Turns on clipboard history with the choices from the opt-in screen.
+    func enableClipboardHistory() {
+        // The Turn On button can be clicked under ⌘K, whose opt-in entries would then be stale.
+        showActions = false
+        confirmation = nil
+        let choices = clipboardOptIn
+        if store.update({
+            $0.preferences.clipboardEnabled = true
+            $0.preferences.clipboardPaused = false
+            $0.preferences.clipboardImagesEnabled = choices.images
+            $0.preferences.clipboardFilesEnabled = choices.files
+            $0.preferences.clipboardRetentionDays = choices.days
+            $0.preferences.clipboardLimit = choices.limit
+        }) {
+            applyPreferences()
+            toast("Clipboard history is on")
+        } else {
+            feedback = .error(store.errorMessage ?? "Clipboard history couldn't be turned on.")
+        }
+    }
+
+    private func open(_ url: URL, itemID: String) {
+        if NSWorkspace.shared.open(url) {
+            store.recordUse(of: itemID)
+            panel?.dismiss(restoreFocus: false)
+        } else {
+            let name = url.lastPathComponent.isEmpty ? url.absoluteString : url.lastPathComponent
+            feedback = .error("Couldn't open “\(name)”. It may have moved.")
+        }
+    }
+
+    // MARK: - Action panel
+
+    func actionsDidToggle() {
+        if showActions {
+            actionEntries = actions(for: selectedItem)
+            actionFilter = ""
+            actionSelection = 0
+            confirmation = nil
+            if let first = actionEntries.first { announceAction(first) }
+        } else {
+            actionEntries = []
+            requestFocus()
+        }
+    }
+
+    var filteredActionEntries: [ActionEntry] {
+        let filter = actionFilter.trimmingCharacters(in: .whitespaces)
+        guard !filter.isEmpty else { return actionEntries }
+        return actionEntries.filter { SearchMatcher.score(filter, in: $0.title) != nil }
+    }
+
+    /// Arrow keys in ⌘K. VoiceOver hears each action as the keyboard reaches it;
+    /// hover moves the highlight too, so the announcement lives here, not in the view.
+    func moveActionSelection(_ offset: Int) {
+        let entries = filteredActionEntries
+        let count = entries.count
+        guard count > 0 else { return }
+        let previous = actionSelection
+        actionSelection = (actionSelection + offset + count) % count
+        if actionSelection != previous { announceAction(entries[actionSelection]) }
+    }
+
+    private func announceAction(_ entry: ActionEntry) {
+        announceForVoiceOver([entry.title, entry.shortcut?.spoken].compactMap { $0 }.joined(separator: ", "))
+    }
+
+    func performActionSelection() {
+        let entries = filteredActionEntries
+        guard entries.indices.contains(actionSelection) else { return }
+        performAction(entries[actionSelection])
+    }
+
+    func performAction(_ entry: ActionEntry) {
+        showActions = false
+        entry.perform()
+    }
+
+    /// Item actions first, then organisation, then panel-level actions.
+    func actions(for item: LauncherItem?) -> [ActionEntry] {
+        var entries: [ActionEntry] = []
+        if destination == .ai { return aiActions() }
+        // Before history exists, the opt-in's two choices are the only actions.
+        if showsClipboardOptIn {
+            return [
+                ActionEntry(id: "turnOn", title: "Turn On Clipboard History", symbol: "power", shortcut: .return, group: .item)
+                { [weak self] in self?.enableClipboardHistory() },
+                ActionEntry(id: "notNow", title: "Not Now", symbol: "xmark", shortcut: .escape, group: .item)
+                { [weak self] in self?.goBack() },
+                ActionEntry(id: "shortcuts", title: "Show Shortcuts", symbol: "keyboard", shortcut: .command("/"), group: .panel)
+                { [weak self] in self?.showShortcuts = true },
+            ]
+        }
+        if let item, !returnIsInert(for: item) {
+            entries.append(
+                ActionEntry(
+                    id: "primary", title: primaryTitle(for: item), symbol: primarySymbol(for: item),
+                    shortcut: .return, group: .item) { [weak self] in self?.perform(item) })
+        }
+        if let item {
+            if let secondary = secondaryTitle(for: item) {
+                entries.append(
+                    ActionEntry(
+                        id: "paste", title: secondary, symbol: "arrow.down.doc", shortcut: .commandReturn, group: .item
+                    ) { [weak self] in
+                        self?.selectedID = item.id
+                        self?.paste(item)
+                    })
+            }
+            switch item.action {
+            case .clipboard(let entry):
+                if let text = entry.plainText {
+                    entries.append(
+                        ActionEntry(id: "askAI", title: "Ask AI About This", symbol: "sparkles", shortcut: .tab, group: .item)
+                        { [weak self] in
+                            self?.selectedID = item.id
+                            let attachment = AIAttachment(source: .clipboard, text: text, appName: entry.sourceName)
+                            self?.openAI(.chat, attachment: attachment)
+                        })
+                }
+                entries.append(
+                    ActionEntry(
+                        id: "pin", title: entry.isPinned ? "Unpin" : "Pin to Top", symbol: entry.isPinned ? "pin.slash" : "pin",
+                        shortcut: .command("P", shift: true), key: "p", modifiers: [.command, .shift], group: .organize
+                    ) { [weak self] in self?.togglePin(item) })
+            case .quicklink(let link, let argument):
+                // Argument rows copy the link with their search term filled in. Other
+                // links copy the template as written, so ~/ paths stay readable.
+                let url =
+                    link.needsQuery && !argument.isEmpty
+                    ? ((try? link.resolvedURL(query: argument).absoluteString) ?? link.template) : link.template
+                entries.append(
+                    ActionEntry(
+                        id: "copyLink", title: "Copy Link", symbol: "link", shortcut: .command("C", shift: true),
+                        key: "c", modifiers: [.command, .shift], group: .item
+                    ) { [weak self] in self?.copy(url, label: link.name) })
+            case .note(let note):
+                entries.append(
+                    ActionEntry(
+                        id: "copyNote", title: "Copy Text", symbol: "doc.on.doc", shortcut: .command("C", shift: true),
+                        key: "c", modifiers: [.command, .shift], group: .item
+                    ) { [weak self] in self?.copy(note.content, label: note.title) })
+            case .calculation(let calculation):
+                if calculation.conversion != nil {
+                    entries.append(
+                        ActionEntry(id: "copyUnit", title: "Copy with Unit", symbol: "doc.on.doc", group: .item) {
+                            [weak self] in
+                            // Full precision, as ↩ copies, with the unit the card shows.
+                            let symbol = calculation.conversion?.target.symbol ?? ""
+                            self?.copy("\(calculation.value) \(symbol)")
+                        })
+                }
+                entries.append(
+                    ActionEntry(id: "copyExpression", title: "Copy Expression", symbol: "function", group: .item) {
+                        [weak self] in self?.copy(calculation.expression)
+                    })
+                // The related-unit chips, one entry each, copying the plain value as ↩ does.
+                for quantity in calculation.conversion?.related ?? [] {
+                    let label = "\(quantity.value) \(quantity.symbol)"
+                    entries.append(
+                        ActionEntry(
+                            id: "copyRelated.\(quantity.symbol)", title: "Copy \(label)", symbol: "doc.on.doc",
+                            group: .item
+                        ) { [weak self] in self?.copy(quantity.copyValue) })
+                }
+            case .snippet(let snippet):
+                entries.append(
+                    ActionEntry(
+                        id: "duplicate", title: "Duplicate", symbol: "plus.square.on.square",
+                        shortcut: .command("D"), key: "d", modifiers: .command, group: .item
+                    ) { [weak self] in
+                        if let copy = self?.store.duplicate(snippet) {
+                            self?.selectedID = "snippet.\(copy.id)"
+                            self?.toast("Duplicated “\(snippet.name.truncatedForFeedback)”")
+                        }
+                    })
+            default: break
+            }
+            if let url = item.fileURL {
+                if case .file = item.action {
+                    entries.append(
+                        ActionEntry(
+                            id: "quickLook", title: "Quick Look", symbol: "eye", shortcut: .command("Y"), key: "y",
+                            modifiers: .command, group: .item
+                        ) { [weak self] in self?.panel?.toggleQuickLook(url) })
+                }
+                entries.append(
+                    ActionEntry(
+                        id: "reveal", title: "Reveal in Finder", symbol: "folder", shortcut: .command("R", shift: true),
+                        key: "r", modifiers: [.command, .shift], group: .item
+                    ) { NSWorkspace.shared.activateFileViewerSelecting([url]) })
+                entries.append(
+                    ActionEntry(
+                        id: "copyPath", title: "Copy Path", symbol: "doc.on.doc", shortcut: .command("C", shift: true),
+                        key: "c", modifiers: [.command, .shift], group: .item
+                    ) { [weak self] in self?.copy(url.path, label: Self.shortenedPath(url)) })
+            }
+            if item.canEdit {
+                entries.append(
+                    ActionEntry(
+                        id: "edit", title: "Edit", symbol: "pencil", shortcut: .command("E"), key: "e", modifiers: .command,
+                        group: .item
+                    ) { [weak self] in
+                        self?.selectedID = item.id
+                        self?.edit(item)
+                    })
+            }
+            if CuratedCommand.supports(item.id) {
+                entries.append(
+                    ActionEntry(
+                        id: "assign", title: "Assign Alias or Shortcut…", symbol: "keyboard", group: .organize
+                    ) { [weak self] in self?.openSettings(.shortcuts, focusing: item.id) })
+            }
+            if item.canFavorite {
+                let favorite = isFavorite(item)
+                entries.append(
+                    ActionEntry(
+                        id: "favorite", title: favorite ? "Remove from Favorites" : "Add to Favorites",
+                        symbol: favorite ? "star.slash" : "star", shortcut: .command("F", shift: true), key: "f",
+                        modifiers: [.command, .shift], group: .organize
+                    ) { [weak self] in self?.toggleFavorite(item) })
+            }
+            if item.canDelete {
+                let noun: String =
+                    switch item.action {
+                    case .clipboard: "Entry"
+                    case .snippet: "Snippet"
+                    case .quicklink: "Quicklink"
+                    default: "Note"
+                    }
+                entries.append(
+                    ActionEntry(
+                        id: "delete", title: "Delete \(noun)…", symbol: "trash", shortcut: KeyShortcut(["⌘", "⌫"]),
+                        key: .delete, modifiers: .command, group: .organize, isDestructive: true
+                    ) { [weak self] in self?.requestDelete(item) })
+            }
+        }
+        if section.createsItems {
+            entries.append(
+                ActionEntry(
+                    id: "create", title: "New \(section.itemNoun.capitalized)", symbol: "plus", shortcut: .command("N"),
+                    group: .panel
+                ) { [weak self] in self?.createItem() })
+        }
+        if section == .clipboard {
+            let enabled = store.database.preferences.clipboardEnabled
+            if enabled || store.database.clipboardIsPaused {
+                entries.append(
+                    ActionEntry(
+                        id: "capture", title: enabled ? "Pause Capture" : "Resume Capture",
+                        symbol: enabled ? "pause" : "play", group: .panel
+                    ) { [weak self] in self?.setClipboardCapture(!enabled) })
+            }
+            entries.append(
+                ActionEntry(
+                    id: "filter", title: "Show \(clipboardFilter.next.title)", symbol: "line.3.horizontal.decrease",
+                    shortcut: .command("P"), group: .panel
+                ) { [weak self] in self?.cycleClipboardFilter() })
+            if !store.database.clipboard.isEmpty {
+                entries.append(
+                    ActionEntry(
+                        id: "clear", title: "Delete All History…", symbol: "trash", group: .panel, isDestructive: true
+                    ) { [weak self] in
+                        guard let self else { return }
+                        self.confirmation = .clearClipboardHistory(
+                            pinnedCount: self.store.database.clipboard.filter(\.isPinned).count)
+                    })
+            }
+        }
+        entries.append(
+            ActionEntry(id: "shortcuts", title: "Show Shortcuts", symbol: "keyboard", shortcut: .command("/"), group: .panel)
+            { [weak self] in self?.showShortcuts = true })
+        return entries
+    }
+
+    private func aiActions() -> [ActionEntry] {
+        var entries: [ActionEntry] = []
+        let response = ai.isGenerating ? nil : ai.latestResponse
+        if response != nil {
+            entries.append(
+                ActionEntry(id: "copy", title: "Copy Response", symbol: "doc.on.doc", shortcut: .command("C", shift: true),
+                            key: "c", modifiers: [.command, .shift], group: .item)
+                { [weak self] in
+                    if let text = self?.ai.latestResponse?.text { self?.copy(text) }
+                })
+            if !aiResultIsUnchanged {
+                entries.append(
+                    ActionEntry(
+                        id: "paste", title: aiPasteTitle, symbol: "arrow.down.doc", shortcut: .commandReturn, group: .item
+                    ) { [weak self] in self?.pasteAIResponse() })
+            }
+            // “No action items found.” isn't worth keeping as a note.
+            if !(ai.action == .actionItems && aiResultIsUnchanged) {
+                entries.append(
+                    ActionEntry(
+                        id: "note", title: "Save as Note", symbol: "note.text.badge.plus", shortcut: .command("S"),
+                        key: "s", modifiers: .command, group: .item
+                    ) { [weak self] in self?.saveResponseAsNote() })
+            }
+        }
+        // A stopped writing result can't be copied, but it can be tried again.
+        if ai.canRetry {
+            entries.append(
+                ActionEntry(
+                    id: "retry", title: "Try Again", symbol: "arrow.clockwise", shortcut: .command("R"), key: "r",
+                    modifiers: .command, group: .item
+                ) { [weak self] in self?.ai.retry() })
+        }
+        // The attachment controls, for the keyboard. Writing commands take their
+        // passage before the first run, as the Use Clipboard and Use Selection buttons do.
+        if ai.availability.isAvailable, !ai.isGenerating {
+            let isChat = ai.action == .chat
+            if isChat || ai.messages.isEmpty {
+                if !ai.attachments.contains(where: { $0.source == .clipboard }) {
+                    entries.append(
+                        ActionEntry(
+                            id: "attachClipboard", title: isChat ? "Attach Clipboard" : "Use Clipboard",
+                            symbol: "list.clipboard", group: .organize
+                        ) { [weak self] in self?.attachClipboardToAI() })
+                }
+                if !ai.attachments.contains(where: { $0.source == .selection }) {
+                    entries.append(
+                        ActionEntry(
+                            id: "attachSelection", title: isChat ? "Attach Selection" : "Use Selection",
+                            symbol: "character.cursor.ibeam", group: .organize
+                        ) { [weak self] in
+                            self?.attachSelectionFromPreviousApp(reportErrors: true)
+                            self?.focusRequest += 1
+                        })
+                }
+            }
+            if let attachment = ai.attachments.last {
+                entries.append(
+                    ActionEntry(
+                        id: "removeAttachment", title: "Remove Attachment", symbol: "xmark.circle", group: .organize
+                    ) { [weak self] in self?.ai.removeAttachment(attachment.id) })
+            }
+        }
+        if ai.action != .chat, response != nil {
+            entries.append(
+                ActionEntry(id: "chat", title: "Continue in Chat", symbol: "bubble.left.and.text.bubble.right", group: .organize)
+                { [weak self] in
+                    guard let self, !self.ai.isGenerating, let text = self.ai.latestResponse?.text else { return }
+                    self.ai.newConversation(action: .chat)
+                    self.ai.open(.chat)
+                    self.ai.attach(AIAttachment(source: .response, text: text))
+                    self.focusRequest += 1
+                })
+        }
+        if !ai.isGenerating {
+            entries.append(
+                ActionEntry(
+                    id: "new", title: ai.action == .chat ? "New Chat" : "Start Over", symbol: "square.and.pencil",
+                    shortcut: .command("N"), group: .organize
+                ) { [weak self] in
+                    self?.ai.newConversation()
+                    self?.focusRequest += 1
+                })
+        }
+        // ⌘1–⌘3 switch a finished writing result between its three views.
+        if ai.action.showsDiff, let response, !response.isPartial, ai.lastSource != nil, !aiResultIsUnchanged {
+            let modes: [(mode: AIDiffMode, title: String, symbol: String)] = [
+                (.changes, "Show Changes", "plus.forwardslash.minus"),
+                (.result, "Show Result", "doc.text"),
+                (.original, "Show Original", "doc.plaintext"),
+            ]
+            for (index, option) in modes.enumerated() {
+                let key = Character("\(index + 1)")
+                entries.append(
+                    ActionEntry(
+                        id: "diff.\(index + 1)", title: option.title,
+                        symbol: ai.diffMode == option.mode ? "checkmark" : option.symbol,
+                        shortcut: .command(String(key)), key: KeyEquivalent(key), modifiers: .command, group: .panel
+                    ) { [weak self] in self?.ai.diffMode = option.mode })
+            }
+        }
+        entries.append(
+            ActionEntry(id: "shortcuts", title: "Show Shortcuts", symbol: "keyboard", shortcut: .command("/"), group: .panel)
+            { [weak self] in self?.showShortcuts = true })
+        return entries
+    }
+
+    private func primarySymbol(for item: LauncherItem) -> String {
+        switch item.action {
+        case .clipboard, .snippet, .calculation: "doc.on.doc"
+        case .window: "macwindow"
+        case .ai, .askAI: "sparkles"
+        case .note: "note.text"
+        case .section: "arrow.right.circle"
+        default: "arrow.up.forward.app"
+        }
+    }
+
+    /// ↩ on the active token's own row before a term is typed would only restart the
+    /// same token, so the bar, ⌘K and ⌘/ don't offer it.
+    func returnIsInert(for item: LauncherItem) -> Bool {
+        guard let link = argumentLink, item.id == "argument.\(link.id)", case .quicklink(_, let argument) = item.action
+        else { return false }
+        return argument.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+
+    /// A source is still streaming, so an empty list isn't the final answer yet.
+    var isAwaitingResults: Bool {
+        let filesPending = argumentLink == nil && files.isSearching && (section == .files || section == .home && query.count >= 2)
+        return filesPending || section == .applications && applications.isLoading
+    }
+
+    /// Clipboard History shows the opt-in screen until capture is on, paused, or history exists.
+    var showsClipboardOptIn: Bool {
+        destination == .search && section == .clipboard && !store.database.preferences.clipboardEnabled
+            && !store.database.clipboardIsPaused && store.database.clipboard.isEmpty
+    }
+
+    func cycleClipboardFilter() {
+        // The opt-in has no list to filter, so ⌘P does nothing there.
+        guard section == .clipboard, !showsClipboardOptIn else { return }
+        clipboardFilter = clipboardFilter.next
+    }
+}

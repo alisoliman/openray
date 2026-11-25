@@ -160,7 +160,7 @@ ditto -c -k --keepParent "$OPENRAY_APP" "$OPENRAY_OUTPUT/$OPENRAY_NAME.zip"
 ln -s /Applications "$OPENRAY_STAGING/Applications"
 cat >"$OPENRAY_STAGING/Install OpenRay.txt" <<'INSTALL'
 Drag OpenRay to Applications, then open it there.
-OpenRay requires an Apple silicon Mac with macOS 26 or later. Press Option-Space to open the launcher.
+OpenRay requires an Apple silicon Mac with macOS 27 or later. Press Option-Space to open the launcher.
 If that shortcut is in use, choose another in Settings from the OpenRay menu bar item.
 Clipboard history and snippet expansion are off by default. Accessibility is optional.
 For help and privacy information, choose OpenRay Help from the menu bar.
@@ -168,8 +168,9 @@ INSTALL
 if (( OPENRAY_PREVIEW )); then
   print 'LOCAL PREVIEW ONLY — ad-hoc signed, not notarized, not for distribution.' >"$OPENRAY_STAGING/LOCAL PREVIEW ONLY.txt"
 fi
-hdiutil create -volname "${OPENRAY_NAME}" -srcfolder "$OPENRAY_STAGING" -format UDZO \
-  "$OPENRAY_OUTPUT/$OPENRAY_NAME.dmg" >"$OPENRAY_OUTPUT/dmg.log"
+# macOS 27 deprecates `hdiutil create`; diskutil builds the same read-only image from the folder.
+diskutil image create from --format UDZO --volumeName "$OPENRAY_NAME" \
+  "$OPENRAY_STAGING" "$OPENRAY_OUTPUT/$OPENRAY_NAME.dmg" >"$OPENRAY_OUTPUT/dmg.log"
 if (( ! OPENRAY_PREVIEW )); then
   codesign --force --sign "$OPENRAY_SIGNING_IDENTITY" "${OPENRAY_SIGNING_KEYCHAIN_ARGS[@]}" --timestamp "$OPENRAY_OUTPUT/$OPENRAY_NAME.dmg"
   notarize "$OPENRAY_OUTPUT/$OPENRAY_NAME.dmg" dmg

@@ -40,7 +40,12 @@ struct ClipboardCaptureContext: Sendable {
 @Observable
 final class ClipboardService {
     private(set) var accessMessage: String?
+    /// The last capture failure. Copy failures go to `lastCopyError` instead.
     private(set) var contentMessage: String?
+    /// Why the last copy didn't reach the clipboard. Cleared when the next copy starts.
+    private(set) var lastCopyError: String?
+    /// How macOS treats OpenRay's background reads of the clipboard.
+    private(set) var accessBehavior: NSPasteboard.AccessBehavior
     private(set) var isProcessing = false
     var usesGeneralPasteboard: Bool { pasteboard.name == .general }
     var changeCount: Int { pasteboard.changeCount }
@@ -71,6 +76,7 @@ final class ClipboardService {
         self.imageProcessor = imageProcessor
         self.captureContext = captureContext
         lastChange = pasteboard.changeCount
+        accessBehavior = pasteboard.accessBehavior
     }
 
     func configure() {
@@ -80,7 +86,7 @@ final class ClipboardService {
         let preferences = store.database.preferences
         let policy = CapturePolicy(
             enabled: preferences.clipboardEnabled, images: preferences.capturesClipboardImages,
-            files: preferences.capturesClipboardFiles, excluded: preferences.excludedClipboardBundleIDs)
+            files: preferences.capturesClipboardFiles, excluded: preferences.effectiveClipboardExclusions)
         if previousPolicy != policy {
             captureGeneration += 1
             previousPolicy = policy
@@ -109,7 +115,7 @@ final class ClipboardService {
         }
         guard store.database.preferences.clipboardEnabled, !isProcessing else { return }
         refreshAccessStatus()
-        guard pasteboard.accessBehavior != .alwaysDeny else { return }
+        guard accessBehavior != .alwaysDeny else { return }
         guard pasteboard.changeCount != lastChange else { return }
         lastChange = pasteboard.changeCount
         let change = lastChange
@@ -119,14 +125,14 @@ final class ClipboardService {
         guard
             ClipboardPolicy.shouldCapture(
                 types: [], sourceBundleID: source.sourceBundleID,
-                excluded: store.database.preferences.excludedClipboardBundleIDs,
+                excluded: store.database.preferences.effectiveClipboardExclusions,
                 secureInput: source.secureInput)
         else { return }
         let types = Set((pasteboard.types ?? []).map(\.rawValue))
         guard
             ClipboardPolicy.shouldCapture(
                 types: types, sourceBundleID: source.sourceBundleID,
-                excluded: store.database.preferences.excludedClipboardBundleIDs,
+                excluded: store.database.preferences.effectiveClipboardExclusions,
                 secureInput: source.secureInput)
         else { return }
         contentMessage = nil
@@ -152,7 +158,7 @@ final class ClipboardService {
                     throw LibraryValidationError("These file references exceed the supported clipboard limits.")
                 }
                 guard pasteboard.changeCount == change else { return }
-                store.capture(entry)
+                if !store.capture(entry) { contentMessage = store.captureRejection }
             } else if types.contains(NSPasteboard.PasteboardType.png.rawValue)
                 || types.contains(NSPasteboard.PasteboardType.tiff.rawValue)
             {
@@ -166,17 +172,21 @@ final class ClipboardService {
                 guard !Task.isCancelled, generation == captureGeneration, store.database.preferences.clipboardEnabled,
                     store.database.preferences.capturesClipboardImages
                 else { return }
-                store.captureImage(
+                if !store.captureImage(
                     prepared, copiedAt: copiedAt, sourceName: source.sourceName, sourceBundleID: source.sourceBundleID)
+                {
+                    contentMessage = store.captureRejection
+                }
             } else if let data = pasteboard.data(forType: .string) {
                 guard data.count <= ClipboardLimits.textBytes else {
                     throw LibraryValidationError("This copied text exceeds the 128 KB clipboard-entry limit.")
                 }
                 guard let text = String(data: data, encoding: .utf8), pasteboard.changeCount == change else { return }
-                store.capture(
+                let captured = store.capture(
                     ClipboardEntry(
                         text: text, copiedAt: copiedAt, sourceName: source.sourceName,
                         sourceBundleID: source.sourceBundleID))
+                if !captured { contentMessage = store.captureRejection }
             }
         } catch is CancellationError {
             return
@@ -188,21 +198,24 @@ final class ClipboardService {
 
     func readText() -> String? { pasteboard.string(forType: .string) }
 
+    func clearContentMessage() { contentMessage = nil }
+
     func refreshAccessStatus() {
+        // Stored so views that show the permission state update when it changes.
+        let behavior = pasteboard.accessBehavior
+        if accessBehavior != behavior { accessBehavior = behavior }
         guard store.database.preferences.clipboardEnabled else {
             accessMessage = nil
             return
         }
-        switch pasteboard.accessBehavior {
+        switch accessBehavior {
         case .alwaysAllow: accessMessage = nil
         case .alwaysDeny:
-            accessMessage =
-                "macOS is blocking clipboard access. Allow OpenRay’s clipboard access in System Settings, then copy text again."
+            accessMessage = "macOS is blocking clipboard access. Allow it in System Settings, then copy again."
         case .default, .ask:
-            accessMessage =
-                "macOS may ask to allow clipboard access. For uninterrupted history, choose Always Allow for OpenRay’s clipboard access in System Settings."
+            accessMessage = "macOS asks before each capture. Choose Always Allow to keep capturing in the background."
         @unknown default:
-            accessMessage = "Check OpenRay’s clipboard access in System Settings if copied text does not appear."
+            accessMessage = "If copied text doesn't appear, check OpenRay's clipboard access in System Settings."
         }
     }
 
@@ -216,6 +229,7 @@ final class ClipboardService {
 
     @discardableResult
     func copy(_ text: String) -> Bool {
+        lastCopyError = nil
         let item = NSPasteboardItem()
         item.setString(text, forType: .string)
         return write([item])
@@ -223,16 +237,16 @@ final class ClipboardService {
 
     @discardableResult
     func copy(_ entry: ClipboardEntry) -> Bool {
-        contentMessage = nil
+        lastCopyError = nil
         guard entry.isValid else {
-            contentMessage = "This saved clipboard entry is invalid."
+            lastCopyError = "This saved clipboard entry is invalid."
             return false
         }
         switch entry.content {
         case .text(let text): return copy(text)
         case .image(let image):
             guard let data = store.imageData(for: image) else {
-                contentMessage = "This saved image is missing or damaged. The current clipboard was not changed."
+                lastCopyError = "This saved image is missing or damaged. The current clipboard was not changed."
                 return false
             }
             let item = NSPasteboardItem()

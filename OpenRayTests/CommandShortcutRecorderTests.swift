@@ -96,6 +96,53 @@ struct CommandShortcutRecorderTests {
         #expect(cancellations == 0)
     }
 
+    @Test func clickingTheRecorderWhileRecordingStopsOnceAndConsumesTheClick() throws {
+        let recorder = CommandShortcutCaptureView()
+        var cancellations = 0
+        var captures = 0
+        recorder.cancel = { cancellations += 1 }
+        recorder.capture = { _ in captures += 1 }
+        let window = makeWindow()
+        defer { window.close() }
+        window.contentView = recorder
+
+        // Consumed, so the button never sees mouse-up and can't start recording again.
+        #expect(recorder.handle(try mouseDown(at: NSPoint(x: 20, y: 20), in: window)))
+        #expect(cancellations == 1)
+        #expect(captures == 0)
+        #expect(!recorder.isMonitoring)
+    }
+
+    @Test func clickingElsewhereStopsRecordingWithoutSwallowingTheClick() throws {
+        let recorder = CommandShortcutCaptureView(frame: NSRect(x: 0, y: 0, width: 100, height: 30))
+        var cancellations = 0
+        recorder.cancel = { cancellations += 1 }
+        let window = makeWindow()
+        defer { window.close() }
+        let container = NSView(frame: NSRect(x: 0, y: 0, width: 300, height: 150))
+        container.addSubview(recorder)
+        window.contentView = container
+
+        #expect(!recorder.handle(try mouseDown(at: NSPoint(x: 200, y: 100), in: window)))
+        #expect(cancellations == 1)
+        #expect(!recorder.isMonitoring)
+    }
+
+    @Test func bareDeleteRemovesTheShortcutButModifiedDeleteIsRecorded() throws {
+        #expect(CommandShortcutRecording.isRemoveKey(try keyEvent(code: kVK_Delete, modifiers: [])))
+        #expect(CommandShortcutRecording.isRemoveKey(try keyEvent(code: kVK_ForwardDelete, modifiers: .function)))
+        #expect(!CommandShortcutRecording.isRemoveKey(try keyEvent(code: kVK_Delete, modifiers: .command)))
+        #expect(!CommandShortcutRecording.isRemoveKey(try keyEvent(code: kVK_ForwardDelete, modifiers: [.function, .option])))
+        #expect(!CommandShortcutRecording.isRemoveKey(try keyEvent(code: kVK_ANSI_K, modifiers: [])))
+    }
+
+    private func mouseDown(at point: NSPoint, in window: NSWindow) throws -> NSEvent {
+        try #require(
+            NSEvent.mouseEvent(
+                with: .leftMouseDown, location: point, modifierFlags: [], timestamp: 0,
+                windowNumber: window.windowNumber, context: nil, eventNumber: 0, clickCount: 1, pressure: 1))
+    }
+
     private func makeWindow() -> NSWindow {
         let window = NSWindow(
             contentRect: NSRect(x: 0, y: 0, width: 300, height: 150), styleMask: [.titled],

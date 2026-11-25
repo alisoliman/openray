@@ -204,7 +204,7 @@ class ArtifactTests(ReleaseFixture):
         self.assertEqual(manifest["build_number"], 42)
         self.assertEqual(manifest["commit"], SHA)
         self.assertEqual(manifest["architecture"], "arm64")
-        self.assertEqual(manifest["minimum_macos"], "26.0")
+        self.assertEqual(manifest["minimum_macos"], "27.0")
         for extension in ("dmg", "zip"):
             self.assertEqual((self.package / f"OpenRay-1.2.3.{extension}").read_bytes(),
                              (self.output / f"OpenRay-macos-arm64.{extension}").read_bytes())

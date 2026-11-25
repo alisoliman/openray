@@ -42,9 +42,11 @@ final class GlobalHotKey {
 
     isolated deinit { unregister() }
 
+    /// `title` names a command in conflict messages; a command without one is "another command".
     func synchronize(
         launcher: LauncherHotKey, bindings: [CommandBinding],
-        onLauncher: @escaping () -> Void, onCommand: @escaping (String) -> Void
+        onLauncher: @escaping () -> Void, onCommand: @escaping (String) -> Void,
+        title: (String) -> String? = { _ in nil }
     ) -> [HotKeyRegistrationIssue] {
         self.onLauncher = onLauncher
         self.onCommand = onCommand
@@ -67,7 +69,8 @@ final class GlobalHotKey {
                 continue
             }
             if let owner = owners[shortcut] {
-                let ownerTitle = owner == Self.launcherTargetID ? "the launcher" : "another command (\(owner))"
+                // Never show the raw target ID.
+                let ownerTitle = owner == Self.launcherTargetID ? "the launcher" : (title(owner) ?? "another command")
                 issues.append(
                     .init(targetID: targetID, message: "\(shortcut.title) is inactive because \(ownerTitle) uses it."))
                 continue

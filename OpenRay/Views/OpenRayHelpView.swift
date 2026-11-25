@@ -1,264 +1,147 @@
 import SwiftUI
 
 struct OpenRayHelpButton: View {
-    @Environment(\.openWindow) private var openWindow
+    let model: LauncherModel
 
     var body: some View {
-        Button("OpenRay Help") { openWindow(id: OpenRayHelpView.windowID) }
+        Button("OpenRay Help") { model.openHelp() }
             .keyboardShortcut("?", modifiers: .command)
     }
 }
 
+/// The full guide and privacy details. ⌘/ in the panel covers shortcuts in context.
 struct OpenRayHelpView: View {
     static let windowID = "openray-help"
     let model: LauncherModel
 
     var body: some View {
         ScrollView {
-            VStack(alignment: .leading, spacing: 26) {
-                VStack(alignment: .leading, spacing: 8) {
-                    Label("OpenRay Help", systemImage: "command.square.fill")
-                        .font(.system(size: 26, weight: .semibold))
-                    Text("Find, create, and work from your keyboard.")
-                        .font(.system(size: 15)).foregroundStyle(.secondary)
-                    Text("Version \(AppInformation.version) · Apple silicon · macOS 26+")
-                        .font(.system(size: 12)).foregroundStyle(.secondary)
-                }
-
-                section("Start with search", symbol: "magnifyingglass") {
-                    Text(
-                        """
-                        Press \(model.store.database.preferences.hotKey.title) from any app to \
-                        show or hide OpenRay. You can change this shortcut in Settings if another \
-                        app uses it.
-                        """)
-                    Text(
-                        """
-                        Search an app name, a filename, or a command such as Snippets or Fix \
-                        Spelling & Grammar. Use the Apps, Files, and Ask AI buttons to go straight \
-                        to a feature. Files uses Spotlight in your home folder; hidden files, \
-                        Library, and generated development folders are excluded.
-                        """)
-                }
-
-                section("Keyboard shortcuts", symbol: "keyboard") {
-                    Grid(alignment: .leading, horizontalSpacing: 24, verticalSpacing: 10) {
-                        shortcut("↑ / ↓", "Select a result or an action")
-                        shortcut(
-                            "Return",
-                            """
-                            Open or copy the selected result; run a selected action
-                            """)
-                        shortcut("⌘K", "Open or close actions for the selected result")
-                        shortcut(
-                            "⌘Return",
-                            """
-                            Paste a clipboard item, snippet, calculation, or note into the \
-                            previously active app
-                            """)
-                        shortcut(
-                            "⌘N",
-                            """
-                            Create a note, snippet, or quicklink in its feature; start a new \
-                            conversation in AI
-                            """)
-                        shortcut("⌘S", "Save the current editor")
-                        shortcut("⌘,", "Open Settings")
-                        shortcut(
-                            "Escape",
-                            """
-                            Close actions or an editor, go back from a feature, clear the root \
-                            search, then hide the launcher
-                            """)
+            VStack(alignment: .leading, spacing: 30) {
+                HStack(spacing: 16) {
+                    ORMark(size: 56)
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text("OpenRay Help").font(.system(size: 26, weight: .semibold)).tracking(-0.5)
+                            .accessibilityAddTraits(.isHeader)
+                        Text("Find, create and work from your keyboard.").font(.system(size: 15))
+                            .foregroundStyle(OR.Color.text2)
+                        Text("Version \(AppInformation.version) · Apple silicon · macOS 27+").font(OR.Font.callout)
+                            .foregroundStyle(OR.Color.text2)
                     }
-                    Text(
-                        """
-                        In a text editor, Escape belongs to the editor first. Use Back to leave \
-                        Settings while editing exclusions.
-                        """
-                    )
-                    .foregroundStyle(.secondary)
                 }
 
-                section("Command aliases and hotkeys", symbol: "command") {
-                    Text(
-                        """
-                        In Settings, use Command aliases & hotkeys to assign an alias or global \
-                        shortcut to the available commands. Type an alias in the launcher to find \
-                        its command, or use a global shortcut while another app is active. Save \
-                        changes in the command editor; shortcut conflicts appear in Settings.
-                        """)
-                }
-
-                section("Make everyday work reusable", symbol: "square.stack.3d.up") {
+                section("Start with search", kind: .command, symbol: "magnifyingglass") {
                     paragraph(
-                        "Notes",
-                        """
-                        Create local notes, find them by title or content, and reopen them to \
-                        edit. Use actions to copy, favorite, or delete an item.
-                        """)
+                        "Press \(model.store.database.preferences.hotKey.title) in any app to show or hide OpenRay. Type an app, a file, a command such as Snippets or a calculation. The top result is selected, and the action bar names what Return does.")
                     paragraph(
-                        "Snippets",
-                        """
-                        Save reusable text with an optional keyword such as ;email. {date} and \
-                        {time} expand when copied or pasted. Cross-app keyword expansion is \
-                        optional in Settings and requires Accessibility.
-                        """)
+                        "Favorites open with ⌘1 to ⌘8. Commands such as Clipboard History are scopes: they appear as a token in the field. Press ⌫ on an empty field to leave a scope, or Esc to go back one step.")
+                }
+
+                section("Keyboard", kind: .command, symbol: "keyboard") {
+                    Grid(alignment: .leading, horizontalSpacing: 18, verticalSpacing: 10) {
+                        shortcut(["↑", "↓"], "Move through results; ← → in grids")
+                        shortcut(["↩"], "Copy or open the selection")
+                        shortcut(["⌘", "↩"], "Send it into the app you came from (Paste to Mail)")
+                        shortcut(["Tab"], "Enter the selected scope, start a quicklink search or ask AI")
+                        shortcut(["⌘", "K"], "All actions for the selection, searchable")
+                        shortcut(["⌘", "/"], "Shortcuts that work where you are")
+                        shortcut(["⌘", "1–8"], "Open a favorite")
+                        shortcut(["⌘", "N"], "New note, snippet or quicklink; new chat in AI")
+                        shortcut(["⌘", "S"], "Save an editor")
+                        shortcut(["⌘", ","], "Settings")
+                        shortcut(["esc"], "Close the top layer: actions, editor, scope, then the search")
+                    }
+                }
+
+                section("Make everyday work reusable", kind: .snippet, symbol: "curlybraces") {
+                    item("Snippets", "Save text with a keyword such as ;sig. {date} and {time} fill in when you copy or paste. With Accessibility on, keywords can expand as you type; each snippet has its own switch.")
+                    item("Quicklinks", "Save a website, a folder, or a search such as https://duckduckgo.com/?q={query}. Type its keyword and a space in Everything, then the search term. ⌘2 and onward send the same term elsewhere.")
+                    item("Notes", "Notes save as you type. The first line becomes the title. Esc is Done.")
+                    item("Clipboard", "Turn on history to search what you copy. Return copies an entry; ⌘↩ pastes it. Pin entries to keep them past the retention limit, and filter by type with ⌘P.")
+                }
+
+                section("Calculate and arrange windows", kind: .calculator, symbol: nil) {
                     paragraph(
-                        "Quicklinks",
-                        """
-                        Save a website, an absolute file path, or a search template such as \
-                        https://example.com/search?q={query}. Give it a keyword such as web, then \
-                        type web swift concurrency in OpenRay. Query text is encoded safely for \
-                        the URL.
-                        """)
+                        "Try 6 * 7, 200 * 15%, sqrt(144), 10 km in mi, 72 f in c or 1 GiB in MiB. Return copies the value without the unit. Currency conversion isn't supported because OpenRay never fetches rates.")
                     paragraph(
-                        "Clipboard",
-                        """
-                        Enable capture to keep a local history of copied text, images, and file \
-                        references. Use the content-type filter to narrow results. Return copies \
-                        an entry; ⌘Return pastes into the previously active app when Accessibility \
-                        is enabled. Pause capture in Settings without losing saved entries.
-                        """)
+                        "Window Management shows each layout as a picture. Layouts apply to the window you came from, named in the field. They need Accessibility.")
                 }
 
-                section("Calculate and arrange windows", symbol: "equal.square") {
-                    Text(
-                        """
-                        Try 6 * 7, 200 * 15%, sqrt(144), 10 km in mi, 72 f in c, or 1 GiB in MiB. \
-                        Return copies the answer. Trigonometric functions use radians; storage \
-                        conversions distinguish MB from MiB. Live currency conversions are not \
-                        supported.
-                        """)
-                    Text(
-                        """
-                        Window commands act on the app that was active before OpenRay. Choose a \
-                        half, quarter, maximize, center, or next display. Restore returns the \
-                        window to its saved original frame. These commands require Accessibility.
-                        """)
+                section("Work with AI", kind: .ai, symbol: nil) {
+                    paragraph(
+                        "Press Tab on any search to ask AI. Writing commands such as Fix Spelling & Grammar pick up the text you selected in another app, show what changed, and ⌘↩ replaces the selection.")
+                    paragraph(
+                        "In chat, Return adds a line and ⌘↩ sends. Attach the clipboard or your selection explicitly. Requests are limited to 6,000 characters.")
+                    paragraph(
+                        "AI runs on this Mac with Apple Intelligence and never falls back to the cloud. It needs an eligible Mac, Apple Intelligence turned on, a supported language and the model downloaded. Review what it writes; it can't browse for live information.")
                 }
 
-                section("Write with Apple Intelligence", symbol: "sparkles") {
-                    Text(
-                        """
-                        Ask AI for a conversation, or choose Summarize, Improve Writing, Fix \
-                        Spelling & Grammar, Make Shorter, or Extract Action Items. Enter the \
-                        source text for a writing command.
-                        """)
-                    Text(
-                        """
-                        Return inserts a new line. ⌘Return sends. Stop ends a response and keeps \
-                        its partial text. Use Copy for the output, Save as Note to keep it, and \
-                        New Chat to start fresh. Input is limited to 6,000 characters.
-                        """)
-                    Text(
-                        """
-                        AI runs on this Mac using Apple Intelligence, with no cloud fallback. It \
-                        requires an eligible Apple silicon Mac, Apple Intelligence enabled, a supported \
-                        language, and the model downloaded. Settings shows readiness. Review \
-                        generated text; the model does not browse for live information.
-                        """)
+                section("Your data and permissions", kind: .permission, symbol: "lock.fill") {
+                    paragraph(
+                        "No account, analytics, ads or cloud sync. Your library, favorites, recent items and clipboard history are stored in ~/Library/Application Support/OpenRay, readable only by your account but not encrypted by OpenRay. Back up library.json and ClipboardImages together.")
+                    paragraph(
+                        "Clipboard history and keyword expansion start off. Known password managers, content marked confidential, anything copied during Secure Input and apps you exclude are never saved. Other sensitive text can be, so pause capture from the menu bar or the action bar when you need to.")
+                    paragraph(
+                        "Accessibility is only for window layouts, pasting into other apps, reading selected text and keyword expansion. Everything else works without it. Settings → Permissions shows each one with its status.")
+                    paragraph(
+                        "Opening a quicklink hands its URL to your browser, and search terms go to the site you chose. Deleting items or clearing history can't be undone in OpenRay.")
                 }
 
-                section("Your data and permissions", symbol: "hand.raised") {
-                    Text(
-                        """
-                        No account, analytics, ads, or cloud sync. Notes, snippets, links, preferences, \
-                        favorites, recent-use history, and enabled clipboard history are stored in \
-                        ~/Library/Application Support/OpenRay. \
-                        Reveal Library in Finder is available in Settings. The files are local and \
-                        restricted to your user account but are not encrypted by OpenRay. Back up \
-                        library.json and ClipboardImages together.
-                        """)
-                    Text(
-                        """
-                        Clipboard capture and keyword expansion are off initially. Clipboard \
-                        permission is separate from Accessibility. Known password managers and \
-                        confidential or transient clipboard content are excluded. Capture also \
-                        pauses during Secure Input, but unmarked \
-                        sensitive content can still be captured. Add app bundle identifiers to \
-                        exclusions or pause capture when needed. Retention, entry count, and media \
-                        limits are shown in Settings.
-                        """)
-                    Text(
-                        """
-                        Accessibility is used only for window layouts, direct paste, selected-text \
-                        import, and optional keyword expansion. Other features work without it. \
-                        OpenRay does not save what you type for expansion or change system \
-                        permissions for you.
-                        """)
-                    Text(
-                        """
-                        Clipboard and selected text enter AI only when you choose their import \
-                        buttons. Chats stay in memory; Save as Note is the explicit way to store a \
-                        response. Deleting library items or clearing history cannot be undone in \
-                        OpenRay. Clearing clipboard history does not alter the current system \
-                        clipboard or delete original copied files.
-                        """)
-                    Text(
-                        """
-                        Clipboard images are stored locally as PNGs. Copied files are references \
-                        to the originals. Opening a quicklink, help link, or support link hands \
-                        its URL to your browser. Search-template queries are sent to the service \
-                        you choose, whose privacy practices apply.
-                        """)
-                }
-
-                section("Help and feedback", symbol: "questionmark.circle") {
-                    Text(
-                        """
-                        If a shortcut fails, choose another in Settings. If permissions change, \
-                        reopen the same app build and use Refresh Status. Install OpenRay in \
-                        Applications before enabling launch at login or granting Accessibility.
-                        """)
-                    HStack(spacing: 20) {
+                section("Help and feedback", kind: .about, symbol: "questionmark") {
+                    paragraph(
+                        "If a shortcut doesn't work, another app may use it. Choose a different one in Settings → Shortcuts, where conflicts are explained. Install OpenRay in Applications before turning on Open at Login or Accessibility.")
+                    HStack(spacing: 18) {
                         Link("Read the guide", destination: AppInformation.documentationURL)
                         Link("Report an issue", destination: AppInformation.supportURL)
                     }
-                    Text(
-                        """
-                        GitHub issues are public. Include your OpenRay and macOS versions and \
-                        steps to reproduce; remove private text, clipboard contents, and personal \
-                        file paths from screenshots and logs.
-                        """
-                    )
-                    .foregroundStyle(.secondary)
+                    .font(OR.Font.bodyEmphasis)
+                    Text("GitHub issues are public. Remove private text, clipboard contents and personal file paths from screenshots and logs.")
+                        .font(OR.Font.callout).foregroundStyle(OR.Color.text2)
                 }
             }
             .font(.system(size: 13))
             .lineSpacing(3)
             .textSelection(.enabled)
-            .padding(28)
-            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(.horizontal, 36).padding(.top, 40).padding(.bottom, 36)
+            .frame(maxWidth: 720, alignment: .leading)
+            .frame(maxWidth: .infinity)
         }
         .frame(minWidth: 600, minHeight: 440)
-        .tint(RayStyle.accent)
+        .tint(OR.Color.accent)
+        .appAppearance(model.store.database.preferences.appearance)
         .accessibilityIdentifier("help.guide")
     }
 
     private func section<Content: View>(
-        _ title: String, symbol: String, @ViewBuilder content: () -> Content
+        _ title: String, kind: Kind, symbol: String?, @ViewBuilder content: () -> Content
     ) -> some View {
         VStack(alignment: .leading, spacing: 12) {
-            Label(title, systemImage: symbol).font(.system(size: 17, weight: .semibold))
-                .accessibilityAddTraits(.isHeader)
-            content()
+            HStack(spacing: 10) {
+                KindTile(kind: kind, symbol: symbol, size: 26)
+                Text(title).font(.system(size: 17, weight: .semibold)).tracking(-0.2)
+                    .accessibilityAddTraits(.isHeader)
+            }
+            VStack(alignment: .leading, spacing: 10) { content() }
+                .padding(.leading, 36)
         }
     }
 
-    private func paragraph(_ title: String, _ detail: String) -> some View {
-        VStack(alignment: .leading, spacing: 4) {
-            Text(title).fontWeight(.semibold)
-            Text(detail)
+    private func paragraph(_ text: String) -> some View {
+        Text(text).foregroundStyle(OR.Color.text).fixedSize(horizontal: false, vertical: true)
+    }
+
+    private func item(_ title: String, _ detail: String) -> some View {
+        VStack(alignment: .leading, spacing: 3) {
+            Text(title).font(OR.Font.headline)
+            Text(detail).foregroundStyle(OR.Color.text).fixedSize(horizontal: false, vertical: true)
         }
     }
 
-    private func shortcut(_ keys: String, _ description: String) -> some View {
-        GridRow(alignment: .top) {
-            Text(keys).font(.system(size: 13, weight: .semibold, design: .monospaced))
-                .fixedSize()
-            Text(description).frame(maxWidth: .infinity, alignment: .leading)
+    private func shortcut(_ keys: [String], _ description: String) -> some View {
+        GridRow(alignment: .center) {
+            KeyCaps(keys).gridColumnAlignment(.trailing)
+            Text(description).foregroundStyle(OR.Color.text).frame(maxWidth: .infinity, alignment: .leading)
         }
-        .accessibilityElement(children: .combine)
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel("\(KeyShortcut(keys).spoken): \(description)")
     }
 }

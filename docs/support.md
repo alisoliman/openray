@@ -4,7 +4,7 @@ Report reproducible problems in the [OpenRay public issue tracker](https://githu
 
 ## Install and open
 
-OpenRay requires an Apple silicon Mac with macOS 26 or later. Intel Macs are not supported. Download the signed, notarized release from the publisher's official download location, extract the ZIP or open the disk image, and move OpenRay to Applications. Open it from Finder. Keep this copy in a stable location before granting permissions or enabling launch at login.
+OpenRay requires an Apple silicon Mac with macOS 27 or later. Intel Macs are not supported. Download the signed, notarized release from the publisher's official download location, extract the ZIP or open the disk image, and move OpenRay to Applications. Open it from Finder. Keep this copy in a stable location before granting permissions or enabling launch at login.
 
 OpenRay runs in the menu bar. Press **Option-Space** to show or hide the launcher, or choose **Open OpenRay** in its menu. If the shortcut is already used by another app, choose another launcher shortcut in Settings. Use **Quit OpenRay** in its menu to exit; dismissing the launcher leaves it running.
 

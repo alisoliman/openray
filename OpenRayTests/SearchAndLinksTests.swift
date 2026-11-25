@@ -13,6 +13,13 @@ struct SearchAndLinksTests {
         #expect(SearchMatcher.score("unrelated", in: "Notes") == nil)
     }
 
+    @Test func fuzzyMatchesStartAtAWordAndIgnoreScatteredLetters() {
+        #expect(SearchMatcher.score("notes", in: "Epson Connect Printer Setup") == nil)
+        #expect(SearchMatcher.score("nts", in: "Notes") != nil)
+        #expect(SearchMatcher.score("wmg", in: "Window Management") != nil)
+        #expect(SearchMatcher.score("ndow", in: "Window Management") != nil)
+    }
+
     @Test func supportsCaseAccentsAndMultipleTerms() {
         #expect(SearchMatcher.score("cafe", in: "Café") == 1_000)
         #expect(SearchMatcher.score("WIN MAN", in: "Window Management") != nil)

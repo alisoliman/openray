@@ -14,12 +14,12 @@ enum WindowLayout: String, CaseIterable, Identifiable, Sendable {
         case .bottomHalf: "Bottom Half"
         case .maximize: "Maximize"
         case .center: "Center"
-        case .topLeft: "Top Left Quarter"
-        case .topRight: "Top Right Quarter"
-        case .bottomLeft: "Bottom Left Quarter"
-        case .bottomRight: "Bottom Right Quarter"
+        case .topLeft: "Top Left"
+        case .topRight: "Top Right"
+        case .bottomLeft: "Bottom Left"
+        case .bottomRight: "Bottom Right"
         case .nextDisplay: "Next Display"
-        case .restore: "Restore Window"
+        case .restore: "Restore"
         }
     }
 
@@ -79,11 +79,24 @@ struct WindowFramePlan {
 
 @MainActor
 final class WindowManager {
+    /// A window in another app that layouts can target, read through Accessibility
+    /// so titles don't need Screen Recording access.
+    struct TargetWindow: Identifiable, Equatable {
+        let pid: pid_t
+        let appName: String
+        let bundleURL: URL?
+        let element: AXUIElement
+        let title: String
+        var id: String { "\(pid).\(CFHash(element))" }
+    }
+
     private struct WindowKey: Hashable {
         var pid: pid_t
         var elementHash: CFHashCode
     }
     private var originalFrames: [WindowKey: CGRect] = [:]
+    /// Listing asks every app; one that's hung must not stall the launcher for AX's default six seconds.
+    private static let listingTimeout: Float = 0.25
 
     var hasPermission: Bool { AXIsProcessTrusted() }
 
@@ -92,22 +105,54 @@ final class WindowManager {
         _ = AXIsProcessTrustedWithOptions(options)
     }
 
-    func arrange(_ layout: WindowLayout, application: NSRunningApplication?) throws {
-        guard hasPermission else {
-            throw LibraryValidationError(
-                "Allow OpenRay in System Settings → Privacy & Security → Accessibility to arrange windows.")
+    /// Standard, unminimized windows of other running apps, grouped by app name
+    /// and front to back within each app. Empty without Accessibility access.
+    func listWindows() -> [TargetWindow] {
+        guard hasPermission else { return [] }
+        let ownPID = ProcessInfo.processInfo.processIdentifier
+        let applications = NSWorkspace.shared.runningApplications.filter {
+            $0.activationPolicy == .regular && $0.processIdentifier != ownPID && !$0.isTerminated
+        }.sorted { ($0.localizedName ?? "").localizedStandardCompare($1.localizedName ?? "") == .orderedAscending }
+        var windows: [TargetWindow] = []
+        for application in applications {
+            let element = AXUIElementCreateApplication(application.processIdentifier)
+            AXUIElementSetMessagingTimeout(element, Self.listingTimeout)
+            guard let elements = attribute(kAXWindowsAttribute, of: element) as? [AXUIElement] else { continue }
+            for window in elements {
+                AXUIElementSetMessagingTimeout(window, Self.listingTimeout)
+                guard attribute(kAXSubroleAttribute, of: window) as? String == kAXStandardWindowSubrole,
+                    attribute(kAXMinimizedAttribute, of: window) as? Bool != true
+                else { continue }
+                windows.append(
+                    TargetWindow(
+                        pid: application.processIdentifier, appName: application.localizedName ?? "App",
+                        bundleURL: application.bundleURL, element: window,
+                        title: attribute(kAXTitleAttribute, of: window) as? String ?? ""))
+            }
         }
+        return windows
+    }
+
+    /// Arranges the focused window of the app you came from.
+    func arrange(_ layout: WindowLayout, application: NSRunningApplication?) throws {
+        try requirePermission()
         guard let application, application.processIdentifier != ProcessInfo.processInfo.processIdentifier,
             !application.isTerminated
         else { throw LibraryValidationError("Focus a window in another app, then open OpenRay and try again.") }
-        let element = AXUIElementCreateApplication(application.processIdentifier)
-        var value: CFTypeRef?
-        guard AXUIElementCopyAttributeValue(element, kAXFocusedWindowAttribute as CFString, &value) == .success,
-            let value, CFGetTypeID(value) == AXUIElementGetTypeID()
-        else {
+        guard let window = focusedWindow(of: application) else {
             throw LibraryValidationError("This app has no accessible focused window.")
         }
-        let window = unsafeDowncast(value, to: AXUIElement.self)
+        try arrange(layout, window: window, pid: application.processIdentifier)
+    }
+
+    /// Arranges a specific window, such as one chosen from listWindows().
+    func arrange(_ layout: WindowLayout, window: AXUIElement, pid: pid_t) throws {
+        try requirePermission()
+        guard pid != ProcessInfo.processInfo.processIdentifier,
+            let application = NSRunningApplication(processIdentifier: pid), !application.isTerminated
+        else { throw LibraryValidationError("That window's app has quit. Choose another window and try again.") }
+        // A window from listWindows() keeps the short listing timeout; a resize gets AX's default (0).
+        AXUIElementSetMessagingTimeout(window, 0)
         let axFrame = try readFrame(window)
         let primaryHeight = NSScreen.screens.first?.frame.maxY ?? 0
         let current = ScreenCoordinates.flip(axFrame, primaryHeight: primaryHeight)
@@ -117,7 +162,7 @@ final class WindowManager {
         else {
             throw LibraryValidationError("No display is available.")
         }
-        let key = WindowKey(pid: application.processIdentifier, elementHash: CFHash(window))
+        let key = WindowKey(pid: pid, elementHash: CFHash(window))
         var desired: CGRect
         if layout == .restore {
             guard let original = originalFrames[key] else {
@@ -139,7 +184,18 @@ final class WindowManager {
         if originalFrames[key] == nil { originalFrames[key] = current }
         try writeFrame(ScreenCoordinates.flip(desired, primaryHeight: primaryHeight), from: axFrame, to: window)
         if layout == .restore { originalFrames.removeValue(forKey: key) }
+        // A chosen window can sit behind the app's focused one; bring it forward with the app.
+        _ = AXUIElementPerformAction(window, kAXRaiseAction as CFString)
         application.activate()
+    }
+
+    /// The title of the window a layout will apply to, when Accessibility allows reading it.
+    func focusedWindowTitle(of application: NSRunningApplication?) -> String? {
+        guard hasPermission, let application, !application.isTerminated,
+            let window = focusedWindow(of: application),
+            let title = attribute(kAXTitleAttribute, of: window) as? String, !title.isEmpty
+        else { return nil }
+        return title
     }
 
     func selectedText(in application: NSRunningApplication?) throws -> String {
@@ -168,10 +224,36 @@ final class WindowManager {
         return intersection.isNull ? 0 : intersection.width * intersection.height
     }
 
+    private func requirePermission() throws {
+        guard hasPermission else {
+            throw LibraryValidationError(
+                "Allow OpenRay in System Settings → Privacy & Security → Accessibility to arrange windows.")
+        }
+    }
+
+    private func focusedWindow(of application: NSRunningApplication) -> AXUIElement? {
+        let element = AXUIElementCreateApplication(application.processIdentifier)
+        guard let value = attribute(kAXFocusedWindowAttribute, of: element),
+            CFGetTypeID(value) == AXUIElementGetTypeID()
+        else { return nil }
+        return unsafeDowncast(value, to: AXUIElement.self)
+    }
+
+    private func attribute(_ name: String, of element: AXUIElement) -> CFTypeRef? {
+        var value: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(element, name as CFString, &value) == .success else { return nil }
+        return value
+    }
+
     private func readFrame(_ window: AXUIElement) throws -> CGRect {
         var positionValue: CFTypeRef?
         var sizeValue: CFTypeRef?
-        guard AXUIElementCopyAttributeValue(window, kAXPositionAttribute as CFString, &positionValue) == .success,
+        let position = AXUIElementCopyAttributeValue(window, kAXPositionAttribute as CFString, &positionValue)
+        // A window chosen earlier may have closed since.
+        if position == .invalidUIElement {
+            throw LibraryValidationError("This window has closed. Choose another window and try again.")
+        }
+        guard position == .success,
             AXUIElementCopyAttributeValue(window, kAXSizeAttribute as CFString, &sizeValue) == .success,
             let positionValue, let sizeValue,
             CFGetTypeID(positionValue) == AXValueGetTypeID(), CFGetTypeID(sizeValue) == AXValueGetTypeID()

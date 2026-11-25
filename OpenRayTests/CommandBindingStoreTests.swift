@@ -13,7 +13,7 @@ struct CommandBindingStoreTests {
         legacy.schemaVersion = version
         legacy.preferences.hotKey = .controlOptionSpace
         legacy.notes = [QuickNote(title: "Keep", content: "My local note")]
-        var json = try #require(JSONSerialization.jsonObject(with: JSONEncoder().encode(legacy)) as? [String: Any])
+        var json = try LegacyLibraryFixture.object(from: legacy)
         json.removeValue(forKey: "commandBindings")
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         try JSONSerialization.data(withJSONObject: json).write(to: url)
@@ -21,6 +21,7 @@ struct CommandBindingStoreTests {
         let store = LibraryStore(fileURL: url)
         #expect(!store.isReadOnly)
         #expect(store.database.schemaVersion == LibraryDatabase.currentSchemaVersion)
+        #expect(!store.database.preferences.needsFirstRun)
         #expect(store.database.commandBindings.isEmpty)
         #expect(store.database.preferences.hotKey == .controlOptionSpace)
         #expect(store.database.notes == legacy.notes)
@@ -31,6 +32,22 @@ struct CommandBindingStoreTests {
         #expect(reopened.database.preferences.hotKey == .controlOptionSpace)
         #expect(reopened.database.notes == legacy.notes)
         #expect(reopened.database.aliasTarget(for: "clip") == "section.clipboard")
+        #expect(!reopened.database.preferences.needsFirstRun)
+    }
+
+    @Test func writingCommandsAcceptAliasesAndShortcuts() {
+        let directory = temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let url = directory.appending(path: "library.json")
+        let store = LibraryStore(fileURL: url)
+        let shortcut = CommandShortcut(keyCode: 1, modifiers: [.control, .option])
+        #expect(store.saveCommandBinding(CommandBinding(targetID: "ai.summarize", alias: "sum", shortcut: shortcut)))
+        #expect(store.saveCommandBinding(CommandBinding(targetID: "ai.actionItems", alias: "todo")))
+
+        let reopened = LibraryStore(fileURL: url)
+        #expect(reopened.database.aliasTarget(for: "SUM") == "ai.summarize")
+        #expect(reopened.database.binding(for: "ai.summarize")?.shortcut == shortcut)
+        #expect(reopened.database.aliasTarget(for: "todo") == "ai.actionItems")
     }
 
     @Test func bindingsRoundTripWithStableTargetsAndExactNormalizedAliases() throws {

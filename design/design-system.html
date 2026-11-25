@@ -50,6 +50,7 @@ html[data-theme="light"] {
   --or-sep: rgba(0,0,0,.085);
   --or-accent: var(--ray-700);
   --or-accent-fill: var(--ray-600);
+  --or-accent-button: var(--ray-600);
   --or-accent-soft: rgba(210,54,43,.10);
   --or-on-accent: #FFFFFF;
   --or-success: #1C7C36; --or-success-soft: rgba(28,124,54,.11);
@@ -87,6 +88,7 @@ html[data-theme="dark"] {
   --or-sep: rgba(255,255,255,.085);
   --or-accent: var(--ray-400);
   --or-accent-fill: var(--ray-500);
+  --or-accent-button: var(--ray-600);
   --or-accent-soft: rgba(255,111,99,.14);
   --or-on-accent: #FFFFFF;
   --or-success: #4CD964; --or-success-soft: rgba(76,217,100,.14);
@@ -341,7 +343,7 @@ html.solid .panel, html.solid .pop { background: var(--or-panel-solid); -webkit-
   font: 550 12.5px/1 var(--font); white-space: nowrap; color: var(--or-text); background: var(--or-fill-2); box-shadow: inset 0 0 0 .5px var(--or-sep);
 }
 .btn.lg { height: 34px; padding: 0 16px; font-size: 13px; border-radius: 10px; }
-.btn.primary { background: var(--or-accent-fill); color: var(--or-on-accent); box-shadow: inset 0 1px 0 rgba(255,255,255,.18), 0 1px 2px rgba(0,0,0,.18); }
+.btn.primary { background: var(--or-accent-button); color: var(--or-on-accent); box-shadow: inset 0 1px 0 rgba(255,255,255,.18), 0 1px 2px rgba(0,0,0,.18); }
 .btn.ghost { background: transparent; box-shadow: none; color: var(--or-text-2); }
 .btn.destructive { background: var(--or-danger-soft); color: var(--or-danger); box-shadow: none; }
 .btn .kbd { height: 18px; min-width: 18px; background: rgba(255,255,255,.18); color: inherit; box-shadow: none; }
@@ -524,12 +526,12 @@ footer.end { padding: 60px 0 80px; color: var(--doc-ink-3); font-size: 13px; }
   <div class="wrap">
     <div class="eyebrow">OpenRay 2.0 · Ground-up redesign</div>
     <h1>One quiet surface for <span>everything</span> you reach for.</h1>
-    <p class="lede">A new visual language and interaction model for OpenRay on macOS 26. It covers every step from pressing ⌥ Space to configuring the app. Every feature now lives in one glass panel. Features are scopes you step in and out of, and the keyboard always knows what Return will do.</p>
+    <p class="lede">A new visual language and interaction model for OpenRay on macOS 27. It covers every step from pressing ⌥ Space to configuring the app. Every feature now lives in one glass panel. Features are scopes you step in and out of, and the keyboard always knows what Return will do.</p>
     <div class="meta">
       <span><b>Status</b> Draft for review</span>
       <span><b>Date</b> 1 October 2026</span>
       <span><b>Owner</b> Ali Soliman</span>
-      <span><b>Platform</b> macOS 26 · Apple silicon · SwiftUI + AppKit</span>
+      <span><b>Platform</b> macOS 27 · Apple silicon · SwiftUI + AppKit</span>
       <span><b>Baseline</b> <code>f34cd3d</code> on <code>main</code></span>
     </div>
 
@@ -659,7 +661,7 @@ footer.end { padding: 60px 0 80px; color: var(--doc-ink-3); font-size: 13px; }
     </header>
 
     <h3>Accent · Ray</h3>
-    <p class="d">The current coral, rebuilt as a ten-step ramp. Light mode uses <b>700</b> for text and glyphs (6.3 : 1 on the panel) and <b>600</b> for fills behind white text (4.9 : 1). Dark mode uses <b>400</b> for text (6.2 : 1) and <b>500</b> for fills. Use the accent for focus, the caret, primary buttons and active scope tokens. It never marks the selected row; selection is neutral.</p>
+    <p class="d">The current coral, rebuilt as a ten-step ramp. Light mode uses <b>700</b> for text and glyphs (6.3 : 1 on the panel) and <b>600</b> for fills behind white text (4.9 : 1). Dark mode uses <b>400</b> for text (6.2 : 1) and <b>500</b> for fills without text, such as switches and the caret. Fills behind white text, such as primary buttons, use <b>600</b> in both appearances, so their labels stay above 4.5 : 1. Use the accent for focus, the caret, primary buttons and active scope tokens. It never marks the selected row; selection is neutral.</p>
     <div class="ramp">
       <div style="background:#FFF2F0;color:#5E160F">50<small>#FFF2F0</small></div>
       <div style="background:#FFDDD8;color:#5E160F">100<small>#FFDDD8</small></div>
@@ -980,8 +982,8 @@ footer.end { padding: 60px 0 80px; color: var(--doc-ink-3); font-size: 13px; }
               <div class="it"><svg class="i"><use href="#i-paste"/></svg>Paste to Mail<span class="sc"><span class="kbd">⌘</span><span class="kbd">↩</span></span></div>
               <div class="it"><svg class="i"><use href="#i-sparkles"/></svg>Ask AI About This<span class="sc"><span class="kbd">Tab</span></span><i class="pin">2</i></div>
               <div class="sepl"></div>
-              <div class="it"><svg class="i"><use href="#i-pin"/></svg>Pin to Top<span class="sc"><span class="kbd">⌘</span><span class="kbd">⇧</span><span class="kbd">P</span></span></div>
-              <div class="it"><svg class="i"><use href="#i-star"/></svg>Add to Favorites<span class="sc"><span class="kbd">⌘</span><span class="kbd">⇧</span><span class="kbd">F</span></span></div>
+              <div class="it"><svg class="i"><use href="#i-pin"/></svg>Pin to Top<span class="sc"><span class="kbd">⇧</span><span class="kbd">⌘</span><span class="kbd">P</span></span></div>
+              <div class="it"><svg class="i"><use href="#i-star"/></svg>Add to Favorites<span class="sc"><span class="kbd">⇧</span><span class="kbd">⌘</span><span class="kbd">F</span></span></div>
               <div class="it danger"><svg class="i"><use href="#i-trash"/></svg>Delete Entry…<span class="sc"><span class="kbd">⌘</span><span class="kbd">⌫</span></span><i class="pin">3</i></div>
               <div class="sepl"></div>
               <div class="it"><svg class="i"><use href="#i-pause"/></svg>Pause Capture</div>
@@ -1308,13 +1310,13 @@ footer.end { padding: 60px 0 80px; color: var(--doc-ink-3); font-size: 13px; }
     <table class="tbl">
       <thead><tr><th>Kind</th><th>↩ Primary</th><th>⌘↩ Into previous app</th><th>Notable ⌘K actions</th></tr></thead>
       <tbody>
-        <tr><td>Application</td><td>Open</td><td>—</td><td>Reveal in Finder ⌘⇧R · Copy Path ⌘⇧C · Add to Favorites ⌘⇧F</td></tr>
-        <tr><td>File or folder</td><td>Open in default app</td><td>Paste file <span class="tag new">New</span></td><td>Reveal in Finder ⌘⇧R · Copy Path ⌘⇧C · Quick Look ⌘Y <span class="tag new">New</span></td></tr>
+        <tr><td>Application</td><td>Open</td><td>—</td><td>Reveal in Finder ⇧⌘R · Copy Path ⇧⌘C · Add to Favorites ⇧⌘F</td></tr>
+        <tr><td>File or folder</td><td>Open in default app</td><td>Paste file <span class="tag new">New</span></td><td>Reveal in Finder ⇧⌘R · Copy Path ⇧⌘C · Quick Look ⌘Y <span class="tag new">New</span></td></tr>
         <tr><td>Scope command</td><td>Enter scope</td><td>—</td><td>Assign Alias or Shortcut… <span class="tag new">New</span> (opens Settings at that row)</td></tr>
-        <tr><td>Clipboard entry</td><td>Copy</td><td>Paste</td><td>Pin to Top ⌘⇧P <span class="tag new">New</span> · Ask AI About This · Delete ⌘⌫</td></tr>
+        <tr><td>Clipboard entry</td><td>Copy</td><td>Paste</td><td>Pin to Top ⇧⌘P <span class="tag new">New</span> · Ask AI About This · Delete ⌘⌫</td></tr>
         <tr><td>Snippet</td><td>Copy expanded</td><td>Paste expanded</td><td>Edit ⌘E · Duplicate · Delete ⌘⌫</td></tr>
-        <tr><td>Quicklink</td><td>Open (or start argument)</td><td>Paste link</td><td>Edit ⌘E · Copy Link ⌘⇧C · Delete ⌘⌫</td></tr>
-        <tr><td>Note</td><td>Open editor</td><td>Paste note</td><td>Copy ⌘⇧C · Delete ⌘⌫</td></tr>
+        <tr><td>Quicklink</td><td>Open (or start argument)</td><td>Paste link</td><td>Edit ⌘E · Copy Link ⇧⌘C · Delete ⌘⌫</td></tr>
+        <tr><td>Note</td><td>Open editor</td><td>Paste note</td><td>Copy ⇧⌘C · Delete ⌘⌫</td></tr>
         <tr><td>Calculation</td><td>Copy result</td><td>Paste result</td><td>Copy with unit · Copy expression</td></tr>
         <tr><td>Window layout</td><td>Apply to target window</td><td>—</td><td>Assign Shortcut…</td></tr>
         <tr><td>AI command</td><td>Run on selection</td><td>—</td><td>Assign Alias or Shortcut…</td></tr>
@@ -1734,7 +1736,7 @@ footer.end { padding: 60px 0 80px; color: var(--doc-ink-3); font-size: 13px; }
                   <div class="k"><span>Copy</span><span><span class="kbd">↩</span></span></div>
                   <div class="k"><span>Paste to Mail</span><span><span class="kbd">⌘</span><span class="kbd">↩</span></span></div>
                   <div class="k"><span>Cycle type filter</span><span><span class="kbd">⌘</span><span class="kbd">P</span></span></div>
-                  <div class="k"><span>Pin to top</span><span><span class="kbd">⌘</span><span class="kbd">⇧</span><span class="kbd">P</span></span></div>
+                  <div class="k"><span>Pin to top</span><span><span class="kbd">⇧</span><span class="kbd">⌘</span><span class="kbd">P</span></span></div>
                   <div class="k"><span>Ask AI about this</span><span><span class="kbd">Tab</span></span></div>
                   <div class="k"><span>Delete entry</span><span><span class="kbd">⌘</span><span class="kbd">⌫</span></span></div>
                 </div>
@@ -1848,6 +1850,7 @@ footer.end { padding: 60px 0 80px; color: var(--doc-ink-3); font-size: 13px; }
           <li><b>Edit in place.</b> Today each command opens a separate “Edit…” sheet. Now the alias is a text field and the shortcut is a recorder in the same row. Changes save when you press Return or the field loses focus. Writing commands become bindable too <span class="tag new">New</span>.</li>
           <li><b>Conflicts appear on the row that has them</b>, in plain words, with the resolution beside them. Today they arrive as a message suggesting “Save Anyway”.</li>
           <li><b>Every bindable command is listed</b>, so the list doubles as a reference. Search in the sidebar filters rows across all panes.</li>
+          <li><b>The sidebar uses native selection.</b> It is neutral, as drawn, while you work in a pane. While the sidebar has keyboard focus it shows Ray, because that is how macOS shows which list arrow keys will move. The accent asset uses Ray 600 in both appearances, so white text on it stays above 4.5:1.</li>
         </ol>
       </div>
     </div>

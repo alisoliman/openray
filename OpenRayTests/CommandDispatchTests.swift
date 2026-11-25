@@ -47,12 +47,14 @@ struct CommandDispatchTests {
         #expect(model.section == .clipboard)
     }
 
-    @Test func curatedTargetsAreExplicitAndExcludeContentAndOtherAICommands() {
+    @Test func curatedTargetsAreExplicitIncludeWritingCommandsAndExcludeContent() {
         let model = model()
         defer { model.stop() }
         #expect(model.bindableCommands.map(\.id) == CuratedCommand.targetIDs)
-        #expect(model.bindableCommands.count == 15)
-        #expect(!CuratedCommand.supports("ai.summarize"))
+        #expect(model.bindableCommands.count == 20)
+        for action in AIAction.allCases where action != .chat {
+            #expect(CuratedCommand.supports("ai.\(action.id)"))
+        }
         #expect(!CuratedCommand.supports("window.nextDisplay"))
         #expect(!CuratedCommand.supports("quicklink.any"))
         #expect(!CuratedCommand.supports("clipboard.any"))

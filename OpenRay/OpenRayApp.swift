@@ -1,3 +1,4 @@
+import AppKit
 import SwiftUI
 
 @main
@@ -5,39 +6,111 @@ struct OpenRayApp: App {
     @NSApplicationDelegateAdaptor(OpenRayDelegate.self) private var delegate
 
     var body: some Scene {
-        MenuBarExtra("OpenRay", systemImage: "command.square.fill") {
-            Button("Open OpenRay    \(delegate.model.store.database.preferences.hotKey.title)") {
-                delegate.model.panel?.show(section: .home)
-            }
-            Button("Ask AI") {
-                delegate.model.openAI()
-                delegate.model.panel?.show()
-            }
-            Button("Clipboard History") { delegate.model.panel?.show(section: .clipboard) }
-            Divider()
-            Button("Settings…") {
-                delegate.model.openSettings()
-                delegate.model.panel?.show()
-            }
-            OpenRayHelpButton()
-            Divider()
-            Button("Quit OpenRay") { NSApp.terminate(nil) }
-                .keyboardShortcut("q")
-        }
-        Settings {
-            SettingsView(model: delegate.model, showsBackButton: false)
-                .frame(width: 640, height: 560)
-                .appAppearance(delegate.model.store.database.preferences.appearance)
+        MenuBarExtra {
+            MenuBarContent(model: delegate.model)
+        } label: {
+            Image(nsImage: ORMarkImage.menuBar(paused: capturePaused))
         }
         .commands {
-            CommandGroup(replacing: .help) { OpenRayHelpButton() }
+            CommandGroup(replacing: .appSettings) {
+                Button("Settings…") { delegate.model.openSettings() }.keyboardShortcut(",")
+            }
+            CommandGroup(replacing: .help) { OpenRayHelpButton(model: delegate.model) }
         }
-        Window("OpenRay Help", id: OpenRayHelpView.windowID) {
-            OpenRayHelpView(model: delegate.model)
-                .appAppearance(delegate.model.store.database.preferences.appearance)
+    }
+
+    /// The menu bar icon carries state: an amber dot means capture is paused.
+    private var capturePaused: Bool { delegate.model.store.database.clipboardIsPaused }
+}
+
+/// Shortcuts show the person's actual bindings, read from the library.
+private struct MenuBarContent: View {
+    let model: LauncherModel
+
+    var body: some View {
+        let preferences = model.store.database.preferences
+        Button("Open OpenRay") { model.panel?.show(section: .home) }
+            .menuShortcut(preferences.hotKey.shortcut)
+        Button("Clipboard History") { model.panel?.show(section: .clipboard) }
+            .menuShortcut(model.store.database.binding(for: "section.clipboard")?.shortcut)
+        Button("Ask AI") {
+            model.panel?.show()
+            // Navigating away would hide the editor's unsaved changes behind AI.
+            if model.editor == nil {
+                model.openAI()
+            } else {
+                model.feedback = .warning("Save or cancel the current editor first.")
+            }
         }
-        .defaultSize(width: 700, height: 660)
-        .defaultLaunchBehavior(.suppressed)
-        .restorationBehavior(.disabled)
+        .menuShortcut(model.store.database.binding(for: "ai.chat")?.shortcut)
+        Divider()
+        if preferences.clipboardEnabled {
+            Text("Clipboard capture is on")
+            Button("Pause Capture", systemImage: "pause.fill") { model.setClipboardCapture(false) }
+        } else if model.store.database.clipboardIsPaused {
+            Text("Clipboard capture is paused")
+            Button("Resume Capture", systemImage: "play.fill") { model.setClipboardCapture(true) }
+        } else {
+            Button("Turn On Clipboard History…") { model.panel?.show(section: .clipboard) }
+        }
+        Divider()
+        Button("Settings…") { model.openSettings() }
+            .keyboardShortcut(",")
+        Button("OpenRay Help") { model.openHelp() }
+        Divider()
+        Button("Quit OpenRay") { NSApp.terminate(nil) }
+            .keyboardShortcut("q")
+    }
+}
+
+extension View {
+    /// Shows a global shortcut beside a menu item. Menu key equivalents only fire
+    /// while the menu is open, so this displays the binding without duplicating it.
+    @ViewBuilder func menuShortcut(_ shortcut: CommandShortcut?) -> some View {
+        if let shortcut, let equivalent = shortcut.keyEquivalent {
+            keyboardShortcut(equivalent, modifiers: shortcut.eventModifiers)
+        } else {
+            self
+        }
+    }
+}
+
+extension CommandShortcut {
+    /// The menu key equivalent, or nil when a menu item can't show the key, such as
+    /// keypad keys (a menu can't tell them from the main keys) and Help.
+    var keyEquivalent: KeyEquivalent? {
+        switch keyCode {
+        case 49: return .space
+        case 36: return .return
+        case 48: return .tab
+        case 51: return .delete
+        case 117: return .deleteForward
+        case 53: return .escape
+        case 115: return .home
+        case 119: return .end
+        case 116: return .pageUp
+        case 121: return .pageDown
+        case 123: return .leftArrow
+        case 124: return .rightArrow
+        case 125: return .downArrow
+        case 126: return .upArrow
+        default:
+            if let number = functionKeyNumber {
+                return UnicodeScalar(UInt32(NSF1FunctionKey + number - 1)).map { KeyEquivalent(Character($0)) }
+            }
+            // The layout's own character, not the uppercased cap, so “ß” isn't dropped.
+            guard usesPrintableKey, let character = layoutCharacter ?? caps.last?.lowercased(), character.count == 1
+            else { return nil }
+            return KeyEquivalent(Character(character))
+        }
+    }
+
+    var eventModifiers: EventModifiers {
+        var result: EventModifiers = []
+        if modifiers.contains(.command) { result.insert(.command) }
+        if modifiers.contains(.control) { result.insert(.control) }
+        if modifiers.contains(.option) { result.insert(.option) }
+        if modifiers.contains(.shift) { result.insert(.shift) }
+        return result
     }
 }

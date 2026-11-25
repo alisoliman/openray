@@ -5,21 +5,81 @@ import ServiceManagement
 @MainActor
 @Observable
 final class LauncherModel {
-    enum Destination { case search, ai, settings }
+    enum Destination { case search, ai }
+    enum OnboardingStep: Int, CaseIterable { case shortcut, features, keys }
+
     var destination: Destination = .search
     private(set) var section: LauncherSection = .home
     var query = "" { didSet { if query != oldValue { searchChanged() } } }
     var selectedID: String?
-    var clipboardFilter: ClipboardFilter = .all { didSet { if clipboardFilter != oldValue { selectedID = nil } } }
-    var editor: LibraryEditor?
-    var showActions = false
-    var message: String?
+    var clipboardFilter: ClipboardFilter = .all {
+        didSet {
+            guard clipboardFilter != oldValue else { return }
+            selectedID = nil
+            selectionWillChange()
+        }
+    }
+    var fileScope: FileSearchScope = .home {
+        didSet {
+            guard fileScope != oldValue else { return }
+            selectedID = nil
+            selectionWillChange()
+            // A hidden panel searches again in resumeSearch() when it shows.
+            if section == .files, panel?.isVisible == true, destination == .search, argumentLink == nil {
+                files.search(query, showRecent: true, scope: fileScope)
+            }
+            store.update { $0.preferences.fileSearchScope = fileScope }
+        }
+    }
+    var editor: LibraryEditor? { didSet { editorDidChange(from: oldValue) } }
+    private(set) var draft: EditorDraft?
+    /// The quicklink whose search term is being typed, shown as an argument token.
+    private(set) var argumentLink: Quicklink?
+    var showActions = false { didSet { if showActions != oldValue { actionsDidToggle() } } }
+    var showShortcuts = false
+    /// The writing command's attached text, shown in full over the AI view.
+    var showsAttachmentPreview = false
+    var feedback: Feedback? { didSet { scheduleFeedbackExpiry() } }
+    var confirmation: ActionConfirmation?
     var focusRequest = 0
-    private(set) var shortcutError: String?
-    private(set) var commandShortcutErrors: [String: String] = [:]
+    /// Set when a remembered query returns; the field selects it so the next keystroke replaces it.
+    var selectsQueryOnFocus = false
+    private(set) var onboarding: OnboardingStep?
+    var onboardingHotKeyPressed = false
+    /// Bumped on each show to play the appear animation.
+    private(set) var presentation = 0
+    /// False while hidden, so the panel can animate in (0.98 → 1) on show.
+    var isPresented = true
+    /// The panel's current size, reported by the view for hit testing.
+    @ObservationIgnored var panelSize = CGSize(width: OR.Metric.panelWidth, height: OR.Detent.list)
+    /// Why the registered launcher shortcut isn't the saved one, or isn't working.
+    var shortcutError: String?
+    /// Why the last launcher shortcut choice was refused. The saved shortcut still works.
+    var launcherHotKeyRefusal: String?
+    var commandShortcutErrors: [String: String] = [:]
     private(set) var accessibilityAllowed = false
     private(set) var loginEnabled = false
     private(set) var loginNeedsApproval = false
+    /// Why the last Open at Login change failed, shown under the setting.
+    private(set) var loginError: String?
+    private(set) var targetWindowTitle: String?
+    /// The window layouts apply to, when one was chosen from the target chip.
+    /// Otherwise layouts use the focused window of the previous app.
+    var targetWindow: WindowManager.TargetWindow?
+
+    struct ClipboardOptInChoices {
+        var images = true
+        var files = false
+        var days = 7
+        var limit = 100
+    }
+    /// Choices on the clipboard opt-in screen, made before anything is stored.
+    var clipboardOptIn = ClipboardOptInChoices()
+
+    // Action panel state, snapshotted when it opens so ↩ runs what was shown.
+    var actionEntries: [ActionEntry] = []
+    var actionFilter = "" { didSet { actionSelection = 0 } }
+    var actionSelection = 0
 
     let store: LibraryStore
     let applications = ApplicationCatalog()
@@ -28,23 +88,50 @@ final class LauncherModel {
     let windows = WindowManager()
     @ObservationIgnored let clipboard: ClipboardService
     @ObservationIgnored let snippets: SnippetExpander
-    @ObservationIgnored private let hotKey = GlobalHotKey()
+    @ObservationIgnored let hotKey = GlobalHotKey()
     @ObservationIgnored weak var panel: LauncherPanelController?
-    @ObservationIgnored var previousApplication: NSRunningApplication?
-    @ObservationIgnored private var isStarted = false
-    @ObservationIgnored private var isRecordingShortcut = false
-    @ObservationIgnored private var commandBindingEditorCount = 0
+    @ObservationIgnored var previousApplication: NSRunningApplication? {
+        didSet {
+            // A new source app means a new context; a chosen window doesn't carry over.
+            targetWindow = nil
+            if previousApplication != oldValue { previousApplicationName = previousApplication?.localizedName }
+        }
+    }
+    private(set) var previousApplicationName: String?
+    /// Opens Settings at a pane and, optionally, at a command's row.
+    @ObservationIgnored var presentSettings: ((SettingsPane?, String?) -> Void)?
+    @ObservationIgnored var presentHelp: (() -> Void)?
+    @ObservationIgnored var isStarted = false
+    @ObservationIgnored var isRecordingShortcut = false
+    @ObservationIgnored var commandBindingEditorCount = 0
+    @ObservationIgnored private var scopeReturnQuery: String?
+    @ObservationIgnored private var aiReturn: (section: LauncherSection, query: String)?
+    @ObservationIgnored private var lastHiddenAt: Date?
+    @ObservationIgnored private var feedbackTask: Task<Void, Never>?
+    @ObservationIgnored private var browserName: String?
+    /// Stands in for the Accessibility read of the selected text. Tests set it.
+    @ObservationIgnored var selectionReader: (() throws -> String)?
 
     init(store: LibraryStore = LibraryStore(), ai: AIChatModel = AIChatModel(), pasteboard: NSPasteboard = .general) {
         self.store = store
         self.ai = ai
         clipboard = ClipboardService(store: store, pasteboard: pasteboard)
         snippets = SnippetExpander(store: store)
+        fileScope = store.database.preferences.fileSearchScope ?? .home
         store.commandBindingsDidChange = { [weak self] in self?.synchronizeCommandHotKeys() }
     }
 
+    /// Compatibility shim: the last error or notice, as text.
+    var message: String? {
+        get { feedback?.text }
+        set { feedback = newValue.map { .error($0) } }
+    }
+
+    // MARK: - Results
+
     var results: [LauncherItem] {
         guard query.count <= 512 else { return [] }
+        if let link = argumentLink { return argumentItems(for: link) }
         // Aliases are a single global namespace, independent of section, usage,
         // favorites, quicklink arguments and calculator interpretation.
         if let targetID = store.database.aliasTarget(for: query),
@@ -76,64 +163,247 @@ final class LauncherModel {
         items = items.filter { seenIDs.insert($0.id).inserted }
         let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
         if !trimmed.isEmpty {
+            let now = Date.now
+            let favorites = store.database.favoriteIDs
+            let usage = Dictionary(store.database.usage.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
             items = items.compactMap { item -> (LauncherItem, Int)? in
                 if case .quicklink(let link, let argument) = item.action, link.argument(in: trimmed) != nil {
                     return (item, argument.isEmpty ? 1_000 : 1_100)
                 }
                 let titleScore = SearchMatcher.score(trimmed, in: item.title)
-                let keywordScore = SearchMatcher.score(trimmed, in: item.keywords).map { $0 - 80 }
+                // Keywords match by word, prefix or substring only; scattered letters are noise there.
+                let keywordScore = SearchMatcher.score(trimmed, in: item.keywords).flatMap { $0 >= 450 ? $0 - 80 : nil }
                 guard let score = [titleScore, keywordScore].compactMap({ $0 }).max() else { return nil }
                 let appBoost: Int
                 if case .application = item.action { appBoost = 70 } else { appBoost = 0 }
                 let commandBoost = item.isBuiltInCommand && titleScore == 1_000 ? 200 : 0
-                return (item, score + appBoost + commandBoost + (store.database.favoriteIDs.contains(item.id) ? 15 : 0))
+                let favoriteBoost = favorites.contains(item.id) ? 15 : 0
+                // Frequent and recent use breaks near-ties (at most 55), never an exact match.
+                let usageBoost =
+                    usage[item.id].map { record -> Int in
+                        let age = now.timeIntervalSince(record.lastUsed)
+                        return min(record.count, 10) * 3 + (age < 86_400 ? 25 : age < 604_800 ? 12 : 0)
+                    } ?? 0
+                return (item, score + appBoost + commandBoost + favoriteBoost + usageBoost)
             }.sorted {
                 if $0.1 != $1.1 { return $0.1 > $1.1 }
                 let comparison = $0.0.title.localizedStandardCompare($1.0.title)
                 return comparison == .orderedSame ? $0.0.id < $1.0.id : comparison == .orderedAscending
             }.map(\.0)
-        } else if section == .home {
-            let usage = Dictionary(uniqueKeysWithValues: store.database.usage.map { ($0.id, $0.lastUsed) })
-            items.sort { lhs, rhs in
-                let leftFavorite = store.database.favoriteIDs.contains(lhs.id)
-                let rightFavorite = store.database.favoriteIDs.contains(rhs.id)
-                if leftFavorite != rightFavorite { return leftFavorite }
-                let leftDate = usage[lhs.id] ?? .distantPast
-                let rightDate = usage[rhs.id] ?? .distantPast
-                if leftDate != rightDate { return leftDate > rightDate }
-                // Keep the curated command order ahead of the installed app catalog.
-                return false
-            }
-            items = Array(items.prefix(14))
         }
         if section == .home || section == .calculator, let calculation = Calculator.evaluate(trimmed) {
             items.insert(
                 LauncherItem(
-                    id: "calculation", title: calculation.result,
-                    subtitle: calculation.expression, symbol: "equal", tint: .green,
-                    badge: "Calculator", action: .calculation(calculation)), at: 0)
+                    id: "calculation", title: calculation.result, subtitle: calculation.expression,
+                    symbol: "equal", kind: .calculator, badge: "Calculator", action: .calculation(calculation)),
+                at: 0)
         }
-        return Array(items.prefix(section == .home ? 45 : 100))
+        let shown = Self.capped(items, in: section)
+        return trimmed.isEmpty ? shown : shown.map { Self.explainingMatch($0, query: trimmed) }
+    }
+
+    /// Home keeps up to 45 instant rows and 20 Spotlight rows, capped separately
+    /// so a flood of late files can never push out the Top Hit. Scopes show 100.
+    nonisolated static func capped(_ items: [LauncherItem], in section: LauncherSection) -> [LauncherItem] {
+        guard section == .home else { return Array(items.prefix(100)) }
+        let instant = items.filter { !$0.isLiveResult }.prefix(45)
+        let live = items.filter(\.isLiveResult).prefix(20)
+        return Array(instant) + Array(live)
+    }
+
+    /// True when the query is empty or only whitespace.
+    var isQueryBlank: Bool { query.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
+
+    /// Bar mode shows only the field while Home is idle. Anything that needs to
+    /// be seen, such as a toast, an error or a delete prompt, expands it.
+    var isCollapsedToBar: Bool {
+        store.database.preferences.usesBarMode && destination == .search && editor == nil && onboarding == nil
+            && section == .home && isQueryBlank && argumentLink == nil && !showActions && feedback == nil
+            && confirmation == nil && store.errorMessage == nil && shortcutError == nil
     }
 
     var groups: [LauncherResultGroup] {
-        let items = results
-        guard query.isEmpty, section == .home else {
-            return [LauncherResultGroup(title: query.isEmpty ? section.title : "Results", items: items)]
+        if let link = argumentLink {
+            let items = argumentItems(for: link)
+            return [
+                LauncherResultGroup(id: "argument", title: nil, items: Array(items.prefix(1))),
+                LauncherResultGroup(id: "elsewhere", title: "Same search elsewhere", items: Array(items.dropFirst())),
+            ].filter { !$0.items.isEmpty }
         }
-        let favorites = items.filter { store.database.favoriteIDs.contains($0.id) }
-        let recentIDs = Set(store.database.usage.map(\.id))
-        let recent = items.filter { !store.database.favoriteIDs.contains($0.id) && recentIDs.contains($0.id) }
-        let suggestions = items.filter { !store.database.favoriteIDs.contains($0.id) && !recentIDs.contains($0.id) }
-        return [
-            LauncherResultGroup(title: "Favorites", items: favorites),
-            LauncherResultGroup(title: "Recently Used", items: recent),
-            LauncherResultGroup(title: "Suggestions", items: suggestions),
-        ].filter { !$0.items.isEmpty }
+        // An empty Home shows favorites and recents, so it never computes results.
+        switch section {
+        case .home where isQueryBlank: return homeGroups
+        case .home: return searchGroups(results)
+        case .clipboard: return clipboardGroups(results)
+        case .windows: return [LauncherResultGroup(id: "windows", title: nil, style: .grid, items: results)]
+        case .calculator:
+            let items = results
+            return items.isEmpty ? [] : [LauncherResultGroup(id: "calculator", title: nil, style: .calculator, items: items)]
+        case .files:
+            return [
+                LauncherResultGroup(
+                    id: "files", title: isQueryBlank ? "Recent in \(fileScope.title)" : nil, items: results)
+            ].filter { !$0.items.isEmpty }
+        default:
+            return [LauncherResultGroup(id: section.rawValue, title: nil, items: results)].filter { !$0.items.isEmpty }
+        }
     }
 
     var orderedResults: [LauncherItem] { groups.flatMap(\.items) }
-    var selectedItem: LauncherItem? { orderedResults.first(where: { $0.id == selectedID }) ?? orderedResults.first }
+    var selectedItem: LauncherItem? {
+        let ordered = orderedResults
+        return ordered.first { $0.id == selectedID } ?? ordered.first
+    }
+
+    /// Up to sixteen favorites (⌘1–⌘8 open the first eight) and four recents.
+    var favoriteItems: [LauncherItem] {
+        let index = Dictionary(
+            (commandItems + applicationItems + quicklinkItems + snippetItems + noteItems + savedFileItems
+                + clipboardItems).map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
+        return store.database.orderedFavoriteIDs.compactMap { index[$0] }.prefix(16).map { $0 }
+    }
+
+    private var homeGroups: [LauncherResultGroup] {
+        let favorites = favoriteItems
+        let favoriteIDs = Set(favorites.map(\.id))
+        let index = Dictionary(
+            (commandItems + applicationItems + quicklinkItems + snippetItems + noteItems + savedFileItems).map {
+                ($0.id, $0)
+            }, uniquingKeysWith: { first, _ in first })
+        // Clipboard entries stay out of Everything unless they are favorites.
+        let recent = store.database.usage.sorted { $0.lastUsed > $1.lastUsed }
+            .filter { !favoriteIDs.contains($0.id) && !$0.id.hasPrefix("clipboard.") }
+            .compactMap { index[$0.id] }.prefix(4)
+        return [
+            LauncherResultGroup(
+                id: "favorites", title: "Favorites", trailing: favorites.count > 1 ? "⌘1 – ⌘\(min(8, favorites.count))" : nil,
+                style: .favorites, items: favorites),
+            LauncherResultGroup(id: "recent", title: "Recent", items: Array(recent)),
+        ].filter { !$0.items.isEmpty }
+    }
+
+    /// Top Hit comes from instant sources only, so late Spotlight results never
+    /// move the selection. Groups have a fixed order and fallbacks come last.
+    private func searchGroups(_ items: [LauncherItem]) -> [LauncherResultGroup] {
+        var groups: [LauncherResultGroup] = []
+        var instant = items.filter { !$0.isLiveResult }
+        if let calculation = instant.first(where: { $0.id == "calculation" }) {
+            groups.append(LauncherResultGroup(id: "calculator", title: "Calculator", style: .calculator, items: [calculation]))
+            instant.removeAll { $0.id == "calculation" }
+        } else if let top = instant.first {
+            groups.append(LauncherResultGroup(id: "top", title: "Top Hit", items: [top]))
+            instant.removeFirst()
+        }
+        func isCommand(_ item: LauncherItem) -> Bool { item.isBuiltInCommand }
+        func isApp(_ item: LauncherItem) -> Bool { if case .application = item.action { true } else { false } }
+        groups.append(LauncherResultGroup(id: "commands", title: "Commands", items: instant.filter(isCommand)))
+        groups.append(LauncherResultGroup(id: "apps", title: "Applications", items: instant.filter(isApp)))
+        groups.append(
+            LauncherResultGroup(
+                id: "library", title: "Library", items: instant.filter { !isCommand($0) && !isApp($0) }))
+        let live = items.filter(\.isLiveResult)
+        let searching = files.isSearching && query.count >= 2
+        // Files appears with its first rows. Until then the field's spinner and the bar's
+        // “Searching…” show progress, and an empty header can't vanish and shift the rows below.
+        if !live.isEmpty {
+            groups.append(
+                LauncherResultGroup(
+                    id: "files", title: "Files", trailing: searching ? "Searching \(FileSearchScope.home.title.lowercased()) folder" : nil,
+                    isLoading: searching, items: live))
+        }
+        groups.append(
+            LauncherResultGroup(
+                id: "fallbacks", title: "Use “\(query.trimmingCharacters(in: .whitespaces).truncatedForFeedback)” with…",
+                style: .fallback, items: fallbackItems))
+        return groups.filter { !$0.items.isEmpty || $0.isLoading }
+    }
+
+    private var fallbackItems: [LauncherItem] {
+        let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return [] }
+        var items = [
+            LauncherItem(
+                id: "fallback.ai", title: "Ask AI", subtitle: ai.availability.isAvailable ? "" : "Not available yet",
+                symbol: "sparkles", kind: .ai, badge: "Ask AI", action: .askAI(trimmed))
+        ]
+        if let web = webSearchLink {
+            items.append(
+                LauncherItem(
+                    id: "fallback.web", title: web.name, subtitle: Self.siteName(for: web),
+                    symbol: "globe", kind: .quicklink, badge: "Quicklink", action: .quicklink(web, trimmed)))
+        }
+        return items
+    }
+
+    private var webSearchLink: Quicklink? {
+        let links = store.database.quicklinks.filter(\.needsQuery)
+        return links.first { $0.keyword.lowercased() == "web" } ?? links.first
+    }
+
+    private func clipboardGroups(_ items: [LauncherItem]) -> [LauncherResultGroup] {
+        func entry(_ item: LauncherItem) -> ClipboardEntry? {
+            if case .clipboard(let entry) = item.action { entry } else { nil }
+        }
+        var groups: [LauncherResultGroup] = []
+        let pinned = items.filter { entry($0)?.isPinned == true }
+        if !pinned.isEmpty { groups.append(LauncherResultGroup(id: "pinned", title: "Pinned", items: pinned)) }
+        let rest = items.filter { entry($0)?.isPinned != true }
+        guard !rest.isEmpty else { return groups }
+        // Search results keep their score order, so the best match stays first and selected.
+        guard isQueryBlank else {
+            groups.append(LauncherResultGroup(id: "clipboard.results", title: nil, items: rest))
+            return groups
+        }
+        // History is newest first: one group per day, so headers never repeat.
+        let calendar = Calendar.current
+        var days: [Date] = []
+        var itemsByDay: [Date: [LauncherItem]] = [:]
+        for item in rest {
+            let day = calendar.startOfDay(for: entry(item)?.copiedAt ?? .now)
+            if itemsByDay[day] == nil { days.append(day) }
+            itemsByDay[day, default: []].append(item)
+        }
+        for day in days {
+            groups.append(
+                LauncherResultGroup(
+                    id: "day.\(day.timeIntervalSinceReferenceDate)", title: Self.dayTitle(for: day, calendar: calendar),
+                    items: itemsByDay[day] ?? []))
+        }
+        return groups
+    }
+
+    nonisolated static func dayTitle(for date: Date, now: Date = .now, calendar: Calendar = .current) -> String {
+        if calendar.isDate(date, inSameDayAs: now) { return "Today" }
+        if let yesterday = calendar.date(byAdding: .day, value: -1, to: now), calendar.isDate(date, inSameDayAs: yesterday) {
+            return "Yesterday"
+        }
+        if let week = calendar.date(byAdding: .day, value: -6, to: calendar.startOfDay(for: now)), date >= week {
+            return date.formatted(.dateTime.weekday(.wide))
+        }
+        return date.formatted(.dateTime.day().month(.wide))
+    }
+
+    private func argumentItems(for link: Quicklink) -> [LauncherItem] {
+        let term = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        let site = Self.siteName(for: link)
+        let resolved = (try? link.resolvedURL(query: term.isEmpty ? "…" : term))?.absoluteString ?? link.template
+        let primary = LauncherItem(
+            id: "argument.\(link.id)",
+            title: term.isEmpty ? "Search \(site)" : "Search \(site) for “\(term)”",
+            // Percent-escapes stay visible, so you can see how the term is encoded.
+            subtitle: term.isEmpty ? "Type what to search for" : Self.displayURL(resolved, decoding: false),
+            symbol: "globe", kind: .quicklink, badge: defaultBrowserName, action: .quicklink(link, term))
+        let others = store.database.quicklinks.filter { $0.needsQuery && $0.id != link.id }.map { other in
+            LauncherItem(
+                id: "argument.\(other.id)", title: other.name,
+                subtitle: Self.displayURL(other.template.replacingOccurrences(of: "{query}", with: "…")),
+                symbol: "link", kind: .quicklink, badge: "Quicklink", keywords: other.keyword,
+                action: .quicklink(other, term))
+        }
+        return [primary] + others
+    }
+
+    // MARK: - Lifecycle
 
     func start() async {
         guard !isStarted else { return }
@@ -161,133 +431,41 @@ final class LauncherModel {
         refreshPermissions()
     }
 
-    var bindableCommands: [LauncherItem] {
-        let commands = commandItems
-        return CuratedCommand.targetIDs.compactMap { id in commands.first { $0.id == id } }
+    /// Called just before the panel appears.
+    func panelWillShow() {
+        presentation += 1
+        let remembered =
+            store.database.preferences.remembersLastQuery
+            && (lastHiddenAt.map { Date().timeIntervalSince($0) <= OR.Timing.rememberQuery } ?? true)
+        if !remembered, draft?.isDirty != true, onboarding == nil {
+            resetToHome()
+        } else if !query.isEmpty {
+            selectsQueryOnFocus = true
+        }
+        if section == .windows { refreshTargetWindow() }
     }
 
-    func commandBinding(for targetID: String) -> CommandBinding {
-        store.database.binding(for: targetID) ?? CommandBinding(targetID: targetID)
+    func panelDidHide() {
+        lastHiddenAt = .now
+        showActions = false
+        showShortcuts = false
+        showsAttachmentPreview = false
+        confirmation = nil
+        // The editor stays open while hidden, so an emptied note is kept until it closes.
+        if draft?.isNote == true { draft?.saveNote() }
     }
 
-    func bindingWarnings(for binding: CommandBinding) -> [String] {
-        guard let shortcut = binding.shortcut else { return [] }
-        var warnings = CommandShortcutPolicy.conflictWarnings(for: shortcut)
-        if shortcut == store.database.preferences.hotKey.shortcut {
-            warnings.append(
-                "This shortcut opens the launcher. The command binding will stay inactive while the launcher uses it.")
-        }
-        for other in store.database.commandBindings
-        where other.targetID != binding.targetID && other.shortcut == shortcut {
-            let title = bindableCommands.first { $0.id == other.targetID }?.title ?? other.targetID
-            warnings.append(
-                "This shortcut is also assigned to \(title). Only the first saved assignment can be active; remove the other shortcut to use it here."
-            )
-        }
-        return warnings
-    }
-
-    @discardableResult
-    func saveCommandBinding(_ binding: CommandBinding, allowConflicts: Bool = false) -> Bool {
-        do {
-            try validateCommandBinding(binding)
-            let warnings = bindingWarnings(for: binding)
-            guard allowConflicts || warnings.isEmpty else {
-                message = warnings.joined(separator: " ") + " Choose Save Anyway to keep this assignment."
-                return false
-            }
-            guard store.saveCommandBinding(binding) else {
-                message = store.errorMessage
-                return false
-            }
-            message = commandShortcutErrors[binding.targetID] ?? "Command binding saved."
-            synchronizeSelection()
-            return true
-        } catch {
-            message = error.localizedDescription
-            return false
-        }
-    }
-
-    func validateCommandBinding(_ binding: CommandBinding) throws {
-        try binding.validate()
-        if let shortcut = binding.shortcut {
-            try CommandShortcutPolicy.validate(
-                shortcut: shortcut, reservedShortcuts: CommandShortcutPolicy.systemReservedShortcuts())
-        }
-        var candidate = store.database
-        candidate.commandBindings.removeAll { $0.targetID == binding.targetID }
-        if !binding.isEmpty { candidate.commandBindings.append(binding) }
-        try candidate.validate()
-    }
-
-    @discardableResult
-    func removeCommandBinding(for targetID: String) -> Bool {
-        guard store.removeCommandBinding(for: targetID) else {
-            message = store.errorMessage
-            return false
-        }
-        message = "Command binding removed."
+    private func resetToHome() {
+        if editor != nil { editor = nil }
+        destination = .search
+        argumentLink = nil
+        section = .home
+        scopeReturnQuery = nil
+        aiReturn = nil
+        if !query.isEmpty { query = "" }
+        feedback = nil
+        selectedID = nil
         synchronizeSelection()
-        return true
-    }
-
-    func beginShortcutRecording() {
-        guard !isRecordingShortcut else { return }
-        isRecordingShortcut = true
-        hotKey.unregister()
-    }
-
-    func beginCommandBindingEditing() { commandBindingEditorCount += 1 }
-
-    func endCommandBindingEditing() { commandBindingEditorCount = max(0, commandBindingEditorCount - 1) }
-
-    func endShortcutRecording() {
-        guard isRecordingShortcut else { return }
-        isRecordingShortcut = false
-        synchronizeCommandHotKeys()
-    }
-
-    private func synchronizeCommandHotKeys() {
-        guard isStarted, !isRecordingShortcut else { return }
-        guard clipboard.usesGeneralPasteboard else {
-            hotKey.unregister()
-            shortcutError = nil
-            commandShortcutErrors = [:]
-            return
-        }
-        let issues = hotKey.synchronize(
-            launcher: store.database.preferences.hotKey, bindings: store.database.commandBindings,
-            onLauncher: { [weak self] in self?.panel?.toggle() },
-            onCommand: { [weak self] in self?.performBoundCommand(targetID: $0) })
-        shortcutError = issues.first { $0.targetID == GlobalHotKey.launcherTargetID }?.message
-        commandShortcutErrors = Dictionary(
-            issues.filter { $0.targetID != GlobalHotKey.launcherTargetID }.map { ($0.targetID, $0.message) },
-            uniquingKeysWith: { first, second in first + " " + second })
-    }
-
-    /// Global invocations use the same dispatch as selected search results.
-    /// Resolve again at delivery so a removed or disallowed target cannot run.
-    func performBoundCommand(targetID: String) {
-        guard !isRecordingShortcut, commandBindingEditorCount == 0,
-            store.database.binding(for: targetID)?.shortcut != nil,
-            let command = bindableCommands.first(where: { $0.id == targetID })
-        else { return }
-        guard editor == nil else {
-            message = "Save or cancel the current editor before using a command shortcut."
-            panel?.show()
-            return
-        }
-        let front = NSWorkspace.shared.frontmostApplication
-        if let front, front.processIdentifier != ProcessInfo.processInfo.processIdentifier {
-            previousApplication = front
-        }
-        perform(command)
-        if case .window = command.action {
-            if message != nil { panel?.show() }
-        } else {
-            panel?.show()
-        }
     }
 
     func refreshPermissions() {
@@ -300,51 +478,191 @@ final class LauncherModel {
         if isStarted && clipboard.usesGeneralPasteboard { snippets.configure() }
     }
 
+    /// Refreshes the real state either way, so the toggle never shows a change that didn't happen.
     func setLaunchAtLogin(_ enabled: Bool) {
+        defer { refreshPermissions() }
         guard clipboard.usesGeneralPasteboard else {
-            message = "Launch at login is disabled for the isolated verification instance."
+            let message = "Open at login is off for the isolated verification instance."
+            loginError = message
+            feedback = .info(message)
             return
         }
         do {
             if enabled { try SMAppService.mainApp.register() } else { try SMAppService.mainApp.unregister() }
-            refreshPermissions()
-        } catch { message = "Launch at login could not be changed: \(error.localizedDescription)" }
+            loginError = nil
+        } catch {
+            let message = "Open at login couldn't be changed. \(error.localizedDescription)"
+            loginError = message
+            feedback = .error(message)
+        }
     }
 
+    func refreshTargetWindow() {
+        targetWindowTitle = targetWindow?.title ?? windows.focusedWindowTitle(of: previousApplication)
+    }
+
+    /// Layouts apply to this window until the source app changes.
+    func selectTargetWindow(_ window: WindowManager.TargetWindow) {
+        // Set the app first: changing it clears any earlier choice.
+        previousApplication = NSRunningApplication(processIdentifier: window.pid)
+        targetWindow = window
+        targetWindowTitle = window.title
+    }
+
+    // MARK: - Navigation
+
     func navigate(to section: LauncherSection) {
+        if section != .home, self.section == .home, destination == .search, argumentLink == nil {
+            scopeReturnQuery = query
+        }
+        if section == .home { scopeReturnQuery = nil }
         destination = .search
+        argumentLink = nil
         self.section = section
         query = ""
         searchChanged()
-        message = nil
+        feedback = nil
         showActions = false
+        confirmation = nil
+        if section == .windows { refreshTargetWindow() }
         synchronizeSelection()
         focusRequest += 1
     }
 
-    func openAI(_ action: AIAction = .chat) {
-        let switchingWhileBusy = ai.isGenerating && ai.action != action
-        ai.open(action)
-        destination = .ai
-        files.stop()
-        message =
-            switchingWhileBusy
-            ? "Stop the current response or wait for it to finish before switching AI commands." : nil
-        showActions = false
+    /// Leaves the current scope and restores the query from before it.
+    func leaveScope() {
+        let restored = scopeReturnQuery ?? ""
+        scopeReturnQuery = nil
+        destination = .search
+        argumentLink = nil
+        section = .home
+        query = restored
+        searchChanged()
+        feedback = nil
+        confirmation = nil
+        synchronizeSelection()
+        focusRequest += 1
     }
 
-    func openSettings() {
-        destination = .settings
+    /// Writing commands always run fresh on the current selection. A query or
+    /// attachment starts a new chat, unless it is the question that started the
+    /// chat on screen; opening AI with neither resumes the chat as it was.
+    func openAI(_ action: AIAction = .chat, prompt: String? = nil, attachment: AIAttachment? = nil) {
+        let switchingWhileBusy = ai.isGenerating && ai.action != action
+        if destination == .search { aiReturn = (section, query) }
+        var sendPrompt = true
+        // Reset before open(_:), so the engine is prepared for the new run.
+        if !ai.isGenerating {
+            if action != .chat, attachment == nil {
+                ai.newConversation(action: action)
+            } else if action == .chat, prompt?.isEmpty == false || attachment != nil {
+                // Esc puts back the query that opened AI, which is the chat's first question.
+                let firstQuestion =
+                    ai.action == .chat ? ai.messages.first { $0.role == .user }.map { $0.displayText ?? $0.text } : nil
+                if attachment == nil, firstQuestion == prompt, ai.messages.contains(where: { $0.role == .assistant }) {
+                    // Esc then Tab on the same query returns to its chat, follow-ups included.
+                    sendPrompt = false
+                } else {
+                    ai.newConversation(action: .chat)
+                }
+            }
+        }
+        ai.open(action)
+        destination = .ai
+        argumentLink = nil
+        files.stop()
+        showActions = false
+        confirmation = nil
+        feedback =
+            switchingWhileBusy
+            ? .warning("Stop the current response or wait for it to finish before switching AI commands.") : nil
+        guard !switchingWhileBusy else { return }
+        if let attachment {
+            ai.attach(attachment)
+        } else if action != .chat, ai.attachments.isEmpty, ai.messages.isEmpty {
+            attachSelectionFromPreviousApp()
+        }
+        if sendPrompt, let prompt, !prompt.isEmpty, action == .chat {
+            // Without AI the question waits in the composer; it is never sent on its own later.
+            ai.draft = prompt
+            if ai.availability.isAvailable { ai.send() }
+        }
+        focusRequest += 1
+    }
+
+    /// Writing commands pick up the selected text from the app you came from.
+    func attachSelectionFromPreviousApp(reportErrors: Bool = false) {
+        guard clipboard.usesGeneralPasteboard || reportErrors || selectionReader != nil else { return }
+        do {
+            let text = try selectionReader?() ?? windows.selectedText(in: previousApplication)
+            ai.attach(AIAttachment(source: .selection, text: text, appName: previousApplicationName))
+        } catch {
+            if reportErrors { feedback = .error(error.localizedDescription) }
+        }
+    }
+
+    func attachClipboardToAI() {
+        if let text = clipboard.readText(), !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            ai.attach(AIAttachment(source: .clipboard, text: text))
+        } else {
+            feedback = .info("There's no text on the clipboard.")
+        }
+        focusRequest += 1
+    }
+
+    func leaveAI() {
+        let destinationReturn = aiReturn
+        aiReturn = nil
+        showsAttachmentPreview = false
+        destination = .search
+        feedback = nil
+        if let destinationReturn {
+            section = destinationReturn.section
+            query = destinationReturn.query
+        } else {
+            section = .home
+            query = ""
+        }
+        searchChanged()
+        synchronizeSelection()
+        requestFocus()
+    }
+
+    /// Opens Settings at a pane, scrolled to a command's row when one is given.
+    func openSettings(_ pane: SettingsPane? = nil, focusing commandID: String? = nil) {
         files.stop()
         showActions = false
         refreshPermissions()
+        panel?.dismiss(restoreFocus: false)
+        presentSettings?(pane, commandID)
     }
 
+    func openHelp() {
+        panel?.dismiss(restoreFocus: false)
+        presentHelp?()
+    }
+
+    /// Esc closes exactly one layer: confirmation, overlays, actions, editor,
+    /// AI, argument, scope, then the query. On an empty home it hides the panel.
     func goBack() {
-        if showActions {
+        if confirmation != nil {
+            confirmation = nil
+        } else if showShortcuts {
+            showShortcuts = false
+        } else if showActions {
             showActions = false
-        } else if destination != .search || section != .home {
-            navigate(to: .home)
+        } else if showsAttachmentPreview {
+            showsAttachmentPreview = false
+        } else if editor != nil {
+            closeEditor()
+        } else if onboarding != nil {
+            finishOnboarding()
+        } else if destination == .ai {
+            leaveAI()
+        } else if argumentLink != nil {
+            clearArgument(restoreKeyword: false)
+        } else if section != .home {
+            leaveScope()
         } else if !query.isEmpty {
             query = ""
         } else {
@@ -352,9 +670,101 @@ final class LauncherModel {
         }
     }
 
+    /// ⌫ on an empty field removes the token: first the argument, then the scope.
+    func deleteBackwardOnEmptyField() -> Bool {
+        if argumentLink != nil {
+            clearArgument(restoreKeyword: true)
+            return true
+        }
+        if destination == .ai, ai.draft.isEmpty {
+            leaveAI()
+            return true
+        }
+        if section != .home, destination == .search {
+            leaveScope()
+            return true
+        }
+        return false
+    }
+
+    /// Tab steps into a selected scope, starts a quicklink argument, or asks AI.
+    /// A query asks AI from any scope, and Esc returns to that scope with it.
+    func handleTab() {
+        guard confirmation == nil, !showActions else { return }
+        let item = selectedItem
+        switch item?.action {
+        case .section(let target)? where section == .home && !query.isEmpty:
+            store.recordUse(of: item!.id)
+            navigate(to: target)
+        case .quicklink(let link, let argument)? where link.needsQuery && argument.isEmpty && argumentLink == nil:
+            beginArgument(link)
+        case .clipboard(let entry)?:
+            if let text = entry.plainText {
+                openAI(.chat, attachment: AIAttachment(source: .clipboard, text: text, appName: entry.sourceName))
+            }
+        default:
+            guard argumentLink == nil else { return }
+            let prompt = query.trimmingCharacters(in: .whitespacesAndNewlines)
+            if section == .home || !prompt.isEmpty { openAI(.chat, prompt: prompt) }
+        }
+    }
+
+    func beginArgument(_ link: Quicklink) {
+        if section == .home, destination == .search { scopeReturnQuery = nil }
+        argumentLink = link
+        query = ""
+        selectedID = "argument.\(link.id)"
+        focusRequest += 1
+    }
+
+    func clearArgument(restoreKeyword: Bool) {
+        guard let link = argumentLink else { return }
+        argumentLink = nil
+        query = restoreKeyword ? link.keyword : ""
+        searchChanged()
+        synchronizeSelection()
+        focusRequest += 1
+    }
+
+    // MARK: - Onboarding
+
+    func beginOnboardingIfNeeded() {
+        // A read-only library holds placeholder defaults, not a new user's.
+        guard store.database.preferences.needsFirstRun, !store.isReadOnly, onboarding == nil else { return }
+        let inMemory = store.fileURL == nil
+        guard !inMemory || ProcessInfo.processInfo.arguments.contains("--first-run") else { return }
+        onboarding = .shortcut
+        onboardingHotKeyPressed = false
+    }
+
+    func advanceOnboarding() {
+        guard let step = onboarding else { return }
+        launcherHotKeyRefusal = nil
+        if let next = OnboardingStep(rawValue: step.rawValue + 1) {
+            onboarding = next
+        } else {
+            finishOnboarding()
+        }
+    }
+
+    func onboardingBack() {
+        guard let step = onboarding, let previous = OnboardingStep(rawValue: step.rawValue - 1) else { return }
+        onboarding = previous
+    }
+
+    func finishOnboarding() {
+        onboarding = nil
+        launcherHotKeyRefusal = nil
+        store.update { $0.preferences.firstRunCompleted = true }
+        resetToHome()
+        focusRequest += 1
+    }
+
+    // MARK: - Selection
+
     func resumeSearch() {
-        if destination == .search, section == .home || section == .files {
-            files.search(query, showRecent: section == .files)
+        if destination == .search, argumentLink == nil, section == .home || section == .files {
+            files.search(query, showRecent: section == .files, scope: section == .files ? fileScope : .home)
         }
     }
 
@@ -363,150 +773,235 @@ final class LauncherModel {
         if !items.contains(where: { $0.id == selectedID }) { selectedID = items.first?.id }
     }
 
+    /// Vertical movement. Grids move by row; lists move by one and wrap.
     func moveSelection(_ offset: Int) {
         guard !showActions else { return }
-        let items = orderedResults
+        let groups = groups
+        let items = groups.flatMap(\.items)
         guard !items.isEmpty else { return }
+        selectionWillChange()
         let index = items.firstIndex(where: { $0.id == selectedID }) ?? 0
+        defer {
+            if selectedID != items[index].id { announceSelection(items.first { $0.id == selectedID }) }
+        }
+        var start = 0
+        for group in groups {
+            let range = start..<(start + group.items.count)
+            start += group.items.count
+            guard range.contains(index), let columns = Self.columns(for: group.style) else { continue }
+            let target = index + offset * columns
+            if range.contains(target) {
+                selectedID = items[target].id
+            } else if offset > 0, (index - range.lowerBound) / columns < (range.count - 1) / columns {
+                // ↓ above a partial last row lands on its last tile rather than skipping it.
+                selectedID = items[range.upperBound - 1].id
+            } else {
+                // Leaving a grid lands on the nearest row outside it.
+                let outside = offset > 0 ? range.upperBound : range.lowerBound - 1
+                selectedID = items[(outside + items.count) % items.count].id
+            }
+            return
+        }
         selectedID = items[(index + offset + items.count) % items.count].id
     }
 
-    func performSelected() {
-        guard !showActions else { return }
-        if let selectedItem { perform(selectedItem) }
+    /// Horizontal movement inside grids. Returns false when the selection is in a list.
+    @discardableResult
+    func moveSelectionHorizontally(_ offset: Int) -> Bool {
+        guard !showActions else { return false }
+        let groups = groups
+        let items = groups.flatMap(\.items)
+        let index = items.firstIndex(where: { $0.id == selectedID }) ?? 0
+        var start = 0
+        for group in groups {
+            let range = start..<(start + group.items.count)
+            start += group.items.count
+            guard range.contains(index), Self.columns(for: group.style) != nil else { continue }
+            let target = index + offset
+            if range.contains(target), target != index {
+                selectionWillChange()
+                selectedID = items[target].id
+                announceSelection(items[target])
+            }
+            return true
+        }
+        return false
     }
 
-    func perform(_ item: LauncherItem) {
+    /// Moving the selection by hand drops a pending confirmation and a stale error.
+    /// Programmatic selection (search, delete, ⌘-numbers) keeps its feedback.
+    private func selectionWillChange() {
+        confirmation = nil
+        if feedback?.style == .error || feedback?.style == .warning { feedback = nil }
+    }
+
+    /// Speaks the row the arrow keys moved to. Query changes reset the selection
+    /// on every keystroke, so they deliberately don't announce.
+    private func announceSelection(_ item: LauncherItem?) {
+        guard let item, NSWorkspace.shared.isVoiceOverEnabled else { return }
+        announceForVoiceOver(
+            [item.accessibilityDescription, item.subtitle, primaryTitle(for: item)].filter { !$0.isEmpty }
+                .joined(separator: ". "))
+    }
+
+    /// Posts a VoiceOver announcement without moving focus. Medium priority
+    /// keeps toasts, which are announced at high priority, in front.
+    func announceForVoiceOver(_ text: String) {
+        guard NSWorkspace.shared.isVoiceOverEnabled, !text.isEmpty else { return }
+        NSAccessibility.post(
+            element: NSApp as Any, notification: .announcementRequested,
+            userInfo: [.announcement: text, .priority: NSAccessibilityPriorityLevel.medium.rawValue])
+    }
+
+    /// Whether ← and → should move the selection rather than the caret.
+    var arrowsMoveSelection: Bool {
+        guard destination == .search, argumentLink == nil, !showActions else { return false }
+        if section == .windows { return true }
+        return section == .home && isQueryBlank
+    }
+
+    nonisolated static func columns(for style: LauncherResultGroup.Style) -> Int? {
+        switch style {
+        case .favorites: 8
+        case .grid: 4
+        default: nil
+        }
+    }
+
+    // MARK: - Query
+
+    private func searchChanged() {
+        selectedID = nil
+        if feedback?.style != .working { feedback = nil }
+        confirmation = nil
+        guard query.count <= 512 else {
+            files.stop()
+            feedback = .warning("Keep searches under 512 characters. For a longer passage, press Tab to ask AI.")
+            return
+        }
+        // Typing a quicklink keyword and a space turns it into an argument token.
+        if section == .home, destination == .search, argumentLink == nil,
+            let (link, argument) = quicklinkArgument(in: query)
+        {
+            argumentLink = link
+            query = argument
+            return
+        }
+        if argumentLink == nil, section == .home || section == .files {
+            files.search(query, showRecent: section == .files, scope: section == .files ? fileScope : .home)
+        } else {
+            files.stop()
+        }
+    }
+
+    private func quicklinkArgument(in input: String) -> (Quicklink, String)? {
+        for link in store.database.quicklinks where link.needsQuery && !link.keyword.isEmpty {
+            let prefix = link.keyword + " "
+            guard input.count > prefix.count - 1, input.lowercased().hasPrefix(prefix.lowercased()) else { continue }
+            let argument = String(input.dropFirst(prefix.count)).replacingOccurrences(
+                of: "^\\s+", with: "", options: .regularExpression)
+            return (link, argument)
+        }
+        return nil
+    }
+
+    // MARK: - Feedback
+
+    private func scheduleFeedbackExpiry() {
+        feedbackTask?.cancel()
+        guard let feedback, feedback.expires else { return }
+        let id = feedback.id
+        feedbackTask = Task { [weak self] in
+            do { try await Task.sleep(for: OR.Timing.toast) } catch { return }
+            guard let self, self.feedback?.id == id else { return }
+            self.feedback = nil
+        }
+    }
+
+    func toast(_ text: String) { feedback = .success(text) }
+
+    /// Returns the keyboard to the field. Requested again on the next run loop,
+    /// because a closing layer can take the shared field editor with it.
+    func requestFocus() {
+        focusRequest += 1
+        DispatchQueue.main.async { [weak self] in self?.focusRequest += 1 }
+    }
+
+    // MARK: - Editors
+
+    private func editorDidChange(from old: LibraryEditor?) {
+        guard editor?.id != old?.id || (editor == nil) != (old == nil) else { return }
+        if old != nil, draft?.isNote == true { draft?.finishNote() }
+        draft = editor.map { EditorDraft(editor: $0, store: store) }
+        // Editing again withdraws “Discard changes?”, so a later ↩ can't discard the new edits.
+        draft?.onEdit = { [weak self] in
+            if case .discardChanges? = self?.confirmation { self?.confirmation = nil }
+        }
+        confirmation = nil
         showActions = false
-        message = nil
-        switch item.action {
-        case .application(let app):
-            Task {
-                do {
-                    _ = try await NSWorkspace.shared.openApplication(
-                        at: app.url, configuration: NSWorkspace.OpenConfiguration())
-                    store.recordUse(of: item.id)
-                    panel?.dismiss(restoreFocus: false)
-                } catch { message = "Could not open \(app.name): \(error.localizedDescription)" }
-            }
-        case .file(let url): open(url, itemID: item.id)
-        case .section(let section):
-            store.recordUse(of: item.id)
-            navigate(to: section)
-        case .ai(let action):
-            store.recordUse(of: item.id)
-            openAI(action)
-        case .settings: openSettings()
-        case .quicklink(let link, let argument):
-            if link.needsQuery && argument.isEmpty {
-                editor = .quicklinkQuery(link, "")
-            } else {
-                openQuicklink(link, query: argument)
-            }
-        case .clipboard(let entry):
-            copy(entry)
-            store.recordUse(of: item.id)
-        case .snippet(let snippet):
-            copy(snippet.expanded())
-            store.recordUse(of: item.id)
-        case .calculation(let calculation): copy(calculation.result)
-        case .note(let note):
-            editor = .note(note)
-            store.recordUse(of: item.id)
-        case .window(let layout):
-            do {
-                try windows.arrange(layout, application: previousApplication)
-                store.recordUse(of: item.id)
-                panel?.dismiss(restoreFocus: false)
-            } catch { message = error.localizedDescription }
-        }
+        if editor == nil { requestFocus() }
     }
 
-    func openQuicklink(_ link: Quicklink, query: String) {
-        do { open(try link.resolvedURL(query: query), itemID: "quicklink.\(link.id)") } catch {
-            message = error.localizedDescription
-        }
-    }
-
-    func copy(_ text: String) {
-        message = clipboard.copy(text) ? "Copied to clipboard" : "Could not write to the clipboard. Try again."
-    }
-
-    func copy(_ entry: ClipboardEntry) {
-        message =
-            clipboard.copy(entry)
-            ? "Copied to clipboard" : (clipboard.contentMessage ?? "Could not write to the clipboard. Try again.")
-    }
-
-    func pasteSelected() {
-        guard let item = selectedItem, item.supportsPaste else { return }
-        if case .clipboard(let entry) = item.action {
-            finishPaste(copied: clipboard.copy(entry))
-        } else if let text = item.copyText {
-            paste(text)
-        }
-    }
-
-    func paste(_ text: String) {
-        finishPaste(copied: clipboard.copy(text))
-    }
-
-    private func finishPaste(copied: Bool) {
-        guard copied else {
-            message = clipboard.contentMessage ?? "Could not copy the content."
+    /// Esc on an editor: notes save as they close; others ask before discarding.
+    /// A note that couldn't be saved asks too, rather than losing the text.
+    func closeEditor(force: Bool = false) {
+        guard let draft else {
+            editor = nil
             return
         }
-        guard clipboard.usesGeneralPasteboard else {
-            message = "Copied to the isolated verification pasteboard. Cross-app paste is disabled in this mode."
+        if draft.isNote {
+            guard draft.finishNote() || force else {
+                confirmation = .discardChanges
+                return
+            }
+            let noteID = editor?.id
+            editor = nil
+            // An emptied note was removed, so there's nothing to select.
+            if section == .notes, let noteID, store.database.notes.contains(where: { "note.\($0.id)" == noteID }) {
+                selectedID = noteID
+            }
             return
         }
-        guard let target = previousApplication, !target.isTerminated, windows.hasPermission else {
-            message = "Copied. Press ⌘V in your app, or enable Accessibility in Settings for direct paste."
+        if draft.isDirty && !force {
+            confirmation = .discardChanges
             return
         }
-        let changeCount = clipboard.changeCount
-        panel?.dismiss(restoreFocus: false)
-        Task {
-            do { try await SyntheticInput.paste(into: target, expectedChangeCount: changeCount) } catch {
-                message = error.localizedDescription
-                panel?.show()
+        editor = nil
+    }
+
+    func saveEditor() {
+        guard let draft else { return }
+        if draft.isNote {
+            if draft.saveNote() { toast("Saved") }
+            return
+        }
+        guard draft.save() else {
+            // The editor moves focus to the field; VoiceOver hears why. Posted directly,
+            // not as feedback, so pressing ⌘S again repeats the same message.
+            if draft.saveError == nil,
+                let message = draft.nameError ?? (draft.isQuicklink ? draft.contentError : nil) ?? draft.keywordError
+                    ?? draft.contentError
+            {
+                announceForVoiceOver(message)
             }
+            return
         }
-    }
-
-    func useSelectionForAI() {
-        do { ai.useText(try windows.selectedText(in: previousApplication)) } catch {
-            message = error.localizedDescription
+        let id = editor?.id
+        let noun = draft.isSnippet ? "snippet" : "quicklink"
+        let name = draft.name.trimmingCharacters(in: .whitespaces)
+        editor = nil
+        if let id {
+            selectedID = id
         }
-    }
-
-    func editSelected() {
-        guard let item = selectedItem else { return }
-        showActions = false
-        switch item.action {
-        case .quicklink(let link, _): editor = .quicklink(link)
-        case .snippet(let snippet): editor = .snippet(snippet)
-        case .note(let note): editor = .note(note)
-        default: break
-        }
-    }
-
-    func delete(_ item: LauncherItem) {
-        store.update { database in
-            switch item.action {
-            case .quicklink(let link, _): database.quicklinks.removeAll { $0.id == link.id }
-            case .snippet(let snippet): database.snippets.removeAll { $0.id == snippet.id }
-            case .note(let note): database.notes.removeAll { $0.id == note.id }
-            case .clipboard(let entry): database.clipboard.removeAll { $0.id == entry.id }
-            default: return
-            }
-            database.favoriteIDs.remove(item.id)
-            database.usage.removeAll { $0.id == item.id }
-        }
-        synchronizeSelection()
+        toast("Saved \(noun) “\(name.truncatedForFeedback)”")
     }
 
     func createItem() {
+        // Never replace unsaved edits silently. Notes save as they close.
+        if let draft, !draft.isNote, draft.isDirty {
+            confirmation = .discardChanges
+            return
+        }
         switch section {
         case .snippets: editor = .snippet(Snippet(name: "", keyword: "", content: ""))
         case .quicklinks: editor = .quicklink(Quicklink(name: "", template: "https://", keyword: ""))
@@ -515,132 +1010,42 @@ final class LauncherModel {
         }
     }
 
-    private func open(_ url: URL, itemID: String) {
-        if NSWorkspace.shared.open(url) {
-            store.recordUse(of: itemID)
-            panel?.dismiss(restoreFocus: false)
-        } else {
-            message =
-                "macOS could not open \(url.lastPathComponent.isEmpty ? url.absoluteString : url.lastPathComponent)."
-        }
+    // MARK: - Helpers
+
+    var defaultBrowserName: String {
+        if let browserName { return browserName }
+        let name =
+            NSWorkspace.shared.urlForApplication(toOpen: URL(string: "https://example.com")!)
+            .map { FileManager.default.displayName(atPath: $0.path).replacingOccurrences(of: ".app", with: "") }
+            ?? "Browser"
+        browserName = name
+        return name
     }
 
-    private func searchChanged() {
-        selectedID = nil
-        message = nil
-        guard query.count <= 512 else {
-            files.stop()
-            message = "Keep search queries under 512 characters. For a longer passage, open Ask AI."
-            return
-        }
-        if section == .home || section == .files {
-            files.search(query, showRecent: section == .files)
-        } else {
-            files.stop()
-        }
-    }
-
-    private var applicationItems: [LauncherItem] {
-        applications.applications.map { app in
-            LauncherItem(
-                id: app.id, title: app.name, subtitle: app.url.deletingLastPathComponent().path,
-                symbol: "app", badge: "Application", keywords: app.bundleIdentifier ?? "",
-                iconURL: app.url, action: .application(app))
-        }
-    }
-
-    private var fileItems: [LauncherItem] {
-        files.results.map { file in
-            LauncherItem(
-                id: file.id, title: file.name, subtitle: file.url.deletingLastPathComponent().path,
-                symbol: "doc", badge: "File", iconURL: file.url, action: .file(file.url))
-        }
-    }
-
-    private var savedFileItems: [LauncherItem] {
-        let ids = store.database.favoriteIDs.union(store.database.usage.map(\.id)).sorted()
-        return ids.filter { $0.hasPrefix("file./") }.map { id in
-            let url = URL(fileURLWithPath: String(id.dropFirst("file.".count)))
-            return LauncherItem(
-                id: id, title: url.lastPathComponent, subtitle: url.deletingLastPathComponent().path,
-                symbol: "doc", badge: "File", iconURL: url, action: .file(url))
-        }
-    }
-
-    private var clipboardItems: [LauncherItem] {
-        store.database.clipboard.map { entry in
-            LauncherItem(
-                id: "clipboard.\(entry.id)", title: entry.title, subtitle: entry.sourceName,
-                symbol: entry.symbol, tint: .orange, badge: entry.kindTitle, keywords: entry.searchableText,
-                clipboardImage: entry.image.flatMap { store.imageResource(for: $0) },
-                action: .clipboard(entry))
-        }
-    }
-
-    private var quicklinkItems: [LauncherItem] {
-        store.database.quicklinks.map { link in
-            let argument = link.argument(in: query) ?? ""
-            return LauncherItem(
-                id: "quicklink.\(link.id)", title: link.name,
-                subtitle: argument.isEmpty ? link.template : "Search for “\(argument)”",
-                symbol: "link", tint: .blue, badge: "Quicklink", keywords: link.keyword,
-                action: .quicklink(link, argument))
-        }
-    }
-
-    private var snippetItems: [LauncherItem] {
-        store.database.snippets.map { snippet in
-            LauncherItem(
-                id: "snippet.\(snippet.id)", title: snippet.name,
-                subtitle: snippet.keyword.isEmpty ? String(snippet.content.prefix(90)) : snippet.keyword,
-                symbol: "text.quote", tint: .orange, badge: "Snippet",
-                keywords: snippet.keyword + " " + snippet.content, action: .snippet(snippet))
-        }
-    }
-
-    private var noteItems: [LauncherItem] {
-        store.database.notes.sorted { $0.modifiedAt > $1.modifiedAt }.map { note in
-            LauncherItem(
-                id: "note.\(note.id)", title: note.title, subtitle: String(note.content.prefix(90)),
-                symbol: "note.text", tint: .green, badge: "Note", keywords: note.content, action: .note(note))
-        }
-    }
-
-    private var windowItems: [LauncherItem] {
-        WindowLayout.allCases.map { layout in
-            LauncherItem(
-                id: "window.\(layout.id)", title: layout.title, subtitle: "Arrange the previously focused window",
-                symbol: layout.symbol, tint: .purple, badge: "Window", keywords: "window resize move tile",
-                action: .window(layout))
-        }
-    }
-
-    private var commandItems: [LauncherItem] {
-        var commands = [
-            LauncherItem(
-                id: "ai.chat", title: "Ask AI", subtitle: "Your private, on-device assistant",
-                symbol: "sparkles", tint: .purple, badge: "Apple Intelligence", keywords: "chat assistant write",
-                action: .ai(.chat))
+    nonisolated static func siteName(for link: Quicklink) -> String {
+        let template = link.template.replacingOccurrences(of: "{query}", with: "")
+        guard let host = URL(string: template)?.host?.lowercased() else { return link.name }
+        let known: [String: String] = [
+            "duckduckgo.com": "DuckDuckGo", "github.com": "GitHub", "www.google.com": "Google", "google.com": "Google",
+            "developer.apple.com": "Apple Developer", "www.bing.com": "Bing", "kagi.com": "Kagi",
+            "en.wikipedia.org": "Wikipedia", "www.youtube.com": "YouTube", "stackoverflow.com": "Stack Overflow",
+            "maps.apple.com": "Apple Maps", "www.amazon.com": "Amazon", "news.ycombinator.com": "Hacker News",
         ]
-        commands += LauncherSection.allCases.filter { $0 != .home }.map { section in
-            LauncherItem(
-                id: "section.\(section.id)", title: section.title,
-                subtitle: section.placeholder.replacingOccurrences(of: "…", with: ""),
-                symbol: section.symbol, tint: section == .clipboard ? .orange : .blue,
-                badge: "Command", keywords: "search " + section.title, action: .section(section))
-        }
-        commands += AIAction.allCases.filter { $0 != .chat }.map { action in
-            LauncherItem(
-                id: "ai.\(action.id)", title: action.title, subtitle: action.subtitle,
-                symbol: action.symbol, tint: .purple, badge: "AI Command", keywords: "AI writing text",
-                action: .ai(action))
-        }
-        commands += windowItems
-        commands.append(
-            LauncherItem(
-                id: "settings", title: "Settings", subtitle: "Make OpenRay your own",
-                symbol: "gearshape", badge: "Command", keywords: "openray settings preferences permissions shortcut",
-                action: .settings))
-        return commands
+        if let name = known[host] { return name }
+        let parts = host.replacingOccurrences(of: "www.", with: "").split(separator: ".")
+        return parts.count >= 2 ? parts[parts.count - 2].capitalized : host
+    }
+
+    nonisolated static func displayURL(_ string: String, decoding: Bool = true) -> String {
+        var display = string
+        for prefix in ["https://", "http://"] where display.hasPrefix(prefix) { display.removeFirst(prefix.count) }
+        if display.hasPrefix("www.") { display.removeFirst(4) }
+        return decoding ? (display.removingPercentEncoding ?? display) : display
+    }
+
+    nonisolated static func shortenedPath(_ url: URL) -> String {
+        let path = url.path
+        let home = FileManager.default.homeDirectoryForCurrentUser.path
+        return path.hasPrefix(home) ? "~" + path.dropFirst(home.count) : path
     }
 }

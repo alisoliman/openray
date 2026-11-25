@@ -4,7 +4,7 @@
 export async function verifyInitialSearchFocus(app) {
   await app.typeText("6 * 7");
   const state = await app.getAXState({ disableDiffing: true });
-  if (!state.includes("Value: 6 * 7") || !state.includes("42, Calculator")) {
+  if (!state.includes("Value: 6 * 7") || !state.includes("6 * 7 equals 42")) {
     throw new Error("Initial keyboard focus failed: typing did not produce the calculator result.");
   }
   return state;
@@ -41,7 +41,7 @@ export async function verifyEmptyClipboardImageCopy(app, describePasteboard) {
   await app.pressKey("Return");
   const after = await app.getAXState({ disableDiffing: true });
   const clipboard = await describePasteboard();
-  if (!after.includes("Copied to clipboard") || !clipboard.pngBytes ||
+  if (!after.includes("Copied “Image") || !clipboard.pngBytes ||
       !clipboard.types.includes("com.openray.generated")) {
     throw new Error("Return did not copy the selected image in its native format.");
   }

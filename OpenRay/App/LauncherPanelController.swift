@@ -1,9 +1,30 @@
 import AppKit
+import QuickLookUI
 import SwiftUI
 
 final class LauncherPanel: NSPanel {
     var onCancel: (() -> Void)?
     var escapeAction: (() -> Bool)?
+    /// The visible panel in content-view coordinates. The rest of the window
+    /// only holds the shadow, so a click there closes the panel.
+    var panelRect: (() -> CGRect)?
+    var onClickOutside: (() -> Void)?
+    /// Return confirms a pending action-bar confirmation, even from a text editor.
+    var confirmAction: (() -> Bool)?
+    /// The file Quick Look previews. Quick Look finds its controller through the
+    /// responder chain, which ends at this window, so the panel controls it.
+    var quickLook: QuickLookPreview? {
+        didSet {
+            // Quick Look doesn't retain its data source; repoint it before the old one goes.
+            guard let oldValue, QLPreviewPanel.sharedPreviewPanelExists(), let preview = QLPreviewPanel.shared(),
+                preview.dataSource === oldValue
+            else { return }
+            preview.dataSource = quickLook
+            preview.delegate = quickLook
+            preview.reloadData()
+        }
+    }
+    var onQuickLookEnd: (() -> Void)?
 
     override var canBecomeKey: Bool { true }
     override var canBecomeMain: Bool { true }
@@ -18,24 +39,104 @@ final class LauncherPanel: NSPanel {
 
     override func sendEvent(_ event: NSEvent) {
         if handleEscapeKey(event) { return }
+        if event.type == .keyDown, [36, 76].contains(event.keyCode),
+            event.modifierFlags.intersection([.command, .control, .option, .shift]).isEmpty,
+            !((firstResponder as? NSTextView)?.hasMarkedText() ?? false), confirmAction?() == true
+        {
+            return
+        }
+        // A closing layer can leave no text responder. Typing should still land in the field.
+        if event.type == .keyDown, firstResponder === self || firstResponder == nil,
+            event.modifierFlags.intersection([.command, .control]).isEmpty,
+            let field = Self.firstTextInput(in: contentView)
+        {
+            // focusIfNeeded puts the caret after the query, so the keystroke adds to it.
+            if let search = field as? FocusedSearchField { search.focusIfNeeded() } else { makeFirstResponder(field) }
+        }
+        if [.leftMouseDown, .rightMouseDown, .otherMouseDown].contains(event.type), let rect = panelRect?(),
+            let content = contentView, !rect.contains(content.convert(event.locationInWindow, from: nil))
+        {
+            onClickOutside?()
+            return
+        }
         super.sendEvent(event)
     }
 
-    /// The borderless host has no scene focus target when Settings opens. Handle
-    /// its unclaimed Escape here, while leaving text editing and sheets native.
+    static func firstTextInput(in view: NSView?) -> NSView? {
+        guard let view, !view.isHiddenOrHasHiddenAncestor else { return nil }
+        if view is FocusedSearchField || view is FocusedComposerTextView { return view }
+        for subview in view.subviews {
+            if let found = firstTextInput(in: subview) { return found }
+        }
+        return nil
+    }
+
+    /// Esc closes exactly one layer, including from inline editors and the AI
+    /// composer. The search field handles its own Escape so it can clear the
+    /// live field editor in the same callback, and input methods keep theirs.
     func handleEscapeKey(_ event: NSEvent) -> Bool {
         guard event.type == .keyDown, event.keyCode == 53,
             event.modifierFlags.intersection([.command, .control, .option, .shift]).isEmpty,
-            attachedSheet == nil, !(firstResponder is NSTextView)
+            attachedSheet == nil
         else { return false }
+        if let editor = firstResponder as? NSTextView {
+            if editor.hasMarkedText() { return false }
+            if editor.isFieldEditor, (editor.delegate as? NSTextField)?.delegate is LauncherSearchInput.Coordinator {
+                return false
+            }
+        }
         return escapeAction?() ?? false
+    }
+
+    nonisolated override func acceptsPreviewPanelControl(_ panel: QLPreviewPanel!) -> Bool {
+        MainActor.assumeIsolated { quickLook != nil }
+    }
+
+    nonisolated override func beginPreviewPanelControl(_ panel: QLPreviewPanel!) {
+        MainActor.assumeIsolated {
+            panel.dataSource = quickLook
+            panel.delegate = quickLook
+            panel.reloadData()
+        }
+    }
+
+    nonisolated override func endPreviewPanelControl(_ panel: QLPreviewPanel!) {
+        MainActor.assumeIsolated {
+            panel.dataSource = nil
+            panel.delegate = nil
+            onQuickLookEnd?()
+        }
+    }
+}
+
+/// One file for the shared Quick Look panel. ⌘Y closes it again, as in Finder.
+final class QuickLookPreview: NSObject, QLPreviewPanelDataSource, QLPreviewPanelDelegate {
+    let url: NSURL
+
+    init(url: URL) {
+        self.url = url as NSURL
+    }
+
+    func numberOfPreviewItems(in panel: QLPreviewPanel!) -> Int { 1 }
+
+    func previewPanel(_ panel: QLPreviewPanel!, previewItemAt index: Int) -> (any QLPreviewItem)! { url }
+
+    func previewPanel(_ panel: QLPreviewPanel!, handle event: NSEvent!) -> Bool {
+        guard event.type == .keyDown, event.charactersIgnoringModifiers?.lowercased() == "y",
+            event.modifierFlags.intersection([.command, .control, .option, .shift]) == .command
+        else { return false }
+        MainActor.assumeIsolated { panel.orderOut(nil) }
+        return true
     }
 }
 
 @MainActor
 final class LauncherPanelController: NSObject, NSWindowDelegate {
     private let model: LauncherModel
-    private var window: NSPanel?
+    private var window: LauncherPanel?
+    private var appearanceObservation: Any?
+    /// Set while Quick Look takes key, so the launcher doesn't close under it.
+    private var isOpeningQuickLook = false
 
     init(model: LauncherModel) {
         self.model = model
@@ -45,6 +146,8 @@ final class LauncherPanelController: NSObject, NSWindowDelegate {
             name: NSApplication.didResignActiveNotification, object: NSApp)
     }
 
+    var isVisible: Bool { window?.isVisible == true }
+
     func toggle() {
         if window?.isVisible == true { dismiss() } else { show() }
     }
@@ -53,37 +156,123 @@ final class LauncherPanelController: NSObject, NSWindowDelegate {
         let front = NSWorkspace.shared.frontmostApplication
         if let front, front.processIdentifier != ProcessInfo.processInfo.processIdentifier {
             model.previousApplication = front
+            model.targetWindow = nil
         }
-        if let section { model.navigate(to: section) }
         if window == nil { createWindow() }
         guard let window else { return }
-        if !window.isVisible {
-            let screen = NSScreen.screens.first(where: { $0.frame.contains(NSEvent.mouseLocation) }) ?? NSScreen.main
-            if let frame = screen?.visibleFrame {
-                window.setFrameOrigin(
-                    CGPoint(
-                        x: frame.midX - window.frame.width / 2,
-                        y: frame.maxY - window.frame.height - max(50, frame.height * 0.12)))
+        let wasVisible = window.isVisible
+        if !wasVisible {
+            model.panelWillShow()
+            model.beginOnboardingIfNeeded()
+            position(window)
+        }
+        if let section {
+            // Closing a dirty editor would only raise the discard prompt, so it stays open.
+            if model.editor == nil {
+                model.navigate(to: section)
+            } else if section != .home, section != model.section {
+                model.feedback = .warning("Save or cancel the current editor first.")
             }
         }
+        applyAppearance()
         model.refreshPermissions()
         model.store.pruneClipboard()
+        if !wasVisible {
+            model.isPresented = false
+            window.alphaValue = 0
+        }
         NSApp.activate()
         window.makeKeyAndOrderFront(nil)
         model.resumeSearch()
         model.focusRequest += 1
+        if !wasVisible {
+            DispatchQueue.main.async { [model] in
+                window.alphaValue = 1
+                let reduceMotion = NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
+                withAnimation(OR.Motion.resolve(OR.Motion.panel, reduceMotion: reduceMotion)) { model.isPresented = true }
+            }
+        }
     }
 
     func dismiss(restoreFocus: Bool = true) {
-        model.showActions = false
-        window?.orderOut(nil)
+        guard let window, window.isVisible else { return }
+        model.panelDidHide()
+        window.orderOut(nil)
+        if isQuickLookVisible { QLPreviewPanel.shared().orderOut(nil) }
         model.files.stop()
         if restoreFocus { model.previousApplication?.activate() }
     }
 
+    /// Previews a file in the shared Quick Look panel above the launcher, or closes it.
+    func toggleQuickLook(_ url: URL) {
+        guard let window, window.isVisible, let preview = QLPreviewPanel.shared() else { return }
+        if preview.isVisible {
+            preview.orderOut(nil)
+            return
+        }
+        window.quickLook = QuickLookPreview(url: url)
+        // Once it's key, Quick Look looks for its controller from the main window.
+        if !window.isMainWindow { window.makeMain() }
+        preview.level = NSWindow.Level(rawValue: NSWindow.Level.floating.rawValue + 1)
+        isOpeningQuickLook = true
+        preview.makeKeyAndOrderFront(nil)
+        isOpeningQuickLook = false
+    }
+
+    private var isQuickLookVisible: Bool {
+        QLPreviewPanel.sharedPreviewPanelExists() && QLPreviewPanel.shared().isVisible
+    }
+
+    /// AppKit usually hands key back when the preview closes. Quick Look also
+    /// ends its control when another of OpenRay's windows takes key, which
+    /// closes the launcher as it would without a preview.
+    private func quickLookDidEnd() {
+        DispatchQueue.main.async { [weak self] in
+            guard let self, let window = self.window, window.isVisible, !window.isKeyWindow, NSApp.isActive
+            else { return }
+            switch NSApp.keyWindow {
+            case nil: window.makeKey()
+            case is QLPreviewPanel: break
+            case .some: self.dismiss(restoreFocus: false)
+            }
+        }
+    }
+
+    /// The upper third of the screen under the pointer, with a fixed top edge.
+    private func position(_ window: NSWindow) {
+        let screen = NSScreen.screens.first(where: { $0.frame.contains(NSEvent.mouseLocation) }) ?? NSScreen.main
+        guard let frame = screen?.visibleFrame else { return }
+        let size = PanelGeometry.windowSize
+        let panelTop = frame.maxY - max(40, frame.height * 0.13)
+        window.setFrame(
+            NSRect(
+                x: (frame.midX - size.width / 2).rounded(),
+                y: (panelTop + PanelGeometry.topMargin - size.height).rounded(),
+                width: size.width, height: size.height),
+            display: false)
+    }
+
+    func applyAppearance() {
+        let appearance: NSAppearance? =
+            switch model.store.database.preferences.appearance {
+            case .system: nil
+            case .light: NSAppearance(named: .aqua)
+            case .dark: NSAppearance(named: .darkAqua)
+            }
+        window?.appearance = appearance
+    }
+
     func windowDidResignKey(_ notification: Notification) {
-        guard window?.attachedSheet == nil, model.editor == nil, !model.showActions else { return }
-        dismiss(restoreFocus: false)
+        guard window?.attachedSheet == nil, !isOpeningQuickLook else { return }
+        guard isQuickLookVisible else {
+            dismiss(restoreFocus: false)
+            return
+        }
+        // The preview holds key while it's open. Any other window taking key still closes the launcher.
+        DispatchQueue.main.async { [weak self] in
+            guard let self, let key = NSApp.keyWindow, key !== self.window, !(key is QLPreviewPanel) else { return }
+            self.dismiss(restoreFocus: false)
+        }
     }
 
     func windowShouldClose(_ sender: NSWindow) -> Bool {
@@ -91,14 +280,16 @@ final class LauncherPanelController: NSObject, NSWindowDelegate {
         return false
     }
 
+    /// Leaving OpenRay closes the launcher and any Quick Look preview over it.
     @objc private func applicationResignedActive(_ notification: Notification) {
-        guard window?.attachedSheet == nil, model.editor == nil else { return }
+        guard window?.attachedSheet == nil else { return }
         dismiss(restoreFocus: false)
     }
 
     private func createWindow() {
+        let size = PanelGeometry.windowSize
         let panel = LauncherPanel(
-            contentRect: NSRect(x: 0, y: 0, width: 780, height: 570),
+            contentRect: NSRect(origin: .zero, size: size),
             styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
         panel.title = model.clipboard.usesGeneralPasteboard ? "OpenRay" : "OpenRay — Clipboard Verification"
         panel.identifier = NSUserInterfaceItemIdentifier("OpenRayLauncher")
@@ -109,17 +300,40 @@ final class LauncherPanelController: NSObject, NSWindowDelegate {
         panel.isReleasedWhenClosed = false
         panel.isOpaque = false
         panel.backgroundColor = .clear
-        panel.hasShadow = true
+        // The panel draws its own layered shadow; see PanelSurface.
+        panel.hasShadow = false
         panel.isMovableByWindowBackground = false
+        panel.animationBehavior = .none
         panel.onCancel = { [weak model] in model?.goBack() }
         panel.delegate = self
         panel.escapeAction = { [weak model] in
-            guard let model, model.destination == .settings, model.editor == nil else { return false }
+            guard let model else { return false }
             model.goBack()
             return true
         }
-        panel.contentView = NSHostingView(rootView: ContentView(model: model))
+        panel.panelRect = { [weak model] in
+            guard let model else { return .zero }
+            let size = model.panelSize
+            let window = PanelGeometry.windowSize
+            // AppKit content coordinates are bottom-up; the panel hangs from the top margin.
+            return CGRect(
+                x: (window.width - size.width) / 2, y: window.height - PanelGeometry.topMargin - size.height,
+                width: size.width, height: size.height)
+        }
+        // The margin belongs to whatever is behind it, so focus goes back to that app.
+        panel.onClickOutside = { [weak self] in self?.dismiss() }
+        panel.onQuickLookEnd = { [weak self] in self?.quickLookDidEnd() }
+        panel.confirmAction = { [weak model] in
+            guard let model, let confirmation = model.confirmation else { return false }
+            model.confirm(confirmation)
+            return true
+        }
+        let host = NSHostingView(rootView: LauncherRootView(model: model))
+        host.sizingOptions = []
+        host.frame = NSRect(origin: .zero, size: size)
+        panel.contentView = host
         window = panel
+        applyAppearance()
     }
 }
 
@@ -129,6 +343,8 @@ final class OpenRayDelegate: NSObject, NSApplicationDelegate {
         store: LibraryStore(fileURL: RuntimeMode.usesInMemoryLibrary ? nil : LibraryStore.defaultURL),
         pasteboard: RuntimeMode.launchPasteboard(arguments: ProcessInfo.processInfo.arguments))
     private var panelController: LauncherPanelController?
+    private(set) lazy var settingsController = SettingsWindowController(model: model)
+    private(set) lazy var helpController = HelpWindowController(model: model)
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         guard !RuntimeMode.isTestHost else { return }
@@ -142,11 +358,18 @@ final class OpenRayDelegate: NSObject, NSApplicationDelegate {
         let panel = LauncherPanelController(model: model)
         panelController = panel
         model.panel = panel
+        model.presentSettings = { [weak self] pane, commandID in
+            self?.settingsController.show(pane: pane, focusCommandID: commandID)
+        }
+        model.presentHelp = { [weak self] in self?.helpController.show() }
         NSWorkspace.shared.notificationCenter.addObserver(
             self, selector: #selector(activeApplicationChanged(_:)),
             name: NSWorkspace.didActivateApplicationNotification, object: nil)
         panel.show()
         Task { await model.start() }
+        if let pane = RuntimeMode.settingsPane(arguments: ProcessInfo.processInfo.arguments) {
+            model.openSettings(pane)
+        }
     }
 
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
@@ -164,7 +387,111 @@ final class OpenRayDelegate: NSObject, NSApplicationDelegate {
             application.processIdentifier != ProcessInfo.processInfo.processIdentifier
         else { return }
         model.previousApplication = application
+        model.targetWindow = nil
     }
+}
+
+/// A standard window hosting SwiftUI, created on demand.
+@MainActor
+class AuxiliaryWindowController: NSObject, NSWindowDelegate {
+    let model: LauncherModel
+    private(set) var window: NSWindow?
+
+    init(model: LauncherModel) {
+        self.model = model
+    }
+
+    func makeRootView() -> AnyView { AnyView(EmptyView()) }
+    var title: String { "OpenRay" }
+    var initialSize: NSSize { NSSize(width: 760, height: 540) }
+    var minimumSize: NSSize { NSSize(width: 640, height: 440) }
+    var identifier: String { "openray.window" }
+
+    func showWindow() {
+        if window == nil {
+            let window = NSWindow(
+                contentRect: NSRect(origin: .zero, size: initialSize),
+                styleMask: [.titled, .closable, .miniaturizable, .resizable, .fullSizeContentView],
+                backing: .buffered, defer: false)
+            window.title = title
+            window.identifier = NSUserInterfaceItemIdentifier(identifier)
+            window.titlebarAppearsTransparent = true
+            window.toolbarStyle = .unified
+            window.isReleasedWhenClosed = false
+            window.minSize = minimumSize
+            window.contentViewController = NSHostingController(rootView: makeRootView())
+            window.setContentSize(initialSize)
+            window.center()
+            window.setFrameAutosaveName(identifier)
+            window.delegate = self
+            self.window = window
+        }
+        applyAppearance()
+        activateFromFrontmostApplication()
+        window?.makeKeyAndOrderFront(nil)
+    }
+
+    /// The launcher is a non-activating panel, so the app it opened over stays
+    /// frontmost. A plain activate() then changes nothing, and this window
+    /// would appear without keyboard focus; taking activation from that app works.
+    private func activateFromFrontmostApplication() {
+        let current = NSRunningApplication.current
+        if let front = NSWorkspace.shared.frontmostApplication, front.processIdentifier != current.processIdentifier,
+            current.activate(from: front)
+        {
+            return
+        }
+        NSApp.activate()
+    }
+
+    func applyAppearance() {
+        window?.appearance =
+            switch model.store.database.preferences.appearance {
+            case .system: nil
+            case .light: NSAppearance(named: .aqua)
+            case .dark: NSAppearance(named: .darkAqua)
+            }
+    }
+
+    func windowDidBecomeKey(_ notification: Notification) {
+        model.refreshPermissions()
+    }
+
+    /// Ends field editing so a focused field, such as an alias, commits before the window goes.
+    func windowWillClose(_ notification: Notification) {
+        window?.makeFirstResponder(nil)
+    }
+}
+
+final class SettingsWindowController: AuxiliaryWindowController {
+    private let navigation = SettingsNavigation()
+
+    override func makeRootView() -> AnyView { AnyView(SettingsWindowView(model: model, navigation: navigation)) }
+    override var title: String { "Settings" }
+    override var initialSize: NSSize { NSSize(width: 780, height: 580) }
+    override var minimumSize: NSSize { NSSize(width: 700, height: 460) }
+    override var identifier: String { "openray.settings" }
+
+    /// Opens Settings, optionally at a pane and at a command's row in Shortcuts.
+    func show(pane: SettingsPane?, focusCommandID: String? = nil) {
+        if let pane {
+            // A leftover sidebar search could hide the pane being opened.
+            navigation.search = ""
+            navigation.pane = pane
+            navigation.focusCommandID = focusCommandID
+        }
+        showWindow()
+    }
+}
+
+final class HelpWindowController: AuxiliaryWindowController {
+    override func makeRootView() -> AnyView { AnyView(OpenRayHelpView(model: model)) }
+    override var title: String { "OpenRay Help" }
+    override var initialSize: NSSize { NSSize(width: 720, height: 680) }
+    override var minimumSize: NSSize { NSSize(width: 600, height: 440) }
+    override var identifier: String { "openray-help" }
+
+    func show() { showWindow() }
 }
 
 enum RuntimeMode {
@@ -186,6 +513,13 @@ enum RuntimeMode {
             })
         else { return nil }
         return .init(name)
+    }
+
+    /// The pane `--open-settings [pane]` asks for. General when the next argument isn't a pane.
+    static func settingsPane(arguments: [String]) -> SettingsPane? {
+        guard let index = arguments.firstIndex(of: "--open-settings") else { return nil }
+        let next = arguments.indices.contains(index + 1) ? SettingsPane(rawValue: arguments[index + 1]) : nil
+        return next ?? .general
     }
 
     static var isTestHost: Bool {

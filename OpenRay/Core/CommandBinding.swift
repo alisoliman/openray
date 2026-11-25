@@ -1,11 +1,13 @@
 import Foundation
 
-/// Commands that can be invoked safely without an item or additional input.
+/// Commands that can be invoked safely without picking an item. Writing commands
+/// use the text selected in the app you came from, so they need no input either.
 enum CuratedCommand {
     static let targetIDs = [
         "section.clipboard", "section.applications", "section.files", "section.snippets",
         "section.quicklinks", "section.notes", "section.calculator", "section.windows",
-        "ai.chat", "settings", "window.leftHalf", "window.rightHalf", "window.maximize",
+        "ai.chat", "ai.summarize", "ai.rewrite", "ai.proofread", "ai.shorten", "ai.actionItems",
+        "settings", "window.leftHalf", "window.rightHalf", "window.maximize",
         "window.center", "window.restore",
     ]
 

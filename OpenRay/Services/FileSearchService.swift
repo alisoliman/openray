@@ -18,21 +18,36 @@ final class FileSearchService: NSObject {
     @ObservationIgnored private var metadataQuery: NSMetadataQuery?
     @ObservationIgnored private var pendingSearch: Task<Void, Never>?
     @ObservationIgnored private var generation = UUID()
+    /// What the current results list: a folder, and either recent files or a name search.
+    @ObservationIgnored private var listing: Listing?
 
-    func search(_ text: String, showRecent: Bool = false) {
+    private struct Listing: Equatable {
+        var scope: FileSearchScope
+        var recent: Bool
+    }
+
+    func search(_ text: String, showRecent: Bool = false, scope: FileSearchScope = .home) {
         stop()
-        results = []
         errorMessage = nil
         let text = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard text.count <= 512 else { return }
-        guard text.count >= 2 || showRecent && text.isEmpty else { return }
+        guard text.count <= 512, text.count >= 2 || showRecent && text.isEmpty else {
+            if !results.isEmpty { results = [] }
+            return
+        }
+        // Keep the last rows while Spotlight gathers. LauncherModel re-scores them
+        // against the new query, so the list doesn't empty and refill on each
+        // keystroke. Rows from another folder, or from a name search shown as the
+        // recent listing, would mislead, so those clear.
+        let listing = Listing(scope: scope, recent: text.isEmpty)
+        if listing != self.listing, !results.isEmpty { results = [] }
+        self.listing = listing
         isSearching = true
         let request = UUID()
         generation = request
         pendingSearch = Task { [weak self] in
             do { try await Task.sleep(for: .milliseconds(180)) } catch { return }
             guard let self, !Task.isCancelled, self.generation == request else { return }
-            self.startQuery(text)
+            self.startQuery(text, scope: scope)
         }
     }
 
@@ -48,10 +63,10 @@ final class FileSearchService: NSObject {
         isSearching = false
     }
 
-    private func startQuery(_ text: String) {
+    private func startQuery(_ text: String, scope: FileSearchScope) {
         let query = NSMetadataQuery()
         let home = FileManager.default.homeDirectoryForCurrentUser.path
-        query.searchScopes = [home]
+        query.searchScopes = [scope.url.path]
         var predicates = [
             NSPredicate(format: "NOT (%K BEGINSWITH %@)", NSMetadataItemPathKey, home + "/Library/"),
             NSPredicate(format: "NOT (%K BEGINSWITH %@)", NSMetadataItemFSNameKey, "."),
@@ -74,6 +89,7 @@ final class FileSearchService: NSObject {
             name: .NSMetadataQueryDidUpdate, object: query)
         if !query.start() {
             isSearching = false
+            results = []
             errorMessage = "Spotlight could not start. Check that indexing is enabled for your home folder."
         }
     }

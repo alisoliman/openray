@@ -38,10 +38,33 @@ struct AIMessageFormattingTests {
 
     @Test func actionItemsAlwaysHaveDistinctListRows() {
         #expect(
-            AIActionItemsResult.formatted([" Send the report. ", "Review\nit Tuesday.", ""])
-                == "- Send the report.\n- Review it Tuesday.")
-        #expect(AIActionItemsResult.formatted([]) == "No action items found.")
-        #expect(AIActionItemsResult.formatted([" \n"]) == "No action items found.")
+            AIActionItems.formatted([
+                AIActionItem(task: " Send the report. ", owner: nil, due: nil),
+                AIActionItem(task: "Review\nit", owner: " ", due: "Tuesday"),
+                AIActionItem(task: "", owner: "Lee", due: nil),
+            ]) == "- Send the report.\n- Review it (due Tuesday)")
+        #expect(
+            AIActionItems.formatted([AIActionItem(task: "Book the room.", owner: "Lee", due: "tomorrow")])
+                == "- Lee: Book the room (due tomorrow)")
+        #expect(AIActionItems.formatted([]) == "No action items found.")
+        #expect(AIActionItems.formatted([AIActionItem(task: " \n", owner: "Lee", due: nil)]) == "No action items found.")
+        #expect(
+            AIActionItems.cleaned([AIActionItem(task: "Call  back", owner: "Unknown", due: "N/A")])
+                == [AIActionItem(task: "Call back", owner: nil, due: nil)])
+    }
+
+    @Test func checklistChipsComeOnlyFromStructuredFields() {
+        // Plain bullet text is never parsed for owners or dates.
+        let plain = ChatMessage(role: .assistant, text: "- Follow up: send the budget table\n- Standup at 9:15")
+        #expect(plain.checklistItems.map(\.task) == ["Follow up: send the budget table", "Standup at 9:15"])
+        #expect(plain.checklistItems.allSatisfy { $0.owner == nil && $0.due == nil })
+        #expect(ChatMessage(role: .assistant, text: "No action items found.").checklistItems.isEmpty)
+
+        let items = [AIActionItem(task: "Book the room", owner: "Lee", due: "tomorrow")]
+        let structured = ChatMessage(
+            role: .assistant, text: AIActionItems.formatted(items), actionItems: items)
+        #expect(structured.checklistItems == items)
+        #expect(ChatMessage(role: .assistant, text: "No action items found.", actionItems: []).checklistItems.isEmpty)
     }
 
     @Test func proofreadingRetainsSourceLayoutWhenNoWordsOrPunctuationChanged() {

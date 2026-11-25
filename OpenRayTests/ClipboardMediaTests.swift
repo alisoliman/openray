@@ -69,7 +69,10 @@ actor GatedImagePreparer: ClipboardImagePreparing {
 struct ClipboardMediaTests {
     private func makeStore() -> LibraryStore {
         let store = LibraryStore(fileURL: nil)
-        store.update { $0.preferences.clipboardEnabled = true }
+        store.update {
+            $0.preferences.clipboardEnabled = true
+            $0.preferences.clipboardFilesEnabled = true
+        }
         return store
     }
 

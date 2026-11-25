@@ -52,11 +52,19 @@ final class LibraryStore {
         do {
             var next = database
             try mutation(&next)
+            // Libraries from before Paused was stored infer it from saved history. Removing
+            // that history, by pruning, Delete All or deleting entries, keeps capture Paused.
+            if database.clipboardIsPaused, next.preferences.clipboardPaused == nil,
+                !next.preferences.clipboardEnabled, !next.clipboardIsPaused
+            {
+                next.preferences.clipboardPaused = true
+            }
             next.discardUnavailableCommandBindings()
             next.schemaVersion = LibraryDatabase.currentSchemaVersion
             let removedClipboardIDs = Set(database.clipboard.map { "clipboard.\($0.id)" })
                 .subtracting(next.clipboard.map { "clipboard.\($0.id)" })
             next.favoriteIDs.subtract(removedClipboardIDs)
+            next.favoriteOrder = next.orderedFavoriteIDs
             next.usage.removeAll { removedClipboardIDs.contains($0.id) }
             try next.validate()
             if let fileURL {
@@ -141,13 +149,17 @@ final class LibraryStore {
     @discardableResult
     func save(_ note: QuickNote) -> Bool {
         update { database in
+            var note = note
+            if note.title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                // The first line becomes the title, so a note never needs a separate name.
+                note.title = QuickNote.derivedTitle(from: note.content)
+            }
             guard !note.title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
-                throw LibraryValidationError("Give this note a title.")
+                throw LibraryValidationError("Write something before saving this note.")
             }
             guard note.content.count <= 100_000 else {
                 throw LibraryValidationError("Notes support up to 100,000 characters.")
             }
-            var note = note
             note.modifiedAt = .now
             if let index = database.notes.firstIndex(where: { $0.id == note.id }) {
                 database.notes[index] = note
@@ -169,26 +181,67 @@ final class LibraryStore {
         }
     }
 
-    func toggleFavorite(_ id: String) {
+    @discardableResult
+    func toggleFavorite(_ id: String) -> Bool {
         update { database in
-            if !database.favoriteIDs.insert(id).inserted { database.favoriteIDs.remove(id) }
+            if database.favoriteIDs.insert(id).inserted {
+                database.favoriteOrder = database.orderedFavoriteIDs.filter { $0 != id } + [id]
+            } else {
+                database.favoriteIDs.remove(id)
+                database.favoriteOrder.removeAll { $0 == id }
+            }
         }
     }
 
     @discardableResult
+    func setPinned(_ pinned: Bool, clipboardEntry id: UUID) -> Bool {
+        update { database in
+            guard let index = database.clipboard.firstIndex(where: { $0.id == id }) else { return }
+            database.clipboard[index].isPinned = pinned
+        }
+    }
+
+    /// Duplicates a snippet under a fresh name. Keywords must stay unique, so the copy has none.
+    @discardableResult
+    func duplicate(_ snippet: Snippet) -> Snippet? {
+        var copy = snippet
+        copy.id = UUID()
+        copy.name = snippet.name + " Copy"
+        copy.keyword = ""
+        return save(copy) ? copy : nil
+    }
+
+    /// Why the last capture wasn't kept although the library could be saved. The
+    /// clipboard scope shows it, so a copy never disappears without explanation.
+    private(set) var captureRejection: String?
+
+    @discardableResult
     func capture(_ entry: ClipboardEntry, now: Date = .now) -> Bool {
+        captureRejection = nil
         guard database.preferences.clipboardEnabled, entry.isValid else { return false }
         if case .image = entry.content, !database.preferences.capturesClipboardImages { return false }
         if case .files = entry.content, !database.preferences.capturesClipboardFiles { return false }
-        return update { database in
+        let insert = { (database: inout LibraryDatabase) in
             var entry = entry
             if let existing = database.clipboard.first(where: { $0.content == entry.content }) {
                 entry.id = existing.id
+                entry.isPinned = existing.isPinned
             }
             database.clipboard.removeAll { $0.content == entry.content }
             database.clipboard.insert(entry, at: 0)
             Self.pruneClipboard(in: &database, now: now)
         }
+        // Pinned entries claim the byte budget first, so a new capture can be the one
+        // pruned. Then nothing is saved and the reason is kept.
+        var preview = database
+        insert(&preview)
+        guard preview.clipboard.contains(where: { $0.content == entry.content }) else {
+            let budget = ByteCountFormatter.string(fromByteCount: Int64(ClipboardLimits.historyBytes), countStyle: .file)
+            captureRejection =
+                "The last copy wasn't saved: pinned entries fill the \(budget) clipboard budget. Unpin some to keep new copies."
+            return false
+        }
+        return update(insert)
     }
 
     @discardableResult
@@ -196,6 +249,7 @@ final class LibraryStore {
         _ prepared: PreparedClipboardImage, copiedAt: Date = .now,
         sourceName: String, sourceBundleID: String? = nil
     ) -> Bool {
+        captureRejection = nil
         guard !isReadOnly, database.preferences.clipboardEnabled, database.preferences.capturesClipboardImages else {
             return false
         }
@@ -231,16 +285,29 @@ final class LibraryStore {
     private static func pruneClipboard(in database: inout LibraryDatabase, now: Date) {
         let cutoff = now.addingTimeInterval(-Double(max(1, database.preferences.clipboardRetentionDays)) * 86_400)
         let previousIDs = Set(database.clipboard.map { "clipboard.\($0.id)" })
+        var unpinned = 0
+        let limit = max(1, min(500, database.preferences.clipboardLimit))
+        // Pinned entries are exempt from retention and the entry count, but not the byte budget.
+        let candidates = database.clipboard.filter { entry in
+            if entry.isPinned { return true }
+            guard entry.copiedAt > cutoff, unpinned < limit else { return false }
+            unpinned += 1
+            return true
+        }
+        // Pinned entries claim the budget first, so newer captures can't push
+        // them out. Within each pass the newest entries win.
         var bytes = 0
-        database.clipboard = Array(
-            database.clipboard.filter { $0.copiedAt > cutoff }
-                .prefix(max(1, min(500, database.preferences.clipboardLimit)))
-                .filter { entry in
-                    let cost = max(0, entry.byteCount)
-                    guard cost <= ClipboardLimits.historyBytes - bytes else { return false }
+        var kept = Set<UUID>()
+        for pinned in [true, false] {
+            for entry in candidates where entry.isPinned == pinned {
+                let cost = max(0, entry.byteCount)
+                if cost <= ClipboardLimits.historyBytes - bytes {
                     bytes += cost
-                    return true
-                })
+                    kept.insert(entry.id)
+                }
+            }
+        }
+        database.clipboard = candidates.filter { kept.contains($0.id) }
         let expiredIDs = previousIDs.subtracting(database.clipboard.map { "clipboard.\($0.id)" })
         database.favoriteIDs.subtract(expiredIDs)
         database.usage.removeAll { expiredIDs.contains($0.id) }

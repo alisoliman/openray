@@ -38,21 +38,34 @@ struct CommandShortcut: Codable, Hashable, Sendable {
     var usesPrintableKey: Bool { Self.printableKeyCodes.contains(keyCode) }
 
     var title: String {
-        let symbols: [(ShortcutModifiers, String)] = [(.control, "⌃"), (.option, "⌥"), (.shift, "⇧"), (.command, "⌘")]
-        return (symbols.compactMap { modifiers.contains($0.0) ? $0.1 : nil } + [keyTitle])
-            .joined(separator: " ")
+        (modifierSymbols + [keyTitle]).joined(separator: " ")
     }
 
-    private var keyTitle: String {
-        let fallback = Self.keyNames[keyCode] ?? "Unknown Key"
+    /// Keycaps: the modifiers in ⌃ ⌥ ⇧ ⌘ order, then one cap for the key, so
+    /// “Page Up” and “Keypad 1” stay whole and Return, Delete and Esc use their glyphs.
+    var caps: [String] {
+        let key =
+            switch keyCode {
+            case 36: "↩"
+            case 51: "⌫"
+            case 53: "esc"
+            default: keyTitle
+            }
+        return modifierSymbols + [key]
+    }
+
+    /// What a printable key types on the current layout, without Shift and not
+    /// uppercased, so menu key equivalents keep keys such as “ß”. Nil for other keys
+    /// and off the main thread.
+    var layoutCharacter: String? {
         // Read the active input source only on the main thread. Background library validation
         // can still produce an error safely using the stable hardware label.
         guard Thread.isMainThread, usesPrintableKey,
             let source = TISCopyCurrentKeyboardLayoutInputSource()?.takeRetainedValue(),
             let pointer = TISGetInputSourceProperty(source, kTISPropertyUnicodeKeyLayoutData)
-        else { return fallback }
+        else { return nil }
         let data = Unmanaged<CFData>.fromOpaque(pointer).takeUnretainedValue()
-        guard let bytes = CFDataGetBytePtr(data) else { return fallback }
+        guard let bytes = CFDataGetBytePtr(data) else { return nil }
         let layout = UnsafeRawPointer(bytes).assumingMemoryBound(to: UCKeyboardLayout.self)
         var deadKeyState: UInt32 = 0
         var length = 0
@@ -60,17 +73,29 @@ struct CommandShortcut: Codable, Hashable, Sendable {
         let status = UCKeyTranslate(
             layout, UInt16(keyCode), UInt16(kUCKeyActionDisplay), 0, UInt32(LMGetKbdType()),
             OptionBits(kUCKeyTranslateNoDeadKeysMask), &deadKeyState, characters.count, &length, &characters)
-        guard status == noErr, length > 0 else { return fallback }
+        guard status == noErr, length > 0 else { return nil }
         let label = String(utf16CodeUnits: characters, count: length)
-        guard !label.unicodeScalars.contains(where: CharacterSet.controlCharacters.contains) else { return fallback }
-        return label.uppercased()
+        guard !label.unicodeScalars.contains(where: CharacterSet.controlCharacters.contains) else { return nil }
+        return label
+    }
+
+    /// 1 through 20 for the function keys F1–F20, otherwise nil.
+    var functionKeyNumber: Int? { Self.functionKeyNumbers[keyCode] }
+
+    private var modifierSymbols: [String] {
+        let symbols: [(ShortcutModifiers, String)] = [(.control, "⌃"), (.option, "⌥"), (.shift, "⇧"), (.command, "⌘")]
+        return symbols.compactMap { modifiers.contains($0.0) ? $0.1 : nil }
+    }
+
+    private var keyTitle: String {
+        layoutCharacter?.uppercased() ?? Self.keyNames[keyCode] ?? "Unknown Key"
     }
 
     func validate() throws {
         guard !modifiers.isEmpty, modifiers.subtracting(.all).isEmpty,
             Self.keyNames[keyCode] != nil
         else {
-            throw LibraryValidationError("Use Command, Control, Option, or Shift together with a standard key.")
+            throw LibraryValidationError("Use Command, Control, Option or Shift together with a standard key.")
         }
         guard modifiers != .all else {
             throw LibraryValidationError("Hyper Key shortcuts with all four modifiers are not supported.")
@@ -83,6 +108,11 @@ struct CommandShortcut: Codable, Hashable, Sendable {
     // Hardware key codes are persisted, so identities never depend on localized key labels.
     // Modifier keys, Fn/Globe, and media keys are deliberately absent.
     private static let printableKeyCodes = Set<UInt32>(0...35).union(37...47).union([50, 93, 94])
+    private static let functionKeyNumbers: [UInt32: Int] = Dictionary(
+        uniqueKeysWithValues: [
+            kVK_F1, kVK_F2, kVK_F3, kVK_F4, kVK_F5, kVK_F6, kVK_F7, kVK_F8, kVK_F9, kVK_F10,
+            kVK_F11, kVK_F12, kVK_F13, kVK_F14, kVK_F15, kVK_F16, kVK_F17, kVK_F18, kVK_F19, kVK_F20,
+        ].enumerated().map { (UInt32($0.element), $0.offset + 1) })
     private static let keyNames: [UInt32: String] = [
         0: "A", 1: "S", 2: "D", 3: "F", 4: "H", 5: "G", 6: "Z", 7: "X", 8: "C", 9: "V",
         10: "§", 11: "B", 12: "Q", 13: "W", 14: "E", 15: "R", 16: "Y", 17: "T", 18: "1", 19: "2",

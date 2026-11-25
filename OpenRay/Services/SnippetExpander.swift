@@ -76,13 +76,13 @@ final class SnippetExpander {
         guard
             ClipboardPolicy.shouldCapture(
                 types: [], sourceBundleID: app.bundleIdentifier,
-                excluded: store.database.preferences.excludedClipboardBundleIDs,
+                excluded: store.database.preferences.effectiveClipboardExclusions,
                 secureInput: false)
         else {
             matcher.reset()
             return
         }
-        if let snippet = matcher.consume(text, snippets: store.database.snippets) {
+        if let snippet = matcher.consume(text, snippets: store.database.snippets.filter(\.expandsAsYouType)) {
             do {
                 try SyntheticInput.replace(
                     keyword: snippet.keyword, with: snippet.expanded(), in: app.processIdentifier)

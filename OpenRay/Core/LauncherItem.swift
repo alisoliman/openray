@@ -11,59 +11,104 @@ struct LauncherItem: Identifiable, Sendable {
         case note(QuickNote)
         case window(WindowLayout)
         case ai(AIAction)
+        /// The “Ask AI” fallback: sends the query as the first message.
+        case askAI(String)
         case calculation(Calculation)
         case settings
     }
-    enum Tint: Sendable { case blue, green, orange, purple, coral, neutral }
     var id: String
     var title: String
     var subtitle: String
     var symbol: String
-    var tint: Tint = .neutral
+    var kind: Kind = .command
     var badge: String
     var keywords = ""
     var iconURL: URL?
     var clipboardImage: ClipboardImageResource?
     var action: Action
+    /// Spotlight results arrive late and never become the Top Hit.
+    var isLiveResult = false
 
     var copyText: String? {
         switch action {
         case .clipboard(let entry): entry.plainText
         case .snippet(let snippet): snippet.expanded()
-        case .calculation(let calculation): calculation.result
+        case .calculation(let calculation): calculation.value
         case .note(let note): note.content
         case .file(let url): url.path
         case .application(let app): app.url.path
-        case .quicklink(let link, _): link.template
+        case .quicklink(let link, let argument):
+            (try? link.resolvedURL(query: argument).absoluteString) ?? link.template
         default: nil
         }
     }
 
+    /// The context-free primary action, used for VoiceOver hints. The action bar
+    /// names the target app as well; see `LauncherModel.primaryTitle(for:)`.
     var primaryActionTitle: String {
         switch action {
-        case .clipboard, .snippet, .calculation: "Copy to Clipboard"
-        case .window: "Apply Layout"
+        case .clipboard, .snippet: "Copy"
+        // Names the number only when it's exactly what's copied and short enough for the
+        // action bar's button, which can't truncate. A rounded conversion says Copy Result.
+        case .calculation(let calculation):
+            calculation.shownValue == calculation.value && calculation.value.count <= 16
+                ? "Copy \(calculation.value)" : "Copy Result"
+        case .window(let layout): "Apply \(layout.title)"
         case .note: "Open Note"
-        case .ai: "Open AI"
-        default: "Open"
+        case .ai(let action): action == .chat ? "Ask AI" : "Run Command"
+        case .askAI: "Ask AI"
+        case .section: "Open Command"
+        case .settings: "Open Settings"
+        case .application: "Open Application"
+        case .quicklink(let link, let argument): link.needsQuery && argument.isEmpty ? "Enter Search Term" : "Open Link"
+        case .file: "Open"
         }
     }
 
     var supportsPaste: Bool {
         switch action {
-        case .clipboard, .snippet, .calculation, .note: true
+        case .clipboard, .snippet, .calculation, .note, .quicklink, .file: true
         default: false
         }
     }
 
+    /// Fallback and quicklink-argument rows stand in for a stored item for one
+    /// query, so favoriting or deleting them would act on something unexpected.
+    private var isSynthetic: Bool { id.hasPrefix("fallback.") || id.hasPrefix("argument.") }
+
     var canFavorite: Bool {
-        if case .calculation = action { false } else { true }
+        switch action {
+        case .calculation, .askAI: false
+        default: !isSynthetic
+        }
+    }
+
+    var canDelete: Bool {
+        switch action {
+        case .clipboard, .snippet, .quicklink, .note: !isSynthetic
+        default: false
+        }
+    }
+
+    var canEdit: Bool {
+        switch action {
+        case .snippet, .quicklink, .note: !id.hasPrefix("fallback.")
+        default: false
+        }
     }
 
     var isBuiltInCommand: Bool {
         switch action {
         case .section, .ai, .settings, .window: true
         default: false
+        }
+    }
+
+    var fileURL: URL? {
+        switch action {
+        case .file(let url): url
+        case .application(let app): app.url
+        default: nil
         }
     }
 
@@ -80,22 +125,44 @@ struct LauncherItem: Identifiable, Sendable {
 }
 
 struct LauncherResultGroup: Identifiable {
-    var title: String
+    enum Style { case list, favorites, grid, calculator, fallback }
+    var id: String
+    var title: String?
+    var trailing: String? = nil
+    var isLoading = false
+    var style: Style = .list
     var items: [LauncherItem]
-    var id: String { title }
+
+    init(
+        id: String? = nil, title: String?, trailing: String? = nil, isLoading: Bool = false, style: Style = .list,
+        items: [LauncherItem]
+    ) {
+        self.id = id ?? title ?? "results"
+        self.title = title
+        self.trailing = trailing
+        self.isLoading = isLoading
+        self.style = style
+        self.items = items
+    }
 }
 
 enum LibraryEditor: Identifiable {
     case quicklink(Quicklink)
     case snippet(Snippet)
     case note(QuickNote)
-    case quicklinkQuery(Quicklink, String)
     var id: String {
         switch self {
         case .quicklink(let item): "quicklink.\(item.id)"
         case .snippet(let item): "snippet.\(item.id)"
         case .note(let item): "note.\(item.id)"
-        case .quicklinkQuery(let item, _): "query.\(item.id)"
+        }
+    }
+
+    var section: LauncherSection {
+        switch self {
+        case .quicklink: .quicklinks
+        case .snippet: .snippets
+        case .note: .notes
         }
     }
 }

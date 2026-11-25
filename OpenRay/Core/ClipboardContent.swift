@@ -30,15 +30,32 @@ enum ClipboardContent: Equatable, Sendable {
 }
 
 enum ClipboardFilter: String, CaseIterable, Identifiable {
-    case all, text, images, files
+    case all, text, images, files, links
     var id: String { rawValue }
-    var title: String { rawValue.capitalized }
+    var title: String { self == .all ? "All Types" : rawValue.capitalized }
+
+    var symbol: String {
+        switch self {
+        case .all: "square.stack"
+        case .text: "text.alignleft"
+        case .images: "photo"
+        case .files: "doc"
+        case .links: "link"
+        }
+    }
 
     func includes(_ entry: ClipboardEntry) -> Bool {
         switch (self, entry.content) {
-        case (.all, _), (.text, .text), (.images, .image), (.files, .files): true
+        case (.all, _), (.images, .image), (.files, .files): true
+        case (.text, .text): !entry.isLink
+        case (.links, .text): entry.isLink
         default: false
         }
+    }
+
+    var next: ClipboardFilter {
+        let all = Self.allCases
+        return all[(all.firstIndex(of: self)! + 1) % all.count]
     }
 }
 
@@ -62,6 +79,8 @@ struct ClipboardEntry: Codable, Identifiable, Equatable, Sendable {
     var copiedAt: Date
     var sourceName: String
     var sourceBundleID: String?
+    /// Pinned entries are exempt from retention and the entry limit, not from the byte budget.
+    var isPinned = false
 
     init(id: UUID = UUID(), text: String, copiedAt: Date = .now, sourceName: String, sourceBundleID: String? = nil) {
         self.init(
@@ -84,6 +103,16 @@ struct ClipboardEntry: Codable, Identifiable, Equatable, Sendable {
     var text: String { plainText ?? "" }
     var image: ClipboardImage? { if case .image(let image) = content { image } else { nil } }
 
+    /// A single web or mail link, so the Links filter can find it.
+    var isLink: Bool {
+        guard case .text(let text) = content else { return false }
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard trimmed.count <= 2_048, !trimmed.contains(where: \.isWhitespace),
+            let url = URL(string: trimmed), let scheme = url.scheme?.lowercased()
+        else { return false }
+        return (["http", "https"].contains(scheme) && url.host?.isEmpty == false) || scheme == "mailto"
+    }
+
     var title: String {
         switch content {
         case .text(let text):
@@ -97,7 +126,7 @@ struct ClipboardEntry: Codable, Identifiable, Equatable, Sendable {
 
     var kindTitle: String {
         switch content {
-        case .text: "Text"
+        case .text: isLink ? "Link" : "Text"
         case .image: "Image"
         case .files(let files): files.count == 1 ? "File" : "Files"
         }
@@ -105,9 +134,9 @@ struct ClipboardEntry: Codable, Identifiable, Equatable, Sendable {
 
     var symbol: String {
         switch content {
-        case .text: "doc.on.clipboard"
+        case .text: isLink ? "link" : "text.alignleft"
         case .image: "photo"
-        case .files: "doc.on.doc"
+        case .files(let files): files.count == 1 ? "doc" : "doc.on.doc"
         }
     }
 
@@ -140,7 +169,7 @@ struct ClipboardEntry: Codable, Identifiable, Equatable, Sendable {
     }
 
     private enum CodingKeys: String, CodingKey {
-        case id, kind, text, image, files, copiedAt, sourceName, sourceBundleID
+        case id, kind, text, image, files, copiedAt, sourceName, sourceBundleID, pinned
     }
 
     init(from decoder: any Decoder) throws {
@@ -149,6 +178,7 @@ struct ClipboardEntry: Codable, Identifiable, Equatable, Sendable {
         copiedAt = try container.decode(Date.self, forKey: .copiedAt)
         sourceName = try container.decode(String.self, forKey: .sourceName)
         sourceBundleID = try container.decodeIfPresent(String.self, forKey: .sourceBundleID)
+        isPinned = try container.decodeIfPresent(Bool.self, forKey: .pinned) ?? false
         // Version 1 entries contained only a `text` field, without a kind tag.
         switch try container.decodeIfPresent(String.self, forKey: .kind) ?? "text" {
         case "text": content = .text(try container.decode(String.self, forKey: .text))
@@ -166,6 +196,7 @@ struct ClipboardEntry: Codable, Identifiable, Equatable, Sendable {
         try container.encode(copiedAt, forKey: .copiedAt)
         try container.encode(sourceName, forKey: .sourceName)
         try container.encodeIfPresent(sourceBundleID, forKey: .sourceBundleID)
+        if isPinned { try container.encode(true, forKey: .pinned) }
         switch content {
         case .text(let text):
             try container.encode("text", forKey: .kind)

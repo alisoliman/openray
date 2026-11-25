@@ -182,6 +182,33 @@ struct GlobalHotKeyTests {
         registry.unregister()
     }
 
+    @Test func duplicateShortcutMessagesNameTheOwnerWithoutItsID() {
+        let backend = FakeHotKeyBackend()
+        let registry = GlobalHotKey(backend: backend, reservedShortcuts: { [] })
+        let bindings = [
+            CommandBinding(targetID: clipboard, shortcut: shortcut),
+            CommandBinding(targetID: notes, shortcut: shortcut),
+        ]
+        let titled = registry.synchronize(
+            launcher: .optionSpace, bindings: bindings, onLauncher: {}, onCommand: { _ in },
+            title: { $0 == clipboard ? "Clipboard History" : nil })
+        #expect(titled.map(\.targetID) == [notes])
+        #expect(titled.first?.message.contains("because Clipboard History uses it") == true)
+        #expect(titled.first?.message.contains(clipboard) == false)
+
+        let untitled = registry.synchronize(
+            launcher: .optionSpace, bindings: bindings, onLauncher: {}, onCommand: { _ in })
+        #expect(untitled.first?.message.contains("because another command uses it") == true)
+        #expect(untitled.first?.message.contains(clipboard) == false)
+
+        let launcherConflict = registry.synchronize(
+            launcher: .optionSpace,
+            bindings: [CommandBinding(targetID: notes, shortcut: LauncherHotKey.optionSpace.shortcut)],
+            onLauncher: {}, onCommand: { _ in }, title: { _ in "Notes" })
+        #expect(launcherConflict.first?.message.contains("because the launcher uses it") == true)
+        registry.unregister()
+    }
+
     @Test func oneRegistrationFailureDoesNotPreventOtherCommandsAndRetriesLater() {
         let backend = FakeHotKeyBackend()
         backend.failures = [shortcut]
