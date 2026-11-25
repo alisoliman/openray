@@ -181,11 +181,17 @@ final class ClipboardService {
                 guard data.count <= ClipboardLimits.textBytes else {
                     throw LibraryValidationError("This copied text exceeds the 128 KB clipboard-entry limit.")
                 }
+                // Formatting is kept next to the text for Paste As. Oversized formatting is dropped, not the copy.
+                let richText = ClipboardRichText.capture(
+                    rtf: types.contains(NSPasteboard.PasteboardType.rtf.rawValue) ? pasteboard.data(forType: .rtf) : nil,
+                    html: types.contains(NSPasteboard.PasteboardType.html.rawValue)
+                        ? pasteboard.data(forType: .html) : nil)
                 guard let text = String(data: data, encoding: .utf8), pasteboard.changeCount == change else { return }
-                let captured = store.capture(
-                    ClipboardEntry(
-                        text: text, copiedAt: copiedAt, sourceName: source.sourceName,
-                        sourceBundleID: source.sourceBundleID))
+                var entry = ClipboardEntry(
+                    text: text, copiedAt: copiedAt, sourceName: source.sourceName,
+                    sourceBundleID: source.sourceBundleID)
+                entry.richText = richText
+                let captured = store.capture(entry)
                 if !captured { contentMessage = store.captureRejection }
             }
         } catch is CancellationError {
@@ -235,31 +241,49 @@ final class ClipboardService {
         return write([item])
     }
 
+    /// Copies text with optional formatting, e.g. a formatted snippet.
     @discardableResult
-    func copy(_ entry: ClipboardEntry) -> Bool {
+    func copy(_ text: String, richText: ClipboardRichText?, as format: ClipboardPasteFormat = .original) -> Bool {
+        lastCopyError = nil
+        guard let items = ClipboardPayload.items(text: text, richText: richText, format: format) else {
+            lastCopyError = "This text has no \(format.title.replacingOccurrences(of: "Paste as ", with: "")) version."
+            return false
+        }
+        return write(items.map(Self.pasteboardItem))
+    }
+
+    @discardableResult
+    func copy(_ entry: ClipboardEntry) -> Bool { copy(entry, as: .original) }
+
+    /// Copies an entry in one of its formats; see `ClipboardPayload.formats(for:)`.
+    @discardableResult
+    func copy(_ entry: ClipboardEntry, as format: ClipboardPasteFormat) -> Bool {
         lastCopyError = nil
         guard entry.isValid else {
             lastCopyError = "This saved clipboard entry is invalid."
             return false
         }
-        switch entry.content {
-        case .text(let text): return copy(text)
-        case .image(let image):
+        var imageData: Data?
+        if case .image(let image) = entry.content, format == .original {
             guard let data = store.imageData(for: image) else {
                 lastCopyError = "This saved image is missing or damaged. The current clipboard was not changed."
                 return false
             }
-            let item = NSPasteboardItem()
-            item.setData(data, forType: .png)
-            return write([item])
-        case .files(let urls):
-            let items = urls.map { url in
-                let item = NSPasteboardItem()
-                item.setString(url.absoluteString, forType: .fileURL)
-                return item
-            }
-            return write(items)
+            imageData = data
         }
+        guard let items = ClipboardPayload.items(for: entry, format: format, imageData: imageData) else {
+            lastCopyError = "“\(format.title)” isn't available for this entry. The current clipboard was not changed."
+            return false
+        }
+        return write(items.map(Self.pasteboardItem))
+    }
+
+    private static func pasteboardItem(_ representations: [ClipboardRepresentation]) -> NSPasteboardItem {
+        let item = NSPasteboardItem()
+        for representation in representations {
+            item.setData(representation.data, forType: NSPasteboard.PasteboardType(representation.type))
+        }
+        return item
     }
 
     private func write(_ items: [NSPasteboardItem]) -> Bool {
