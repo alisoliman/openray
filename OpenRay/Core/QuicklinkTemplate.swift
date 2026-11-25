@@ -37,34 +37,32 @@ struct QuicklinkTemplate: Hashable, Sendable {
 
     /// The link with the legacy `{query}` and `{Name}` arguments rewritten as
     /// `{argument name="…"}`, for export to tools that only know the newer syntax.
+    /// Only those tokens change; everything else, escapes included, stays as written.
     var modernizedLink: String {
-        var result = ""
-        for segment in template.segments {
-            switch segment {
-            case .literal(let text): result += text
-            case .placeholder(let placeholder):
-                if case .argument(let argument) = placeholder.token, let name = argument.name,
-                    !placeholder.source.hasPrefix("{argument")
-                {
-                    let modifiers = placeholder.modifiers.map { " | \($0.rawValue)" }.joined()
-                    result += "{argument name=\"\(name)\"\(modifiers)}"
-                } else {
-                    result += placeholder.source
-                }
-            }
+        var result = link
+        for placeholder in template.placeholders.reversed() where placeholder.isLegacyArgument {
+            guard case .argument(let argument) = placeholder.token, let name = argument.name else { continue }
+            let modifiers = placeholder.modifiers.map { " | \($0.rawValue)" }.joined()
+            result.replaceSubrange(placeholder.range, with: "{argument name=\"\(name)\"\(modifiers)}")
         }
         return result
     }
 
-    /// Renders the link and checks the result.
+    /// Plans the link with `source`'s snippets, renders it and checks the result.
+    /// Blocking issues anywhere, including inside referenced snippets, and invalid
+    /// placeholders, whose literal braces don't belong in a link, stop it.
     func resolve(using source: some PlaceholderDataSource) throws -> QuicklinkResolution {
         guard !link.isEmpty else { throw LibraryValidationError("Enter a URL, a deeplink or a file path.") }
-        if let issue = template.validationIssues.first { throw LibraryValidationError(issue.message) }
-        let rendering = template.render(source, options: .init(appliesContextFormatting: !isPath))
+        let plan = template.plan(snippets: source.snippetText(named:))
+        if let issue = plan.issues.first(where: { $0.blocksExecution || Self.isInvalid($0) }) {
+            throw LibraryValidationError(issue.message)
+        }
+        let rendering = plan.render(source, options: .init(appliesContextFormatting: !isPath))
         if let missing = rendering.missingArguments.first {
             throw LibraryValidationError(
                 missing == "query" ? "Enter a search term for this quicklink." : "Enter a value for “\(missing)”.")
         }
+        if let issue = rendering.blockingIssues.first { throw LibraryValidationError(issue.message) }
         let text = rendering.text
         guard !text.unicodeScalars.contains(where: { CharacterSet.controlCharacters.contains($0) }) else {
             throw LibraryValidationError("A quicklink can't contain line breaks or control characters.")
@@ -102,10 +100,15 @@ struct QuicklinkTemplate: Hashable, Sendable {
         }
     }
 
-    /// Checks the link for saving: placeholder syntax, then a trial render with
-    /// sample values for every argument and source.
+    /// Checks the link for saving: every placeholder issue, including ones a run
+    /// would tolerate such as `{cursor}`, then a trial render with sample values.
     func validate() throws {
+        if let issue = template.validationIssues.first { throw LibraryValidationError(issue.message) }
         _ = try resolve(using: SampleQuicklinkValues())
+    }
+
+    private static func isInvalid(_ issue: PlaceholderIssue) -> Bool {
+        if case .invalid = issue { true } else { false }
     }
 
     /// The scheme before the first `:`, if the text starts with one.
@@ -237,9 +240,25 @@ struct WorkspaceApplicationResolver: ApplicationResolving {
     }
 }
 
+enum QuicklinkOpeners {
+    /// The opener the app should use: an inert one in the test host and in
+    /// verification runs, the workspace otherwise.
+    @MainActor static func makeDefault() -> any QuicklinkOpening {
+        ClipEffectBoundary.isInert ? InertQuicklinkOpener() : WorkspaceQuicklinkOpener()
+    }
+}
+
+/// Refuses to open anything.
+struct InertQuicklinkOpener: QuicklinkOpening {
+    func open(_ url: URL, with application: ResolvedApplication?) async throws {
+        throw ClipEffectBoundary.Blocked(action: "opening links and apps")
+    }
+}
+
 /// Opens links with NSWorkspace, in the chosen app or the default handler.
 struct WorkspaceQuicklinkOpener: QuicklinkOpening {
     func open(_ url: URL, with application: ResolvedApplication?) async throws {
+        try ClipEffectBoundary.check("opening links and apps")
         let configuration = NSWorkspace.OpenConfiguration()
         if let application {
             _ = try await NSWorkspace.shared.open([url], withApplicationAt: application.url, configuration: configuration)

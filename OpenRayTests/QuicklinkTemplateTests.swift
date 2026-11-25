@@ -155,3 +155,34 @@ struct QuicklinkTemplateTests {
         #expect(try JSONDecoder().decode(QuicklinkApplication.self, from: data) == app)
     }
 }
+
+struct QuicklinkReviewFixTests {
+    @Test func modernizingKeepsEscapesAndModernSyntaxExactly() throws {
+        let escaped = #"https://example.com/?q=\{clipboard}&r={query}"#
+        #expect(QuicklinkTemplate(escaped).modernizedLink == #"https://example.com/?q=\{clipboard}&r={argument name="query"}"#)
+        let spaced = #"https://x.com/{ argument name="x" default="d" options="a, b"}"#
+        #expect(QuicklinkTemplate(spaced).modernizedLink == spaced)
+
+        // Export, import and resolve: the escaped token stays literal text, never a clipboard read.
+        let exported = try LibraryImport.exportQuicklinks([ImportedQuicklink(name: "Escaped", link: QuicklinkTemplate(escaped).modernizedLink)])
+        let imported = try #require(try LibraryImport.quicklinks(from: exported).items.first)
+        #expect(imported.link == #"https://example.com/?q=\{clipboard}&r={argument name="query"}"#)
+        let template = QuicklinkTemplate(imported.link)
+        #expect(!template.template.placeholders.contains { $0.kind == .clipboard })
+        #expect(template.arguments.map(\.id) == [.named("query")])
+    }
+
+    @Test func legacyPlaceholdersAreMarked() {
+        let template = QuicklinkTemplate("x://{query}/{Name}/{argument name=\"query\"}")
+        #expect(template.template.placeholders.map(\.isLegacyArgument) == [true, true, false])
+    }
+
+    @MainActor @Test func theTestHostGetsAnInertOpener() async {
+        #expect(ClipEffectBoundary.isInert)
+        let opener = QuicklinkOpeners.makeDefault()
+        #expect(opener is InertQuicklinkOpener)
+        await #expect(throws: ClipEffectBoundary.Blocked(action: "opening links and apps")) {
+            try await opener.open(URL(string: "https://example.com")!, with: nil)
+        }
+    }
+}
