@@ -35,38 +35,6 @@ extension ClipboardPolicy {
     }
 }
 
-/// Slice 2's single gate in front of effects outside OpenRay: typing into other
-/// apps, watching global keys, opening links and apps, beeping, and writing the
-/// general pasteboard. Every live executor and writer asks here first.
-///
-/// It uses the app's existing `RuntimeMode` detection until the shared
-/// `SideEffectGuard` lands; then `isInert` and `check(_:)` forward to it, and
-/// nothing else changes.
-enum ClipEffectBoundary {
-    struct Blocked: LocalizedError, Equatable {
-        var action: String
-        var errorDescription: String? { "OpenRay doesn't allow \(action) while tests or verification run." }
-    }
-
-    /// True in the test host and in verification or in-memory runs.
-    static var isInert: Bool { RuntimeMode.isTestHost || RuntimeMode.usesInMemoryLibrary }
-
-    static func check(_ action: String) throws {
-        if isInert { throw Blocked(action: action) }
-    }
-
-    /// Writes to the general pasteboard are refused while inert; named boards are fine.
-    @MainActor static func checkWrite(to pasteboard: NSPasteboard) throws {
-        if pasteboard.name == .general { try check("writing to the clipboard") }
-    }
-
-    /// The board a service should use: a private one instead of the general
-    /// pasteboard while inert, so default construction never touches the real clipboard.
-    @MainActor static func pasteboard(for requested: NSPasteboard) -> NSPasteboard {
-        isInert && requested.name == .general ? NSPasteboard.withUniqueName() : requested
-    }
-}
-
 struct ClipboardCaptureContext: Sendable {
     var sourceName: String
     var sourceBundleID: String?
@@ -103,6 +71,7 @@ final class ClipboardService {
     @ObservationIgnored private let imageProcessor: any ClipboardImagePreparing
     @ObservationIgnored private let captureContext: @MainActor () -> ClipboardCaptureContext
     @ObservationIgnored private var previousPolicy: CapturePolicy?
+    @ObservationIgnored private let sideEffects: SideEffectGuard
 
     private struct CapturePolicy: Equatable {
         var enabled: Bool
@@ -114,10 +83,12 @@ final class ClipboardService {
     init(
         store: LibraryStore, pasteboard: NSPasteboard = .general,
         imageProcessor: any ClipboardImagePreparing = ClipboardImageProcessor.shared,
-        captureContext: @escaping @MainActor () -> ClipboardCaptureContext = ClipboardCaptureContext.current
+        captureContext: @escaping @MainActor () -> ClipboardCaptureContext = ClipboardCaptureContext.current,
+        sideEffects: SideEffectGuard = .current
     ) {
         self.store = store
-        let pasteboard = ClipEffectBoundary.pasteboard(for: pasteboard)
+        self.sideEffects = sideEffects
+        let pasteboard = Self.pasteboard(for: pasteboard, sideEffects: sideEffects)
         self.pasteboard = pasteboard
         self.imageProcessor = imageProcessor
         self.captureContext = captureContext
@@ -252,6 +223,13 @@ final class ClipboardService {
     /// same concealed and transient checks capture uses.
     func placeholderText() -> String? { ClipboardPolicy.placeholderText(from: pasteboard) }
 
+    /// The board a service uses: a private one instead of the general pasteboard
+    /// while side effects are inert, so default construction in tests and
+    /// verification never touches the person's clipboard.
+    static func pasteboard(for requested: NSPasteboard, sideEffects: SideEffectGuard) -> NSPasteboard {
+        sideEffects.mayWrite(to: requested) ? requested : NSPasteboard.withUniqueName()
+    }
+
     /// RTF and HTML from the first item whose plain text is `text`. Representations
     /// from different items are never paired.
     static func richText(matching text: Data, in items: [NSPasteboardItem]) -> ClipboardRichText? {
@@ -346,7 +324,7 @@ final class ClipboardService {
 
     /// Every write goes through here, so the general pasteboard is refused while inert.
     private func write(_ items: [NSPasteboardItem]) -> Bool {
-        do { try ClipEffectBoundary.checkWrite(to: pasteboard) } catch {
+        do { try sideEffects.checkWrite(to: pasteboard) } catch {
             lastCopyError = error.localizedDescription
             return false
         }
@@ -363,7 +341,7 @@ enum SyntheticInput {
     static let marker: Int64 = 0x4F52_4159
 
     static func paste(into application: NSRunningApplication, expectedChangeCount: Int) async throws {
-        try ClipEffectBoundary.check("pasting into other apps")
+        try SideEffectGuard.check("pasting into other apps")
         guard AXIsProcessTrusted() else {
             throw LibraryValidationError(
                 "Copied to the clipboard. Enable Accessibility in Settings for direct paste, or press ⌘V in your app.")
@@ -384,8 +362,8 @@ enum SyntheticInput {
 
     /// Posts one key press to `pid` only. Every synthetic key event OpenRay sends
     /// for snippets goes through here or `postText`.
-    static func postKey(_ code: CGKeyCode, toProcess pid: pid_t) throws {
-        try ClipEffectBoundary.check("typing into other apps")
+    static func postKey(_ code: CGKeyCode, toProcess pid: pid_t, sideEffects: SideEffectGuard = .current) throws {
+        try sideEffects.check("typing into other apps")
         guard let down = CGEvent(keyboardEventSource: nil, virtualKey: code, keyDown: true),
             let up = CGEvent(keyboardEventSource: nil, virtualKey: code, keyDown: false)
         else {
@@ -398,8 +376,8 @@ enum SyntheticInput {
     }
 
     /// Types up to 20 UTF-16 code units into `pid` only.
-    static func postText(_ chunk: [UInt16], toProcess pid: pid_t) throws {
-        try ClipEffectBoundary.check("typing into other apps")
+    static func postText(_ chunk: [UInt16], toProcess pid: pid_t, sideEffects: SideEffectGuard = .current) throws {
+        try sideEffects.check("typing into other apps")
         guard let down = CGEvent(keyboardEventSource: nil, virtualKey: 0, keyDown: true),
             let up = CGEvent(keyboardEventSource: nil, virtualKey: 0, keyDown: false)
         else {
@@ -428,7 +406,7 @@ enum SyntheticInput {
     }
 
     private static func key(_ code: CGKeyCode, flags: CGEventFlags = []) throws {
-        try ClipEffectBoundary.check("pasting into other apps")
+        try SideEffectGuard.check("pasting into other apps")
         guard let down = CGEvent(keyboardEventSource: nil, virtualKey: code, keyDown: true),
             let up = CGEvent(keyboardEventSource: nil, virtualKey: code, keyDown: false)
         else {

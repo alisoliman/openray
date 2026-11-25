@@ -144,17 +144,24 @@ struct ClipboardRichTextTests {
     }
 
     @Test func defaultServicesNeverUseTheRealClipboard() {
-        #expect(ClipEffectBoundary.isInert)
+        #expect(SideEffectGuard.isInert)
         #expect(!ClipboardService(store: makeStore()).usesGeneralPasteboard)
         #expect(!ClipboardService(store: makeStore(), pasteboard: .general).usesGeneralPasteboard)
         #expect(!LauncherModel(store: LibraryStore(fileURL: nil)).clipboard.usesGeneralPasteboard)
-        #expect(throws: ClipEffectBoundary.Blocked(action: "writing to the clipboard")) {
-            try ClipEffectBoundary.checkWrite(to: .general)
-        }
+    }
+
+    @Test(arguments: [SideEffectGuard.Mode.testHost, .verification])
+    func inertModesIsolateTheGeneralPasteboard(_ mode: SideEffectGuard.Mode) {
+        let sideEffects = SideEffectGuard(mode: mode)
+        let service = ClipboardService(store: makeStore(), pasteboard: .general, sideEffects: sideEffects)
+        #expect(!service.usesGeneralPasteboard)
+        // The private board it got instead works normally.
+        #expect(service.copy("Private"))
+        #expect(service.readText() == "Private")
         let named = NSPasteboard(name: .init("OpenRayTests.\(UUID())"))
         defer { named.releaseGlobally() }
-        #expect(throws: Never.self) { try ClipEffectBoundary.checkWrite(to: named) }
-        #expect(ClipEffectBoundary.pasteboard(for: named) === named)
+        #expect(ClipboardService.pasteboard(for: named, sideEffects: sideEffects) === named)
+        #expect(!sideEffects.mayWrite(to: .general))
     }
 
     @Test func placeholderTextFollowsTheCapturePrivacyRules() {

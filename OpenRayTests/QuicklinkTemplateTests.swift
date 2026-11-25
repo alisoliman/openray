@@ -177,12 +177,15 @@ struct QuicklinkReviewFixTests {
         #expect(template.template.placeholders.map(\.isLegacyArgument) == [true, true, false])
     }
 
-    @MainActor @Test func theTestHostGetsAnInertOpener() async {
-        #expect(ClipEffectBoundary.isInert)
-        let opener = QuicklinkOpeners.makeDefault()
+    @MainActor @Test(arguments: [SideEffectGuard.Mode.testHost, .verification])
+    func inertModesGetAnInertOpener(_ mode: SideEffectGuard.Mode) async {
+        let opener = QuicklinkOpeners.makeDefault(sideEffects: SideEffectGuard(mode: mode))
         #expect(opener is InertQuicklinkOpener)
-        await #expect(throws: ClipEffectBoundary.Blocked(action: "opening links and apps")) {
+        await #expect(throws: SideEffectGuard.Blocked(what: "opening links and apps", mode: mode)) {
             try await opener.open(URL(string: "https://example.com")!, with: nil)
         }
+        // Built only, never called.
+        #expect(QuicklinkOpeners.makeDefault(sideEffects: SideEffectGuard(mode: .live)) is WorkspaceQuicklinkOpener)
+        #expect(QuicklinkOpeners.makeDefault() is InertQuicklinkOpener)
     }
 }

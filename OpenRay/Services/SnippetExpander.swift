@@ -281,23 +281,28 @@ protocol SnippetInserting {
 enum SnippetInserters {
     /// The inserter the app should use: an inert one in the test host and in
     /// verification runs, live keyboard events otherwise.
-    @MainActor static func makeDefault() -> any SnippetInserting {
-        ClipEffectBoundary.isInert ? InertSnippetInserter() : LiveSnippetInserter()
+    @MainActor static func makeDefault(sideEffects: SideEffectGuard = .current) -> any SnippetInserting {
+        sideEffects.isInert ? InertSnippetInserter(sideEffects: sideEffects) : LiveSnippetInserter(sideEffects: sideEffects)
     }
 }
 
 /// Refuses every expansion.
 struct InertSnippetInserter: SnippetInserting {
+    var sideEffects = SideEffectGuard.current
+
     func insert(_ plan: SnippetExpansionPlan, into processID: pid_t) throws -> KeystrokeScript.Result {
-        throw ClipEffectBoundary.Blocked(action: "typing into other apps")
+        throw SideEffectGuard.Blocked(what: "typing into other apps", mode: sideEffects.mode)
     }
 }
 
 /// Types into the focused field of `processID` with synthetic key events.
 struct LiveSnippetInserter: SnippetInserting {
+    var sideEffects = SideEffectGuard.current
+
     func insert(_ plan: SnippetExpansionPlan, into processID: pid_t) throws -> KeystrokeScript.Result {
-        try ClipEffectBoundary.check("typing into other apps")
-        return try KeystrokeScript.run(plan, on: AccessibilityKeystrokeTarget(processID: processID))
+        try sideEffects.check("typing into other apps")
+        return try KeystrokeScript.run(
+            plan, on: AccessibilityKeystrokeTarget(processID: processID, sideEffects: sideEffects))
     }
 }
 
@@ -306,11 +311,13 @@ struct LiveSnippetInserter: SnippetInserting {
 @MainActor
 final class AccessibilityKeystrokeTarget: KeystrokeTarget {
     let processID: pid_t
+    private let sideEffects: SideEffectGuard
     private let application: AXUIElement
     private let focused: AXUIElement?
 
-    init(processID: pid_t) {
+    init(processID: pid_t, sideEffects: SideEffectGuard = .current) {
         self.processID = processID
+        self.sideEffects = sideEffects
         application = AXUIElementCreateApplication(processID)
         focused = Self.focusedElement(in: application)
     }
@@ -325,9 +332,17 @@ final class AccessibilityKeystrokeTarget: KeystrokeTarget {
         return CFEqual(current, focused)
     }
 
-    func pressDelete() throws { try SyntheticInput.postKey(CGKeyCode(kVK_Delete), toProcess: processID) }
-    func type(_ chunk: [UInt16]) throws { try SyntheticInput.postText(chunk, toProcess: processID) }
-    func pressLeftArrow() throws { try SyntheticInput.postKey(CGKeyCode(kVK_LeftArrow), toProcess: processID) }
+    func pressDelete() throws {
+        try SyntheticInput.postKey(CGKeyCode(kVK_Delete), toProcess: processID, sideEffects: sideEffects)
+    }
+
+    func type(_ chunk: [UInt16]) throws {
+        try SyntheticInput.postText(chunk, toProcess: processID, sideEffects: sideEffects)
+    }
+
+    func pressLeftArrow() throws {
+        try SyntheticInput.postKey(CGKeyCode(kVK_LeftArrow), toProcess: processID, sideEffects: sideEffects)
+    }
 
     func caretLocation() -> Int? {
         guard let focused else { return nil }
@@ -349,7 +364,7 @@ final class AccessibilityKeystrokeTarget: KeystrokeTarget {
     }
 
     func setCaretLocation(_ location: Int) -> Bool {
-        guard (try? ClipEffectBoundary.check("moving the caret in other apps")) != nil, let focused else { return false }
+        guard (try? sideEffects.check("moving the caret in other apps")) != nil, let focused else { return false }
         var range = CFRange(location: location, length: 0)
         guard let value = AXValueCreate(.cfRange, &range) else { return false }
         return AXUIElementSetAttributeValue(focused, kAXSelectedTextRangeAttribute as CFString, value) == .success
@@ -440,6 +455,7 @@ final class SnippetExpander {
     private let isSecureInputEnabled: @MainActor () -> Bool
     private let values: ValuesProvider
     private let failureFeedback: @MainActor () -> Void
+    private let sideEffects: SideEffectGuard
     private var monitor: Any?
     private var mouseMonitor: Any?
     private var matcher = SnippetMatcher()
@@ -451,33 +467,42 @@ final class SnippetExpander {
         didSet { matcher.reset() }
     }
 
+    /// Defaults come from `sideEffects`: inert executors in the test host and in
+    /// verification runs, so a default expander never types, beeps, watches keys
+    /// or reads the person's clipboard there.
     init(
         store: LibraryStore, inserter: (any SnippetInserting)? = nil,
         isSecureInputEnabled: @escaping @MainActor () -> Bool = { IsSecureEventInputEnabled() },
-        values: ValuesProvider? = nil, failureFeedback: (@MainActor () -> Void)? = nil
+        values: ValuesProvider? = nil, failureFeedback: (@MainActor () -> Void)? = nil,
+        sideEffects: SideEffectGuard = .current
     ) {
         self.store = store
-        self.inserter = inserter ?? SnippetInserters.makeDefault()
+        self.sideEffects = sideEffects
+        self.inserter = inserter ?? SnippetInserters.makeDefault(sideEffects: sideEffects)
         self.isSecureInputEnabled = isSecureInputEnabled
-        self.values = values ?? Self.liveValues
-        self.failureFeedback = failureFeedback ?? Self.alertSound
+        self.values = values ?? Self.liveValues(sideEffects: sideEffects)
+        self.failureFeedback = failureFeedback ?? Self.alertSound(sideEffects: sideEffects)
     }
 
     /// Reads the general pasteboard for `{clipboard}` when a run needs it, never while inert.
-    static let liveValues: ValuesProvider = { database, requirements in
-        PlaceholderValues.snapshot(library: database, requirements: requirements) {
-            ClipEffectBoundary.isInert ? nil : ClipboardPolicy.placeholderText(from: .general)
+    static func liveValues(sideEffects: SideEffectGuard) -> ValuesProvider {
+        { database, requirements in
+            PlaceholderValues.snapshot(library: database, requirements: requirements) {
+                sideEffects.isInert ? nil : ClipboardPolicy.placeholderText(from: .general)
+            }
         }
     }
 
-    static let alertSound: @MainActor () -> Void = {
-        guard (try? ClipEffectBoundary.check("playing the alert sound")) != nil else { return }
-        NSSound.beep()
+    static func alertSound(sideEffects: SideEffectGuard) -> @MainActor () -> Void {
+        {
+            guard (try? sideEffects.check("playing the alert sound")) != nil else { return }
+            NSSound.beep()
+        }
     }
 
     func configure() {
         stop()
-        guard (try? ClipEffectBoundary.check("watching keystrokes")) != nil,
+        guard (try? sideEffects.check("watching keystrokes")) != nil,
             store.database.preferences.snippetExpansionEnabled, AXIsProcessTrusted()
         else { return }
         monitor = NSEvent.addGlobalMonitorForEvents(matching: .keyDown) { [weak self] event in

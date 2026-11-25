@@ -243,22 +243,26 @@ struct WorkspaceApplicationResolver: ApplicationResolving {
 enum QuicklinkOpeners {
     /// The opener the app should use: an inert one in the test host and in
     /// verification runs, the workspace otherwise.
-    @MainActor static func makeDefault() -> any QuicklinkOpening {
-        ClipEffectBoundary.isInert ? InertQuicklinkOpener() : WorkspaceQuicklinkOpener()
+    @MainActor static func makeDefault(sideEffects: SideEffectGuard = .current) -> any QuicklinkOpening {
+        sideEffects.isInert ? InertQuicklinkOpener(sideEffects: sideEffects) : WorkspaceQuicklinkOpener(sideEffects: sideEffects)
     }
 }
 
 /// Refuses to open anything.
 struct InertQuicklinkOpener: QuicklinkOpening {
+    var sideEffects = SideEffectGuard.current
+
     func open(_ url: URL, with application: ResolvedApplication?) async throws {
-        throw ClipEffectBoundary.Blocked(action: "opening links and apps")
+        throw SideEffectGuard.Blocked(what: "opening links and apps", mode: sideEffects.mode)
     }
 }
 
 /// Opens links with NSWorkspace, in the chosen app or the default handler.
 struct WorkspaceQuicklinkOpener: QuicklinkOpening {
+    var sideEffects = SideEffectGuard.current
+
     func open(_ url: URL, with application: ResolvedApplication?) async throws {
-        try ClipEffectBoundary.check("opening links and apps")
+        try sideEffects.check("opening links and apps")
         let configuration = NSWorkspace.OpenConfiguration()
         if let application {
             _ = try await NSWorkspace.shared.open([url], withApplicationAt: application.url, configuration: configuration)

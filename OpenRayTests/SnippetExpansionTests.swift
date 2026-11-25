@@ -409,11 +409,14 @@ struct SnippetExpanderTests {
         #expect(inserter.plans.map(\.1) == [2])
     }
 
-    @Test func theTestHostGetsInertDefaults() {
-        #expect(ClipEffectBoundary.isInert)
-        #expect(SnippetInserters.makeDefault() is InertSnippetInserter)
-        #expect(throws: ClipEffectBoundary.Blocked(action: "typing into other apps")) {
-            try InertSnippetInserter().insert(SnippetExpansionPlan(deleteCount: 1, text: "x", caretLeft: 0), into: 1)
+    @Test(arguments: [SideEffectGuard.Mode.testHost, .verification])
+    func inertModesGetInertDefaults(_ mode: SideEffectGuard.Mode) {
+        let sideEffects = SideEffectGuard(mode: mode)
+        #expect(SideEffectGuard.isTestHost)
+        #expect(SnippetInserters.makeDefault(sideEffects: sideEffects) is InertSnippetInserter)
+        #expect(throws: SideEffectGuard.Blocked(what: "typing into other apps", mode: mode)) {
+            try InertSnippetInserter(sideEffects: sideEffects).insert(
+                SnippetExpansionPlan(deleteCount: 1, text: "x", caretLeft: 0), into: 1)
         }
         // A default expander reaches only the inert inserter and never reads the real clipboard.
         let store = LibraryStore(fileURL: nil)
@@ -421,13 +424,19 @@ struct SnippetExpanderTests {
             $0.preferences.snippetExpansionEnabled = true
             $0.snippets = [Snippet(name: "Clip", keyword: ";c", content: "{clipboard}")]
         }
-        let expander = SnippetExpander(store: store, isSecureInputEnabled: { false })
+        let expander = SnippetExpander(store: store, isSecureInputEnabled: { false }, sideEffects: sideEffects)
         let outcome = expander.handle(SnippetKeyInput(characters: ";c", processID: 1, bundleIdentifier: "com.apple.TextEdit"))
         #expect(
             outcome
                 == .failed(
                     SnippetExpansionPlan(deleteCount: 2, text: "", caretLeft: 0),
-                    ClipEffectBoundary.Blocked(action: "typing into other apps").localizedDescription))
+                    SideEffectGuard.Blocked(what: "typing into other apps", mode: mode).localizedDescription))
+    }
+
+    @Test func aLiveLaunchGetsTheLiveInserter() {
+        // Built only, never called: constructing it has no effect.
+        #expect(SnippetInserters.makeDefault(sideEffects: SideEffectGuard(mode: .live)) is LiveSnippetInserter)
+        #expect(SnippetInserters.makeDefault() is InertSnippetInserter)
     }
 
     @Test func snapshotsReadOnlyWhatThePlanNeeds() {
