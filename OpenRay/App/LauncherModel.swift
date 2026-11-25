@@ -82,13 +82,27 @@ final class LauncherModel {
     var actionSelection = 0
 
     let store: LibraryStore
+    /// The registered command providers. Rows with `.provided` actions dispatch through it.
+    let registry: CommandRegistry
+    /// Rows from providers' live searches, by provider id, for the current query and scope.
+    private(set) var providedLiveItems: [String: [LauncherItem]] = [:]
+    /// Providers whose live search for the current query hasn't answered yet.
+    private(set) var pendingLiveProviderIDs: Set<String> = []
+    /// True while a provider's live search for the current query is running.
+    var isLoadingProvidedItems: Bool { !pendingLiveProviderIDs.isEmpty }
+    @ObservationIgnored private var providedLiveTasks: [Task<Void, Never>] = []
+    /// Bumped whenever live searches restart or stop, so a late answer for an earlier query is dropped.
+    @ObservationIgnored private var liveGeneration = 0
     let applications = ApplicationCatalog()
     let files = FileSearchService()
     let ai: AIChatModel
     let windows = WindowManager()
     @ObservationIgnored let clipboard: ClipboardService
     @ObservationIgnored let snippets: SnippetExpander
-    @ObservationIgnored let hotKey = GlobalHotKey()
+    @ObservationIgnored let hotKey: GlobalHotKey
+    /// A hotkey registry passed in by a test, backed by a fake. It may register while the
+    /// pasteboard is isolated; the real Carbon one never does.
+    @ObservationIgnored let usesInjectedHotKey: Bool
     @ObservationIgnored weak var panel: LauncherPanelController?
     @ObservationIgnored var previousApplication: NSRunningApplication? {
         didSet {
@@ -112,8 +126,14 @@ final class LauncherModel {
     /// Stands in for the Accessibility read of the selected text. Tests set it.
     @ObservationIgnored var selectionReader: (() throws -> String)?
 
-    init(store: LibraryStore = LibraryStore(), ai: AIChatModel = AIChatModel(), pasteboard: NSPasteboard = .general) {
+    init(
+        store: LibraryStore = LibraryStore(), ai: AIChatModel = AIChatModel(), pasteboard: NSPasteboard = .general,
+        registry: CommandRegistry = CommandRegistry(), hotKey: GlobalHotKey? = nil
+    ) {
         self.store = store
+        self.registry = registry
+        self.hotKey = hotKey ?? GlobalHotKey()
+        usesInjectedHotKey = hotKey != nil
         self.ai = ai
         clipboard = ClipboardService(store: store, pasteboard: pasteboard)
         snippets = SnippetExpander(store: store)
@@ -144,7 +164,9 @@ final class LauncherModel {
         case .home:
             items = commandItems + applicationItems + quicklinkItems + snippetItems + noteItems + savedFileItems
             items += clipboardItems.filter { store.database.favoriteIDs.contains($0.id) }
+            items += registry.rootItems(for: query.trimmingCharacters(in: .whitespacesAndNewlines), in: self)
             if query.count >= 2 { items += fileItems }
+            items += providedLiveItemsInOrder
         case .applications: items = applicationItems
         case .files: items = fileItems
         case .clipboard:
@@ -157,12 +179,15 @@ final class LauncherModel {
         case .notes: items = noteItems
         case .calculator: items = []
         case .windows: items = windowItems
+        case .provided(let scope):
+            items = registry.scopeItems(scope, query: query.trimmingCharacters(in: .whitespacesAndNewlines), in: self)
+            items += providedLiveItemsInOrder
         }
 
         var seenIDs = Set<String>()
         items = items.filter { seenIDs.insert($0.id).inserted }
         let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
-        if !trimmed.isEmpty {
+        if !trimmed.isEmpty, section.providedScope?.ranksItems ?? true {
             let now = Date.now
             let favorites = store.database.favoriteIDs
             let usage = Dictionary(store.database.usage.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
@@ -170,6 +195,8 @@ final class LauncherModel {
                 if case .quicklink(let link, let argument) = item.action, link.argument(in: trimmed) != nil {
                     return (item, argument.isEmpty ? 1_000 : 1_100)
                 }
+                // Provided rows that answer the query, such as a conversion, skip the matcher.
+                if case .provided(let ref) = item.action, let rank = ref.rank { return (item, rank) }
                 let titleScore = SearchMatcher.score(trimmed, in: item.title)
                 // Keywords match by word, prefix or substring only; scattered letters are noise there.
                 let keywordScore = SearchMatcher.score(trimmed, in: item.keywords).flatMap { $0 >= 450 ? $0 - 80 : nil }
@@ -244,6 +271,8 @@ final class LauncherModel {
                 LauncherResultGroup(
                     id: "files", title: isQueryBlank ? "Recent in \(fileScope.title)" : nil, items: results)
             ].filter { !$0.items.isEmpty }
+        case .provided(let scope):
+            return registry.scopeGroups(scope, items: results, in: self)
         default:
             return [LauncherResultGroup(id: section.rawValue, title: nil, items: results)].filter { !$0.items.isEmpty }
         }
@@ -260,7 +289,8 @@ final class LauncherModel {
         let index = Dictionary(
             (commandItems + applicationItems + quicklinkItems + snippetItems + noteItems + savedFileItems
                 + clipboardItems).map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
-        return store.database.orderedFavoriteIDs.compactMap { index[$0] }.prefix(16).map { $0 }
+        return store.database.orderedFavoriteIDs.compactMap { index[$0] ?? registry.item(withID: $0, in: self) }
+            .prefix(16).map { $0 }
     }
 
     private var homeGroups: [LauncherResultGroup] {
@@ -273,7 +303,7 @@ final class LauncherModel {
         // Clipboard entries stay out of Everything unless they are favorites.
         let recent = store.database.usage.sorted { $0.lastUsed > $1.lastUsed }
             .filter { !favoriteIDs.contains($0.id) && !$0.id.hasPrefix("clipboard.") }
-            .compactMap { index[$0.id] }.prefix(4)
+            .compactMap { index[$0.id] ?? registry.item(withID: $0.id, in: self) }.prefix(4)
         return [
             LauncherResultGroup(
                 id: "favorites", title: "Favorites", trailing: favorites.count > 1 ? "⌘1 – ⌘\(min(8, favorites.count))" : nil,
@@ -301,7 +331,10 @@ final class LauncherModel {
         groups.append(
             LauncherResultGroup(
                 id: "library", title: "Library", items: instant.filter { !isCommand($0) && !isApp($0) }))
-        let live = items.filter(\.isLiveResult)
+        let live = items.filter { item in
+            if case .provided = item.action { return false }
+            return item.isLiveResult
+        }
         let searching = files.isSearching && query.count >= 2
         // Files appears with its first rows. Until then the field's spinner and the bar's
         // “Searching…” show progress, and an empty header can't vanish and shift the rows below.
@@ -310,6 +343,14 @@ final class LauncherModel {
                 LauncherResultGroup(
                     id: "files", title: "Files", trailing: searching ? "Searching \(FileSearchScope.home.title.lowercased()) folder" : nil,
                     isLoading: searching, items: live))
+        }
+        // Each provider's live rows follow Files under the provider's own title.
+        for provider in registry.providers {
+            let rows = items.filter { item in
+                if case .provided(let ref) = item.action { return item.isLiveResult && ref.provider == provider.id }
+                return false
+            }
+            groups.append(LauncherResultGroup(id: "live.\(provider.id)", title: provider.liveGroupTitle, items: rows))
         }
         groups.append(
             LauncherResultGroup(
@@ -332,7 +373,7 @@ final class LauncherModel {
                     id: "fallback.web", title: web.name, subtitle: Self.siteName(for: web),
                     symbol: "globe", kind: .quicklink, badge: "Quicklink", action: .quicklink(web, trimmed)))
         }
-        return items
+        return items + registry.fallbackItems(for: trimmed, in: self)
     }
 
     private var webSearchLink: Quicklink? {
@@ -420,6 +461,7 @@ final class LauncherModel {
         clipboard.stop()
         snippets.stop()
         files.stop()
+        cancelProvidedLiveItems()
         ai.cancel()
     }
 
@@ -451,6 +493,8 @@ final class LauncherModel {
         showShortcuts = false
         showsAttachmentPreview = false
         confirmation = nil
+        // Showing again restarts them in resumeSearch().
+        cancelProvidedLiveItems()
         // The editor stays open while hidden, so an emptied note is kept until it closes.
         if draft?.isNote == true { draft?.saveNote() }
     }
@@ -571,6 +615,7 @@ final class LauncherModel {
         destination = .ai
         argumentLink = nil
         files.stop()
+        cancelProvidedLiveItems()
         showActions = false
         confirmation = nil
         feedback =
@@ -766,6 +811,7 @@ final class LauncherModel {
         if destination == .search, argumentLink == nil, section == .home || section == .files {
             files.search(query, showRecent: section == .files, scope: section == .files ? fileScope : .home)
         }
+        refreshProvidedLiveItems()
     }
 
     func synchronizeSelection() {
@@ -788,7 +834,7 @@ final class LauncherModel {
         for group in groups {
             let range = start..<(start + group.items.count)
             start += group.items.count
-            guard range.contains(index), let columns = Self.columns(for: group.style) else { continue }
+            guard range.contains(index), let columns = Self.columns(for: group) else { continue }
             let target = index + offset * columns
             if range.contains(target) {
                 selectedID = items[target].id
@@ -816,7 +862,7 @@ final class LauncherModel {
         for group in groups {
             let range = start..<(start + group.items.count)
             start += group.items.count
-            guard range.contains(index), Self.columns(for: group.style) != nil else { continue }
+            guard range.contains(index), Self.columns(for: group) != nil else { continue }
             let target = index + offset
             if range.contains(target), target != index {
                 selectionWillChange()
@@ -856,8 +902,14 @@ final class LauncherModel {
     /// Whether ← and → should move the selection rather than the caret.
     var arrowsMoveSelection: Bool {
         guard destination == .search, argumentLink == nil, !showActions else { return false }
-        if section == .windows { return true }
+        if section == .windows || section.providedScope?.style == .grid { return true }
         return section == .home && isQueryBlank
+    }
+
+    /// A group's grid width, shared by drawing and keyboard movement. Nil for lists.
+    static func columns(for group: LauncherResultGroup) -> Int? {
+        guard let columns = columns(for: group.style) else { return nil }
+        return max(1, group.columns ?? columns)
     }
 
     nonisolated static func columns(for style: LauncherResultGroup.Style) -> Int? {
@@ -876,6 +928,7 @@ final class LauncherModel {
         confirmation = nil
         guard query.count <= 512 else {
             files.stop()
+            cancelProvidedLiveItems()
             feedback = .warning("Keep searches under 512 characters. For a longer passage, press Tab to ask AI.")
             return
         }
@@ -892,6 +945,72 @@ final class LauncherModel {
         } else {
             files.stop()
         }
+        refreshProvidedLiveItems()
+    }
+
+    /// Live provider rows, in registration order, for `results`.
+    private var providedLiveItemsInOrder: [LauncherItem] {
+        guard !providedLiveItems.isEmpty else { return [] }
+        return registry.providers.flatMap { providedLiveItems[$0.id] ?? [] }
+    }
+
+    /// Starts the providers' live searches for the current query, replacing any still running.
+    /// Root search asks every provider with one once there's a query; a provided scope asks its
+    /// owner. Each provider runs on its own task, so a slow one never holds up the others, and
+    /// an answer that arrives after the query changed is dropped.
+    func refreshProvidedLiveItems() {
+        cancelProvidedLiveItems()
+        let scope = section.providedScope
+        let term = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard destination == .search, argumentLink == nil, query.count <= 512,
+            scope != nil || (section == .home && !term.isEmpty)
+        else { return }
+        let generation = liveGeneration
+        for providerID in registry.liveProviders(for: scope).map(\.id) {
+            pendingLiveProviderIDs.insert(providerID)
+            providedLiveTasks.append(
+                Task { [weak self] in
+                    guard let provider = self?.registry.provider(id: providerID), let model = self else { return }
+                    let rows = await provider.liveItems(for: term, scope: scope, in: model)
+                    guard let self, !Task.isCancelled, self.liveGeneration == generation else { return }
+                    // Root-search rows never become the Top Hit; see searchGroups.
+                    self.providedLiveItems[providerID] = rows.map { row in
+                        var row = row
+                        row.isLiveResult = scope == nil
+                        return row
+                    }
+                    self.pendingLiveProviderIDs.remove(providerID)
+                })
+        }
+    }
+
+    /// Stops every live search and forgets its rows: on a new query, on hide, and on leaving search.
+    func cancelProvidedLiveItems() {
+        liveGeneration += 1
+        for task in providedLiveTasks { task.cancel() }
+        providedLiveTasks = []
+        if !pendingLiveProviderIDs.isEmpty { pendingLiveProviderIDs = [] }
+        if !providedLiveItems.isEmpty { providedLiveItems = [:] }
+    }
+
+    /// What an empty provided scope says: the provider's words, or a generic searching, empty
+    /// or no-matches message.
+    func providedEmptyState(for scope: ProvidedScope) -> ProvidedEmptyState {
+        let term = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        if let state = registry.emptyState(for: scope, query: term, isLoading: isLoadingProvidedItems, in: self) {
+            return state
+        }
+        if isLoadingProvidedItems {
+            return ProvidedEmptyState(title: "Searching \(scope.title)…", detail: "Results appear as they arrive.")
+        }
+        if term.isEmpty {
+            return ProvidedEmptyState(
+                title: "No \(scope.itemNoun)s yet", detail: "There's nothing in \(scope.title) right now.")
+        }
+        return ProvidedEmptyState(
+            title: "No matches for “\(term.truncatedForFeedback)”",
+            detail: "Try a different name or keyword, or clear the search to see everything in \(scope.title).",
+            symbol: "magnifyingglass")
     }
 
     private func quicklinkArgument(in input: String) -> (Quicklink, String)? {

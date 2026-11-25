@@ -43,6 +43,10 @@ extension LauncherModel {
 
     func validateCommandBinding(_ binding: CommandBinding) throws {
         try binding.validate()
+        // Removing a binding always works; adding one needs a command that exists right now.
+        guard binding.isEmpty || bindableCommands.contains(where: { $0.id == binding.targetID }) else {
+            throw LibraryValidationError("This command isn't available right now.")
+        }
         if let shortcut = binding.shortcut {
             try CommandShortcutPolicy.validate(
                 shortcut: shortcut, reservedShortcuts: CommandShortcutPolicy.systemReservedShortcuts())
@@ -83,14 +87,14 @@ extension LauncherModel {
         guard isStarted, !isRecordingShortcut else { return }
         // The refusal was about an earlier choice; registration below reports the current state.
         launcherHotKeyRefusal = nil
-        guard clipboard.usesGeneralPasteboard else {
+        guard clipboard.usesGeneralPasteboard || usesInjectedHotKey else {
             hotKey.unregister()
             shortcutError = nil
             commandShortcutErrors = [:]
             return
         }
         let stored = store.database.preferences.hotKey
-        let bindings = store.database.commandBindings
+        let bindings = registrableCommandBindings
         // A saved choice macOS now reserves (Input Sources, say) would leave no way
         // to open OpenRay, so register the first choice that works without saving it.
         let launcher =
@@ -114,6 +118,21 @@ extension LauncherModel {
         commandShortcutErrors = Dictionary(
             issues.filter { $0.targetID != GlobalHotKey.launcherTargetID }.map { ($0.targetID, $0.message) },
             uniquingKeysWith: { first, second in first + " " + second })
+    }
+
+    /// The saved bindings whose command exists right now. A missing command, such as a script
+    /// whose file is gone, keeps its saved binding but doesn't hold its shortcut, so another
+    /// command can use it and pressing it never silently does nothing.
+    var registrableCommandBindings: [CommandBinding] {
+        let available = Set(bindableCommands.map(\.id))
+        return store.database.commandBindings.filter { available.contains($0.targetID) }
+    }
+
+    /// Providers call this when their commands appear or disappear, so hotkeys and the
+    /// selection follow the catalog.
+    func commandCatalogDidChange() {
+        synchronizeCommandHotKeys()
+        synchronizeSelection()
     }
 
     /// The launcher shortcut to register: the saved one when macOS allows it,
@@ -192,15 +211,30 @@ extension LauncherModel {
         if let front, front.processIdentifier != ProcessInfo.processInfo.processIdentifier {
             previousApplication = front
         }
-        if case .window = command.action {
+        if runsWithoutPanel(command) {
             perform(command)
-            if let pending = feedback {
+            // A problem to report, or a question to confirm, brings the panel up. Showing can
+            // reset to Home, which clears both, so they're put back after.
+            if feedback != nil || confirmation != nil {
+                let pendingFeedback = feedback
+                let pendingConfirmation = confirmation
                 panel?.show()
-                feedback = pending
+                feedback = pendingFeedback
+                confirmation = pendingConfirmation
             }
         } else {
             panel?.show()
             perform(command)
+        }
+    }
+
+    /// Window layouts and provided commands with `mode: .noView` act on the app you're in,
+    /// so a hotkey runs them without showing the panel. The panel shows only to report a problem.
+    func runsWithoutPanel(_ command: LauncherItem) -> Bool {
+        switch command.action {
+        case .window: true
+        case .provided(let ref): registry.descriptor(for: ref, in: self)?.mode == .noView
+        default: false
         }
     }
 }

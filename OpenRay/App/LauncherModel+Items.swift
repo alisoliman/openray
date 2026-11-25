@@ -1,9 +1,15 @@
 import AppKit
 
 extension LauncherModel {
+    /// Commands that can hold an alias or hotkey right now: the original twenty in their order,
+    /// then the registry's bindable catalog (shown and hidden commands alike) in registration
+    /// order. Settings, aliases, hotkey titles and hotkey registration all use this one list.
     var bindableCommands: [LauncherItem] {
-        let commands = commandItems
-        return CuratedCommand.targetIDs.compactMap { id in commands.first { $0.id == id } }
+        let registered = registry.bindableCommandItems(in: self)
+        let index = Dictionary(
+            (commandItems + registered).map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
+        let curatedIDs = Set(CuratedCommand.targetIDs)
+        return CuratedCommand.targetIDs.compactMap { index[$0] } + registered.filter { !curatedIDs.contains($0.id) }
     }
 
     var applicationItems: [LauncherItem] {
@@ -106,6 +112,9 @@ extension LauncherModel {
             if item.subtitle == aiCommandSubtitle, SearchMatcher.score(term, in: action.subtitle) != nil {
                 item.subtitle = action.subtitle
             }
+        case .provided(let ref) where SearchMatcher.score(term, in: item.title) == nil:
+            // The same for provided commands: a description the search matched replaces the subtitle.
+            if let detail = ref.matchDetail, SearchMatcher.score(term, in: detail) != nil { item.subtitle = detail }
         default: break
         }
         return item
@@ -162,19 +171,15 @@ extension LauncherModel {
                 symbol: section.tileSymbol, kind: section.kind, badge: "Command",
                 keywords: "search " + section.title, action: .section(section))
         }
-        commands += AIAction.allCases.filter { $0 != .chat }.map { action in
-            LauncherItem(
-                id: "ai.\(action.id)", title: action.title,
-                subtitle: ai.availability.isAvailable ? Self.aiCommandSubtitle : "Not available yet",
-                symbol: action.kindSymbol, kind: .ai, badge: "AI command", keywords: "AI writing text " + action.subtitle,
-                action: .ai(action))
-        }
+        // The writing commands come from AIWritingCommandProvider, through the registry below.
         commands += windowItems
         commands.append(
             LauncherItem(
                 id: "settings", title: "Settings", subtitle: "Shortcuts, clipboard, permissions and more",
                 symbol: "gearshape", kind: .system, badge: "Command",
                 keywords: "openray settings preferences permissions shortcut", action: .settings))
+        // Registered providers' commands. New commands register a provider; they don't edit this list.
+        commands += registry.commandItems(in: self)
         return commands
     }
 

@@ -50,8 +50,9 @@ struct CommandDispatchTests {
     @Test func curatedTargetsAreExplicitIncludeWritingCommandsAndExcludeContent() {
         let model = model()
         defer { model.stop() }
-        #expect(model.bindableCommands.map(\.id) == CuratedCommand.targetIDs)
-        #expect(model.bindableCommands.count == 20)
+        // The original twenty lead in their order; registered providers may add more after them.
+        #expect(Array(model.bindableCommands.map(\.id).prefix(CuratedCommand.targetIDs.count)) == CuratedCommand.targetIDs)
+        #expect(CuratedCommand.targetIDs.count == 20)
         for action in AIAction.allCases where action != .chat {
             #expect(CuratedCommand.supports("ai.\(action.id)"))
         }

@@ -15,6 +15,9 @@ struct LauncherItem: Identifiable, Sendable {
         case askAI(String)
         case calculation(Calculation)
         case settings
+        /// A row a registered `CommandProvider` built. Perform, titles, actions and the preview
+        /// dispatch through `LauncherModel.registry`; the flags below read the ref's traits.
+        case provided(ProvidedRef)
     }
     var id: String
     var title: String
@@ -39,6 +42,7 @@ struct LauncherItem: Identifiable, Sendable {
         case .application(let app): app.url.path
         case .quicklink(let link, let argument):
             (try? link.resolvedURL(query: argument).absoluteString) ?? link.template
+        case .provided(let ref): ref.copyText
         default: nil
         }
     }
@@ -62,12 +66,14 @@ struct LauncherItem: Identifiable, Sendable {
         case .application: "Open Application"
         case .quicklink(let link, let argument): link.needsQuery && argument.isEmpty ? "Enter Search Term" : "Open Link"
         case .file: "Open"
+        case .provided(let ref): ref.primaryTitle ?? "Open Command"
         }
     }
 
     var supportsPaste: Bool {
         switch action {
         case .clipboard, .snippet, .calculation, .note, .quicklink, .file: true
+        case .provided(let ref): ref.has(.paste) && ref.copyText != nil
         default: false
         }
     }
@@ -79,6 +85,7 @@ struct LauncherItem: Identifiable, Sendable {
     var canFavorite: Bool {
         switch action {
         case .calculation, .askAI: false
+        case .provided(let ref): ref.has(.favorite) && !isSynthetic
         default: !isSynthetic
         }
     }
@@ -86,6 +93,7 @@ struct LauncherItem: Identifiable, Sendable {
     var canDelete: Bool {
         switch action {
         case .clipboard, .snippet, .quicklink, .note: !isSynthetic
+        case .provided(let ref): ref.has(.delete) && !isSynthetic
         default: false
         }
     }
@@ -93,6 +101,7 @@ struct LauncherItem: Identifiable, Sendable {
     var canEdit: Bool {
         switch action {
         case .snippet, .quicklink, .note: !id.hasPrefix("fallback.")
+        case .provided(let ref): ref.has(.edit) && !id.hasPrefix("fallback.")
         default: false
         }
     }
@@ -100,6 +109,7 @@ struct LauncherItem: Identifiable, Sendable {
     var isBuiltInCommand: Bool {
         switch action {
         case .section, .ai, .settings, .window: true
+        case .provided(let ref): ref.has(.command)
         default: false
         }
     }
@@ -132,10 +142,14 @@ struct LauncherResultGroup: Identifiable {
     var isLoading = false
     var style: Style = .list
     var items: [LauncherItem]
+    /// A `.grid` group's column count. Drawing and ←/→/↑/↓ both use it. Nil uses the style's default.
+    var columns: Int? = nil
+    /// How a `.grid` group draws its tiles. Nil draws window layout tiles, as Window Management does.
+    var tile: GridTileRenderer? = nil
 
     init(
         id: String? = nil, title: String?, trailing: String? = nil, isLoading: Bool = false, style: Style = .list,
-        items: [LauncherItem]
+        items: [LauncherItem], columns: Int? = nil, tile: GridTileRenderer? = nil
     ) {
         self.id = id ?? title ?? "results"
         self.title = title
@@ -143,6 +157,8 @@ struct LauncherResultGroup: Identifiable {
         self.isLoading = isLoading
         self.style = style
         self.items = items
+        self.columns = columns
+        self.tile = tile
     }
 }
 
