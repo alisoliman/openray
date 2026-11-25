@@ -97,6 +97,8 @@ struct PreviewPane: View {
                 Text(url.lastPathComponent).font(OR.Font.bodyEmphasis).foregroundStyle(OR.Color.text).lineLimit(2)
                 Text(FileFacts(url: url).kind).font(OR.Font.callout).foregroundStyle(OR.Color.text2)
             }
+        case .provided(let ref):
+            if let content = model.registry.preview(for: item, ref: ref, in: model)?.content { content }
         default:
             EmptyView()
         }
@@ -159,6 +161,8 @@ struct PreviewPane: View {
                 rows.append(("Opened", "\(count) time\(count == 1 ? "" : "s") from OpenRay"))
             }
             return rows
+        case .provided(let ref):
+            return model.registry.preview(for: item, ref: ref, in: model)?.metadata.map { ($0.label, $0.value) } ?? []
         default: return []
         }
     }

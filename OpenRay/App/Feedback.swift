@@ -33,12 +33,15 @@ enum ActionConfirmation: Identifiable {
     case discardChanges
     /// Delete All removes pinned entries too, so the prompt counts them.
     case clearClipboardHistory(pinnedCount: Int)
+    /// A provider's question, such as a command's “Shut down now?”. ↩ runs its `perform`.
+    case provided(ProvidedConfirmation)
 
     var id: String {
         switch self {
         case .delete(let item): "delete.\(item.id)"
         case .discardChanges: "discard"
         case .clearClipboardHistory: "clear"
+        case .provided(let confirmation): "provided.\(confirmation.id)"
         }
     }
 
@@ -47,6 +50,7 @@ enum ActionConfirmation: Identifiable {
         case .delete(let item): "Delete “\(item.title.truncatedForFeedback)”?"
         case .discardChanges: "Discard changes?"
         case .clearClipboardHistory: "Delete all clipboard history?"
+        case .provided(let confirmation): confirmation.question
         }
     }
 
@@ -58,6 +62,7 @@ enum ActionConfirmation: Identifiable {
             "This also deletes \(pinned) pinned \(pinned == 1 ? "entry" : "entries"). "
                 + "Your current clipboard stays as it is."
         case .clearClipboardHistory: "Your current clipboard stays as it is."
+        case .provided(let confirmation): confirmation.detail
         }
     }
 
@@ -66,6 +71,7 @@ enum ActionConfirmation: Identifiable {
         case .delete: "Delete"
         case .discardChanges: "Discard"
         case .clearClipboardHistory: "Delete All"
+        case .provided(let confirmation): confirmation.confirmTitle
         }
     }
 
@@ -73,6 +79,7 @@ enum ActionConfirmation: Identifiable {
         switch self {
         case .delete, .clearClipboardHistory: "trash"
         case .discardChanges: "arrow.uturn.backward"
+        case .provided(let confirmation): confirmation.symbol
         }
     }
 }

@@ -87,7 +87,7 @@ struct LibraryStoreTests {
         let store = LibraryStore(fileURL: url)
         let database = store.database
         #expect(!store.isReadOnly)
-        #expect(database.schemaVersion == 4)
+        #expect(database.schemaVersion == LibraryDatabase.currentSchemaVersion)
         #expect(!database.preferences.needsFirstRun)
         #expect(database.preferences.firstRunCompleted == nil)
         #expect(database.preferences.remembersLastQuery)
@@ -103,7 +103,7 @@ struct LibraryStoreTests {
         #expect(store.save(QuickNote(title: "After upgrade", content: "Saved by OpenRay 2.0")))
         let reopened = LibraryStore(fileURL: url)
         #expect(!reopened.isReadOnly)
-        #expect(reopened.database.schemaVersion == 4)
+        #expect(reopened.database.schemaVersion == LibraryDatabase.currentSchemaVersion)
         #expect(!reopened.database.preferences.needsFirstRun)
     }
 

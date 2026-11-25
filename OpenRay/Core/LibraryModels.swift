@@ -1,9 +1,37 @@
 import Foundation
 
-enum LauncherSection: String, CaseIterable, Identifiable, Sendable {
+/// Where the launcher is: Everything, a built-in scope, or a provider's own scope.
+enum LauncherSection: CaseIterable, Identifiable, Hashable, Sendable {
     case home, applications, files, clipboard, snippets, quicklinks, notes, calculator, windows
+    /// A list a registered provider pushes. Its scope supplies the title, symbol and the rest.
+    case provided(ProvidedScope)
+
+    /// The built-in scopes. Provided scopes are open-ended, so they aren't listed.
+    static let allCases: [LauncherSection] = [
+        .home, .applications, .files, .clipboard, .snippets, .quicklinks, .notes, .calculator, .windows,
+    ]
+
+    var rawValue: String {
+        switch self {
+        case .home: "home"
+        case .applications: "applications"
+        case .files: "files"
+        case .clipboard: "clipboard"
+        case .snippets: "snippets"
+        case .quicklinks: "quicklinks"
+        case .notes: "notes"
+        case .calculator: "calculator"
+        case .windows: "windows"
+        case .provided(let scope): scope.id
+        }
+    }
 
     var id: String { rawValue }
+
+    /// The provider's scope, when this is one.
+    var providedScope: ProvidedScope? {
+        if case .provided(let scope) = self { scope } else { nil }
+    }
 
     var title: String {
         switch self {
@@ -16,6 +44,7 @@ enum LauncherSection: String, CaseIterable, Identifiable, Sendable {
         case .notes: "Notes"
         case .calculator: "Calculator & Conversions"
         case .windows: "Window Management"
+        case .provided(let scope): scope.title
         }
     }
 
@@ -30,6 +59,7 @@ enum LauncherSection: String, CaseIterable, Identifiable, Sendable {
         case .notes: "note.text"
         case .calculator: "equal.square"
         case .windows: "rectangle.split.2x1"
+        case .provided(let scope): scope.symbol
         }
     }
 
@@ -44,6 +74,7 @@ enum LauncherSection: String, CaseIterable, Identifiable, Sendable {
         case .notes: "Search notes"
         case .calculator: "Type a calculation or conversion"
         case .windows: "Filter layouts"
+        case .provided(let scope): scope.placeholder
         }
     }
 
@@ -53,6 +84,7 @@ enum LauncherSection: String, CaseIterable, Identifiable, Sendable {
         case .clipboard: "Clipboard"
         case .calculator: "Calculator"
         case .windows: "Windows"
+        case .provided(let scope): scope.shortTitle ?? scope.title
         default: title
         }
     }
@@ -69,6 +101,7 @@ enum LauncherSection: String, CaseIterable, Identifiable, Sendable {
         case .notes: "Quick notes, saved on this Mac"
         case .calculator: "Arithmetic and unit conversions"
         case .windows: "Halves, quarters, center and more"
+        case .provided(let scope): scope.summary
         }
     }
 
@@ -83,6 +116,7 @@ enum LauncherSection: String, CaseIterable, Identifiable, Sendable {
         case .notes: .note
         case .calculator: .calculator
         case .windows: .window
+        case .provided(let scope): scope.kind
         }
     }
 
@@ -90,12 +124,13 @@ enum LauncherSection: String, CaseIterable, Identifiable, Sendable {
         switch self {
         case .applications: "square.grid.2x2"
         case .files: "folder"
+        case .provided(let scope): scope.symbol
         default: kind.symbol
         }
     }
 
     /// Scopes that show a preview pane beside a two-line list.
-    var showsPreview: Bool { [.clipboard, .snippets, .notes, .files, .quicklinks].contains(self) }
+    var showsPreview: Bool { providedScope?.showsPreview ?? [.clipboard, .snippets, .notes, .files, .quicklinks].contains(self) }
 
     /// Scopes whose items can be created from the panel.
     var createsItems: Bool { [.snippets, .quicklinks, .notes].contains(self) }
@@ -105,6 +140,7 @@ enum LauncherSection: String, CaseIterable, Identifiable, Sendable {
         case .snippets: "snippet"
         case .quicklinks: "quicklink"
         case .notes: "note"
+        case .provided(let scope): scope.itemNoun
         default: "item"
         }
     }
@@ -190,131 +226,6 @@ struct AppPreferences: Codable, Equatable, Sendable {
     ]
 }
 
-struct Quicklink: Codable, Identifiable, Equatable, Sendable {
-    var id: UUID = UUID()
-    var name: String
-    var template: String
-    var keyword: String
-
-    var needsQuery: Bool { template.contains("{query}") }
-
-    func argument(in input: String) -> String? {
-        guard !keyword.isEmpty else { return nil }
-        let parts = input.trimmingCharacters(in: .whitespacesAndNewlines).split(
-            maxSplits: 1, whereSeparator: \.isWhitespace)
-        guard let first = parts.first, String(first).caseInsensitiveCompare(keyword) == .orderedSame else { return nil }
-        return parts.count == 2 ? String(parts[1]).trimmingCharacters(in: .whitespacesAndNewlines) : ""
-    }
-
-    func resolvedURL(query: String = "") throws -> URL {
-        let trimmed = template.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { throw LibraryValidationError("Enter a URL or an absolute file path.") }
-        if needsQuery && query.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-            throw LibraryValidationError("Enter a search term for this quicklink.")
-        }
-        if trimmed.hasPrefix("/") || trimmed.hasPrefix("~/") {
-            guard !needsQuery else {
-                throw LibraryValidationError("Query placeholders are only supported in web links.")
-            }
-            return URL(fileURLWithPath: (trimmed as NSString).expandingTildeInPath)
-        }
-        // Only RFC 3986 unreserved characters may remain unescaped inside a query.
-        let unreserved = CharacterSet(
-            charactersIn: "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-._~")
-        let encoded = query.addingPercentEncoding(withAllowedCharacters: unreserved) ?? ""
-        let substituted = trimmed.replacingOccurrences(of: "{query}", with: encoded)
-        guard let url = URL(string: substituted),
-            let scheme = url.scheme?.lowercased(),
-            ["https", "http", "file", "mailto"].contains(scheme),
-            !["http", "https"].contains(scheme) || url.host?.isEmpty == false
-        else {
-            throw LibraryValidationError("Use an http(s) URL, a mailto link or an absolute file path.")
-        }
-        return url
-    }
-
-    func validate() throws {
-        guard !name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
-            throw LibraryValidationError("Give this quicklink a name.")
-        }
-        guard keyword.count <= 32, !keyword.contains(where: \.isWhitespace) else {
-            throw LibraryValidationError("Use a quicklink keyword of up to 32 characters without spaces.")
-        }
-        _ = try resolvedURL(query: needsQuery ? "test" : "")
-        let withoutPlaceholder = template.replacingOccurrences(of: "{query}", with: "")
-        guard !withoutPlaceholder.contains("{") && !withoutPlaceholder.contains("}") else {
-            throw LibraryValidationError("The supported placeholder is {query}.")
-        }
-    }
-
-    static let defaults = [
-        Quicklink(name: "Search the Web", template: "https://duckduckgo.com/?q={query}", keyword: "web"),
-        Quicklink(name: "Search GitHub", template: "https://github.com/search?q={query}", keyword: "gh"),
-    ]
-}
-
-struct Snippet: Codable, Identifiable, Equatable, Sendable {
-    var id: UUID = UUID()
-    var name: String
-    var keyword: String
-    var content: String
-    /// Per-snippet keyword expansion. Missing means on, subject to the master switch.
-    var expandsKeyword: Bool? = nil
-
-    var expandsAsYouType: Bool { expandsKeyword ?? true }
-
-    func expanded(at date: Date = .now, locale: Locale = .current, timeZone: TimeZone = .current) -> String {
-        let dateFormatter = DateFormatter()
-        dateFormatter.locale = locale
-        dateFormatter.timeZone = timeZone
-        dateFormatter.dateStyle = .medium
-        let timeFormatter = DateFormatter()
-        timeFormatter.locale = locale
-        timeFormatter.timeZone = timeZone
-        timeFormatter.timeStyle = .short
-        return
-            content
-            .replacingOccurrences(of: "{date}", with: dateFormatter.string(from: date))
-            .replacingOccurrences(of: "{time}", with: timeFormatter.string(from: date))
-    }
-
-    func validate(against others: [Snippet]) throws {
-        guard !name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
-            throw LibraryValidationError("Give this snippet a name.")
-        }
-        guard !content.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty, content.count <= 32_000 else {
-            throw LibraryValidationError("Snippet text must contain between 1 and 32,000 characters.")
-        }
-        if !keyword.isEmpty {
-            let allowed = CharacterSet(
-                charactersIn: "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789;:/._-")
-            guard (2...32).contains(keyword.count), keyword.unicodeScalars.allSatisfy(allowed.contains) else {
-                throw LibraryValidationError("Use a 2–32 character keyword without spaces, such as ;email.")
-            }
-            guard !others.contains(where: { $0.id != id && $0.keyword == keyword }) else {
-                throw LibraryValidationError("Another snippet already uses this keyword.")
-            }
-        }
-    }
-}
-
-struct QuickNote: Codable, Identifiable, Equatable, Sendable {
-    var id: UUID = UUID()
-    var title: String
-    var content: String
-    var modifiedAt: Date = .now
-
-    static func derivedTitle(from content: String) -> String {
-        let line =
-            content.split(whereSeparator: \.isNewline).first { !$0.trimmingCharacters(in: .whitespaces).isEmpty } ?? ""
-        return String(line.trimmingCharacters(in: .whitespaces).prefix(80))
-    }
-
-    var wordCount: Int {
-        content.split { $0.isWhitespace || $0.isNewline }.count
-    }
-}
-
 struct UsageRecord: Codable, Equatable, Sendable {
     var id: String
     var count: Int = 1
@@ -322,8 +233,9 @@ struct UsageRecord: Codable, Equatable, Sendable {
 }
 
 struct LibraryDatabase: Codable, Equatable, Sendable {
-    // Version 4 is OpenRay 2.0. Earlier builds open its libraries read-only.
-    static let currentSchemaVersion = 4
+    // Version 4 is OpenRay 2.0. Version 5 adds the collections the parity slices fill in.
+    // A build opens libraries newer than it understands read-only.
+    static let currentSchemaVersion = 5
     var schemaVersion = LibraryDatabase.currentSchemaVersion
     var preferences = AppPreferences()
     var quicklinks = Quicklink.defaults
@@ -336,11 +248,38 @@ struct LibraryDatabase: Codable, Equatable, Sendable {
     var usage: [UsageRecord] = []
     var commandBindings: [CommandBinding] = []
 
+    // Added in schema 5. Each is decoded with decodeIfPresent, so version 4 libraries load
+    // with them empty, and each belongs to one slice; see LibraryRecords.swift.
+    /// Slice 7: user-defined AI commands.
+    var aiCommands: [AICommandRecord] = []
+    /// Slice 7: agents.
+    var agents: [AgentRecord] = []
+    /// Slice 1: commands turned off in Settings, by command id.
+    var disabledCommandIDs: Set<String> = []
+    /// Slice 1: fallback commands in the order the person chose, by item id.
+    var fallbackOrder: [String] = []
+    /// Slice 8: folders of script commands.
+    var scriptDirectories: [ScriptDirectoryRecord] = []
+    /// Slice 5: saved multi-app window layouts.
+    var windowLayouts: [WindowLayoutRecord] = []
+    /// Slice 6: focus categories.
+    var focusCategories: [FocusCategoryRecord] = []
+    /// Slice 3: emoji frecency.
+    var emojiUsage: [EmojiUsageRecord] = []
+    /// Slice 3: kept calculations.
+    var calculatorHistory: [CalculatorHistoryRecord] = []
+    /// Per-command settings: command id → key → value. Any slice can store small values here
+    /// without a schema change, e.g. `commandPreferences["system.sleep", default: [:]]["confirm"] = "false"`.
+    var commandPreferences: [String: [String: String]] = [:]
+
     static let defaultFavorites = ["ai.chat", "section.clipboard", "section.files", "section.notes", "section.snippets"]
 
     private enum CodingKeys: String, CodingKey {
         case schemaVersion, preferences, quicklinks, snippets, notes, clipboard, favoriteIDs, favoriteOrder, usage,
             commandBindings
+        // Schema 5.
+        case aiCommands, agents, disabledCommandIDs, fallbackOrder, scriptDirectories, windowLayouts,
+            focusCategories, emojiUsage, calculatorHistory, commandPreferences
     }
 
     var orderedFavoriteIDs: [String] {
@@ -386,6 +325,19 @@ struct LibraryDatabase: Codable, Equatable, Sendable {
         commandBindings =
             try container.decodeIfPresent([AvailableCommandBinding].self, forKey: .commandBindings)?
             .compactMap(\.binding) ?? []
+        aiCommands = try container.decodeIfPresent([AICommandRecord].self, forKey: .aiCommands) ?? []
+        agents = try container.decodeIfPresent([AgentRecord].self, forKey: .agents) ?? []
+        disabledCommandIDs = try container.decodeIfPresent(Set<String>.self, forKey: .disabledCommandIDs) ?? []
+        fallbackOrder = try container.decodeIfPresent([String].self, forKey: .fallbackOrder) ?? []
+        scriptDirectories =
+            try container.decodeIfPresent([ScriptDirectoryRecord].self, forKey: .scriptDirectories) ?? []
+        windowLayouts = try container.decodeIfPresent([WindowLayoutRecord].self, forKey: .windowLayouts) ?? []
+        focusCategories = try container.decodeIfPresent([FocusCategoryRecord].self, forKey: .focusCategories) ?? []
+        emojiUsage = try container.decodeIfPresent([EmojiUsageRecord].self, forKey: .emojiUsage) ?? []
+        calculatorHistory =
+            try container.decodeIfPresent([CalculatorHistoryRecord].self, forKey: .calculatorHistory) ?? []
+        commandPreferences =
+            try container.decodeIfPresent([String: [String: String]].self, forKey: .commandPreferences) ?? [:]
     }
 
     func binding(for targetID: String) -> CommandBinding? {
@@ -412,6 +364,9 @@ struct LibraryDatabase: Codable, Equatable, Sendable {
             quicklinks.map { $0.id.uuidString }, snippets.map { $0.id.uuidString },
             notes.map { $0.id.uuidString }, clipboard.map { $0.id.uuidString }, usage.map(\.id),
             commandBindings.map(\.targetID),
+            aiCommands.map { $0.id.uuidString }, agents.map { $0.id.uuidString },
+            scriptDirectories.map { $0.id.uuidString }, windowLayouts.map { $0.id.uuidString },
+            focusCategories.map(\.id), emojiUsage.map(\.id), calculatorHistory.map { $0.id.uuidString },
         ]
         guard identities.allSatisfy({ Set($0).count == $0.count }) else {
             throw LibraryValidationError("The library contains duplicate item identifiers.")

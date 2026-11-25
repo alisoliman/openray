@@ -82,6 +82,8 @@ struct ScopeEmptyState: View {
             } else {
                 noMatches
             }
+        case .provided(let scope):
+            ProvidedScopeEmptyState(model: model, scope: scope)
         case .home where model.isQueryBlank:
             // Nothing pinned or used yet, so welcome rather than “No matches”.
             EmptyStateView(

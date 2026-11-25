@@ -13,6 +13,12 @@ struct ActionEntry: Identifiable {
     var modifiers: EventModifiers = []
     var group: Group
     var isDestructive = false
+    /// A titled section the entry belongs to, such as “Paste As”. Nil keeps it in its group's
+    /// untitled run. The panel doesn't draw section titles yet (Slice 1 does).
+    var section: String? = nil
+    /// A submenu. An entry with children opens them rather than performing; until the panel
+    /// draws submenus (Slice 1), it performs `perform`, so give such entries a sensible one.
+    var children: [ActionEntry] = []
     var perform: @MainActor () -> Void
 }
 
@@ -103,6 +109,8 @@ extension LauncherModel {
                 }
                 feedback = .error(error.localizedDescription)
             }
+        case .provided(let ref):
+            registry.perform(item, ref: ref, in: self)
         }
     }
 
@@ -177,7 +185,12 @@ extension LauncherModel {
     }
 
     /// Pastes an item into the app you came from, or copies it when that can't work.
+    /// A provided row runs its provider's secondary action, which is text paste by default.
     func paste(_ item: LauncherItem) {
+        if case .provided(let ref) = item.action {
+            registry.performSecondary(item, ref: ref, in: self)
+            return
+        }
         guard item.supportsPaste else { return }
         switch item.action {
         case .clipboard(let entry): finishPaste(copied: clipboard.copy(entry), label: entry.title)
@@ -192,6 +205,12 @@ extension LauncherModel {
 
     func paste(_ text: String, label: String? = nil) {
         finishPaste(copied: clipboard.copy(text), label: label ?? text)
+    }
+
+    /// Pastes a row's `copyText`: the default ⌘↩ for provided rows with the `.paste` trait.
+    func pasteText(of item: LauncherItem) {
+        guard item.supportsPaste, let text = item.copyText else { return }
+        paste(text, label: item.title)
     }
 
     private func finishPaste(copied: Bool, label: String) {
@@ -284,13 +303,17 @@ extension LauncherModel {
             link.needsQuery && argument.isEmpty ? "Enter Search Term" : "Open in \(openerName(for: link))"
         case .window(let layout):
             accessibilityAllowed ? "Apply \(layout.title)" : "Enable Accessibility"
+        case .provided(let ref): registry.primaryTitle(for: item, ref: ref, in: self)
         default: item.primaryActionTitle
         }
     }
 
     /// The ⌘↩ label, when it applies. It says “Copy · ⌘V in …” when direct paste can't work.
+    /// A provided row asks its provider, which offers text paste by default.
     func secondaryTitle(for item: LauncherItem) -> String? {
-        guard item.supportsPaste, !item.id.hasPrefix("argument."), !item.id.hasPrefix("fallback.") else { return nil }
+        guard !item.id.hasPrefix("argument."), !item.id.hasPrefix("fallback.") else { return nil }
+        if case .provided(let ref) = item.action { return registry.secondaryTitle(for: item, ref: ref, in: self) }
+        guard item.supportsPaste else { return nil }
         if case .quicklink(let link, let argument) = item.action, link.needsQuery && argument.isEmpty { return nil }
         let noun: String
         switch item.action {
@@ -298,6 +321,16 @@ extension LauncherModel {
         case .quicklink: noun = "Paste Link to"
         default: noun = "Paste to"
         }
+        return pasteTitle(noun)
+    }
+
+    /// The generic ⌘↩ label for pasting a row's text, or nil when it has none to paste.
+    func textPasteTitle(for item: LauncherItem) -> String? {
+        item.supportsPaste ? pasteTitle("Paste to") : nil
+    }
+
+    /// “<noun> <app>” when the paste can reach the app, otherwise “Copy · ⌘V in <app>”.
+    func pasteTitle(_ noun: String) -> String {
         if canPasteDirectly || !clipboard.usesGeneralPasteboard { return "\(noun) \(targetAppName)" }
         return "Copy · ⌘V in \(targetAppName)"
     }
@@ -332,15 +365,19 @@ extension LauncherModel {
         self.confirmation = nil
         switch confirmation {
         case .delete(let item):
+            // A provider may explain a failure, or a partial success, itself; keep its words.
+            feedback = nil
             if delete(item) {
-                toast("Deleted “\(item.title.truncatedForFeedback)”")
-            } else {
+                if feedback == nil { toast("Deleted “\(item.title.truncatedForFeedback)”") }
+            } else if feedback == nil {
                 feedback = .error(store.errorMessage ?? "Couldn't delete the item.")
             }
         case .discardChanges:
             closeEditor(force: true)
         case .clearClipboardHistory:
             if clipboard.clearHistory() { toast("Clipboard history deleted") }
+        case .provided(let confirmation):
+            confirmation.perform()
         }
     }
 
@@ -351,6 +388,29 @@ extension LauncherModel {
         let ordered = orderedResults
         let next = ordered.firstIndex(where: { $0.id == item.id }).flatMap { index in
             ordered.indices.contains(index + 1) ? ordered[index + 1].id : index > 0 ? ordered[index - 1].id : nil
+        }
+        if case .provided(let ref) = item.action {
+            guard let deletion = registry.deletion(for: item, ref: ref, in: self) else { return false }
+            switch deletion {
+            case .library(let remove):
+                // One save: the row goes with its favorite and usage, or nothing changes.
+                let deleted = store.update { database in
+                    try remove(&database)
+                    database.favoriteIDs.remove(item.id)
+                    database.usage.removeAll { $0.id == item.id }
+                }
+                guard deleted else { return false }
+            case .store(let remove):
+                guard remove() else { return false }
+                if !store.forget(itemIDs: [item.id]) {
+                    feedback = .warning(
+                        "Deleted “\(item.title.truncatedForFeedback)”, but Favorites and Recent couldn't be updated. "
+                            + "OpenRay tries again with the next change it saves.")
+                }
+            }
+            selectedID = next
+            synchronizeSelection()
+            return true
         }
         let deleted = store.update { database in
             switch item.action {
@@ -371,6 +431,12 @@ extension LauncherModel {
 
     /// Opens the inline editor for a quicklink, snippet or note.
     func edit(_ item: LauncherItem) {
+        if case .provided(let ref) = item.action {
+            guard item.canEdit else { return }
+            showActions = false
+            registry.edit(item, ref: ref, in: self)
+            return
+        }
         let target: LibraryEditor
         switch item.action {
         case .quicklink(let link, _): target = .quicklink(link)
@@ -604,6 +670,8 @@ extension LauncherModel {
                             group: .item
                         ) { [weak self] in self?.copy(quantity.copyValue) })
                 }
+            case .provided(let ref):
+                entries += registry.actions(for: item, ref: ref, in: self)
             case .snippet(let snippet):
                 entries.append(
                     ActionEntry(
@@ -667,6 +735,7 @@ extension LauncherModel {
                     case .clipboard: "Entry"
                     case .snippet: "Snippet"
                     case .quicklink: "Quicklink"
+                    case .provided(let ref): registry.itemNoun(for: ref)
                     default: "Note"
                     }
                 entries.append(
@@ -828,6 +897,7 @@ extension LauncherModel {
         case .ai, .askAI: "sparkles"
         case .note: "note.text"
         case .section: "arrow.right.circle"
+        case .provided(let ref): registry.primarySymbol(for: item, ref: ref, in: self)
         default: "arrow.up.forward.app"
         }
     }
@@ -844,6 +914,7 @@ extension LauncherModel {
     var isAwaitingResults: Bool {
         let filesPending = argumentLink == nil && files.isSearching && (section == .files || section == .home && query.count >= 2)
         return filesPending || section == .applications && applications.isLoading
+            || section.providedScope != nil && isLoadingProvidedItems
     }
 
     /// Clipboard History shows the opt-in screen until capture is on, paused, or history exists.
