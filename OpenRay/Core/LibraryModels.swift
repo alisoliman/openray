@@ -197,8 +197,9 @@ struct UsageRecord: Codable, Equatable, Sendable {
 }
 
 struct LibraryDatabase: Codable, Equatable, Sendable {
-    // Version 4 is OpenRay 2.0. Earlier builds open its libraries read-only.
-    static let currentSchemaVersion = 4
+    // Version 4 is OpenRay 2.0. Version 5 adds the collections the parity slices fill in.
+    // A build opens libraries newer than it understands read-only.
+    static let currentSchemaVersion = 5
     var schemaVersion = LibraryDatabase.currentSchemaVersion
     var preferences = AppPreferences()
     var quicklinks = Quicklink.defaults
@@ -211,11 +212,38 @@ struct LibraryDatabase: Codable, Equatable, Sendable {
     var usage: [UsageRecord] = []
     var commandBindings: [CommandBinding] = []
 
+    // Added in schema 5. Each is decoded with decodeIfPresent, so version 4 libraries load
+    // with them empty, and each belongs to one slice; see LibraryRecords.swift.
+    /// Slice 7: user-defined AI commands.
+    var aiCommands: [AICommandRecord] = []
+    /// Slice 7: agents.
+    var agents: [AgentRecord] = []
+    /// Slice 1: commands turned off in Settings, by command id.
+    var disabledCommandIDs: Set<String> = []
+    /// Slice 1: fallback commands in the order the person chose, by item id.
+    var fallbackOrder: [String] = []
+    /// Slice 8: folders of script commands.
+    var scriptDirectories: [ScriptDirectoryRecord] = []
+    /// Slice 5: saved multi-app window layouts.
+    var windowLayouts: [WindowLayoutRecord] = []
+    /// Slice 6: focus categories.
+    var focusCategories: [FocusCategoryRecord] = []
+    /// Slice 3: emoji frecency.
+    var emojiUsage: [EmojiUsageRecord] = []
+    /// Slice 3: kept calculations.
+    var calculatorHistory: [CalculatorHistoryRecord] = []
+    /// Per-command settings: command id → key → value. Any slice can store small values here
+    /// without a schema change, e.g. `commandPreferences["system.sleep", default: [:]]["confirm"] = "false"`.
+    var commandPreferences: [String: [String: String]] = [:]
+
     static let defaultFavorites = ["ai.chat", "section.clipboard", "section.files", "section.notes", "section.snippets"]
 
     private enum CodingKeys: String, CodingKey {
         case schemaVersion, preferences, quicklinks, snippets, notes, clipboard, favoriteIDs, favoriteOrder, usage,
             commandBindings
+        // Schema 5.
+        case aiCommands, agents, disabledCommandIDs, fallbackOrder, scriptDirectories, windowLayouts,
+            focusCategories, emojiUsage, calculatorHistory, commandPreferences
     }
 
     var orderedFavoriteIDs: [String] {
@@ -261,6 +289,19 @@ struct LibraryDatabase: Codable, Equatable, Sendable {
         commandBindings =
             try container.decodeIfPresent([AvailableCommandBinding].self, forKey: .commandBindings)?
             .compactMap(\.binding) ?? []
+        aiCommands = try container.decodeIfPresent([AICommandRecord].self, forKey: .aiCommands) ?? []
+        agents = try container.decodeIfPresent([AgentRecord].self, forKey: .agents) ?? []
+        disabledCommandIDs = try container.decodeIfPresent(Set<String>.self, forKey: .disabledCommandIDs) ?? []
+        fallbackOrder = try container.decodeIfPresent([String].self, forKey: .fallbackOrder) ?? []
+        scriptDirectories =
+            try container.decodeIfPresent([ScriptDirectoryRecord].self, forKey: .scriptDirectories) ?? []
+        windowLayouts = try container.decodeIfPresent([WindowLayoutRecord].self, forKey: .windowLayouts) ?? []
+        focusCategories = try container.decodeIfPresent([FocusCategoryRecord].self, forKey: .focusCategories) ?? []
+        emojiUsage = try container.decodeIfPresent([EmojiUsageRecord].self, forKey: .emojiUsage) ?? []
+        calculatorHistory =
+            try container.decodeIfPresent([CalculatorHistoryRecord].self, forKey: .calculatorHistory) ?? []
+        commandPreferences =
+            try container.decodeIfPresent([String: [String: String]].self, forKey: .commandPreferences) ?? [:]
     }
 
     func binding(for targetID: String) -> CommandBinding? {
@@ -287,6 +328,9 @@ struct LibraryDatabase: Codable, Equatable, Sendable {
             quicklinks.map { $0.id.uuidString }, snippets.map { $0.id.uuidString },
             notes.map { $0.id.uuidString }, clipboard.map { $0.id.uuidString }, usage.map(\.id),
             commandBindings.map(\.targetID),
+            aiCommands.map { $0.id.uuidString }, agents.map { $0.id.uuidString },
+            scriptDirectories.map { $0.id.uuidString }, windowLayouts.map { $0.id.uuidString },
+            focusCategories.map(\.id), emojiUsage.map(\.id), calculatorHistory.map { $0.id.uuidString },
         ]
         guard identities.allSatisfy({ Set($0).count == $0.count }) else {
             throw LibraryValidationError("The library contains duplicate item identifiers.")
