@@ -74,10 +74,19 @@ struct ResultsList: View {
             }
             .padding(.top, 2).padding(.bottom, 6)
         case .grid:
-            LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: 6), count: 4), spacing: 6) {
+            LazyVGrid(
+                columns: Array(
+                    repeating: GridItem(.flexible(), spacing: 6), count: LauncherModel.columns(for: group) ?? 4),
+                spacing: 6
+            ) {
                 ForEach(group.items) { item in
-                    WindowTile(model: model, item: item, selected: item.id == selectedID)
-                        .id(Self.rowID(group: group.id, item: item.id))
+                    if let tile = group.tile {
+                        ProvidedGridTile(model: model, item: item, selected: item.id == selectedID, renderer: tile)
+                            .id(Self.rowID(group: group.id, item: item.id))
+                    } else {
+                        WindowTile(model: model, item: item, selected: item.id == selectedID)
+                            .id(Self.rowID(group: group.id, item: item.id))
+                    }
                 }
             }
             .padding(.vertical, 4)
@@ -231,6 +240,7 @@ struct ResultRow: View {
     private var unavailable: Bool {
         if case .window = item.action { return !model.accessibilityAllowed }
         if case .ai(let action) = item.action, action != .chat { return !model.ai.availability.isAvailable }
+        if case .provided(let ref) = item.action { return ref.has(.unavailable) }
         return false
     }
 

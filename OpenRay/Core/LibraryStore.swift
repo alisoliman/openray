@@ -11,6 +11,9 @@ final class LibraryStore {
     let fileURL: URL?
     @ObservationIgnored var commandBindingsDidChange: (() -> Void)?
     @ObservationIgnored private let images: ClipboardImageStore
+    /// Rows deleted from another store whose favorite and usage records a failed save left
+    /// behind. Every later save removes them too, until one succeeds.
+    @ObservationIgnored private(set) var pendingForgottenIDs: Set<String> = []
 
     init(fileURL: URL? = LibraryStore.defaultURL) {
         self.fileURL = fileURL
@@ -60,6 +63,8 @@ final class LibraryStore {
                 next.preferences.clipboardPaused = true
             }
             next.discardUnavailableCommandBindings()
+            next.favoriteIDs.subtract(pendingForgottenIDs)
+            next.usage.removeAll { pendingForgottenIDs.contains($0.id) }
             next.schemaVersion = LibraryDatabase.currentSchemaVersion
             let removedClipboardIDs = Set(database.clipboard.map { "clipboard.\($0.id)" })
                 .subtracting(next.clipboard.map { "clipboard.\($0.id)" })
@@ -82,6 +87,7 @@ final class LibraryStore {
                 .subtracting(next.clipboard.compactMap(\.image).map(\.id))
             let bindingsChanged = database.commandBindings != next.commandBindings
             database = next
+            pendingForgottenIDs = []
             if bindingsChanged { commandBindingsDidChange?() }
             if !removedImages.isEmpty {
                 Task { await ClipboardImageProcessor.shared.forget(removedImages) }
@@ -96,6 +102,18 @@ final class LibraryStore {
             errorMessage = error.localizedDescription
             return false
         }
+    }
+
+    /// Removes the favorite and usage records of rows deleted from another store. When the save
+    /// fails, later saves keep trying, so the records can't outlive the rows for good.
+    @discardableResult
+    func forget(itemIDs: Set<String>) -> Bool {
+        let referenced = itemIDs.filter { id in
+            database.favoriteIDs.contains(id) || database.usage.contains { $0.id == id }
+        }
+        guard !referenced.isEmpty else { return true }
+        pendingForgottenIDs.formUnion(referenced)
+        return update { _ in }
     }
 
     @discardableResult

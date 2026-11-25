@@ -241,7 +241,7 @@ struct ShortcutsOverlay: View {
             rows += [("Reveal in Finder", ["⇧", "⌘", "R"]), ("Copy Path", ["⇧", "⌘", "C"])]
         case .windows:
             rows += [("Move Between Layouts", ["←", "→", "↑", "↓"])]
-        case .calculator:
+        case .calculator, .provided:
             break
         }
         if model.section != .home, model.section != .clipboard, let tab { rows.append(tab) }
