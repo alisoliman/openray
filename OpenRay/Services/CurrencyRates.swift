@@ -173,7 +173,7 @@ enum CurrencyConversion {
         let related = ["USD", "EUR", "GBP", "JPY", "CHF", "CAD", "AUD", "CNY"]
             .filter { $0 != request.source && $0 != target }
             .compactMap { code -> Calculation.Quantity? in
-                guard let value = table.convert(amount, from: request.source, to: code) else { return nil }
+                guard let value = table.convert(amount, from: request.source, to: code), value.isFinite else { return nil }
                 let digits = CurrencyCatalog.fractionDigits(for: code)
                 return .init(
                     value: value.formatted(.number.locale(Locale(identifier: "en_US")).precision(.fractionLength(digits))),

@@ -45,6 +45,10 @@ struct Calculation: Equatable, Sendable {
     var resultLabel: String? = nil
     /// The instant a date or time result names.
     var date: Date? = nil
+    /// The input is only words ("time", "today", "next friday", "time in tokyo"), so it may
+    /// equally be a search for an app, file or command with that title. Root search ranks
+    /// an ambiguous answer as an ordinary row instead of putting it first.
+    var isAmbiguous = false
 
     /// The number as shown. A conversion shows six significant digits and copies all of them.
     var shownValue: String { conversion?.target.value ?? value }
@@ -217,15 +221,28 @@ enum Calculator {
         for phrase in phrases {
             if var calculation = try phrase(normalized, context) {
                 calculation.expression = input
+                calculation.isAmbiguous = isWordsOnly(input)
                 return calculation
             }
         }
         if var conversion = try convert(normalized, context: context) {
             conversion.expression = input
+            conversion.isAmbiguous = isWordsOnly(input)
             return conversion
         }
         let value = try parse(normalized)
-        return Calculation(expression: input, result: format(value), detail: "Calculator · Return to copy")
+        var calculation = Calculation(expression: input, result: format(value), detail: "Calculator · Return to copy")
+        // "pi" and "e" alone are words too.
+        calculation.isAmbiguous = isWordsOnly(input)
+        return calculation
+    }
+
+    /// Whether an input has no digits, operators or currency signs, only words.
+    static func isWordsOnly(_ input: String) -> Bool {
+        !input.unicodeScalars.contains { scalar in
+            CharacterSet.decimalDigits.contains(scalar) || CharacterSet.symbols.contains(scalar)
+                || "+-*/^%=()√−×÷.:".unicodeScalars.contains(scalar)
+        }
     }
 
     static func normalized(_ input: String) -> String {

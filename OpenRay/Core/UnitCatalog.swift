@@ -357,9 +357,11 @@ enum MusicNote {
     /// The nearest note to a frequency, and how many cents sharp (+) or flat (−) it is.
     static func nearest(to frequency: Double) -> (name: String, cents: Int)? {
         guard frequency > 0, frequency.isFinite else { return nil }
-        let exact = 69 + 12 * log2(frequency / 440)
-        let midi = Int(exact.rounded())
-        guard (0...127).contains(midi) else { return nil }
+        // Subtracting logarithms avoids the underflow of frequency / 440 for tiny values.
+        let exact = 69 + 12 * (log2(frequency) - log2(440.0))
+        let rounded = exact.rounded()
+        guard rounded.isFinite, (0...127).contains(rounded) else { return nil }
+        let midi = Int(rounded)
         let cents = Int(((exact - Double(midi)) * 100).rounded())
         return ("\(names[midi % 12])\(midi / 12 - 1)", cents)
     }

@@ -47,18 +47,32 @@ enum DateMath {
         return start <= end ? count : -count
     }
 
-    /// Adds working days, skipping the calendar's weekend.
+    /// The most working days a phrase may add: about 40 years.
+    static let maximumWorkdays = 10_000
+
+    /// Adds working days, skipping the calendar's weekend. Any seven days in a row hold
+    /// the same number of workdays, so whole weeks jump at once and at most a week is
+    /// walked day by day; this runs on every keystroke. Nil beyond `maximumWorkdays`.
     static func adding(workdays: Int, to date: Date, calendar: Calendar) -> Date? {
-        var result = date
-        var remaining = abs(workdays)
+        guard workdays.magnitude <= UInt(maximumWorkdays) else { return nil }
         let step = workdays < 0 ? -1 : 1
-        var guardCount = 0
+        var remaining = Int(workdays.magnitude)
+        let perWeek = (1...7).filter { offset in
+            calendar.date(byAdding: .day, value: offset, to: date).map { !calendar.isDateInWeekend($0) } ?? false
+        }.count
+        guard perWeek > 0 else { return nil }
+        var result = date
+        let weeks = max(0, (remaining - 1) / perWeek)
+        if weeks > 0 {
+            guard let jumped = calendar.date(byAdding: .day, value: step * weeks * 7, to: result) else { return nil }
+            result = jumped
+            remaining -= weeks * perWeek
+        }
+        var steps = 0
         while remaining > 0 {
-            guard let next = calendar.date(byAdding: .day, value: step, to: result), guardCount < 100_000 else {
-                return nil
-            }
+            guard steps < 14, let next = calendar.date(byAdding: .day, value: step, to: result) else { return nil }
             result = next
-            guardCount += 1
+            steps += 1
             if !calendar.isDateInWeekend(result) { remaining -= 1 }
         }
         return result
@@ -74,8 +88,9 @@ enum DateMath {
         return DateComponents(year: year, month: month, day: day)
     }
 
+    /// Year, month, day; then optional hour, minute, second, fraction and offset.
     static let isoDate = CalculatorPattern(
-        #"^(\d{4})-(\d{2})-(\d{2})(?:t(\d{2}):(\d{2})(?::(\d{2})(?:\.\d+)?)?(z|[+-]\d{2}:?\d{2})?)?$"#)
+        #"^(\d{4})-(\d{2})-(\d{2})(?:t(\d{2}):(\d{2})(?::(\d{2})(\.\d{1,9})?)?(z|[+-]\d{2}(?::?\d{2})?)?)?$"#)
 
     static let months: [String: Int] = [
         "january": 1, "jan": 1, "february": 2, "feb": 2, "march": 3, "mar": 3, "april": 4, "apr": 4, "may": 5,
@@ -191,20 +206,21 @@ enum CalendarFormat {
         return "\(Calculator.format(rounded)) \(abs(rounded) == 1 ? singular : plural)"
     }
 
-    /// "4 months, 6 days", or "3 hours, 20 minutes" for spans under a day.
+    /// "4 months, 6 days", or "3 hours, 20 minutes, 5 seconds" for timed spans.
     static func breakdown(from start: Date, to end: Date, calendar: Calendar, includeTime: Bool) -> String {
         let (first, last) = start <= end ? (start, end) : (end, start)
         let components = calendar.dateComponents(
-            includeTime ? [.year, .month, .day, .hour, .minute] : [.year, .month, .day], from: first, to: last)
+            includeTime ? [.year, .month, .day, .hour, .minute, .second] : [.year, .month, .day], from: first, to: last)
         let parts: [(Int?, String, String)] = [
             (components.year, "year", "years"), (components.month, "month", "months"), (components.day, "day", "days"),
             (components.hour, "hour", "hours"), (components.minute, "minute", "minutes"),
+            (components.second, "second", "seconds"),
         ]
         let text = parts.compactMap { value, singular, plural -> String? in
             guard let value, value != 0 else { return nil }
             return "\(value) \(value == 1 ? singular : plural)"
         }.joined(separator: ", ")
-        return text.isEmpty ? (includeTime ? "0 minutes" : "0 days") : text
+        return text.isEmpty ? (includeTime ? "0 seconds" : "0 days") : text
     }
 
     /// "today", "tomorrow", "in 19 days", "3 days ago".
@@ -251,15 +267,25 @@ private struct DateParser {
 
     let tokens: [String]
     let context: CalculatorContext
+    /// Month and weekday names, ISO dates and four-digit years are Gregorian whatever
+    /// calendar the Mac uses. Answers are still formatted with the context's calendar.
+    let calendar: Calendar
     var index = 0
     var sawInvalidDate = false
+    /// A duration or timestamp too large to compute. Checked like `sawInvalidDate`, so
+    /// only a complete phrase reports it and trailing prose never does.
+    var sawOutOfRange = false
 
     init(tokens: [String], context: CalculatorContext) {
         self.tokens = tokens
         self.context = context
+        var gregorian = Calendar(identifier: .gregorian)
+        gregorian.timeZone = context.calendar.timeZone
+        if let locale = context.calendar.locale { gregorian.locale = locale }
+        gregorian.firstWeekday = context.calendar.firstWeekday
+        gregorian.minimumDaysInFirstWeek = context.calendar.minimumDaysInFirstWeek
+        calendar = gregorian
     }
-
-    var calendar: Calendar { context.calendar }
     var today: Date { calendar.startOfDay(for: context.now) }
     var atEnd: Bool { index == tokens.count }
 
@@ -285,9 +311,11 @@ private struct DateParser {
     mutating func attempt<T>(_ body: (inout DateParser) throws -> T?) rethrows -> T? {
         let start = index
         let invalid = sawInvalidDate
+        let outOfRange = sawOutOfRange
         if let value = try body(&self) { return value }
         index = start
         sawInvalidDate = invalid
+        sawOutOfRange = outOfRange
         return nil
     }
 
@@ -302,8 +330,10 @@ private struct DateParser {
         for form in forms {
             index = 0
             sawInvalidDate = false
+            sawOutOfRange = false
             if let result = try form(&self), atEnd {
                 if sawInvalidDate { throw Issue.invalidDate }
+                if sawOutOfRange { throw Issue.resultOutOfRange }
                 return result
             }
         }
@@ -323,23 +353,33 @@ private struct DateParser {
             resultLabel: "Unix time", date: context.now)
     }
 
+    /// "unix 0", "unix -86400", "1700000000 to date", "1700000000000 ms to date". A marker
+    /// (unix, timestamp, epoch, to date) accepts any signed number of seconds; "ms" marks
+    /// milliseconds, and a value too large for seconds but in range for milliseconds is read
+    /// as milliseconds.
     mutating func unixToDate() throws -> Calculation? {
+        let milliseconds: Set<String> = ["ms", "millis", "milliseconds"]
         var number: String?
+        var isMilliseconds = false
         if acceptAny(["unix", "timestamp", "epoch"]) != nil || accept("from", "unix") {
-            _ = accept("time")
-            if let token = peek(), Self.isTimestamp(token) {
-                index += 1
-                number = token
-            }
-        } else if let token = peek(), Self.isTimestamp(token) {
-            index += 1
-            guard accept("unix", "time") || accept("unix") || accept("to", "date") || accept("as", "date")
-                || accept("in", "date") || accept("timestamp")
-            else { return nil }
+            _ = acceptAny(["time", "timestamp"])
+            isMilliseconds = acceptAny(milliseconds) != nil
+            number = acceptNumber()
+            isMilliseconds = acceptAny(milliseconds) != nil || isMilliseconds
+        } else if let token = acceptNumber() {
+            isMilliseconds = acceptAny(milliseconds) != nil
+            let suffix =
+                accept("unix", "time") || accept("unix", "timestamp") || accept("unix") || accept("timestamp")
+                || accept("to", "date", "time") || accept("to", "date") || accept("as", "date") || accept("in", "date")
+            guard suffix else { return nil }
             number = token
         }
         guard let number, atEnd, let value = Double(number) else { return nil }
-        let seconds = number.count >= 12 ? value / 1_000 : value
+        var seconds = isMilliseconds ? value / 1_000 : value
+        if !isMilliseconds, abs(seconds) > Self.maximumUnixSeconds, abs(value) <= Self.maximumUnixSeconds * 1_000 {
+            seconds = value / 1_000
+        }
+        guard abs(seconds) <= Self.maximumUnixSeconds else { throw Issue.resultOutOfRange }
         let date = Date(timeIntervalSince1970: seconds)
         return Calculation(
             expression: "", result: CalendarFormat.dateTime(date, context: context, seconds: true),
@@ -360,9 +400,9 @@ private struct DateParser {
             _ = accept("time")
         }
         guard let parsed, atEnd else { return nil }
-        let seconds = Int(parsed.date.timeIntervalSince1970.rounded(.down))
+        let seconds = Calculator.format(parsed.date.timeIntervalSince1970)
         return Calculation(
-            expression: "", result: "\(seconds)", detail: "Unix time · Return to copy", kind: .date,
+            expression: "", result: seconds, detail: "Unix time · Return to copy", kind: .date,
             resultLabel: "Unix time", date: parsed.date)
     }
 
@@ -626,10 +666,11 @@ private struct DateParser {
         let includeTime = first.hasTime || second.hasTime
         let span = second.date.timeIntervalSince(first.date)
         if includeTime {
+            // The copied value keeps 12 significant digits of hours, so seconds survive.
             return Calculation(
                 expression: "", result: CalendarFormat.breakdown(from: first.date, to: second.date, calendar: calendar, includeTime: true),
-                detail: "\(CalendarFormat.count(span / 3_600, "hour", "hours")) · Return to copy",
-                value: Calculator.format((span / 3_600 * 100).rounded() / 100), kind: .duration)
+                detail: "\(Calculator.format(span / 3_600)) hours · \(Calculator.format(span)) seconds · Return to copy",
+                value: Calculator.format(span / 3_600), kind: .duration)
         }
         let days = calendar.dateComponents([.day], from: first.date, to: second.date).day ?? 0
         return Calculation(
@@ -671,10 +712,25 @@ private struct DateParser {
     mutating func duration() -> ParsedDuration? {
         var result = ParsedDuration()
         var matched = false
+        var span: Double = 0
         while let term = attempt({ $0.durationTerm() }) {
             matched = true
+            span += abs(term.amount) * (Self.unitSeconds[term.unit] ?? 0)
+            // Terms past about 10,000 years would trap converting to Int, or stall the
+            // search adding workdays. They still parse, so a complete phrase reports them.
+            guard span <= Self.maximumSpan, abs(term.amount) <= (Self.maximumAmount[term.unit] ?? 0) else {
+                sawOutOfRange = true
+                _ = accept("and")
+                continue
+            }
             switch term.unit {
-            case .workdays: result.workdays += Int(term.amount)
+            case .workdays:
+                let total = result.workdays + Int(term.amount)
+                if abs(total) > DateMath.maximumWorkdays {
+                    sawOutOfRange = true
+                } else {
+                    result.workdays = total
+                }
             case .seconds: result.seconds += term.amount
             case .minutes: result.seconds += term.amount * 60
             case .hours: result.seconds += term.amount * 3_600
@@ -695,12 +751,12 @@ private struct DateParser {
     mutating func durationTerm() -> (amount: Double, unit: CountUnit)? {
         guard let token = peek() else { return nil }
         if let groups = DateParser.attached.groups(in: token), let number = groups[1].flatMap(Double.init),
-            let unit = groups[2].flatMap({ Self.durationUnits[$0] })
+            number.isFinite, let unit = groups[2].flatMap({ Self.durationUnits[$0] })
         {
             index += 1
             return (number, unit)
         }
-        guard let amount = Double(token) ?? Self.numberWords[token] else { return nil }
+        guard let amount = Double(token) ?? Self.numberWords[token], amount.isFinite else { return nil }
         index += 1
         if accept("business", "days") || accept("business", "day") || accept("working", "days")
             || accept("work", "days")
@@ -729,6 +785,31 @@ private struct DateParser {
     }
 
     private static let attached = CalculatorPattern(#"^(\d+(?:\.\d+)?)([a-z]+)$"#)
+
+    /// About 10,000 years, the most any date phrase may span.
+    private static let maximumSpan: Double = 3.2e11
+
+    private static let unitSeconds: [CountUnit: Double] = [
+        .seconds: 1, .minutes: 60, .hours: 3_600, .days: 86_400, .weeks: 604_800, .months: 2_629_746,
+        .years: 31_556_952, .workdays: 86_400 * 7 / 5,
+    ]
+
+    private static let maximumAmount: [CountUnit: Double] = [
+        .seconds: maximumSpan, .minutes: maximumSpan / 60, .hours: maximumSpan / 3_600, .days: maximumSpan / 86_400,
+        .weeks: maximumSpan / 604_800, .months: 120_000, .years: 10_000, .workdays: Double(DateMath.maximumWorkdays),
+    ]
+
+    /// Seconds since 1970 that a unix phrase may name: about year 5138 either way.
+    static let maximumUnixSeconds: Double = 1e11
+
+    /// A signed decimal number, as one token.
+    mutating func acceptNumber() -> String? {
+        guard let token = peek(), DateParser.signedNumber.groups(in: token) != nil else { return nil }
+        index += 1
+        return token
+    }
+
+    private static let signedNumber = CalculatorPattern(#"^[+-]?\d{1,16}(?:\.\d+)?$"#)
 
     private static let durationUnits: [String: CountUnit] = [
         "s": .seconds, "sec": .seconds, "secs": .seconds, "second": .seconds, "seconds": .seconds,
@@ -954,39 +1035,53 @@ private struct DateParser {
         return chosen.map { ParsedDate(date: $0, hasExplicitYear: false) }
     }
 
-    func validDate(_ components: DateComponents) -> Date? {
+    /// The date only if the calendar didn't have to normalize it (no February 30).
+    func validDate(_ components: DateComponents, in calendar: Calendar? = nil) -> Date? {
+        let calendar = calendar ?? self.calendar
         guard let date = calendar.date(from: components) else { return nil }
-        let check = calendar.dateComponents([.year, .month, .day], from: date)
-        guard check.year == components.year, check.month == components.month, check.day == components.day else {
-            return nil
-        }
+        let check = calendar.dateComponents([.year, .month, .day, .hour, .minute], from: date)
+        guard check.year == components.year, check.month == components.month, check.day == components.day,
+            components.hour == nil || check.hour == components.hour,
+            components.minute == nil || check.minute == components.minute
+        else { return nil }
         return date
     }
 
-    func isoDate(_ token: String) -> ParsedDate? {
-        guard let groups = DateMath.isoDate.groups(in: token), let year = groups[1].flatMap(Int.init),
-            let month = groups[2].flatMap(Int.init), let day = groups[3].flatMap(Int.init)
-        else { return nil }
-        guard groups[4] != nil else {
-            return validDate(DateComponents(year: year, month: month, day: day)).map { ParsedDate(date: $0) }
+    /// A 2026-03-31 or 2026-03-31T14:30:00.250+01:00 token. A token shaped like ISO 8601
+    /// with an impossible date, time or offset is reported as an invalid date instead of
+    /// falling through to arithmetic.
+    mutating func isoDate(_ token: String) -> ParsedDate? {
+        guard let groups = DateMath.isoDate.groups(in: token) else { return nil }
+        let invalid = { (parser: inout DateParser) -> ParsedDate in
+            parser.sawInvalidDate = true
+            return ParsedDate(date: parser.today)
         }
+        guard let year = groups[1].flatMap(Int.init), let month = groups[2].flatMap(Int.init),
+            let day = groups[3].flatMap(Int.init)
+        else { return invalid(&self) }
         var zoned = calendar
-        if let zone = groups[7] {
-            if zone == "z" {
-                zoned.timeZone = TimeZone(identifier: "UTC") ?? zoned.timeZone
-            } else {
-                let digits = zone.dropFirst().replacingOccurrences(of: ":", with: "")
-                let hours = Int(digits.prefix(2)) ?? 0
-                let minutes = Int(digits.suffix(2)) ?? 0
-                let offset = (hours * 3_600 + minutes * 60) * (zone.hasPrefix("-") ? -1 : 1)
-                zoned.timeZone = TimeZone(secondsFromGMT: offset) ?? zoned.timeZone
-            }
+        if let zone = groups[8], zone != "z" {
+            let digits = zone.dropFirst().replacingOccurrences(of: ":", with: "")
+            let hours = Int(digits.prefix(2)) ?? 99
+            let minutes = digits.count > 2 ? Int(digits.dropFirst(2)) ?? 99 : 0
+            guard hours <= 14, minutes < 60,
+                let offset = TimeZone(secondsFromGMT: (hours * 3_600 + minutes * 60) * (zone.hasPrefix("-") ? -1 : 1))
+            else { return invalid(&self) }
+            zoned.timeZone = offset
+        } else if groups[8] == "z" {
+            zoned.timeZone = TimeZone(identifier: "UTC") ?? .gmt
         }
-        let components = DateComponents(
-            year: year, month: month, day: day, hour: groups[4].flatMap(Int.init), minute: groups[5].flatMap(Int.init),
-            second: groups[6].flatMap(Int.init) ?? 0)
-        guard let date = zoned.date(from: components) else { return nil }
-        return ParsedDate(date: date, hasTime: true)
+        let hour = groups[4].flatMap(Int.init)
+        let minute = groups[5].flatMap(Int.init)
+        let second = groups[6].flatMap(Int.init) ?? 0
+        guard (0...23).contains(hour ?? 0), (0...59).contains(minute ?? 0), (0...59).contains(second),
+            let date = validDate(
+                DateComponents(year: year, month: month, day: day, hour: hour ?? 0, minute: minute ?? 0, second: second),
+                in: zoned)
+        else { return invalid(&self) }
+        guard hour != nil else { return ParsedDate(date: date) }
+        let fraction = groups[7].flatMap { Double("0" + $0) } ?? 0
+        return ParsedDate(date: date.addingTimeInterval(fraction), hasTime: true)
     }
 
     func dayNumber(_ token: String?) -> Int? {

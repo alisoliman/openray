@@ -29,12 +29,14 @@ enum TimeZoneTable {
             .split(whereSeparator: \.isWhitespace).joined(separator: " ")
     }
 
-    /// "utc+5:30", "gmt-3", "utc".
+    /// "utc+5:30", "gmt-3", "utc". Only a name with no offset means plain UTC; an
+    /// impossible offset ("utc+99") names no zone at all.
     private static func fixedOffset(_ key: String) -> ZoneMatch? {
         guard let groups = offsetPattern.groups(in: key), let prefix = groups[1] else { return nil }
-        guard let sign = groups[2], let hoursText = groups[3], let hours = Int(hoursText), hours <= 14 else {
+        guard let sign = groups[2], let hoursText = groups[3] else {
             return TimeZone(identifier: "UTC").map { ZoneMatch(timeZone: $0, label: prefix.uppercased()) }
         }
+        guard let hours = Int(hoursText), hours <= 14 else { return nil }
         let minutes = groups[4].flatMap { Int($0) } ?? 0
         guard minutes < 60 else { return nil }
         let seconds = (hours * 3_600 + minutes * 60) * (sign == "-" ? -1 : 1)

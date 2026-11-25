@@ -71,6 +71,9 @@ struct EmojiCatalogTests {
         preferences.setKeywords([" LGTM ", "ship it", "lgtm", ""], for: "👍")
         #expect(preferences.customKeywords["👍"] == ["lgtm", "ship it"])
         #expect(catalog.search("lgtm", preferences: preferences, now: now).first?.glyph == "👍")
+        #expect(catalog.search("ship it", preferences: preferences, now: now).first?.glyph == "👍")
+        // A word of the phrase finds it too, after the emoji named "ship".
+        #expect(catalog.search("ship", preferences: preferences, now: now).prefix(3).contains { $0.glyph == "👍" })
         #expect(catalog.search("lgtm", now: now).first?.glyph != "👍")
         preferences.setKeywords([], for: "👍")
         #expect(preferences.customKeywords["👍"] == nil)

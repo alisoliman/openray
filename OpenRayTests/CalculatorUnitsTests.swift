@@ -168,7 +168,7 @@ struct CalculatorUnitsTests {
     @Test(arguments: [
         ("0.75 as fraction", "3/4"), ("1.75 as fraction", "1 3/4"), ("1.75 as improper", "7/4"),
         ("7/4 as mixed", "1 3/4"), ("1/3 + 1/6 as fraction", "1/2"), ("-1.25 as a fraction", "-1 1/4"),
-        ("2 as fraction", "2"), ("0.333333333333 as fraction", "1/3"), ("pi as improper fraction", "≈ 355/113"),
+        ("2 as fraction", "2"), ("0.333333333333 as fraction", "≈ 1/3"), ("1/3 as fraction", "1/3"), ("pi as improper fraction", "≈ 355/113"),
     ])
     func fractions(input: String, expected: String) {
         #expect(Clock.evaluate(input)?.result == expected, "\(input)")

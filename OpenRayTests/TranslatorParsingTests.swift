@@ -169,3 +169,18 @@ struct TranslationServiceTests {
         #expect(download.lastSource.id == "en-US")
     }
 }
+
+struct TranslatorCaseMappingTests {
+    @Test func originalTextSurvivesCaseMapping() throws {
+        let inline = try #require(TranslationParser.parse("İstanbul in english"))
+        #expect(inline.text == "İstanbul")
+        #expect(inline.target.id == "en-US")
+        let command = try #require(TranslationParser.parse("translate İstanbul from turkish to english"))
+        #expect(command.text == "İstanbul")
+        #expect(command.source?.id == "tr")
+        #expect(command.target.id == "en-US")
+        let question = try #require(TranslationParser.parse("HOW DO YOU SAY İİİ IN GERMAN"))
+        #expect(question.text == "İİİ")
+        #expect(question.target.id == "de")
+    }
+}

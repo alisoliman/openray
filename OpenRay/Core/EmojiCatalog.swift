@@ -239,7 +239,10 @@ struct EmojiCatalog: Sendable {
     private struct SearchFields: Sendable {
         var name: String
         var nameWords: [String]
+        /// Whole keywords, some of them phrases ("light bulb").
         var keywords: [String]
+        /// Every word of every keyword, for multiword and prefix matches.
+        var keywordWords: [String]
         var categoryWords: [String]
     }
 
@@ -287,8 +290,10 @@ struct EmojiCatalog: Sendable {
         self.index = index
         fields = unique.map { entry in
             let name = Self.fold(entry.name)
+            let keywords = entry.keywords.map(Self.fold)
             return SearchFields(
-                name: name, nameWords: Self.words(name), keywords: entry.keywords.map(Self.fold),
+                name: name, nameWords: Self.words(name), keywords: keywords,
+                keywordWords: Array(Set(keywords.flatMap(Self.words))),
                 categoryWords: Self.words(Self.fold(entry.category.title)))
         }
     }
@@ -365,8 +370,18 @@ struct EmojiCatalog: Sendable {
         return sections
     }
 
+    /// Whole-phrase matches score first, so a saved keyword such as "ship it" finds its
+    /// emoji; then each query word must match a word of the name, a keyword or a custom
+    /// keyword, exactly or as a prefix.
     private static func score(_ fields: SearchFields, custom: [String], terms: [String], phrase: String) -> Int? {
         var total = fields.name == phrase ? 1_000 : 0
+        if custom.contains(phrase) {
+            total += 900
+        } else if terms.count > 1, custom.contains(where: { $0.hasPrefix(phrase) }) {
+            total += 600
+        }
+        if terms.count > 1, fields.keywords.contains(phrase) { total += 300 }
+        let customWords = custom.flatMap(words)
         for term in terms {
             var best = 0
             if fields.name.hasPrefix(term) { best = max(best, 400) }
@@ -375,14 +390,14 @@ struct EmojiCatalog: Sendable {
             } else if fields.nameWords.contains(where: { $0.hasPrefix(term) }) {
                 best = max(best, 250)
             }
-            if custom.contains(term) {
+            if custom.contains(term) || customWords.contains(term) {
                 best = max(best, 380)
-            } else if custom.contains(where: { $0.hasPrefix(term) }) {
+            } else if custom.contains(where: { $0.hasPrefix(term) }) || customWords.contains(where: { $0.hasPrefix(term) }) {
                 best = max(best, 300)
             }
-            if fields.keywords.contains(term) {
+            if fields.keywords.contains(term) || fields.keywordWords.contains(term) {
                 best = max(best, 200)
-            } else if fields.keywords.contains(where: { $0.hasPrefix(term) }) {
+            } else if fields.keywordWords.contains(where: { $0.hasPrefix(term) }) {
                 best = max(best, 120)
             }
             if term.count >= 3 {

@@ -103,17 +103,18 @@ enum TranslationParser {
         let trimmed = input.trimmingCharacters(in: .whitespacesAndNewlines)
         guard trimmed.count <= maximumLength, trimmed.count >= 4 else { return nil }
         if let command = commandPhrase(trimmed) { return command }
-        for prefix in ["how do you say ", "how to say ", "how would you say ", "say "] where trimmed.lowercased().hasPrefix(prefix) {
-            return inline(String(trimmed.dropFirst(prefix.count)), connectors: [" in ", " into "])
+        for prefix in ["how do you say ", "how to say ", "how would you say ", "say "] {
+            if let range = trimmed.range(of: prefix, options: [.caseInsensitive, .anchored]) {
+                return inline(String(trimmed[range.upperBound...]), connectors: [" in ", " into "])
+            }
         }
         return inline(trimmed, connectors: [" in ", " into "])
     }
 
     /// "translate X to|into|in L" and "translate X from L1 to L2".
     private static func commandPhrase(_ text: String) -> TranslationRequest? {
-        let lower = text.lowercased()
-        guard lower.hasPrefix("translate ") else { return nil }
-        let body = String(text.dropFirst("translate ".count))
+        guard let range = text.range(of: "translate ", options: [.caseInsensitive, .anchored]) else { return nil }
+        let body = String(text[range.upperBound...])
         if let request = inline(body, connectors: [" to ", " into ", " in "]) {
             if let (text, source) = sourceSuffix(request.text) {
                 return TranslationRequest(text: text, source: source, target: request.target)
@@ -124,12 +125,12 @@ enum TranslationParser {
     }
 
     /// "<text> in|into <language>", splitting at the last connector so "in" inside the
-    /// text stays. The text may be quoted.
+    /// text stays. The text may be quoted. Ranges come from the original string, because
+    /// lowercasing can change its length ("İ").
     private static func inline(_ text: String, connectors: [String]) -> TranslationRequest? {
-        let lower = text.lowercased()
         var best: (range: Range<String.Index>, language: TranslationLanguage)?
         for connector in connectors {
-            guard let range = lower.range(of: connector, options: .backwards) else { continue }
+            guard let range = text.range(of: connector, options: [.caseInsensitive, .backwards]) else { continue }
             let name = String(text[range.upperBound...]).trimmingCharacters(in: .whitespaces)
                 .trimmingCharacters(in: CharacterSet(charactersIn: ".?!"))
             guard let language = TranslationLanguages.named(name) else { continue }
@@ -143,7 +144,7 @@ enum TranslationParser {
 
     /// "hallo from german" → ("hallo", German).
     private static func sourceSuffix(_ text: String) -> (String, TranslationLanguage)? {
-        guard let range = text.lowercased().range(of: " from ", options: .backwards) else { return nil }
+        guard let range = text.range(of: " from ", options: [.caseInsensitive, .backwards]) else { return nil }
         let name = String(text[range.upperBound...]).trimmingCharacters(in: .whitespaces)
         guard let language = TranslationLanguages.named(name) else { return nil }
         let remaining = unquoted(String(text[..<range.lowerBound]))
