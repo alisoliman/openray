@@ -42,6 +42,11 @@ struct CommandDescriptor: Identifiable, Hashable, Sendable {
     var showsInRoot = true
     /// Dimmed, with `subtitle` saying why: a missing permission, or AI that isn't ready.
     var isUnavailable = false
+    /// False keeps the command out of Settings › Shortcuts and refuses aliases and hotkeys for it,
+    /// even when its registration accepts the id.
+    var isBindable = true
+    /// Asked in the action bar before the command runs, from search and from a hotkey alike.
+    var confirmation: CommandConfirmation? = nil
 
     /// What ↩ does, said in VoiceOver hints. The action bar asks the provider, which can be more specific.
     var primaryTitle: String {
@@ -51,6 +56,15 @@ struct CommandDescriptor: Identifiable, Hashable, Sendable {
         case .menuBar: "Open Command"
         }
     }
+}
+
+/// The question a command asks before it runs: “Shut down now?” · “Open apps may ask to save.”
+struct CommandConfirmation: Hashable, Sendable {
+    var question: String
+    var detail: String
+    /// The ↩ button's title: “Shut Down”.
+    var confirmTitle: String
+    var symbol = "exclamationmark.triangle"
 }
 
 /// The payload of `LauncherItem.Action.provided`: which provider owns a row, and what the
@@ -120,6 +134,11 @@ struct ProvidedScope: Hashable, Sendable {
     /// True ranks the provider's rows with the shared matcher, as built-in scopes do.
     /// False shows them in the provider's order; the provider filters for itself.
     var ranksItems = true
+    /// Columns in the default group when `style` is `.grid`. Nil uses the launcher's default (4).
+    var columns: Int? = nil
+    /// The resolved argument values of the command that opened the scope, by `ArgumentSpec.name`.
+    /// Not part of the scope's identity.
+    var arguments: [String: String] = [:]
 
     static func == (lhs: ProvidedScope, rhs: ProvidedScope) -> Bool { lhs.id == rhs.id }
     func hash(into hasher: inout Hasher) { hasher.combine(id) }
@@ -133,8 +152,9 @@ struct CommandProviderRegistration: Sendable {
     var id: String
     /// Commands that can hold an alias or hotkey, in the order Settings lists them.
     var bindableIDs: [String] = []
-    /// Prefixes for commands that come and go, such as `script.`. Their bindings are kept
-    /// while the command is missing, and work again when it returns.
+    /// Namespaces whose every command can hold an alias or hotkey, such as `system.` or `script.`.
+    /// Declare your namespace here once, and new commands under it need no further declaration.
+    /// Bindings for commands that are missing right now are kept, inactive, until they return.
     var bindablePrefixes: [String] = []
     var make: @MainActor @Sendable () -> any CommandProvider
 

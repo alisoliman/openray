@@ -2,8 +2,9 @@
 /// Settings › Shortcuts after the original twenty, and the order rows from different
 /// providers tie in.
 ///
-/// Each slice adds its own line in its own slot. The comment lines between slots keep
-/// parallel additions from touching adjacent lines, so they merge without conflicts.
+/// To register, insert your line directly below your slice's comment. Keep the comment; never
+/// replace it. The retained comment lines separate the slots, so additions from parallel
+/// branches never touch the same or adjacent lines and merge without conflicts.
 enum CommandProviders {
     static let all: [CommandProviderRegistration] = [
         AIWritingCommandProvider.registration,

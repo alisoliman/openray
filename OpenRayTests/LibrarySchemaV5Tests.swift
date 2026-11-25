@@ -198,12 +198,13 @@ struct Step0SeamTests {
     // MARK: Settings panes
 
     @Test func settingsPanesKeepTheirIdentifiersAndOrder() {
-        #expect(
-            SettingsPane.allCases.map(\.rawValue) == [
-                "general", "shortcuts", "clipboard", "snippets", "files", "ai", "permissions", "library", "about",
-            ])
-        #expect(SettingsPane.primary == [.general, .shortcuts, .clipboard, .snippets, .files, .ai])
-        #expect(SettingsPane.secondary == [.permissions, .library, .about])
+        // The original panes keep their order and grouping; slices may add panes between them.
+        let original = ["general", "shortcuts", "clipboard", "snippets", "files", "ai", "permissions", "library", "about"]
+        #expect(SettingsPane.allCases.map(\.rawValue).filter(original.contains) == original)
+        #expect(SettingsPane.primary.filter([.general, .shortcuts, .clipboard, .snippets, .files, .ai].contains) == [
+            .general, .shortcuts, .clipboard, .snippets, .files, .ai,
+        ])
+        #expect(SettingsPane.secondary.filter([.permissions, .library, .about].contains) == [.permissions, .library, .about])
         #expect(SettingsPane(rawValue: "clipboard") == .clipboard)
         #expect(SettingsPane(rawValue: "nope") == nil)
         #expect(RuntimeMode.settingsPane(arguments: ["--open-settings", "library"]) == .library)
@@ -227,9 +228,8 @@ struct Step0SeamTests {
     // MARK: Scopes
 
     @Test func builtInScopesKeepTheirIdentity() {
-        #expect(LauncherSection.allCases.map(\.rawValue) == [
-            "home", "applications", "files", "clipboard", "snippets", "quicklinks", "notes", "calculator", "windows",
-        ])
+        let builtIns = ["home", "applications", "files", "clipboard", "snippets", "quicklinks", "notes", "calculator", "windows"]
+        #expect(LauncherSection.allCases.map(\.rawValue).filter(builtIns.contains) == builtIns)
         let scope = ProvidedScope(
             id: "test.scope", provider: "test", title: "Scope", symbol: "star", kind: .command, placeholder: "Search")
         var renamed = scope

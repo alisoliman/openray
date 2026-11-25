@@ -4,7 +4,7 @@ import SwiftUI
 ///
 /// Each pane declares itself next to its view, as `extension SettingsPane { static let … }`
 /// (see `GeneralPane.swift`). Adding a pane takes that declaration plus one line in
-/// `primary` or `secondary` below, which set the sidebar order.
+/// `primary` or `secondary` below, inserted under your slice's comment, which set the sidebar order.
 struct SettingsPane: Identifiable, Hashable, Sendable {
     let id: String
     let title: String
@@ -46,8 +46,9 @@ struct SettingsPane: Identifiable, Hashable, Sendable {
 }
 
 extension SettingsPane {
-    // One pane per line, in sidebar order. Each slice adds its own line, separated by
-    // the comment lines, so parallel additions merge without conflicts.
+    // One pane per line, in sidebar order. To add a pane, insert its line directly below your
+    // slice's comment. Keep the comment; never replace it. The retained comment lines separate
+    // the slots, so additions from parallel branches merge without conflicts.
     static let primary: [SettingsPane] = [
         .general,
         // Slice 1: keyboard

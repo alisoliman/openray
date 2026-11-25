@@ -1,18 +1,15 @@
 import AppKit
 
 extension LauncherModel {
-    /// Commands that can hold an alias or hotkey: the original twenty in their order, then every
-    /// other registered command whose registration accepts it, in registration order.
+    /// Commands that can hold an alias or hotkey right now: the original twenty in their order,
+    /// then the registry's bindable catalog (shown and hidden commands alike) in registration
+    /// order. Settings, aliases, hotkey titles and hotkey registration all use this one list.
     var bindableCommands: [LauncherItem] {
-        let commands = commandItems + registry.hiddenCommandItems(in: self)
-        let index = Dictionary(commands.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
-        let curated = CuratedCommand.targetIDs.compactMap { index[$0] }
+        let registered = registry.bindableCommandItems(in: self)
+        let index = Dictionary(
+            (commandItems + registered).map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
         let curatedIDs = Set(CuratedCommand.targetIDs)
-        let registered = commands.filter { item in
-            guard case .provided = item.action, !curatedIDs.contains(item.id) else { return false }
-            return CuratedCommand.supports(item.id)
-        }
-        return curated + registered
+        return CuratedCommand.targetIDs.compactMap { index[$0] } + registered.filter { !curatedIDs.contains($0.id) }
     }
 
     var applicationItems: [LauncherItem] {

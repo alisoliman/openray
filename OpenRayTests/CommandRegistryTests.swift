@@ -8,12 +8,21 @@ import Testing
 /// so its commands can't hold bindings; the writing commands cover that path.
 @MainActor
 final class FakeCommandProvider: CommandProvider {
+    /// Accepts every `test.` id. Tests opt in with `CuratedCommand.$registrations.withValue(…)`.
+    nonisolated static let registration = CommandProviderRegistration(id: "test.fake", bindablePrefixes: ["test."]) {
+        FakeCommandProvider()
+    }
     static let scope = ProvidedScope(
         id: "test.list", provider: "test.fake", title: "Fake List", symbol: "list.bullet", kind: .note,
         placeholder: "Search fake rows", summary: "Rows for tests", itemNoun: "row", showsPreview: true)
     static let gridScope = ProvidedScope(
         id: "test.grid", provider: "test.fake", title: "Fake Grid", symbol: "square.grid.3x3", kind: .command,
         placeholder: "Search tiles", style: .grid, ranksItems: false)
+    static let wideGridScope = ProvidedScope(
+        id: "test.grid3", provider: "test.fake", title: "Three Columns", symbol: "square.grid.3x3", kind: .command,
+        placeholder: "Search tiles", style: .grid, ranksItems: false, columns: 3)
+    static let confirmation = CommandConfirmation(
+        question: "Really run it?", detail: "Fake commands can't be undone.", confirmTitle: "Run")
 
     let id = "test.fake"
     var performed: [String] = []
@@ -24,6 +33,12 @@ final class FakeCommandProvider: CommandProvider {
     var liveRows: [String] = []
     var liveQueries: [String] = []
     var available = true
+    /// Dynamic commands, as a script folder would list them: `test.script.<name>`.
+    var scripts: [String] = []
+    var imageRows = false
+    var secondaryPerformed: [String] = []
+    var failDeletion = false
+    var scopeArguments: [[String: String]] = []
 
     init() {}
 
@@ -40,9 +55,26 @@ final class FakeCommandProvider: CommandProvider {
                 symbol: "eye.slash", mode: .noView, showsInRoot: false),
             CommandDescriptor(
                 id: "test.args", title: "Zebra Needs Argument", subtitle: "Takes a name", kind: .command,
-                symbol: "character.cursor.ibeam", arguments: [ArgumentSpec(name: "name", placeholder: "Name")],
+                symbol: "character.cursor.ibeam",
+                arguments: [
+                    ArgumentSpec(name: "name", placeholder: "Name"),
+                    ArgumentSpec(name: "greeting", placeholder: "Greeting", isOptional: true, defaultValue: "Hello"),
+                ],
                 mode: .noView),
+            CommandDescriptor(
+                id: "test.confirm", title: "Yak Confirm", subtitle: "Asks first", kind: .command,
+                symbol: "exclamationmark.triangle", mode: .noView, confirmation: Self.confirmation),
+            CommandDescriptor(
+                id: "test.scoped", title: "Yak Scoped List", subtitle: "Opens a filtered list", kind: .note,
+                symbol: "line.3.horizontal.decrease",
+                arguments: [ArgumentSpec(name: "filter", placeholder: "Filter", isOptional: true, defaultValue: "all")],
+                mode: .view(.provided(Self.scope))),
         ]
+            + scripts.map { name in
+                CommandDescriptor(
+                    id: "test.script.\(name)", title: "Script \(name)", subtitle: "A script", kind: .command,
+                    symbol: "terminal", mode: .noView)
+            }
     }
 
     func rootItems(for query: String, in model: LauncherModel) -> [LauncherItem] {
@@ -63,12 +95,24 @@ final class FakeCommandProvider: CommandProvider {
                     traits: [.favorite, .paste, .delete, .edit])))
     }
 
+    /// A row whose ⌘↩ isn't text paste: it has no `.paste` trait and its own secondary action.
+    func imageRow() -> LauncherItem {
+        LauncherItem(
+            id: "test.image", title: "Image Row", subtitle: "A picture", symbol: "photo", kind: .file, badge: "Image",
+            action: .provided(ProvidedRef(provider: id, id: "Image Row", payload: "image")))
+    }
+
     func item(withID id: String, in model: LauncherModel) -> LauncherItem? {
-        id.hasPrefix("test.row.") ? row(String(id.dropFirst("test.row.".count))) : nil
+        guard id.hasPrefix("test.row.") else { return nil }
+        let title = String(id.dropFirst("test.row.".count))
+        return rows.contains(title) ? row(title) : nil
     }
 
     func scopeItems(_ scope: ProvidedScope, query: String, in model: LauncherModel) -> [LauncherItem] {
-        scope == Self.gridScope ? ["Zulu", "Alpha"].map(row) : rows.map(row)
+        scopeArguments.append(scope.arguments)
+        if scope == Self.gridScope { return ["Zulu", "Alpha"].map(row) }
+        if scope == Self.wideGridScope { return (1...7).map { row("Tile \($0)") } }
+        return rows.map(row) + (imageRows ? [imageRow()] : [])
     }
 
     var providesLiveItems: Bool { true }
@@ -113,12 +157,27 @@ final class FakeCommandProvider: CommandProvider {
         ProvidedPreview(content: AnyView(Text(item.title)), metadata: [("Name", item.title)])
     }
 
+    func secondaryTitle(for item: LauncherItem, ref: ProvidedRef, in model: LauncherModel) -> String? {
+        ref.payload == "image" ? model.pasteTitle("Paste Image to") : model.textPasteTitle(for: item)
+    }
+
+    func performSecondary(_ item: LauncherItem, ref: ProvidedRef, in model: LauncherModel) {
+        if ref.payload == "image" { secondaryPerformed.append(ref.id) } else { model.pasteText(of: item) }
+    }
+
     func itemNoun(for ref: ProvidedRef) -> String { "Row" }
 
-    func delete(_ item: LauncherItem, ref: ProvidedRef, in model: LauncherModel) -> Bool {
-        deleted.append(ref.id)
-        rows.removeAll { $0 == ref.id }
-        return true
+    func deletion(for item: LauncherItem, ref: ProvidedRef, in model: LauncherModel) -> ProvidedDeletion? {
+        .store { [weak self, weak model] in
+            guard let self else { return false }
+            if self.failDeletion {
+                model?.feedback = .error("The fake store refused.")
+                return false
+            }
+            self.deleted.append(ref.id)
+            self.rows.removeAll { $0 == ref.id }
+            return true
+        }
     }
 
     func edit(_ item: LauncherItem, ref: ProvidedRef, in model: LauncherModel) { edited.append(ref.id) }
@@ -204,7 +263,7 @@ struct CommandRegistryTests {
         filled.action = .provided(ProvidedRef(provider: "test.fake", id: "test.args", arguments: ["name": "Ada"]))
         model.perform(filled)
         #expect(fake.performed == ["test.args"])
-        #expect(fake.performedArguments == [["name": "Ada"]])
+        #expect(fake.performedArguments == [["name": "Ada", "greeting": "Hello"]])
     }
 
     @Test func answerRowsUseTheirFixedRankAndFallbacksArePrefixed() throws {
@@ -428,8 +487,11 @@ struct CommandRegistryTests {
     @Test func bindableCommandsKeepTheirOrderAfterThePort() {
         let model = model()
         defer { model.stop() }
-        #expect(model.bindableCommands.map(\.id) == CuratedCommand.targetIDs)
-        #expect(model.commandItems.filter { $0.id.hasPrefix("ai.") }.count == AIAction.allCases.count)
+        // The original twenty lead, in order; later registrations may follow them.
+        let ids = model.bindableCommands.map(\.id)
+        #expect(Array(ids.prefix(CuratedCommand.targetIDs.count)) == CuratedCommand.targetIDs)
+        let writing = AIAction.allCases.filter { $0 != .chat }.map { "ai.\($0.id)" }
+        #expect(model.commandItems.map(\.id).filter(writing.contains) == writing)
     }
 
     private func waitForLiveItems(_ model: LauncherModel) async throws {

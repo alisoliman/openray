@@ -8,12 +8,58 @@ struct ProvidedPreview {
     var metadata: [(label: String, value: String)] = []
 }
 
+/// How a provider removes one of its rows after the person confirms.
+enum ProvidedDeletion {
+    /// The row lives in `library.json`. The launcher runs the mutation and clears the row's
+    /// favorite and usage records in the same save, so they succeed or fail together.
+    case library((inout LibraryDatabase) throws -> Void)
+    /// The row lives in the provider's own store. Return false, after setting `model.feedback`
+    /// to say why, when it couldn't be removed. The launcher then clears the favorite and usage
+    /// records, and retries that cleanup on later saves if it fails.
+    case store(@MainActor () -> Bool)
+}
+
+/// A question asked in the action bar before something runs. ↩ calls `perform`; esc cancels.
+struct ProvidedConfirmation {
+    var id: String
+    var question: String
+    var detail: String
+    var confirmTitle: String
+    var symbol = "exclamationmark.triangle"
+    var perform: @MainActor () -> Void
+
+    init(id: String, _ text: CommandConfirmation, perform: @escaping @MainActor () -> Void) {
+        self.id = id
+        question = text.question
+        detail = text.detail
+        confirmTitle = text.confirmTitle
+        symbol = text.symbol
+        self.perform = perform
+    }
+}
+
+/// What an empty provided scope says.
+struct ProvidedEmptyState: Equatable {
+    var title: String
+    var detail: String
+    var symbol: String? = nil
+}
+
+/// Draws one tile of a grid group. The launcher adds the selection fill, hover, click and
+/// accessibility around it, so the renderer draws only the tile's content.
+struct GridTileRenderer {
+    var render: @MainActor (_ item: LauncherItem, _ selected: Bool) -> AnyView
+
+    /// The row's glyph over its title, for grids without a custom look.
+    static let standard = GridTileRenderer { item, _ in AnyView(StandardGridTile(item: item)) }
+}
+
 /// A source of commands and rows. Register one with a line in `CommandProviders.all`.
 ///
 /// Every requirement except `id` and `commands(in:)` has a default, so a provider implements
 /// only what it offers. Rows a provider builds carry `.provided(ProvidedRef)` actions whose
-/// `provider` is this provider's `id`; the launcher routes ↩, ⌘K, the preview, delete and edit
-/// for those rows back here. Everything runs on the main actor, with the launcher's model.
+/// `provider` is this provider's `id`; the launcher routes ↩, ⌘↩, ⌘K, the preview, delete and
+/// edit for those rows back here. Everything runs on the main actor, with the launcher's model.
 @MainActor
 protocol CommandProvider: AnyObject {
     /// Matches the registration's id.
@@ -31,19 +77,25 @@ protocol CommandProvider: AnyObject {
     func item(withID id: String, in model: LauncherModel) -> LauncherItem?
 
     /// The rows of one of this provider's scopes. Ranked by the shared matcher unless the scope
-    /// sets `ranksItems = false`.
+    /// sets `ranksItems = false`. `scope.arguments` holds the opening command's argument values.
     func scopeItems(_ scope: ProvidedScope, query: String, in model: LauncherModel) -> [LauncherItem]
 
-    /// Groups for a scope's rows, already ranked or filtered. Nil shows one untitled group in
-    /// the scope's `style`.
+    /// Groups for a scope's rows, already ranked or filtered. Nil shows one untitled group in the
+    /// scope's `style` and `columns`. Groups with no rows are dropped unless they're `isLoading`.
     func scopeGroups(_ scope: ProvidedScope, items: [LauncherItem], in model: LauncherModel) -> [LauncherResultGroup]?
+
+    /// What the scope says when it has no rows. `isLoading` is true while a live search is
+    /// still running. Nil uses a generic searching, empty or no-matches message.
+    func emptyState(for scope: ProvidedScope, query: String, isLoading: Bool, in model: LauncherModel)
+        -> ProvidedEmptyState?
 
     /// True when `liveItems` has anything to say, so the launcher starts a search for it.
     var providesLiveItems: Bool { get }
     /// The root-search group title for this provider's live rows.
     var liveGroupTitle: String { get }
-    /// Rows that take time: a search the launcher starts on each query change and cancels when
-    /// the query changes again. `scope` is nil in root search, where the rows never become the
+    /// Rows that take time. The launcher starts each provider's search on its own task on every
+    /// query change, cancels it when the query changes or search is left, and drops results
+    /// for an earlier query. `scope` is nil in root search, where the rows never become the
     /// Top Hit and appear in their own group; in a scope they follow the scope's rows.
     func liveItems(for query: String, scope: ProvidedScope?, in model: LauncherModel) async -> [LauncherItem]
 
@@ -51,14 +103,20 @@ protocol CommandProvider: AnyObject {
     /// `fallback.`; the registry adds the prefix when it's missing.
     func fallbackItems(for query: String, in model: LauncherModel) -> [LauncherItem]
 
-    /// ↩ on one of this provider's rows. Commands with `mode: .view(scope)` never get here:
-    /// the registry opens their scope.
+    /// ↩ on one of this provider's rows. Commands with `mode: .view(scope)` never get here: the
+    /// registry opens their scope. Arguments arrive resolved: defaults applied, text trimmed.
     func perform(_ item: LauncherItem, ref: ProvidedRef, in model: LauncherModel)
 
     /// The action bar's ↩ label. Nil uses the ref's `primaryTitle`.
     func primaryTitle(for item: LauncherItem, ref: ProvidedRef, in model: LauncherModel) -> String?
     /// The ⌘K symbol beside the ↩ entry. Nil picks one from the command's mode.
     func primarySymbol(for item: LauncherItem, ref: ProvidedRef, in model: LauncherModel) -> String?
+
+    /// The ⌘↩ label in the action bar and ⌘K, or nil for no secondary action. The default
+    /// offers text paste (“Paste to Notes”) for rows with the `.paste` trait and a `copyText`.
+    func secondaryTitle(for item: LauncherItem, ref: ProvidedRef, in model: LauncherModel) -> String?
+    /// ⌘↩, from the keyboard, the action bar or ⌘K. The default pastes `copyText`.
+    func performSecondary(_ item: LauncherItem, ref: ProvidedRef, in model: LauncherModel)
 
     /// Extra ⌘K entries for a row. They follow ↩ and ⌘↩ and come before Edit, Favorite and Delete,
     /// which the launcher adds from the ref's traits. Use `section` and `children` to structure them.
@@ -69,9 +127,8 @@ protocol CommandProvider: AnyObject {
 
     /// The noun in “Delete …”, capitalized: “Script”, “Chat”.
     func itemNoun(for ref: ProvidedRef) -> String
-    /// Removes a row with the `.delete` trait after the person confirms. Return false, and set
-    /// `model.feedback`, when it couldn't be removed. The launcher then forgets its favorite and usage.
-    func delete(_ item: LauncherItem, ref: ProvidedRef, in model: LauncherModel) -> Bool
+    /// How to remove a row with the `.delete` trait, once the person confirms. Nil can't delete it.
+    func deletion(for item: LauncherItem, ref: ProvidedRef, in model: LauncherModel) -> ProvidedDeletion?
     /// Opens an editor for a row with the `.edit` trait.
     func edit(_ item: LauncherItem, ref: ProvidedRef, in model: LauncherModel)
 }
@@ -83,6 +140,9 @@ extension CommandProvider {
     func scopeGroups(_ scope: ProvidedScope, items: [LauncherItem], in model: LauncherModel) -> [LauncherResultGroup]? {
         nil
     }
+    func emptyState(for scope: ProvidedScope, query: String, isLoading: Bool, in model: LauncherModel)
+        -> ProvidedEmptyState?
+    { nil }
     var providesLiveItems: Bool { false }
     var liveGroupTitle: String { "Results" }
     func liveItems(for query: String, scope: ProvidedScope?, in model: LauncherModel) async -> [LauncherItem] { [] }
@@ -90,10 +150,16 @@ extension CommandProvider {
     func perform(_ item: LauncherItem, ref: ProvidedRef, in model: LauncherModel) {}
     func primaryTitle(for item: LauncherItem, ref: ProvidedRef, in model: LauncherModel) -> String? { nil }
     func primarySymbol(for item: LauncherItem, ref: ProvidedRef, in model: LauncherModel) -> String? { nil }
+    func secondaryTitle(for item: LauncherItem, ref: ProvidedRef, in model: LauncherModel) -> String? {
+        model.textPasteTitle(for: item)
+    }
+    func performSecondary(_ item: LauncherItem, ref: ProvidedRef, in model: LauncherModel) {
+        model.pasteText(of: item)
+    }
     func actions(for item: LauncherItem, ref: ProvidedRef, in model: LauncherModel) -> [ActionEntry] { [] }
     func preview(for item: LauncherItem, ref: ProvidedRef, in model: LauncherModel) -> ProvidedPreview? { nil }
     func itemNoun(for ref: ProvidedRef) -> String { "Item" }
-    func delete(_ item: LauncherItem, ref: ProvidedRef, in model: LauncherModel) -> Bool { false }
+    func deletion(for item: LauncherItem, ref: ProvidedRef, in model: LauncherModel) -> ProvidedDeletion? { nil }
     func edit(_ item: LauncherItem, ref: ProvidedRef, in model: LauncherModel) {}
 
     /// A command's row, as the registry builds it.
@@ -129,6 +195,16 @@ final class CommandRegistry {
         providers.flatMap { provider in provider.commands(in: model).filter { !$0.showsInRoot }.map(provider.item(for:)) }
     }
 
+    /// The commands that can hold an alias or hotkey right now, shown or hidden, in registration
+    /// order and then each provider's own order. This is the one catalog Settings, aliases and
+    /// hotkey registration share.
+    func bindableCommandItems(in model: LauncherModel) -> [LauncherItem] {
+        providers.flatMap { provider in
+            provider.commands(in: model).filter { $0.isBindable && CuratedCommand.supports($0.id) }
+                .map(provider.item(for:))
+        }
+    }
+
     func rootItems(for query: String, in model: LauncherModel) -> [LauncherItem] {
         providers.flatMap { $0.rootItems(for: query, in: model) }
     }
@@ -148,11 +224,24 @@ final class CommandRegistry {
         provider(id: scope.provider)?.scopeItems(scope, query: query, in: model) ?? []
     }
 
+    /// A scope's groups. Provider groups that are loading stay, even while empty. The default
+    /// group appears only with rows, so an empty scope shows its empty state.
     func scopeGroups(_ scope: ProvidedScope, items: [LauncherItem], in model: LauncherModel) -> [LauncherResultGroup] {
         if let groups = provider(id: scope.provider)?.scopeGroups(scope, items: items, in: model) {
-            return groups.filter { !$0.items.isEmpty }
+            return groups.filter { !$0.items.isEmpty || $0.isLoading }
         }
-        return [LauncherResultGroup(id: scope.id, title: nil, style: scope.style, items: items)].filter { !$0.items.isEmpty }
+        var group = LauncherResultGroup(id: scope.id, title: nil, style: scope.style, items: items)
+        if scope.style == .grid {
+            group.columns = scope.columns
+            group.tile = .standard
+        }
+        return [group].filter { !$0.items.isEmpty }
+    }
+
+    func emptyState(for scope: ProvidedScope, query: String, isLoading: Bool, in model: LauncherModel)
+        -> ProvidedEmptyState?
+    {
+        provider(id: scope.provider)?.emptyState(for: scope, query: query, isLoading: isLoading, in: model)
     }
 
     func fallbackItems(for query: String, in model: LauncherModel) -> [LauncherItem] {
@@ -176,27 +265,51 @@ final class CommandRegistry {
         provider(id: ref.provider)?.commands(in: model).first { $0.id == ref.id }
     }
 
-    /// Runs a row. Commands that push a scope open it here; required arguments are checked
-    /// first; everything else goes to the provider.
+    /// Runs a row. For a command, the declared arguments are resolved first: defaults applied,
+    /// text trimmed, required ones checked. A command with a confirmation asks it in the action
+    /// bar. A command that pushes a scope opens it, carrying the argument values. Everything
+    /// else goes to the provider, with the resolved values in `ref.arguments`.
     func perform(_ item: LauncherItem, ref: ProvidedRef, in model: LauncherModel) {
         guard let provider = provider(id: ref.provider) else {
             model.feedback = .error("“\(item.title.truncatedForFeedback)” is no longer available.")
             return
         }
-        if let descriptor = provider.commands(in: model).first(where: { $0.id == ref.id }) {
+        guard let descriptor = provider.commands(in: model).first(where: { $0.id == ref.id }) else {
+            provider.perform(item, ref: ref, in: model)
+            return
+        }
+        var resolved = ref
+        if !descriptor.arguments.isEmpty {
             do {
-                _ = try ArgumentSpec.resolve(descriptor.arguments, typed: ref.arguments)
+                let values = try ArgumentSpec.resolve(descriptor.arguments, typed: ref.arguments)
+                let declared = Set(descriptor.arguments.map(\.name))
+                resolved.arguments = ref.arguments.filter { !declared.contains($0.key) }.merging(values) { _, new in new }
             } catch {
                 model.feedback = .warning(error.localizedDescription)
                 return
             }
-            if case .view(let scope) = descriptor.mode {
+        }
+        let run: @MainActor () -> Void = { [weak model] in
+            guard let model else { return }
+            switch descriptor.mode {
+            case .view(let section):
                 model.store.recordUse(of: item.id)
-                model.navigate(to: scope)
-                return
+                if case .provided(var scope) = section {
+                    scope.arguments = resolved.arguments
+                    model.navigate(to: .provided(scope))
+                } else {
+                    model.navigate(to: section)
+                }
+            default:
+                provider.perform(item, ref: resolved, in: model)
             }
         }
-        provider.perform(item, ref: ref, in: model)
+        if let question = descriptor.confirmation {
+            model.selectedID = item.id
+            model.confirmation = .provided(ProvidedConfirmation(id: descriptor.id, question, perform: run))
+        } else {
+            run()
+        }
     }
 
     func primaryTitle(for item: LauncherItem, ref: ProvidedRef, in model: LauncherModel) -> String {
@@ -212,6 +325,15 @@ final class CommandRegistry {
         }
     }
 
+    func secondaryTitle(for item: LauncherItem, ref: ProvidedRef, in model: LauncherModel) -> String? {
+        guard let provider = provider(id: ref.provider) else { return nil }
+        return provider.secondaryTitle(for: item, ref: ref, in: model)
+    }
+
+    func performSecondary(_ item: LauncherItem, ref: ProvidedRef, in model: LauncherModel) {
+        provider(id: ref.provider)?.performSecondary(item, ref: ref, in: model)
+    }
+
     func actions(for item: LauncherItem, ref: ProvidedRef, in model: LauncherModel) -> [ActionEntry] {
         provider(id: ref.provider)?.actions(for: item, ref: ref, in: model) ?? []
     }
@@ -222,8 +344,8 @@ final class CommandRegistry {
 
     func itemNoun(for ref: ProvidedRef) -> String { provider(id: ref.provider)?.itemNoun(for: ref) ?? "Item" }
 
-    func delete(_ item: LauncherItem, ref: ProvidedRef, in model: LauncherModel) -> Bool {
-        provider(id: ref.provider)?.delete(item, ref: ref, in: model) ?? false
+    func deletion(for item: LauncherItem, ref: ProvidedRef, in model: LauncherModel) -> ProvidedDeletion? {
+        provider(id: ref.provider)?.deletion(for: item, ref: ref, in: model)
     }
 
     func edit(_ item: LauncherItem, ref: ProvidedRef, in model: LauncherModel) {

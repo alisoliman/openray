@@ -18,8 +18,12 @@ enum CuratedCommand {
         "window.center", "window.restore",
     ]
 
+    /// The registrations bindings are checked against. Always `CommandProviders.all` in the app;
+    /// tests bind extra registrations with `CuratedCommand.$registrations.withValue(…)`.
+    @TaskLocal static var registrations: [CommandProviderRegistration] = CommandProviders.all
+
     static func supports(_ targetID: String) -> Bool {
-        supports(targetID, registrations: CommandProviders.all)
+        supports(targetID, registrations: registrations)
     }
 
     static func supports(_ targetID: String, registrations: [CommandProviderRegistration]) -> Bool {

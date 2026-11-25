@@ -142,10 +142,14 @@ struct LauncherResultGroup: Identifiable {
     var isLoading = false
     var style: Style = .list
     var items: [LauncherItem]
+    /// A `.grid` group's column count. Drawing and ←/→/↑/↓ both use it. Nil uses the style's default.
+    var columns: Int? = nil
+    /// How a `.grid` group draws its tiles. Nil draws window layout tiles, as Window Management does.
+    var tile: GridTileRenderer? = nil
 
     init(
         id: String? = nil, title: String?, trailing: String? = nil, isLoading: Bool = false, style: Style = .list,
-        items: [LauncherItem]
+        items: [LauncherItem], columns: Int? = nil, tile: GridTileRenderer? = nil
     ) {
         self.id = id ?? title ?? "results"
         self.title = title
@@ -153,6 +157,8 @@ struct LauncherResultGroup: Identifiable {
         self.isLoading = isLoading
         self.style = style
         self.items = items
+        self.columns = columns
+        self.tile = tile
     }
 }
 
