@@ -10,7 +10,8 @@ struct RecognizedTextLine: Equatable, Sendable {
     var text: String
     /// Vision's confidence, from 0 to 1.
     var confidence: Float
-    /// The line's bounds in normalized image coordinates (0 to 1, origin at the bottom left).
+    /// The line's bounds in normalized coordinates of the upright image, after any
+    /// orientation metadata is applied (0 to 1, origin at the bottom left).
     var boundingBox: CGRect
 }
 
@@ -89,8 +90,8 @@ struct VisionTextRecognizer: TextRecognizing {
     func recognizeText(in imageData: Data, options: TextRecognitionOptions = .init()) async throws
         -> TextRecognitionResult
     {
-        let image = try Self.decode(imageData)
-        return try await recognize(image, options: options)
+        let (image, orientation) = try Self.decode(imageData)
+        return try await recognize(image, orientation: orientation, options: options)
     }
 
     func recognizeText(inImageAt url: URL, options: TextRecognitionOptions = .init()) async throws
@@ -101,17 +102,20 @@ struct VisionTextRecognizer: TextRecognizing {
         guard (values?.fileSize ?? 0) <= Self.maximumBytes else { throw TextRecognitionError.imageTooLarge }
         guard let source = CGImageSourceCreateWithURL(url as CFURL, [kCGImageSourceShouldCache: false] as CFDictionary)
         else { throw TextRecognitionError.unreadableImage }
-        return try await recognize(try Self.image(from: source), options: options)
+        let (image, orientation) = try Self.image(from: source)
+        return try await recognize(image, orientation: orientation, options: options)
     }
 
     func barcodePayloads(in imageData: Data) async throws -> [String] {
-        let image = try Self.decode(imageData)
-        let observations = try await DetectBarcodesRequest().perform(on: image)
+        let (image, orientation) = try Self.decode(imageData)
+        let observations = try await DetectBarcodesRequest().perform(on: image, orientation: orientation)
         var seen = Set<String>()
         return observations.compactMap(\.payloadString).filter { !$0.isEmpty && seen.insert($0).inserted }
     }
 
-    private func recognize(_ image: CGImage, options: TextRecognitionOptions) async throws -> TextRecognitionResult {
+    private func recognize(
+        _ image: CGImage, orientation: CGImagePropertyOrientation, options: TextRecognitionOptions
+    ) async throws -> TextRecognitionResult {
         try Task.checkCancellation()
         var request = RecognizeTextRequest()
         request.recognitionLevel = options.level == .fast ? .fast : .accurate
@@ -122,7 +126,7 @@ struct VisionTextRecognizer: TextRecognizing {
             request.automaticallyDetectsLanguage = false
             request.recognitionLanguages = options.languages.map { Locale.Language(identifier: $0) }
         }
-        let observations = try await request.perform(on: image)
+        let observations = try await request.perform(on: image, orientation: orientation)
         try Task.checkCancellation()
         let lines = observations.compactMap { observation -> RecognizedTextLine? in
             guard let candidate = observation.topCandidates(1).first, candidate.confidence >= options.minimumConfidence
@@ -135,7 +139,7 @@ struct VisionTextRecognizer: TextRecognizing {
         return TextRecognitionResult(lines: lines)
     }
 
-    private static func decode(_ data: Data) throws -> CGImage {
+    private static func decode(_ data: Data) throws -> (CGImage, CGImagePropertyOrientation) {
         guard !data.isEmpty else { throw TextRecognitionError.unreadableImage }
         guard data.count <= maximumBytes else { throw TextRecognitionError.imageTooLarge }
         guard let source = CGImageSourceCreateWithData(data as CFData, [kCGImageSourceShouldCache: false] as CFDictionary)
@@ -144,7 +148,9 @@ struct VisionTextRecognizer: TextRecognizing {
     }
 
     /// Checks the pixel count before decoding, so a huge image is refused cheaply.
-    private static func image(from source: CGImageSource) throws -> CGImage {
+    /// ImageIO returns the stored pixels, so the EXIF orientation travels with them
+    /// to Vision, which reads the image upright.
+    private static func image(from source: CGImageSource) throws -> (CGImage, CGImagePropertyOrientation) {
         guard let properties = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [CFString: Any],
             let width = (properties[kCGImagePropertyPixelWidth] as? NSNumber)?.intValue,
             let height = (properties[kCGImagePropertyPixelHeight] as? NSNumber)?.intValue,
@@ -154,7 +160,9 @@ struct VisionTextRecognizer: TextRecognizing {
         guard let image = CGImageSourceCreateImageAtIndex(source, 0, nil) else {
             throw TextRecognitionError.unreadableImage
         }
-        return image
+        let orientation = (properties[kCGImagePropertyOrientation] as? NSNumber)
+            .flatMap { CGImagePropertyOrientation(rawValue: $0.uint32Value) } ?? .up
+        return (image, orientation)
     }
 }
 

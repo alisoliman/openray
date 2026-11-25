@@ -29,6 +29,29 @@ private enum OCRFixtures {
         return try encode(try #require(context.makeImage()))
     }
 
+    /// Text stored rotated 90° counterclockwise with EXIF orientation 6, which
+    /// tells viewers to turn it clockwise, as cameras write portrait photos.
+    static func rotatedTIFF(text: String) throws -> Data {
+        let uprightPNG = try png(text: text)
+        let source = try #require(CGImageSourceCreateWithData(uprightPNG as CFData, nil))
+        let upright = try #require(CGImageSourceCreateImageAtIndex(source, 0, nil))
+        let width = upright.width
+        let height = upright.height
+        let context = try #require(
+            CGContext(
+                data: nil, width: height, height: width, bitsPerComponent: 8, bytesPerRow: 0,
+                space: CGColorSpaceCreateDeviceRGB(), bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue))
+        context.translateBy(x: CGFloat(height), y: 0)
+        context.rotate(by: .pi / 2)
+        context.draw(upright, in: CGRect(x: 0, y: 0, width: width, height: height))
+        let stored = try #require(context.makeImage())
+        let buffer = NSMutableData()
+        let destination = try #require(CGImageDestinationCreateWithData(buffer, UTType.tiff.identifier as CFString, 1, nil))
+        CGImageDestinationAddImage(destination, stored, [kCGImagePropertyOrientation: 6] as CFDictionary)
+        #expect(CGImageDestinationFinalize(destination))
+        return buffer as Data
+    }
+
     static func qrCode(_ message: String) throws -> Data {
         let filter = CIFilter.qrCodeGenerator()
         filter.message = Data(message.utf8)
@@ -87,6 +110,18 @@ struct TextRecognitionTests {
         try OCRFixtures.png(text: "INVOICE 42").write(to: url)
         let result = try await VisionTextRecognizer().recognizeText(inImageAt: url, options: .init(level: .accurate, languages: ["en-US"]))
         #expect(result.text.uppercased().contains("INVOICE"))
+    }
+
+    @Test func orientationMetadataIsApplied() async throws {
+        let tiff = try OCRFixtures.rotatedTIFF(text: "OPENRAY 2026")
+        let source = try #require(CGImageSourceCreateWithData(tiff as CFData, nil))
+        let properties = try #require(CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [CFString: Any])
+        #expect((properties[kCGImagePropertyOrientation] as? NSNumber)?.intValue == 6)
+        let result = try await VisionTextRecognizer().recognizeText(in: tiff)
+        #expect(result.text.uppercased().replacingOccurrences(of: " ", with: "").contains("OPENRAY"))
+        // Boxes are in the upright image: a wide line of text stays wide.
+        let box = try #require(result.lines.first?.boundingBox)
+        #expect(box.width > box.height)
     }
 
     @Test func blankImagesHaveNoText() async throws {
