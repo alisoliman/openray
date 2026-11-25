@@ -102,10 +102,81 @@ struct ClipboardRichTextTests {
         #expect(!service.copy(plain, as: .rtf))
         #expect(service.lastCopyError?.contains("isn't available") == true)
         #expect(board.changeCount == before)
+    }
 
-        // Copies OpenRay writes are never captured back into history.
+    @Test func copiesMarkedAsOpenRaysOwnAreNeverCaptured() async throws {
+        let board = NSPasteboard(name: .init("OpenRayTests.\(UUID())"))
+        defer { board.releaseGlobally() }
+        let store = makeStore()
+        let service = makeService(store: store, board: board)
+        // Written by another writer, so the service sees a new change count each time.
+        write([(.rtf, sampleRTF), (.string, Data("Tagged".utf8)), (.init("com.openray.generated"), Data("1".utf8))], to: board)
         await service.poll()
         #expect(store.database.clipboard.isEmpty)
+        write([(.rtf, sampleRTF), (.string, Data("Untagged".utf8))], to: board)
+        await service.poll()
+        #expect(store.database.clipboard.map(\.plainText) == ["Untagged"])
+        #expect(store.database.clipboard.first?.richText?.rtf == sampleRTF)
+    }
+
+    @Test func formattingComesOnlyFromTheItemTheTextCameFrom() async throws {
+        let board = NSPasteboard(name: .init("OpenRayTests.\(UUID())"))
+        defer { board.releaseGlobally() }
+        let store = makeStore()
+        let service = makeService(store: store, board: board)
+        let plain = NSPasteboardItem()
+        plain.setString("First item", forType: .string)
+        let rich = NSPasteboardItem()
+        rich.setString("Second item", forType: .string)
+        rich.setData(sampleHTML, forType: .html)
+        rich.setData(sampleRTF, forType: .rtf)
+        board.clearContents()
+        #expect(board.writeObjects([plain, rich]))
+        await service.poll()
+        // AppKit joins the plain text of all items; that text matches neither item's
+        // formatting, so none is attached.
+        let entry = try #require(store.database.clipboard.first)
+        #expect(entry.plainText?.hasPrefix("First item") == true)
+        #expect(entry.richText == nil)
+
+        #expect(ClipboardService.richText(matching: Data("Second item".utf8), in: [rich]) == ClipboardRichText(rtf: sampleRTF, html: sampleHTML))
+        #expect(ClipboardService.richText(matching: Data("Other".utf8), in: [rich]) == nil)
+    }
+
+    @Test func defaultServicesNeverUseTheRealClipboard() {
+        #expect(ClipEffectBoundary.isInert)
+        #expect(!ClipboardService(store: makeStore()).usesGeneralPasteboard)
+        #expect(!ClipboardService(store: makeStore(), pasteboard: .general).usesGeneralPasteboard)
+        #expect(!LauncherModel(store: LibraryStore(fileURL: nil)).clipboard.usesGeneralPasteboard)
+        #expect(throws: ClipEffectBoundary.Blocked(action: "writing to the clipboard")) {
+            try ClipEffectBoundary.checkWrite(to: .general)
+        }
+        let named = NSPasteboard(name: .init("OpenRayTests.\(UUID())"))
+        defer { named.releaseGlobally() }
+        #expect(throws: Never.self) { try ClipEffectBoundary.checkWrite(to: named) }
+        #expect(ClipEffectBoundary.pasteboard(for: named) === named)
+    }
+
+    @Test func placeholderTextFollowsTheCapturePrivacyRules() {
+        let board = NSPasteboard(name: .init("OpenRayTests.\(UUID())"))
+        defer { board.releaseGlobally() }
+        write([(.string, Data("Visible".utf8))], to: board)
+        #expect(ClipboardPolicy.placeholderText(from: board) == "Visible")
+        write([(.string, Data("Mine".utf8)), (.init("com.openray.generated"), Data("1".utf8))], to: board)
+        #expect(ClipboardPolicy.placeholderText(from: board) == "Mine")
+        for marker in ["org.nspasteboard.ConcealedType", "org.nspasteboard.TransientType", "com.agilebits.onepassword"] {
+            write([(.string, Data("secret".utf8)), (.init(marker), Data())], to: board)
+            #expect(ClipboardPolicy.placeholderText(from: board) == nil, "\(marker)")
+        }
+        write([(.png, Data([1]))], to: board)
+        #expect(ClipboardPolicy.placeholderText(from: board) == nil)
+    }
+
+    @Test func editingTextDropsStaleFormatting() {
+        var entry = ClipboardEntry(text: "Bold", sourceName: "F")
+        entry.richText = ClipboardRichText(rtf: sampleRTF)
+        entry.replaceText("Edited")
+        #expect(entry.plainText == "Edited" && entry.richText == nil)
     }
 
     @Test func copyFormattedTextDirectly() {
@@ -234,7 +305,9 @@ struct ClipboardRichTextTests {
     // MARK: Retention
 
     @Test func retentionChoicesMapFromSavedDays() {
-        #expect(ClipboardRetention.default == .thirtyDays)
+        #expect(ClipboardRetention.default == .sevenDays)
+        #expect(ClipboardRetentionPolicy().retention == .sevenDays)
+        #expect(ClipboardRetention.default.days == AppPreferences().clipboardRetentionDays)
         #expect(ClipboardRetention.allCases.map(\.days) == [1, 7, 30, 90, nil])
         #expect(ClipboardRetention(days: 1) == .oneDay)
         #expect(ClipboardRetention(days: 0) == .oneDay)

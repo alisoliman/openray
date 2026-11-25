@@ -122,6 +122,14 @@ struct ClipboardEntry: Codable, Identifiable, Equatable, Sendable {
         return (["http", "https"].contains(scheme) && url.host?.isEmpty == false) || scheme == "mailto"
     }
 
+    /// Replaces the text of a text entry, e.g. for Edit Content. Saved formatting
+    /// no longer matches the text, so it's dropped.
+    mutating func replaceText(_ text: String) {
+        guard case .text = content else { return }
+        content = .text(text)
+        richText = nil
+    }
+
     /// What copied text looks like: a link, an email address, a color or plain text.
     var textKind: ClipboardTextKind? {
         guard case .text(let text) = content else { return nil }
@@ -544,7 +552,8 @@ enum ClipboardPayload {
 enum ClipboardRetention: String, Codable, CaseIterable, Identifiable, Sendable {
     case oneDay, sevenDays, thirtyDays, threeMonths, unlimited
 
-    static let `default` = ClipboardRetention.thirtyDays
+    /// Matches `AppPreferences.clipboardRetentionDays`' default.
+    static let `default` = ClipboardRetention.sevenDays
 
     var id: String { rawValue }
 

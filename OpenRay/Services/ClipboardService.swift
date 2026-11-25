@@ -22,6 +22,51 @@ enum ClipboardPolicy {
     }
 }
 
+extension ClipboardPolicy {
+    /// What `{clipboard}` may insert: the board's plain text, unless the copy is
+    /// marked concealed, transient or auto-generated. OpenRay's own copies are fine.
+    @MainActor static func placeholderText(from pasteboard: NSPasteboard) -> String? {
+        let types = Set((pasteboard.types ?? []).map(\.rawValue))
+        guard ignoredTypes.subtracting(["com.openray.generated"]).isDisjoint(with: types),
+            types.contains(NSPasteboard.PasteboardType.string.rawValue),
+            let data = pasteboard.data(forType: .string), data.count <= ClipboardLimits.textBytes
+        else { return nil }
+        return String(data: data, encoding: .utf8)
+    }
+}
+
+/// Slice 2's single gate in front of effects outside OpenRay: typing into other
+/// apps, watching global keys, opening links and apps, beeping, and writing the
+/// general pasteboard. Every live executor and writer asks here first.
+///
+/// It uses the app's existing `RuntimeMode` detection until the shared
+/// `SideEffectGuard` lands; then `isInert` and `check(_:)` forward to it, and
+/// nothing else changes.
+enum ClipEffectBoundary {
+    struct Blocked: LocalizedError, Equatable {
+        var action: String
+        var errorDescription: String? { "OpenRay doesn't allow \(action) while tests or verification run." }
+    }
+
+    /// True in the test host and in verification or in-memory runs.
+    static var isInert: Bool { RuntimeMode.isTestHost || RuntimeMode.usesInMemoryLibrary }
+
+    static func check(_ action: String) throws {
+        if isInert { throw Blocked(action: action) }
+    }
+
+    /// Writes to the general pasteboard are refused while inert; named boards are fine.
+    @MainActor static func checkWrite(to pasteboard: NSPasteboard) throws {
+        if pasteboard.name == .general { try check("writing to the clipboard") }
+    }
+
+    /// The board a service should use: a private one instead of the general
+    /// pasteboard while inert, so default construction never touches the real clipboard.
+    @MainActor static func pasteboard(for requested: NSPasteboard) -> NSPasteboard {
+        isInert && requested.name == .general ? NSPasteboard.withUniqueName() : requested
+    }
+}
+
 struct ClipboardCaptureContext: Sendable {
     var sourceName: String
     var sourceBundleID: String?
@@ -72,6 +117,7 @@ final class ClipboardService {
         captureContext: @escaping @MainActor () -> ClipboardCaptureContext = ClipboardCaptureContext.current
     ) {
         self.store = store
+        let pasteboard = ClipEffectBoundary.pasteboard(for: pasteboard)
         self.pasteboard = pasteboard
         self.imageProcessor = imageProcessor
         self.captureContext = captureContext
@@ -181,11 +227,9 @@ final class ClipboardService {
                 guard data.count <= ClipboardLimits.textBytes else {
                     throw LibraryValidationError("This copied text exceeds the 128 KB clipboard-entry limit.")
                 }
-                // Formatting is kept next to the text for Paste As. Oversized formatting is dropped, not the copy.
-                let richText = ClipboardRichText.capture(
-                    rtf: types.contains(NSPasteboard.PasteboardType.rtf.rawValue) ? pasteboard.data(forType: .rtf) : nil,
-                    html: types.contains(NSPasteboard.PasteboardType.html.rawValue)
-                        ? pasteboard.data(forType: .html) : nil)
+                // Formatting is kept next to the text for Paste As, but only from the item
+                // the text came from. Oversized formatting is dropped, not the copy.
+                let richText = Self.richText(matching: data, in: pasteboard.pasteboardItems ?? [])
                 guard let text = String(data: data, encoding: .utf8), pasteboard.changeCount == change else { return }
                 var entry = ClipboardEntry(
                     text: text, copiedAt: copiedAt, sourceName: source.sourceName,
@@ -203,6 +247,20 @@ final class ClipboardService {
     }
 
     func readText() -> String? { pasteboard.string(forType: .string) }
+
+    /// The current text for `{clipboard}`, read now and only when asked, with the
+    /// same concealed and transient checks capture uses.
+    func placeholderText() -> String? { ClipboardPolicy.placeholderText(from: pasteboard) }
+
+    /// RTF and HTML from the first item whose plain text is `text`. Representations
+    /// from different items are never paired.
+    static func richText(matching text: Data, in items: [NSPasteboardItem]) -> ClipboardRichText? {
+        guard let item = items.first(where: { $0.types.contains(.string) }), item.data(forType: .string) == text
+        else { return nil }
+        return ClipboardRichText.capture(
+            rtf: item.types.contains(.rtf) ? item.data(forType: .rtf) : nil,
+            html: item.types.contains(.html) ? item.data(forType: .html) : nil)
+    }
 
     func clearContentMessage() { contentMessage = nil }
 
@@ -286,7 +344,12 @@ final class ClipboardService {
         return item
     }
 
+    /// Every write goes through here, so the general pasteboard is refused while inert.
     private func write(_ items: [NSPasteboardItem]) -> Bool {
+        do { try ClipEffectBoundary.checkWrite(to: pasteboard) } catch {
+            lastCopyError = error.localizedDescription
+            return false
+        }
         for item in items { item.setString("1", forType: NSPasteboard.PasteboardType("com.openray.generated")) }
         pasteboard.clearContents()
         let success = pasteboard.writeObjects(items)
@@ -300,6 +363,7 @@ enum SyntheticInput {
     static let marker: Int64 = 0x4F52_4159
 
     static func paste(into application: NSRunningApplication, expectedChangeCount: Int) async throws {
+        try ClipEffectBoundary.check("pasting into other apps")
         guard AXIsProcessTrusted() else {
             throw LibraryValidationError(
                 "Copied to the clipboard. Enable Accessibility in Settings for direct paste, or press ⌘V in your app.")
@@ -318,35 +382,33 @@ enum SyntheticInput {
         try key(CGKeyCode(kVK_ANSI_V), flags: .maskCommand)
     }
 
-    /// Deletes `count` characters before the caret, types `text`, then moves the
-    /// caret left `caretLeft` times. Before typing and again before moving the
-    /// caret, it checks that the target app is frontmost and no secure field has focus.
-    static func replace(deleting count: Int, with text: String, caretLeft: Int, in pid: pid_t) throws {
-        guard canType(into: pid) else { return }
-        // This path never touches the clipboard. One backspace removes one typed character.
-        for _ in 0..<max(0, count) { try key(CGKeyCode(kVK_Delete)) }
-        try type(text)
-        guard caretLeft > 0, canType(into: pid) else { return }
-        for _ in 0..<min(caretLeft, 65_536) { try key(CGKeyCode(kVK_LeftArrow)) }
+    /// Posts one key press to `pid` only. Every synthetic key event OpenRay sends
+    /// for snippets goes through here or `postText`.
+    static func postKey(_ code: CGKeyCode, toProcess pid: pid_t) throws {
+        try ClipEffectBoundary.check("typing into other apps")
+        guard let down = CGEvent(keyboardEventSource: nil, virtualKey: code, keyDown: true),
+            let up = CGEvent(keyboardEventSource: nil, virtualKey: code, keyDown: false)
+        else {
+            throw LibraryValidationError("macOS could not create a keyboard event.")
+        }
+        for event in [down, up] {
+            event.setIntegerValueField(.eventSourceUserData, value: marker)
+            event.postToPid(pid)
+        }
     }
 
-    private static func canType(into pid: pid_t) -> Bool {
-        AXIsProcessTrusted() && !IsSecureEventInputEnabled()
-            && NSWorkspace.shared.frontmostApplication?.processIdentifier == pid
-    }
-
-    private static func type(_ text: String) throws {
-        for chunk in unicodeChunks(text) {
-            guard let down = CGEvent(keyboardEventSource: nil, virtualKey: 0, keyDown: true),
-                let up = CGEvent(keyboardEventSource: nil, virtualKey: 0, keyDown: false)
-            else {
-                throw LibraryValidationError("macOS could not insert the snippet.")
-            }
-            for event in [down, up] {
-                event.keyboardSetUnicodeString(stringLength: chunk.count, unicodeString: chunk)
-                event.setIntegerValueField(.eventSourceUserData, value: marker)
-                event.post(tap: .cghidEventTap)
-            }
+    /// Types up to 20 UTF-16 code units into `pid` only.
+    static func postText(_ chunk: [UInt16], toProcess pid: pid_t) throws {
+        try ClipEffectBoundary.check("typing into other apps")
+        guard let down = CGEvent(keyboardEventSource: nil, virtualKey: 0, keyDown: true),
+            let up = CGEvent(keyboardEventSource: nil, virtualKey: 0, keyDown: false)
+        else {
+            throw LibraryValidationError("macOS could not insert the snippet.")
+        }
+        for event in [down, up] {
+            event.keyboardSetUnicodeString(stringLength: chunk.count, unicodeString: chunk)
+            event.setIntegerValueField(.eventSourceUserData, value: marker)
+            event.postToPid(pid)
         }
     }
 
@@ -366,6 +428,7 @@ enum SyntheticInput {
     }
 
     private static func key(_ code: CGKeyCode, flags: CGEventFlags = []) throws {
+        try ClipEffectBoundary.check("pasting into other apps")
         guard let down = CGEvent(keyboardEventSource: nil, virtualKey: code, keyDown: true),
             let up = CGEvent(keyboardEventSource: nil, virtualKey: code, keyDown: false)
         else {
