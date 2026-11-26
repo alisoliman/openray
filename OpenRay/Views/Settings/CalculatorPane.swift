@@ -71,7 +71,8 @@ struct CalculatorPane: View {
     }
 
     @ViewBuilder private func history(_ provider: CalculatorProvider) -> some View {
-        let count = model.store.database.calculatorHistory.count
+        // Only entries still within the three months count.
+        let count = provider.history(in: model).entries.count
         Section("History") {
             LabeledContent {
                 Button("Clear History…", role: .destructive) { confirmsClear = true }

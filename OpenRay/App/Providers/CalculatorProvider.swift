@@ -4,11 +4,13 @@ import Foundation
 ///
 /// Root search and the Calculator scope show one answer for the query. `LauncherModel` builds
 /// it from `answer(for:in:)`: an unambiguous answer ("2 + 3", "5pm ldn in sf") is the
-/// calculator card on top; a words-only one ("time", "today") is an ordinary row that never
-/// takes the Top Hit, and while search results are still arriving its ↩ waits for them, so a
-/// file or app named like the word gets ↩ instead. Each search's answer is a snapshot: the card,
-/// ↩, ⌘↩ and the history all use the value that was shown. ↩ copies and ⌘↩ pastes through
-/// `AnswerDelivery`, and both record the calculation in `LibraryDatabase.calculatorHistory`.
+/// calculator card on top and the default selection; a words-only one ("time", "today") is an
+/// ordinary row that never takes the Top Hit, and while search results are still arriving it
+/// isn't the default selection either (`pendingWordAnswerID`). ↩ and ⌘↩ act at once on the
+/// row selected at the key press; nothing is queued. Each search's answer is a snapshot, and the
+/// row carries the value it shows, so ↩, ⌘↩ and the history use what was on screen. ↩ copies
+/// and ⌘↩ pastes through `AnswerDelivery`, and both record the calculation in
+/// `LibraryDatabase.calculatorHistory`.
 @MainActor
 final class CalculatorProvider: CommandProvider {
     nonisolated static let registration = CommandProviderRegistration(
@@ -19,13 +21,17 @@ final class CalculatorProvider: CommandProvider {
     nonisolated static let answerID = "calculation"
     /// The answer row's id when the query is only words and the answer is an ordinary row.
     nonisolated static let wordAnswerID = "calculation.answer"
+    /// The same row while search results are still arriving: never the default selection.
+    nonisolated static let pendingWordAnswerID = "calculation.answer.pending"
+
+    nonisolated static func isWordAnswer(_ id: String?) -> Bool {
+        id == wordAnswerID || id == pendingWordAnswerID
+    }
 
     nonisolated static let historyID = "calculator.history"
     nonisolated static let refreshID = "calculator.refreshCurrencies"
     /// History rows per page, under the launcher's 100-row scope cap with room for paging rows.
     nonisolated static let historyPageSize = 98
-    /// How long ↩ on a words-only answer waits for pending search results.
-    nonisolated static let pendingSearchWait: Duration = .milliseconds(800)
     /// How often an open launcher checks whether opted-in rates are due.
     nonisolated static let staleCheckInterval: TimeInterval = 3_600
 
@@ -50,7 +56,9 @@ final class CalculatorProvider: CommandProvider {
     private var isConfigured = false
     private var lastStaleCheck: Date?
     private var snapshot: (key: SnapshotKey, calculation: Calculation?)?
-    private var pendingActivation: Task<Void, Never>?
+    /// Saves pruned history without being asked. Off for the app's provider in the test host
+    /// and verification mode, so a default model there never rewrites a library.
+    private let prunesAutomatically: Bool
 
     /// What makes an answer current: the query, the search it belongs to and the settings.
     private struct SnapshotKey: Equatable {
@@ -71,12 +79,14 @@ final class CalculatorProvider: CommandProvider {
             rates = CurrencyRateStore()
             publishesSettings = true
         }
+        prunesAutomatically = !sideEffects.isInert
         now = { Date() }
     }
 
-    init(rates: CurrencyRateStore, now: @escaping () -> Date = { Date() }) {
+    init(rates: CurrencyRateStore, now: @escaping () -> Date = { Date() }, prunesAutomatically: Bool = true) {
         self.rates = rates
         publishesSettings = false
+        self.prunesAutomatically = prunesAutomatically
         self.now = now
     }
 
@@ -153,6 +163,12 @@ final class CalculatorProvider: CommandProvider {
             lastStaleCheck = now()
             refresh(in: model, force: false)
         }
+        schedulePrune(in: model)
+    }
+
+    /// Saves the history without expired entries, after the current update, when any expired.
+    private func schedulePrune(in model: LauncherModel) {
+        guard prunesAutomatically else { return }
         Task { [weak self, weak model] in
             guard let self, let model else { return }
             self.pruneHistory(in: model)
@@ -181,16 +197,24 @@ final class CalculatorProvider: CommandProvider {
         return calculation
     }
 
-    /// The answer row for a calculation. Its ref carries the typed expression; actions read the
-    /// search's snapshot, so they use the value the row shows.
-    static func answerItem(for calculation: Calculation) -> LauncherItem {
-        LauncherItem(
-            id: calculation.isAmbiguous ? wordAnswerID : answerID, title: calculation.result,
-            subtitle: calculation.expression, symbol: "equal", kind: .calculator, badge: "Calculator",
+    /// The answer row for a calculation. It carries the shown value and the history metadata,
+    /// so ↩ and ⌘↩ deliver exactly what the row displays. `searchPending` marks a words-only
+    /// answer that mustn't be the default selection yet.
+    static func answerItem(for calculation: Calculation, searchPending: Bool = false) -> LauncherItem {
+        let id = calculation.isAmbiguous ? (searchPending ? pendingWordAnswerID : wordAnswerID) : answerID
+        return LauncherItem(
+            id: id, title: calculation.result, subtitle: calculation.expression, symbol: "equal", kind: .calculator,
+            badge: "Calculator",
             action: .provided(
                 ProvidedRef(
                     provider: registration.id, id: "answer", payload: calculation.expression,
+                    arguments: ["result": calculation.result, "kind": calculation.kind.rawValue],
                     copyText: calculation.value, primaryTitle: "Copy Answer", traits: [.paste])))
+    }
+
+    /// Whether ordinary search results are still arriving.
+    static func isSearchPending(_ model: LauncherModel) -> Bool {
+        model.files.isSearching || model.isLoadingProvidedItems
     }
 
     /// The calculation behind an answer row.
@@ -245,8 +269,9 @@ final class CalculatorProvider: CommandProvider {
 
     func scopeItems(_ scope: ProvidedScope, query: String, in model: LauncherModel) -> [LauncherItem] {
         guard scope.id == Self.historyID else { return [] }
-        // Opening History directly also loads settings and drops expired entries.
+        // Opening History directly also loads settings; entries that expired since are saved away.
         configure(model)
+        if history(in: model).entries.count != model.store.database.calculatorHistory.count { schedulePrune(in: model) }
         return historyItems(in: model, query: query, page: scope.arguments["page"].flatMap(Int.init) ?? 0)
     }
 
@@ -334,7 +359,7 @@ final class CalculatorProvider: CommandProvider {
                 }
             }
         case "answer":
-            activate(item, ref: ref, secondary: false, in: model)
+            deliver(ref, secondary: false, in: model)
         case "history":
             guard let text = ref.copyText else { return }
             AnswerDelivery.primary(text, label: item.title, in: model)
@@ -367,7 +392,7 @@ final class CalculatorProvider: CommandProvider {
     func performSecondary(_ item: LauncherItem, ref: ProvidedRef, in model: LauncherModel) {
         switch ref.id {
         case "answer":
-            activate(item, ref: ref, secondary: true, in: model)
+            deliver(ref, secondary: true, in: model)
         case "history":
             guard let text = ref.copyText else { return }
             AnswerDelivery.secondary(text, label: item.title, in: model)
@@ -375,54 +400,18 @@ final class CalculatorProvider: CommandProvider {
         }
     }
 
-    // MARK: Words-only answers while search is pending
-
-    /// Whether a words-only answer is only first because other results haven't arrived yet.
-    static func isProvisional(_ item: LauncherItem, in model: LauncherModel) -> Bool {
-        item.id == wordAnswerID && !model.selectionMovedByHand && isSearchPending(model)
-    }
-
-    static func isSearchPending(_ model: LauncherModel) -> Bool {
-        model.files.isSearching || model.isLoadingProvidedItems
-    }
-
-    /// ↩ and ⌘↩ on an answer. A words-only answer that was only selected because nothing else
-    /// had arrived waits, up to `pendingSearchWait`, for search to settle, then acts on whatever
-    /// is selected: a file or app named like the word if one arrived, else the answer.
-    private func activate(_ item: LauncherItem, ref: ProvidedRef, secondary: Bool, in model: LauncherModel) {
-        guard Self.isProvisional(item, in: model) else {
-            deliver(ref, secondary: secondary, in: model)
-            return
-        }
-        guard pendingActivation == nil else { return }
-        let search = model.searchGeneration
-        pendingActivation = Task { [weak self, weak model] in
-            let deadline = ContinuousClock.now.advanced(by: Self.pendingSearchWait)
-            while let model, Self.isSearchPending(model), ContinuousClock.now < deadline, !Task.isCancelled {
-                try? await Task.sleep(for: .milliseconds(20))
-            }
-            guard let self else { return }
-            self.pendingActivation = nil
-            guard let model, model.searchGeneration == search, !Task.isCancelled else { return }
-            model.synchronizeSelection()
-            guard let selected = model.selectedItem else { return }
-            if selected.id == Self.wordAnswerID, case .provided(let ref) = selected.action {
-                self.deliver(ref, secondary: secondary, in: model)
-            } else if secondary {
-                model.paste(selected)
-            } else {
-                model.perform(selected)
-            }
-        }
-    }
-
+    /// Copies or pastes the row's own value and records it, as shown.
     private func deliver(_ ref: ProvidedRef, secondary: Bool, in model: LauncherModel) {
-        guard let calculation = calculation(for: ref, in: model) else { return }
+        guard let value = ref.copyText else { return }
         let delivered =
             secondary
-            ? AnswerDelivery.secondary(calculation.value, label: calculation.value, in: model)
-            : AnswerDelivery.primary(calculation.value, label: calculation.value, in: model)
-        if delivered { record(calculation, in: model) }
+            ? AnswerDelivery.secondary(value, label: value, in: model)
+            : AnswerDelivery.primary(value, label: value, in: model)
+        guard delivered else { return }
+        let shown = Calculation(
+            expression: ref.payload ?? value, result: ref.arguments["result"] ?? value, detail: "", value: value,
+            kind: ref.arguments["kind"].flatMap(Calculation.Kind.init(rawValue:)) ?? .arithmetic)
+        record(shown, in: model)
     }
 
     // MARK: Actions

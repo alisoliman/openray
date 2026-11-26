@@ -87,37 +87,16 @@ struct Slice3ReviewTests {
             await AppleTranslationEngine(sideEffects: SideEffectGuard(mode: .testHost))
                 .availability(from: Locale.Language(identifier: "en"), to: Locale.Language(identifier: "de")) == .unsupported)
         let downloads = TranslationDownloads()
-        downloads.start(source: "en-US", target: "de", text: "hi") { _ in }
+        let context = TranslationDownloads.Context(search: 1, presentation: 1, scope: "translate")
+        downloads.start(source: "en-US", target: "de", context: context) { _ in }
         #expect(downloads.request == nil)
-        #expect(downloads.configuration(for: "en-US>de") == nil)
+        #expect(downloads.configuration(for: "en-US>de", context: context) == nil)
         #expect(downloads.status(for: "en-US>de") == "Language downloads are off in this mode.")
     }
 
     // MARK: Words-only answers while search is pending
 
-    @Test func earlyReturnWaitsAndThenGoesToALateMatch() async throws {
-        let live = SuspendingLiveProvider(id: "late")
-        let model = model([calculator(), live])
-        defer {
-            live.releaseAll()
-            model.stop()
-        }
-        search(model, "time in tokyo")
-        #expect(model.selectedItem?.id == CalculatorProvider.wordAnswerID)
-        model.performSelected()
-        model.pasteSelected()
-        #expect(pasteboard.string(forType: .string) == nil)
-        try await waitUntil { live.started.contains("time in tokyo") }
-        live.release("time in tokyo")
-        try await waitUntil { model.groups.contains { $0.id == "live.late" } }
-        try await Task.sleep(for: .milliseconds(120))
-        // ↩ went to the row that arrived above the answer: nothing was copied or recorded.
-        #expect(pasteboard.string(forType: .string) == nil)
-        #expect(model.store.database.calculatorHistory.isEmpty)
-        #expect(model.selectedItem?.id == "late.time in tokyo")
-    }
-
-    @Test func earlyReturnDeliversTheAnswerWhenNothingArrives() async throws {
+    @Test func aPendingWordAnswerIsNeverTheDefaultSelection() async throws {
         let live = SuspendingLiveProvider(id: "late")
         live.emptyQueries = ["time in tokyo"]
         let model = model([calculator(), live])
@@ -126,17 +105,44 @@ struct Slice3ReviewTests {
             model.stop()
         }
         search(model, "time in tokyo")
-        let shown = try #require(model.selectedItem?.calculatorAnswer(in: model)?.value)
+        #expect(model.results.contains { $0.id == CalculatorProvider.pendingWordAnswerID })
+        #expect(model.selectedItem?.id == "fallback.ai")
+        // ⌘↩ has nothing to do on Ask AI, and nothing is queued for later.
         model.pasteSelected()
-        #expect(pasteboard.string(forType: .string) == nil)
         try await waitUntil { live.started.contains("time in tokyo") }
         live.release("time in tokyo")
-        try await waitUntil { pasteboard.string(forType: .string) != nil }
+        try await waitUntil { model.results.contains { $0.id == CalculatorProvider.wordAnswerID } }
+        #expect(pasteboard.string(forType: .string) == nil)
+        // Once search settles, the untouched selection follows the default: the answer.
+        model.synchronizeSelection()
+        #expect(model.selectedItem?.id == CalculatorProvider.wordAnswerID)
+        let shown = try #require(model.selectedItem?.calculatorAnswer(in: model)?.value)
+        model.performSelected()
         #expect(pasteboard.string(forType: .string) == shown)
-        #expect(model.store.database.calculatorHistory.first?.expression == "time in tokyo")
     }
 
-    @Test func chosenAnswersAndExplicitMathActAtOnce() async throws {
+    @Test func aTitleMatchOrALateRowIsTheDefaultInstead() async throws {
+        let live = SuspendingLiveProvider(id: "late")
+        let model = model([calculator(), TitledCommandsProvider(titles: ["Time in Tokyo Clock"]), live])
+        defer {
+            live.releaseAll()
+            model.stop()
+        }
+        search(model, "time in tokyo")
+        #expect(model.selectedItem?.title == "Time in Tokyo Clock")
+        // "today" matches no title here, so while the live search runs Ask AI is the default.
+        search(model, "today")
+        #expect(model.results.contains { $0.id == CalculatorProvider.pendingWordAnswerID })
+        #expect(model.selectedItem?.id == "fallback.ai")
+        try await waitUntil { live.started.contains("today") }
+        live.release("today")
+        try await waitUntil { model.groups.contains { $0.id == "live.late" } }
+        model.synchronizeSelection()
+        #expect(model.selectedItem?.id == "late.today")
+        #expect(pasteboard.string(forType: .string) == nil)
+    }
+
+    @Test func anAnswerChosenByHandActsAtOnceAndStaysChosen() async throws {
         let live = SuspendingLiveProvider(id: "late")
         let model = model([calculator(), TitledCommandsProvider(titles: ["Time in Tokyo Clock"]), live])
         defer {
@@ -145,12 +151,27 @@ struct Slice3ReviewTests {
         }
         search(model, "time in tokyo")
         model.moveSelection(1)
-        #expect(model.selectedID == CalculatorProvider.wordAnswerID)
+        #expect(model.selectedID == CalculatorProvider.pendingWordAnswerID)
         let shown = try #require(model.selectedItem?.calculatorAnswer(in: model)?.value)
         model.performSelected()
         #expect(pasteboard.string(forType: .string) == shown)
+        try await waitUntil { live.started.contains("time in tokyo") }
+        live.release("time in tokyo")
+        try await waitUntil { model.groups.contains { $0.id == "live.late" } }
+        model.synchronizeSelection()
+        #expect(model.selectedID == CalculatorProvider.wordAnswerID)
+    }
+
+    @Test func explicitMathIsPreselectedWhilePending() async throws {
+        let live = SuspendingLiveProvider(id: "late")
+        let model = model([calculator(), live])
+        defer {
+            live.releaseAll()
+            model.stop()
+        }
         search(model, "2 + 3")
         #expect(model.isLoadingProvidedItems)
+        #expect(model.selectedItem?.id == CalculatorProvider.answerID)
         model.performSelected()
         #expect(pasteboard.string(forType: .string) == "5")
     }

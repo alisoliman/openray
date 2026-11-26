@@ -238,12 +238,17 @@ final class LauncherModel {
     /// ordinary row instead of putting it first.
     private func calculatorAnswerItem(for query: String) -> LauncherItem? {
         let provider = registry.provider(id: CalculatorProvider.registration.id) as? CalculatorProvider
+        // Only root search has results that arrive later.
+        let pending = section == .home && CalculatorProvider.isSearchPending(self)
         if let provider {
-            return provider.answer(for: query, in: self).map(CalculatorProvider.answerItem(for:))
+            return provider.answer(for: query, in: self).map {
+                CalculatorProvider.answerItem(for: $0, searchPending: pending)
+            }
         }
         guard let calculation = Calculator.evaluate(query) else { return nil }
+        let wordID = pending ? CalculatorProvider.pendingWordAnswerID : CalculatorProvider.wordAnswerID
         return LauncherItem(
-            id: calculation.isAmbiguous ? CalculatorProvider.wordAnswerID : CalculatorProvider.answerID,
+            id: calculation.isAmbiguous ? wordID : CalculatorProvider.answerID,
             title: calculation.result, subtitle: calculation.expression, symbol: "equal", kind: .calculator,
             badge: "Calculator", action: .calculation(calculation))
     }
@@ -300,7 +305,9 @@ final class LauncherModel {
     var orderedResults: [LauncherItem] { groups.flatMap(\.items) }
     var selectedItem: LauncherItem? {
         let ordered = orderedResults
-        return ordered.first { $0.id == selectedID } ?? ordered.first
+        if let selected = ordered.first(where: { $0.id == selectedID }) { return selected }
+        let fallback = ProvisionalSelection.defaultID(in: ordered)
+        return ordered.first { $0.id == fallback }
     }
 
     /// Up to sixteen favorites (⌘1–⌘8 open the first eight) and four recents.
@@ -337,8 +344,8 @@ final class LauncherModel {
         var groups: [LauncherResultGroup] = []
         var instant = items.filter { !$0.isLiveResult }
         // A words-only calculator answer never takes the Top Hit; it follows Files and live rows.
-        let wordAnswer = instant.first { $0.id == CalculatorProvider.wordAnswerID }
-        instant.removeAll { $0.id == CalculatorProvider.wordAnswerID }
+        let wordAnswer = instant.first { CalculatorProvider.isWordAnswer($0.id) }
+        instant.removeAll { CalculatorProvider.isWordAnswer($0.id) }
         if let calculation = instant.first(where: { $0.id == CalculatorProvider.answerID }) {
             groups.append(LauncherResultGroup(id: "calculator", title: "Calculator", style: .calculator, items: [calculation]))
             instant.removeAll { $0.id == CalculatorProvider.answerID }
@@ -841,14 +848,21 @@ final class LauncherModel {
 
     func synchronizeSelection() {
         let items = orderedResults
-        if !items.contains(where: { $0.id == selectedID }) {
-            selectedID = items.first?.id
-        } else if selectedID == CalculatorProvider.wordAnswerID, !selectionMovedByHand, let first = items.first?.id,
-            first != selectedID
+        // A words-only answer chosen while search was pending stays chosen once it settles.
+        if selectedID == CalculatorProvider.pendingWordAnswerID,
+            items.contains(where: { $0.id == CalculatorProvider.wordAnswerID })
         {
-            // A words-only calculator answer holds the selection only while it's first: a file or
-            // provider row that lands above it later takes ↩, unless the person moved to the answer.
-            selectedID = first
+            selectedID = CalculatorProvider.wordAnswerID
+        }
+        let preferred = ProvisionalSelection.defaultID(in: items)
+        if !items.contains(where: { $0.id == selectedID }) {
+            selectedID = preferred
+        } else if !selectionMovedByHand, selectedID != preferred,
+            ProvisionalSelection.followsDefault(selectedID: selectedID, items: items)
+        {
+            // See ProvisionalSelection: an untouched selection follows the default around a
+            // words-only answer or Translate's language rows, so ↩ never lands on them by accident.
+            selectedID = preferred
         }
     }
 

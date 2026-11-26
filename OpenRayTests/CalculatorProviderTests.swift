@@ -112,7 +112,8 @@ struct CalculatorProviderTests {
             model.stop()
         }
         search(model, "time in tokyo")
-        #expect(model.selectedItem?.id == CalculatorProvider.wordAnswerID)
+        // While the live search runs, the answer isn't the default.
+        #expect(model.selectedItem?.id == "fallback.ai")
         try await waitUntil { live.started.contains("time in tokyo") }
         live.release("time in tokyo")
         try await waitUntil { model.groups.contains { $0.id == "live.late" } }
@@ -132,7 +133,7 @@ struct CalculatorProviderTests {
         search(model, "time in tokyo")
         #expect(model.selectedItem?.title == "Time in Tokyo Clock")
         model.moveSelection(1)
-        #expect(model.selectedID == CalculatorProvider.wordAnswerID)
+        #expect(CalculatorProvider.isWordAnswer(model.selectedID))
         try await waitUntil { live.started.contains("time in tokyo") }
         live.release("time in tokyo")
         try await waitUntil { model.groups.contains { $0.id == "live.late" } }
