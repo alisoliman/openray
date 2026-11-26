@@ -29,7 +29,8 @@ final class InertDictation: AIDictating {
 /// it says so, and never prompts or crashes.
 @MainActor
 final class SpeechDictation: AIDictating {
-    private let audio = AVAudioEngine()
+    /// Made on first use, so nothing touches audio until dictation starts.
+    private lazy var audio = AVAudioEngine()
     private var request: SFSpeechAudioBufferRecognitionRequest?
     private var task: SFSpeechRecognitionTask?
     private(set) var isListening = false

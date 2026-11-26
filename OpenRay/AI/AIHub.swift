@@ -222,6 +222,8 @@ final class AIHub {
 
     /// Shows the chat window.
     func openChatWindow() {
+        // Made before the window draws, so its view never creates state mid-update.
+        _ = windowChat
         windowRequests += 1
         launcher?.panel?.dismiss(restoreFocus: false)
         presentWindow?()
