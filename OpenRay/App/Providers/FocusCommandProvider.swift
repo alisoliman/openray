@@ -164,10 +164,12 @@ final class FocusCommandProvider: CommandProvider, MenuBarExtraProviding {
             return
         }
         preferences.lastGoal = goal
-        if minutes > 0 { preferences.minutes = minutes }
+        // No Time Limit (0) is remembered too, so Toggle starts what the last session was.
+        preferences.minutes = minutes
         preferences.save(to: model.store)
         report("Focusing on \(configuration.displayGoal)", in: model)
-        model.panel?.dismiss()
+        // Handing focus back activates another app, which an inert launch must not do.
+        model.panel?.dismiss(restoreFocus: !SideEffectGuard.isInert)
     }
 
     private func complete(in model: LauncherModel) {

@@ -22,7 +22,7 @@ struct FocusPane: View {
         SettingsPaneScaffold(pane: .focus) {
             Section("Next session") {
                 Picker("Usual length", selection: binding(\.minutes)) {
-                    ForEach(FocusPreferences.presets, id: \.self) { Text(FocusFormat.duration(minutes: $0)).tag($0) }
+                    ForEach(lengthChoices, id: \.self) { Text(FocusFormat.duration(minutes: $0)).tag($0) }
                     Text("No time limit").tag(0)
                 }
                 .neutralMenus()
@@ -59,6 +59,13 @@ struct FocusPane: View {
                 .settingsSwitch()
             }
         }
+    }
+
+    /// The presets, plus a length typed for an earlier session, so the picker can show it.
+    private var lengthChoices: [Int] {
+        let saved = preferences.minutes
+        return saved > 0 && !FocusPreferences.presets.contains(saved)
+            ? (FocusPreferences.presets + [saved]).sorted() : FocusPreferences.presets
     }
 
     private func binding<Value>(_ path: WritableKeyPath<FocusPreferences, Value>) -> Binding<Value> {

@@ -440,7 +440,18 @@ final class WorkspaceFocusAppControl: FocusAppControlling {
 
     func hide(_ app: FocusRunningApp) throws {
         try guardrail.check("hiding \(app.name)")
-        NSRunningApplication(processIdentifier: app.processIdentifier)?.hide()
+        guard NSRunningApplication(processIdentifier: app.processIdentifier)?.hide() == true else {
+            throw FocusAppError.couldNotHide(app.name)
+        }
+    }
+}
+
+enum FocusAppError: LocalizedError, Equatable {
+    case couldNotHide(String)
+    var errorDescription: String? {
+        switch self {
+        case .couldNotHide(let name): "OpenRay couldn't hide \(name)."
+        }
     }
 }
 
@@ -549,7 +560,8 @@ final class FocusController {
             machine.recordBlocked(bundleID: bundleID, name: app.name)
             notices.showBlocked(appName: app.name, goal: session?.configuration.displayGoal ?? "Focus")
         } catch {
-            // Refused by the guard: nothing was hidden, so nothing is recorded.
+            // Refused by the guard, or the app didn't hide: it wasn't held back, so it isn't
+            // counted or announced as blocked.
         }
     }
 }

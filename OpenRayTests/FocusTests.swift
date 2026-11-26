@@ -10,13 +10,18 @@ import Testing
 final class FakeFocusApps: FocusAppControlling {
     var onActivate: ((FocusRunningApp) -> Void)?
     var running: [FocusRunningApp] = []
+    /// Models an app that refuses to hide.
+    var failsToHide = false
     private(set) var isObserving = false
     private(set) var hidden: [String] = []
 
     func startObserving() { isObserving = true }
     func stopObserving() { isObserving = false }
     func runningApplications() -> [FocusRunningApp] { running }
-    func hide(_ app: FocusRunningApp) throws { hidden.append(app.bundleID ?? app.name) }
+    func hide(_ app: FocusRunningApp) throws {
+        if failsToHide { throw FocusAppError.couldNotHide(app.name) }
+        hidden.append(app.bundleID ?? app.name)
+    }
 
     /// Brings an app forward, as NSWorkspace would report.
     func activate(_ app: FocusRunningApp) { onActivate?(app) }
@@ -233,6 +238,15 @@ struct FocusControllerTests {
         #expect(notices.summaries.first?.finishedOnTime == true)
     }
 
+    @Test func anAppThatDoesntHideIsntCountedAsBlocked() throws {
+        let (controller, apps, notices, _) = make()
+        try controller.start(FocusFixture.configuration())
+        apps.failsToHide = true
+        apps.activate(FocusFixture.slack)
+        #expect(notices.blocked.isEmpty)
+        #expect(controller.session?.blockedAttempts.isEmpty == true)
+    }
+
     @Test func theLiveAppControlIsInertInTests() {
         let live = WorkspaceFocusAppControl(guardrail: SideEffectGuard(mode: .testHost))
         live.startObserving()
@@ -275,6 +289,18 @@ struct FocusProviderTests {
         // The next session remembers the goal and length.
         #expect(FocusPreferences.load(from: model.store).minutes == 40)
         #expect(FocusPreferences.load(from: model.store).lastGoal == "Draft chapter")
+    }
+
+    @Test func noTimeLimitIsRememberedForTheNextToggle() throws {
+        let (model, controller, _, _) = make()
+        model.navigate(to: .provided(FocusCommandProvider.startScope))
+        model.perform(try #require(model.results.first { $0.id == "focus.length.0" }))
+        #expect(controller.session?.configuration.duration == nil)
+        #expect(FocusPreferences.load(from: model.store).minutes == 0)
+        try controller.complete()
+        let toggle = try #require(model.commandItems.first { $0.id == FocusCommandProvider.toggleID })
+        model.perform(toggle)
+        #expect(controller.session?.configuration.duration == nil)
     }
 
     @Test func sessionCommandsAppearWhileASessionRuns() throws {
