@@ -373,7 +373,7 @@ extension LauncherModel {
         if !isFolder || filePathQuery == nil {
             entries.append(
                 ActionEntry(id: "sendToAI", title: "Send to AI Chat", symbol: "sparkles", group: .item) {
-                    [weak self] in self?.sendFileToAI(url)
+                    [weak self] in _ = self?.sendFileToAI(url)
                 })
         }
         entries.append(
@@ -592,13 +592,12 @@ extension LauncherModel {
         }
     }
 
-    /// Starts a new chat about the file. The chat can't take file attachments yet, so the
-    /// path goes into the message, ready to finish and send.
-    func sendFileToAI(_ url: URL) {
+    /// Starts a new chat with the file attached: text and code, a PDF's text, or an image,
+    /// read on this Mac (Slice 7's `sendFilesToAI`). The returned task ends once it's attached.
+    @discardableResult
+    func sendFileToAI(_ url: URL) -> Task<Void, Never> {
         if !ai.isGenerating { ai.newConversation(action: .chat) }
-        openAI(.chat)
-        ai.draft = "About “\(url.lastPathComponent)” (\(Self.shortenedPath(url))): "
-        focusRequest += 1
+        return Task { await sendFilesToAI([url]) }
     }
 
     /// Opens the quicklink editor filled in with the file, ready to name and save.

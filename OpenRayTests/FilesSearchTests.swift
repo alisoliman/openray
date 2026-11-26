@@ -573,7 +573,7 @@ struct FilesSearchTests {
         model.files.stop()
     }
 
-    @Test func excludeSortHiddenQuicklinkAndAIActionsWork() throws {
+    @Test func excludeSortHiddenQuicklinkAndAIActionsWork() async throws {
         let model = model()
         let file = URL(fileURLWithPath: "/Users/tester/Archive/old.pdf")
         model.excludeFromFileSearch(file)
@@ -596,9 +596,21 @@ struct FilesSearchTests {
         #expect(link.template == file.path)
         model.closeEditor(force: true)
 
-        model.sendFileToAI(file)
+        // Send to AI attaches the file itself, read on this Mac.
+        let folder = FileManager.default.temporaryDirectory.appending(
+            path: "OpenRaySendToAI-\(UUID().uuidString)", directoryHint: .isDirectory)
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: folder) }
+        let notes = folder.appending(path: "notes.txt")
+        try Data("Ship the archive on Friday.".utf8).write(to: notes)
+        await model.sendFileToAI(notes).value
         #expect(model.destination == .ai)
-        #expect(model.ai.draft.contains("old.pdf"))
+        #expect(model.ai.action == .chat)
+        let attachment = try #require(model.ai.attachments.first)
+        #expect(attachment.source == .file)
+        #expect(attachment.title == "notes.txt")
+        #expect(attachment.text == "Ship the archive on Friday.")
+        #expect(model.ai.draft.isEmpty)
         model.files.stop()
     }
 
