@@ -550,8 +550,15 @@ final class HelpWindowController: AuxiliaryWindowController {
 }
 
 enum RuntimeMode {
-    @MainActor static func launchPasteboard(arguments: [String]) -> NSPasteboard {
-        guard arguments.contains("--verification-pasteboard") else { return .general }
+    /// The pasteboard a launch uses: a named verification pasteboard when one is given, a
+    /// private one in any other inert launch (the test host, `--in-memory-library`), and the
+    /// system clipboard only in a normal launch.
+    @MainActor static func launchPasteboard(
+        arguments: [String], sideEffects: SideEffectGuard = .current
+    ) -> NSPasteboard {
+        guard arguments.contains("--verification-pasteboard") else {
+            return sideEffects.isInert ? NSPasteboard.withUniqueName() : .general
+        }
         if let name = verificationPasteboardName(arguments: arguments) { return NSPasteboard(name: name) }
         // Invalid verification arguments must never fall back to the user's clipboard.
         return NSPasteboard.withUniqueName()
@@ -584,7 +591,7 @@ enum RuntimeMode {
     }
 
     static var usesInMemoryLibrary: Bool {
-        isTestHost || ProcessInfo.processInfo.arguments.contains("--in-memory-library")
+        isTestHost || SideEffectGuard.isInert || ProcessInfo.processInfo.arguments.contains("--in-memory-library")
             || ProcessInfo.processInfo.arguments.contains("--verification-pasteboard")
     }
 }

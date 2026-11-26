@@ -136,10 +136,16 @@ final class LauncherModel {
     /// Stands in for the Accessibility read of the selected text. Tests set it.
     @ObservationIgnored var selectionReader: (() throws -> String)?
 
+    /// Defaults follow `SideEffectGuard`: a normal launch uses the library on disk and the system
+    /// clipboard; the test host and verification mode get an in-memory library and a private,
+    /// uniquely named pasteboard, so a default-built model can't touch the person's data.
     init(
-        store: LibraryStore = LibraryStore(), ai: AIChatModel = AIChatModel(), pasteboard: NSPasteboard = .general,
-        registry: CommandRegistry = CommandRegistry(), hotKey: GlobalHotKey? = nil, hyperKey: HyperKey? = nil
+        store: LibraryStore? = nil, ai: AIChatModel = AIChatModel(), pasteboard: NSPasteboard? = nil,
+        registry: CommandRegistry = CommandRegistry(), hotKey: GlobalHotKey? = nil, hyperKey: HyperKey? = nil,
+        sideEffects: SideEffectGuard = .current
     ) {
+        let store = store ?? LibraryStore(fileURL: sideEffects.isInert ? nil : LibraryStore.defaultURL)
+        let pasteboard = pasteboard ?? (sideEffects.isInert ? NSPasteboard.withUniqueName() : .general)
         self.hyperKey = hyperKey ?? HyperKey()
         self.store = store
         self.registry = registry
