@@ -218,11 +218,14 @@ struct SnippetExpansionPlan: Equatable, Sendable {
 /// recording fake.
 @MainActor
 protocol KeystrokeTarget {
-    /// The same app is frontmost, the same element has focus and no secure field is active.
+    /// The same app is frontmost, the same element has focus (when the app reports one)
+    /// as when the keyword was completed, and no secure field is active.
     func isUnchanged() -> Bool
-    /// The `utf16Count` code units right before a collapsed caret in the focused field,
-    /// or nil when the selection isn't collapsed or the field can't be read.
-    func precedingText(utf16Count: Int) -> String?
+    /// What's right before the caret in the focused field, as far as Accessibility can tell.
+    func precedingText(utf16Count: Int) -> PrecedingText
+    /// A short pause for the app to catch up on keys it was sent: Accessibility can
+    /// report a field's text a moment after the key event.
+    func settle()
     func pressDelete() throws
     /// Types up to 20 UTF-16 code units.
     func type(_ chunk: [UInt16]) throws
@@ -235,9 +238,29 @@ protocol KeystrokeTarget {
     func setCaretLocation(_ location: Int) -> Bool
 }
 
+/// What Accessibility reports right before the caret.
+enum PrecedingText: Equatable, Sendable {
+    /// The text before a collapsed caret.
+    case text(String)
+    /// Something is selected, so typing didn't end at a caret there.
+    case selection
+    /// The field doesn't report its text: terminals, many Electron apps and others.
+    case unreadable
+}
+
 /// Runs a plan against a target, re-checking the target before every event and
 /// stopping at the first change.
+///
+/// Before deleting anything it checks it's in the right place:
+/// - Where Accessibility reports the text before the caret, that text must end with
+///   the typed keyword. A mismatch or a selection refuses, after a few short retries,
+///   since apps can update their text a moment after the key event.
+/// - Where it doesn't (terminals, VS Code, Slack and other Electron apps), expansion
+///   works as it always has: the same frontmost app, the same focused element when it
+///   can be read, no Secure Input and no focus change since the keyword was typed.
 enum KeystrokeScript {
+    /// Reads of the preceding text before a mismatch refuses.
+    static let confirmationAttempts = 8
     enum Result: Equatable, Sendable {
         case completed
         /// Focus or the frontmost app changed; nothing more was sent.
@@ -247,10 +270,24 @@ enum KeystrokeScript {
         case unconfirmed
     }
 
+    /// True when the keyword is right before the caret, or when the field can't say
+    /// and the base checks (`isUnchanged`) carry the decision.
+    @MainActor static func confirm(_ plan: SnippetExpansionPlan, on target: some KeystrokeTarget) -> Bool {
+        for attempt in 0..<confirmationAttempts {
+            switch target.precedingText(utf16Count: plan.deleteUTF16Count) {
+            case .unreadable: return true
+            case .text(let text) where text == plan.deletedText: return true
+            case .text, .selection:
+                if attempt < confirmationAttempts - 1 { target.settle() }
+            }
+        }
+        return false
+    }
+
     @MainActor static func run(_ plan: SnippetExpansionPlan, on target: some KeystrokeTarget) throws -> Result {
         guard target.isUnchanged() else { return .interrupted }
-        // Deleting is only safe in the field that has the keyword right before its caret.
-        guard target.precedingText(utf16Count: plan.deleteUTF16Count) == plan.deletedText else { return .unconfirmed }
+        guard confirm(plan, on: target) else { return .unconfirmed }
+        guard target.isUnchanged() else { return .interrupted }
         let start = plan.caretLeft > 0 ? target.caretLocation() : nil
         for _ in 0..<plan.deleteCount {
             guard target.isUnchanged() else { return .interrupted }
@@ -289,7 +326,10 @@ enum KeystrokeScript {
 /// Performs an expansion in another app.
 @MainActor
 protocol SnippetInserting {
-    func insert(_ plan: SnippetExpansionPlan, into processID: pid_t) throws -> KeystrokeScript.Result
+    /// Notes where the person is typing, the moment a keyword completes and before
+    /// anything is rendered, so a later focus change is caught.
+    func target(for processID: pid_t) -> any KeystrokeTarget
+    func insert(_ plan: SnippetExpansionPlan, on target: any KeystrokeTarget) throws -> KeystrokeScript.Result
 }
 
 enum SnippetInserters {
@@ -302,24 +342,45 @@ enum SnippetInserters {
     }
 }
 
-/// Refuses every expansion.
+/// Refuses every expansion, and reads nothing from other apps.
 struct InertSnippetInserter: SnippetInserting {
     var sideEffects = SideEffectGuard.current
 
-    func insert(_ plan: SnippetExpansionPlan, into processID: pid_t) throws -> KeystrokeScript.Result {
+    func target(for processID: pid_t) -> any KeystrokeTarget { InertKeystrokeTarget(sideEffects: sideEffects) }
+
+    func insert(_ plan: SnippetExpansionPlan, on target: any KeystrokeTarget) throws -> KeystrokeScript.Result {
         throw SideEffectGuard.Blocked(what: "typing into other apps", mode: sideEffects.mode)
     }
+}
+
+/// A target that never reads or sends anything.
+struct InertKeystrokeTarget: KeystrokeTarget {
+    var sideEffects: SideEffectGuard
+
+    func isUnchanged() -> Bool { false }
+    func precedingText(utf16Count: Int) -> PrecedingText { .unreadable }
+    func settle() {}
+    func pressDelete() throws { throw SideEffectGuard.Blocked(what: "typing into other apps", mode: sideEffects.mode) }
+    func type(_ chunk: [UInt16]) throws { throw SideEffectGuard.Blocked(what: "typing into other apps", mode: sideEffects.mode) }
+    func caretLocation() -> Int? { nil }
+    func waitForCaret(at location: Int) -> Bool { false }
+    func setCaretLocation(_ location: Int) -> Bool { false }
 }
 
 /// Types into the focused field of `processID` with synthetic key events.
 struct LiveSnippetInserter: SnippetInserting {
     var sideEffects = SideEffectGuard.current
 
-    func insert(_ plan: SnippetExpansionPlan, into processID: pid_t) throws -> KeystrokeScript.Result {
+    /// Reads the app's focused element now; it never sends anything.
+    func target(for processID: pid_t) -> any KeystrokeTarget {
         let sideEffects = sideEffects.restrictedByProcess
-        try sideEffects.check("typing into other apps")
-        return try KeystrokeScript.run(
-            plan, on: AccessibilityKeystrokeTarget(processID: processID, sideEffects: sideEffects))
+        guard !sideEffects.isInert else { return InertKeystrokeTarget(sideEffects: sideEffects) }
+        return AccessibilityKeystrokeTarget(processID: processID, sideEffects: sideEffects)
+    }
+
+    func insert(_ plan: SnippetExpansionPlan, on target: any KeystrokeTarget) throws -> KeystrokeScript.Result {
+        try sideEffects.restrictedByProcess.check("typing into other apps")
+        return try KeystrokeScript.run(plan, on: target)
     }
 }
 
@@ -357,17 +418,23 @@ final class AccessibilityKeystrokeTarget: KeystrokeTarget {
         try SyntheticInput.postText(chunk, toProcess: processID, sideEffects: sideEffects)
     }
 
-    func precedingText(utf16Count: Int) -> String? {
-        guard let focused, let range = selectedRange(), range.length == 0, range.location >= utf16Count else { return nil }
+    func precedingText(utf16Count: Int) -> PrecedingText {
+        guard let focused, let range = selectedRange() else { return .unreadable }
+        guard range.length == 0 else { return .selection }
+        // A caret before the keyword's length can't have the keyword before it.
+        guard range.location >= utf16Count else { return .text("") }
         var request = CFRange(location: range.location - utf16Count, length: utf16Count)
-        guard let parameter = AXValueCreate(.cfRange, &request) else { return nil }
+        guard let parameter = AXValueCreate(.cfRange, &request) else { return .unreadable }
         var value: CFTypeRef?
         guard
             AXUIElementCopyParameterizedAttributeValue(
-                focused, kAXStringForRangeParameterizedAttribute as CFString, parameter, &value) == .success
-        else { return nil }
-        return value as? String
+                focused, kAXStringForRangeParameterizedAttribute as CFString, parameter, &value) == .success,
+            let text = value as? String
+        else { return .unreadable }
+        return .text(text)
     }
+
+    func settle() { usleep(15_000) }
 
     func caretLocation() -> Int? { selectedRange()?.location }
 
@@ -602,6 +669,8 @@ final class SnippetExpander {
         }
         guard let trigger = matcher.trigger(for: text, snippets: database.snippets.filter(\.expandsAsYouType))
         else { return nil }
+        // Where the keyword was typed, noted before anything is read or rendered.
+        let target = inserter.target(for: input.processID)
         // Arguments can't be asked for mid-typing: optional ones take their
         // defaults, and a required one refuses the expansion.
         let plan = PlaceholderTemplate(trigger.snippet.content, context: .snippet)
@@ -623,7 +692,7 @@ final class SnippetExpander {
             return .refused(blocking)
         }
         do {
-            switch try inserter.insert(expansion, into: input.processID) {
+            switch try inserter.insert(expansion, on: target) {
             case .completed: return .inserted(expansion)
             case .interrupted, .unconfirmed:
                 failureFeedback()
