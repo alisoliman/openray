@@ -234,6 +234,16 @@ enum Availability {
         return calendar.date(bySettingHour: minutes / 60, minute: minutes % 60, second: 0, of: day)
     }
 
+    /// True when `interval` falls inside one working day's hours, on a day the options cover.
+    static func isWithinWorkingHours(_ interval: DateInterval, options: Options, calendar: Calendar) -> Bool {
+        let day = calendar.startOfDay(for: interval.start)
+        guard !(options.skipsWeekends && calendar.isDateInWeekend(day)),
+            let open = wallClock(options.dayStart, on: day, calendar: calendar),
+            let close = wallClock(options.dayEnd, on: day, calendar: calendar)
+        else { return false }
+        return interval.start >= open && interval.end <= close
+    }
+
     /// True when no event that takes its time overlaps `interval`.
     static func isFree(_ interval: DateInterval, events: [CalendarEvent]) -> Bool {
         !events.contains { $0.blocksTime && $0.overlaps(interval) }
@@ -376,10 +386,11 @@ final class WorkspaceURLOpener: URLOpening {
 }
 
 enum CalendarServiceError: LocalizedError, Equatable {
-    case noAccess, noDefaultCalendar, couldNotOpen(String)
+    case noAccess, noDefaultCalendar, couldNotOpen(String), couldNotRead
     var errorDescription: String? {
         switch self {
         case .noAccess: "OpenRay doesn't have access to your calendars."
+        case .couldNotRead: "OpenRay couldn't read your calendars to check that time."
         case .noDefaultCalendar: "There's no default calendar for new events."
         case .couldNotOpen(let what): "OpenRay couldn't open this \(what) link."
         }
@@ -412,7 +423,8 @@ final class EventKitCalendarSource: CalendarEventSource {
     }
 
     var access: CalendarAccess {
-        guard !guardrail.isInert else { return .unavailable }
+        // The stricter of the injected and the process rule (`effective` after the a4e845d merge).
+        guard !guardrail.isInert, !SideEffectGuard.isInert else { return .unavailable }
         switch EKEventStore.authorizationStatus(for: .event) {
         case .notDetermined: return .notDetermined
         case .restricted: return .restricted
@@ -580,19 +592,25 @@ final class CalendarService {
 
     /// Reloads the cache from the source.
     func refresh() {
-        updateAccess()
-        guard access.canRead else {
-            if !events.isEmpty { events = [] }
-            return
+        do { try refreshVerified() } catch {
+            if !access.canRead, !events.isEmpty { events = [] }
         }
+    }
+
+    /// Reloads the cache, and throws when it can't: no read access (write-only included), or
+    /// the read failed. Block Time decides only on events read just now.
+    func refreshVerified() throws {
+        updateAccess()
+        guard access.canRead else { throw CalendarServiceError.noAccess }
         let start = calendar.startOfDay(for: now())
         do {
             events = try source.events(from: start, to: start.addingTimeInterval(lookahead))
             lastError = nil
+            lastRefresh = now()
         } catch {
             lastError = error.localizedDescription
+            throw CalendarServiceError.couldNotRead
         }
-        lastRefresh = now()
     }
 
     func refreshIfStale() {
@@ -689,6 +707,13 @@ final class CalendarService {
     /// Whether `interval` is still free in the cache, for checking a proposed slot again.
     func isFree(_ interval: DateInterval, hidden: Set<String> = []) -> Bool {
         Availability.isFree(interval, events: events.filter { !hidden.contains($0.calendarID) })
+    }
+
+    /// Whether Block Time may still write `interval`: it hasn't started, it's inside working
+    /// hours on a working day, and nothing in the cache takes any of it.
+    func isBookable(_ interval: DateInterval, options: Availability.Options, hidden: Set<String> = []) -> Bool {
+        Availability.isWithinWorkingHours(interval, options: options, calendar: calendar) && interval.start >= now()
+            && isFree(interval, hidden: hidden)
     }
 
     // MARK: Text

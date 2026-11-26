@@ -420,6 +420,7 @@ final class CalendarCommandProvider: CommandProvider, MenuBarExtraProviding {
     /// Asks, then adds an event in the next free slot of the length chosen. Nothing is offered
     /// when no working-hours slot is free, and the slot is checked again when the person confirms.
     func blockTime(in model: LauncherModel, title: String?, minutes: Int?) {
+        service.updateAccess()
         guard service.access == .fullAccess else {
             model.feedback = .warning("Open My Schedule to allow calendar access first.")
             return
@@ -429,8 +430,12 @@ final class CalendarCommandProvider: CommandProvider, MenuBarExtraProviding {
     }
 
     private func proposeBlock(minutes: Int, name: String, in model: LauncherModel, retry: Bool) {
-        // Always from fresh events: what was cached can be minutes old.
-        service.refresh()
+        // Always from events read just now: what was cached can be minutes old, and a failed
+        // read can't vouch for any time.
+        do { try service.refreshVerified() } catch {
+            model.feedback = .warning(error.localizedDescription)
+            return
+        }
         let preferences = preferences(model)
         let length = FocusFormat.duration(minutes: minutes)
         guard
@@ -442,14 +447,19 @@ final class CalendarCommandProvider: CommandProvider, MenuBarExtraProviding {
         }
         let when = Self.describe(slot, now: service.now(), calendar: service.calendar)
         let question = CommandConfirmation(
-            question: retry ? "That time was just taken. Block \(length) \(when) instead?" : "Block \(length) \(when)?",
+            question: retry ? "That time is no longer free. Block \(length) \(when) instead?" : "Block \(length) \(when)?",
             detail: "Adds “\(name)” to your default calendar.", confirmTitle: "Block Time", symbol: "calendar.badge.plus")
         model.confirmation = .provided(
             ProvidedConfirmation(id: "calendar.blockTime.confirm", question) { [weak self, weak model] in
                 guard let self, let model else { return }
-                // The calendar can change while the question is up.
-                self.service.refresh()
-                guard self.service.isFree(slot, hidden: preferences.hiddenCalendarIDs) else {
+                // The calendar, the clock and access can all change while the question is up, so
+                // the time is checked again on events read just now.
+                do { try self.service.refreshVerified() } catch {
+                    model.feedback = .warning(error.localizedDescription)
+                    return
+                }
+                let current = self.preferences(model)
+                guard self.service.isBookable(slot, options: current.availability, hidden: current.hiddenCalendarIDs) else {
                     self.proposeBlock(minutes: minutes, name: name, in: model, retry: true)
                     return
                 }

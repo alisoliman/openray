@@ -196,13 +196,15 @@ struct FocusControllerTests {
         apps.running = [FocusFixture.slack, FocusFixture.xcode, FocusFixture.finder]
         try controller.start(FocusFixture.configuration())
         #expect(apps.hidden == ["com.tinyspeck.slackmacgap"])
+        // Hidden at the start counts as held back.
+        #expect(controller.session?.blockedAttempts["com.tinyspeck.slackmacgap"] == 1)
         #expect(apps.isObserving)
         #expect(notices.started.map(\.goal) == ["Write the report"])
         apps.activate(FocusFixture.xcode)
         apps.activate(FocusFixture.slack)
         #expect(apps.hidden == ["com.tinyspeck.slackmacgap", "com.tinyspeck.slackmacgap"])
         #expect(notices.blocked == ["Slack"])
-        #expect(controller.session?.blockedAttempts["com.tinyspeck.slackmacgap"] == 1)
+        #expect(controller.session?.blockedAttempts["com.tinyspeck.slackmacgap"] == 2)
     }
 
     @Test func pausedAndSnoozedSessionsLetAppsThrough() throws {

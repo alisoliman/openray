@@ -13,6 +13,8 @@ final class FakeCalendarSource: CalendarEventSource {
     var stored: [CalendarEvent] = []
     var calendarList: [CalendarInfo] = []
     var onChange: (@MainActor () -> Void)?
+    /// Models a read that fails, such as the calendar database being unavailable.
+    var failsToRead = false
     private(set) var requestCount = 0
     private(set) var readCount = 0
     private(set) var created: [CalendarEvent] = []
@@ -31,6 +33,7 @@ final class FakeCalendarSource: CalendarEventSource {
 
     func events(from start: Date, to end: Date) throws -> [CalendarEvent] {
         guard access.canRead else { throw CalendarServiceError.noAccess }
+        if failsToRead { throw CocoaError(.fileReadUnknown) }
         readCount += 1
         return stored.filter { $0.end > start && $0.start < end }.sorted { $0.start < $1.start }
     }
@@ -313,13 +316,13 @@ struct CalendarProviderTests {
         for _ in 0..<20 { await Task.yield() }
     }
 
-    private func make(access: CalendarAccess = .fullAccess, events: [CalendarEvent] = [], now: Date = CalendarFixture.date(10, 7))
-        -> (LauncherModel, CalendarService, FakeCalendarSource, FakeURLOpener)
-    {
+    private func make(
+        access: CalendarAccess = .fullAccess, events: [CalendarEvent] = [], clock: MutableClock = MutableClock(CalendarFixture.date(10, 7))
+    ) -> (LauncherModel, CalendarService, FakeCalendarSource, FakeURLOpener) {
         let source = FakeCalendarSource(access: access)
         source.stored = events
         let opener = FakeURLOpener()
-        let service = CalendarService(source: source, opener: opener, now: { now }, calendar: CalendarFixture.calendar)
+        let service = CalendarService(source: source, opener: opener, now: { clock.now }, calendar: CalendarFixture.calendar)
         let model = LauncherModel(
             store: LibraryStore(fileURL: nil), ai: AIChatModel(engine: TestAIEngine()), pasteboard: NSPasteboard.withUniqueName(),
             registry: CommandRegistry(providers: [CalendarCommandProvider(service: service)]))
@@ -449,10 +452,52 @@ struct CalendarProviderTests {
         model.confirm(first)
         #expect(source.created.isEmpty)
         let second = try #require(model.confirmation)
-        #expect(second.question.hasPrefix("That time was just taken. Block 1 h today"))
+        #expect(second.question.hasPrefix("That time is no longer free. Block 1 h today"))
         model.confirm(second)
         #expect(source.created.first?.start == CalendarFixture.date(11, 30))
         #expect(source.created.first?.end == CalendarFixture.date(12, 30))
+    }
+
+    @Test func blockTimeOffersANewTimeWhenTheProposedOneHasStarted() throws {
+        let clock = MutableClock(CalendarFixture.date(10, 7))
+        let (model, service, source, _) = make(clock: clock)
+        service.refresh()
+        let command = try #require(model.commandItems.first { $0.id == CalendarCommandProvider.blockTimeID })
+        model.perform(command)
+        let first = try #require(model.confirmation)
+        #expect(first.question.contains("today"))
+        // The prompt sat open until its time had begun.
+        clock.now = CalendarFixture.date(10, 20)
+        model.confirm(first)
+        #expect(source.created.isEmpty)
+        let second = try #require(model.confirmation)
+        #expect(second.question.hasPrefix("That time is no longer free"))
+        model.confirm(second)
+        #expect(source.created.first?.start == CalendarFixture.date(10, 30))
+    }
+
+    @Test func blockTimeWritesNothingWhenItCantReadTheCalendarAtApproval() throws {
+        let (model, service, source, _) = make()
+        service.refresh()
+        let command = try #require(model.commandItems.first { $0.id == CalendarCommandProvider.blockTimeID })
+        model.perform(command)
+        // The read fails while the question is up.
+        source.failsToRead = true
+        model.confirm(try #require(model.confirmation))
+        #expect(source.created.isEmpty)
+        #expect(model.feedback?.text == CalendarServiceError.couldNotRead.errorDescription)
+        // Access dropped to write-only: nothing can vouch for the time, so nothing is written.
+        source.failsToRead = false
+        model.perform(command)
+        source.access = .writeOnly
+        model.confirm(try #require(model.confirmation))
+        #expect(source.created.isEmpty)
+        #expect(model.feedback?.style == .warning)
+        // And no question is asked at all when the first read fails.
+        source.access = .fullAccess
+        source.failsToRead = true
+        model.perform(command)
+        #expect(model.confirmation == nil)
     }
 
     @Test func copyAvailabilityCopiesAndSaysSo() throws {

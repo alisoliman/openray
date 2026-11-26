@@ -414,7 +414,8 @@ final class WorkspaceFocusAppControl: FocusAppControlling {
     }
 
     func startObserving() {
-        guard observer == nil, !guardrail.isInert else { return }
+        // The stricter of the injected and the process rule (`effective` after the a4e845d merge).
+        guard observer == nil, !guardrail.isInert, !SideEffectGuard.isInert else { return }
         observer = NSWorkspace.shared.notificationCenter.addObserver(
             forName: NSWorkspace.didActivateApplicationNotification, object: nil, queue: .main
         ) { [weak self] notification in
@@ -432,7 +433,7 @@ final class WorkspaceFocusAppControl: FocusAppControlling {
     }
 
     func runningApplications() -> [FocusRunningApp] {
-        guard !guardrail.isInert else { return [] }
+        guard !guardrail.isInert, !SideEffectGuard.isInert else { return [] }
         return NSWorkspace.shared.runningApplications.filter { $0.activationPolicy == .regular && !$0.isHidden }.map {
             FocusRunningApp(bundleID: $0.bundleIdentifier, name: $0.localizedName ?? "", processIdentifier: $0.processIdentifier)
         }
@@ -505,7 +506,9 @@ final class FocusController {
         startTicker()
         // Apps already open in front of you that the session blocks are hidden now.
         for app in apps.runningApplications() where machine.shouldBlock(bundleID: app.bundleID, at: now()) {
-            try? apps.hide(app)
+            // Hidden at the start counts as held back, like any later attempt.
+            guard let bundleID = app.bundleID, (try? apps.hide(app)) != nil else { continue }
+            machine.recordBlocked(bundleID: bundleID, name: app.name)
         }
         notices.showStarted(configuration)
     }
