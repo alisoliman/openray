@@ -168,15 +168,15 @@ struct ClipboardRichTextTests {
         let board = NSPasteboard(name: .init("OpenRayTests.\(UUID())"))
         defer { board.releaseGlobally() }
         write([(.string, Data("Visible".utf8))], to: board)
-        #expect(ClipboardPolicy.placeholderText(from: board) == "Visible")
+        #expect(ClipboardPolicy.placeholderText(from: board, secureInput: false) == "Visible")
         write([(.string, Data("Mine".utf8)), (.init("com.openray.generated"), Data("1".utf8))], to: board)
-        #expect(ClipboardPolicy.placeholderText(from: board) == "Mine")
+        #expect(ClipboardPolicy.placeholderText(from: board, secureInput: false) == "Mine")
         for marker in ["org.nspasteboard.ConcealedType", "org.nspasteboard.TransientType", "com.agilebits.onepassword"] {
             write([(.string, Data("secret".utf8)), (.init(marker), Data())], to: board)
-            #expect(ClipboardPolicy.placeholderText(from: board) == nil, "\(marker)")
+            #expect(ClipboardPolicy.placeholderText(from: board, secureInput: false) == nil, "\(marker)")
         }
         write([(.png, Data([1]))], to: board)
-        #expect(ClipboardPolicy.placeholderText(from: board) == nil)
+        #expect(ClipboardPolicy.placeholderText(from: board, secureInput: false) == nil)
     }
 
     @Test func editingTextDropsStaleFormatting() {

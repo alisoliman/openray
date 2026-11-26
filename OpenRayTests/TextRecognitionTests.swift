@@ -6,6 +6,7 @@ import Foundation
 import ImageIO
 import Testing
 import UniformTypeIdentifiers
+import Vision
 
 @testable import OpenRay
 
@@ -89,6 +90,29 @@ private struct FakeRecognizer: TextRecognizing {
     func barcodePayloads(in imageData: Data) async throws -> [String] { [] }
 }
 
+/// Vision's text recognizer compiles on-device models that some machines can't run: GitHub's
+/// macOS virtual machines fail with `e5rt_e5_compiler_compile` / `.unknownError`. The tests that
+/// recognize real text run only where a one-time probe succeeds; OpenRay's own OCR logic is
+/// covered with fakes everywhere.
+private enum VisionOCRProbe {
+    static let isAvailable: Bool = {
+        guard let png = try? OCRFixtures.png(text: "OPENRAY 42"),
+            let source = CGImageSourceCreateWithData(png as CFData, nil),
+            let image = CGImageSourceCreateImageAtIndex(source, 0, nil)
+        else { return false }
+        let request = VNRecognizeTextRequest()
+        request.recognitionLevel = .accurate
+        do {
+            try VNImageRequestHandler(cgImage: image).perform([request])
+            return !(request.results ?? []).isEmpty
+        } catch {
+            return false
+        }
+    }()
+
+    static let unavailableReason: Comment = "Vision text recognition can't run on this machine (for example a CI virtual machine)"
+}
+
 /// Vision occasionally fails with a transient runtime error (Neural Engine or model loading)
 /// when the machine is under heavy load. Those calls are retried; a wrong recognition result
 /// still fails the test, and `TextRecognitionError` is never retried.
@@ -107,7 +131,8 @@ func withVisionRetry<T>(attempts: Int = 3, _ body: () async throws -> T) async t
 /// triggers the transient runtime errors.
 @Suite(.serialized)
 struct TextRecognitionTests {
-    @Test func recognizesRenderedText() async throws {
+    @Test(.enabled(if: VisionOCRProbe.isAvailable, VisionOCRProbe.unavailableReason))
+    func recognizesRenderedText() async throws {
         let png = try OCRFixtures.png(text: "OPENRAY 2026")
         let result = try await withVisionRetry { try await VisionTextRecognizer().recognizeText(in: png) }
         let text = result.text.uppercased().replacingOccurrences(of: " ", with: "")
@@ -119,7 +144,8 @@ struct TextRecognitionTests {
         #expect(result.storableText?.isEmpty == false)
     }
 
-    @Test func recognizesTextInAFile() async throws {
+    @Test(.enabled(if: VisionOCRProbe.isAvailable, VisionOCRProbe.unavailableReason))
+    func recognizesTextInAFile() async throws {
         let directory = FileManager.default.temporaryDirectory.appending(path: "OpenRayOCR-\(UUID().uuidString)")
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: directory) }
@@ -131,7 +157,8 @@ struct TextRecognitionTests {
         #expect(result.text.uppercased().contains("INVOICE"))
     }
 
-    @Test func orientationMetadataIsApplied() async throws {
+    @Test(.enabled(if: VisionOCRProbe.isAvailable, VisionOCRProbe.unavailableReason))
+    func orientationMetadataIsApplied() async throws {
         let tiff = try OCRFixtures.rotatedTIFF(text: "OPENRAY 2026")
         let source = try #require(CGImageSourceCreateWithData(tiff as CFData, nil))
         let properties = try #require(CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [CFString: Any])

@@ -74,6 +74,14 @@ final class ClipboardService {
     /// How macOS treats OpenRay's background reads of the clipboard.
     private(set) var accessBehavior: NSPasteboard.AccessBehavior
     private(set) var isProcessing = false
+    /// Whether Secure Input is on (a password field, or the lock screen), which keeps the
+    /// clipboard out of placeholders. The test host reads it as off, because its real value
+    /// depends on whether the Mac's screen happens to be locked; tests that cover Secure Input
+    /// set this or pass `secureInput:` to `ClipboardPolicy` directly.
+    @ObservationIgnored
+    var isSecureInputActive: @MainActor () -> Bool = {
+        SideEffectGuard.current.isTestHost ? false : IsSecureEventInputEnabled()
+    }
     var usesGeneralPasteboard: Bool { pasteboard.name == .general }
     var changeCount: Int { pasteboard.changeCount }
     @ObservationIgnored private let store: LibraryStore
@@ -296,7 +304,8 @@ final class ClipboardService {
         let generation = pasteboard.changeCount
         guard generation != excludedGeneration else { return nil }
         if unattributedIsExcluded, generation != attributedGeneration { return nil }
-        return ClipboardPolicy.placeholderText(from: pasteboard, expectedGeneration: generation)
+        return ClipboardPolicy.placeholderText(
+            from: pasteboard, secureInput: isSecureInputActive(), expectedGeneration: generation)
     }
 
     /// The board a service uses: a private one instead of the general pasteboard
