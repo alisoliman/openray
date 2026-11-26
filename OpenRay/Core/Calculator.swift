@@ -1,4 +1,5 @@
 import Foundation
+import Synchronization
 
 struct Calculation: Equatable, Sendable {
     /// What a result is, so views and actions can label and treat it.
@@ -95,9 +96,32 @@ struct CalculatorContext: Sendable {
         self.pixelsPerEm = pixelsPerEm
     }
 
-    static var live: CalculatorContext { CalculatorContext() }
+    /// The current clock and the app's calculator settings: rates once the owner turns them
+    /// on, and the rem size. Root search, the calculator scope and their error cards all use it,
+    /// so they agree about what converts.
+    static var live: CalculatorContext {
+        let settings = CalculatorSettings.current
+        return CalculatorContext(currencyRates: settings.currencyRates, pixelsPerEm: settings.pixelsPerEm)
+    }
 
     var timeZone: TimeZone { calendar.timeZone }
+}
+
+/// App-wide calculator settings for `CalculatorContext.live`. Only the app's calculator
+/// provider writes them; tests pass a context instead, so parallel tests never share rates.
+enum CalculatorSettings {
+    struct Values: Equatable, Sendable {
+        var currencyRates: CurrencyRateTable?
+        var pixelsPerEm: Double = 16
+    }
+
+    private static let storage = Mutex(Values())
+
+    static var current: Values { storage.withLock { $0 } }
+
+    static func publish(_ values: Values) {
+        storage.withLock { $0 = values }
+    }
 }
 
 enum Calculator {

@@ -57,6 +57,7 @@ extension SettingsPane {
         .clipboard,
         .snippets,
         // Slice 3: calculator, emoji, translator
+        .calculator,
         .files,
         // Slice 4: applications
         .ai,

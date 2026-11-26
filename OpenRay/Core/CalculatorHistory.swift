@@ -97,6 +97,29 @@ struct CalculatorHistory: Codable, Equatable, Sendable {
         }
     }
 
+    /// The history in `LibraryDatabase.calculatorHistory`, which stores it newest first.
+    /// Incomplete records are skipped.
+    init(records: [CalculatorHistoryRecord], limit: Int = defaultLimit) {
+        let entries = records.compactMap { record -> Entry? in
+            guard let expression = record.expression, let result = record.result, let date = record.date else {
+                return nil
+            }
+            return Entry(
+                id: record.id, expression: expression, result: result, value: record.value ?? result,
+                kind: record.kind.flatMap(Calculation.Kind.init(rawValue:)) ?? .arithmetic, date: date)
+        }
+        self.init(entries: entries, limit: limit)
+    }
+
+    /// The records to store, newest first.
+    var records: [CalculatorHistoryRecord] {
+        entries.map { entry in
+            CalculatorHistoryRecord(
+                id: entry.id, expression: entry.expression, result: entry.result, value: entry.value,
+                kind: entry.kind.rawValue, date: entry.date)
+        }
+    }
+
     /// Case-, width- and spacing-insensitive, so "10 KM in mi" repeats "10 km  in mi".
     static func key(_ text: String) -> String {
         text.folding(options: [.caseInsensitive, .widthInsensitive], locale: nil)

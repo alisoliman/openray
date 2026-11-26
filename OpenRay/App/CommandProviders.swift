@@ -11,6 +11,7 @@ enum CommandProviders {
         // Slice 1: launcher core
         // Slice 2: clipboard, snippets, quicklinks
         // Slice 3: calculator, emoji, translator
+        CalculatorProvider.registration,
         // Slice 4: files, screenshots, applications
         // Slice 5: system, windows
         // Slice 6: notes, calendar, focus

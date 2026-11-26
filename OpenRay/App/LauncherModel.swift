@@ -119,6 +119,8 @@ final class LauncherModel {
     @ObservationIgnored var isRecordingShortcut = false
     @ObservationIgnored var commandBindingEditorCount = 0
     @ObservationIgnored private var scopeReturnQuery: String?
+    /// Set when ↑/↓/←/→ move the selection, cleared by a new query. See `synchronizeSelection`.
+    @ObservationIgnored private var selectionMovedByHand = false
     @ObservationIgnored private var aiReturn: (section: LauncherSection, query: String)?
     @ObservationIgnored private var lastHiddenAt: Date?
     @ObservationIgnored private var feedbackTask: Task<Void, Never>?
@@ -218,15 +220,29 @@ final class LauncherModel {
                 return comparison == .orderedSame ? $0.0.id < $1.0.id : comparison == .orderedAscending
             }.map(\.0)
         }
-        if section == .home || section == .calculator, let calculation = Calculator.evaluate(trimmed) {
-            items.insert(
-                LauncherItem(
-                    id: "calculation", title: calculation.result, subtitle: calculation.expression,
-                    symbol: "equal", kind: .calculator, badge: "Calculator", action: .calculation(calculation)),
-                at: 0)
+        if section == .home || section == .calculator, let answer = calculatorAnswerItem(for: trimmed) {
+            // First in the list so the cap never drops it; searchGroups decides where it shows.
+            items.insert(answer, at: 0)
         }
         let shown = Self.capped(items, in: section)
         return trimmed.isEmpty ? shown : shown.map { Self.explainingMatch($0, query: trimmed) }
+    }
+
+    /// The calculator's answer for a query, as a row. With the calculator provider registered
+    /// it's the provider's row, using its settings (currency rates, rem size), and ↩, ⌘↩, ⌘K
+    /// and history go through it; otherwise a plain `.calculation` row. A words-only answer
+    /// ("time", "today") gets `CalculatorProvider.wordAnswerID`, so root search ranks it as an
+    /// ordinary row instead of putting it first.
+    private func calculatorAnswerItem(for query: String) -> LauncherItem? {
+        let provider = registry.provider(id: CalculatorProvider.registration.id) as? CalculatorProvider
+        guard let calculation = Calculator.evaluate(query, context: provider?.context(in: self) ?? .live) else {
+            return nil
+        }
+        if provider != nil { return CalculatorProvider.answerItem(for: calculation) }
+        return LauncherItem(
+            id: calculation.isAmbiguous ? CalculatorProvider.wordAnswerID : CalculatorProvider.answerID,
+            title: calculation.result, subtitle: calculation.expression, symbol: "equal", kind: .calculator,
+            badge: "Calculator", action: .calculation(calculation))
     }
 
     /// Home keeps up to 45 instant rows and 20 Spotlight rows, capped separately
@@ -317,9 +333,12 @@ final class LauncherModel {
     private func searchGroups(_ items: [LauncherItem]) -> [LauncherResultGroup] {
         var groups: [LauncherResultGroup] = []
         var instant = items.filter { !$0.isLiveResult }
-        if let calculation = instant.first(where: { $0.id == "calculation" }) {
+        // A words-only calculator answer never takes the Top Hit; it follows Files and live rows.
+        let wordAnswer = instant.first { $0.id == CalculatorProvider.wordAnswerID }
+        instant.removeAll { $0.id == CalculatorProvider.wordAnswerID }
+        if let calculation = instant.first(where: { $0.id == CalculatorProvider.answerID }) {
             groups.append(LauncherResultGroup(id: "calculator", title: "Calculator", style: .calculator, items: [calculation]))
-            instant.removeAll { $0.id == "calculation" }
+            instant.removeAll { $0.id == CalculatorProvider.answerID }
         } else if let top = instant.first {
             groups.append(LauncherResultGroup(id: "top", title: "Top Hit", items: [top]))
             instant.removeFirst()
@@ -351,6 +370,9 @@ final class LauncherModel {
                 return false
             }
             groups.append(LauncherResultGroup(id: "live.\(provider.id)", title: provider.liveGroupTitle, items: rows))
+        }
+        if let wordAnswer {
+            groups.append(LauncherResultGroup(id: "calculator", title: "Calculator", items: [wordAnswer]))
         }
         groups.append(
             LauncherResultGroup(
@@ -816,7 +838,15 @@ final class LauncherModel {
 
     func synchronizeSelection() {
         let items = orderedResults
-        if !items.contains(where: { $0.id == selectedID }) { selectedID = items.first?.id }
+        if !items.contains(where: { $0.id == selectedID }) {
+            selectedID = items.first?.id
+        } else if selectedID == CalculatorProvider.wordAnswerID, !selectionMovedByHand, let first = items.first?.id,
+            first != selectedID
+        {
+            // A words-only calculator answer holds the selection only while it's first: a file or
+            // provider row that lands above it later takes ↩, unless the person moved to the answer.
+            selectedID = first
+        }
     }
 
     /// Vertical movement. Grids move by row; lists move by one and wrap.
@@ -877,6 +907,7 @@ final class LauncherModel {
     /// Moving the selection by hand drops a pending confirmation and a stale error.
     /// Programmatic selection (search, delete, ⌘-numbers) keeps its feedback.
     private func selectionWillChange() {
+        selectionMovedByHand = true
         confirmation = nil
         if feedback?.style == .error || feedback?.style == .warning { feedback = nil }
     }
@@ -924,6 +955,7 @@ final class LauncherModel {
 
     private func searchChanged() {
         selectedID = nil
+        selectionMovedByHand = false
         if feedback?.style != .working { feedback = nil }
         confirmation = nil
         guard query.count <= 512 else {
