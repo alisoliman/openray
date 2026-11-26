@@ -94,10 +94,13 @@ final class LocalApprovalStore {
         return approved == current
     }
 
-    /// Allows the folder as it is now. False when there's no folder at its path.
+    /// Allows the folder as it is now. With `shown`, only if it's still exactly the folder the
+    /// person was shown (same resolved path, device and inode); a folder moved, replaced or
+    /// redirected while they decided isn't approved. False when there's nothing to approve.
     @discardableResult
-    func approve(_ record: ScriptDirectoryRecord) -> Bool {
+    func approve(_ record: ScriptDirectoryRecord, as shown: FolderIdentity? = nil) -> Bool {
         guard let url = record.url, let identity = FolderIdentity.current(of: url) else { return false }
+        if let shown, shown != identity { return false }
         return update { $0.scriptFolders[record.id] = identity }
     }
 

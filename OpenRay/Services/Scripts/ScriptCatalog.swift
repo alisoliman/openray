@@ -1,4 +1,5 @@
 import CoreServices
+import Darwin
 import CryptoKit
 import Foundation
 import Observation
@@ -69,11 +70,13 @@ enum ScriptScanner {
         var seen = Set<String>()
         for directory in directories where directory.isEnabled {
             guard let folder = directory.url else { continue }
+            var root = realPath(folder)
             if let approvals {
                 guard let approved = approvals[directory.id], FolderIdentity.current(of: folder) == approved else {
                     result.unapproved.insert(directory.id)
                     continue
                 }
+                root = approved.resolvedPath
             }
             let entries: [URL]
             do {
@@ -88,7 +91,7 @@ enum ScriptScanner {
                 $0.lastPathComponent.localizedStandardCompare($1.lastPathComponent) == .orderedAscending
             }
             for url in sorted {
-                switch inspect(url, directory: directory) {
+                switch inspect(url, directory: directory, root: root) {
                 case .command(let command)?:
                     if seen.insert(command.id).inserted { result.commands.append(command) }
                 case .issue(let issue)?:
@@ -101,11 +104,26 @@ enum ScriptScanner {
         return result
     }
 
-    /// One file: a command, an issue, or nil when it isn't a script command at all.
-    static func inspect(_ url: URL, directory: ScriptDirectoryRecord) -> Inspection? {
+    /// The path with every link resolved, as the file system does (`realpath`). Nil when nothing's there.
+    static func realPath(_ url: URL) -> String? {
+        guard let resolved = Darwin.realpath(url.path, nil) else { return nil }
+        defer { free(resolved) }
+        return String(cString: resolved)
+    }
+
+    /// One file: a command, an issue, or nil when it isn't a script command at all. With `root`
+    /// (the folder's resolved path), a script that's a link must lead to a file inside the folder.
+    static func inspect(_ url: URL, directory: ScriptDirectoryRecord, root: String? = nil) -> Inspection? {
         let name = url.lastPathComponent
         guard !name.hasPrefix("."), !name.contains(".template.") else { return nil }
-        let resolved = url.resolvingSymlinksInPath()
+        guard let real = realPath(url) else { return nil }
+        if let root, !real.hasPrefix(root.hasSuffix("/") ? root : root + "/") {
+            return .issue(
+                ScriptIssue(
+                    url: url, directoryID: directory.id, title: nil,
+                    problems: ["It's a link to a file outside its folder, so it won't run."]))
+        }
+        let resolved = URL(fileURLWithPath: real)
         guard let values = try? resolved.resourceValues(forKeys: [.isRegularFileKey, .fileSizeKey]),
             values.isRegularFile == true, (values.fileSize ?? 0) <= maximumFileBytes,
             let data = try? Data(contentsOf: resolved)

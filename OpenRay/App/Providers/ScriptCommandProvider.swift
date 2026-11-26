@@ -266,6 +266,40 @@ final class ScriptCommandProvider: CommandProvider {
         }
     }
 
+    /// The script as it is now, when it may run; nil otherwise, after saying why (unless `quietly`)
+    /// and rescanning. Every way of running a script (search, fallbacks, links, hotkeys, Run Again
+    /// and inline refresh) passes here at the moment of launch, so a stale scan never decides:
+    /// - its folder is still listed and turned on, and is still the folder this Mac allowed
+    ///   (resolved path, device and inode);
+    /// - the file, with links resolved, is a regular file inside that folder;
+    /// - its header, read again now, is the one the launcher showed: same title, mode,
+    ///   confirmation and arguments.
+    /// The result launches the resolved file itself, not the path a link took to reach it.
+    func authorize(_ script: ScriptCommand, in model: LauncherModel, quietly: Bool) -> ScriptCommand? {
+        func refuse(_ message: String) -> ScriptCommand? {
+            if !quietly { model.feedback = .error(message) }
+            catalog.reload()
+            return nil
+        }
+        let title = script.title.truncatedForFeedback
+        guard let record = model.store.database.scriptDirectories.first(where: { $0.id == script.directoryID }),
+            record.isEnabled, let folder = record.url
+        else { return refuse("“\(title)” is in a script folder that's turned off or removed.") }
+        guard let approved = approvals(for: model).approvals.scriptFolders[record.id],
+            FolderIdentity.current(of: folder) == approved
+        else { return refuse("“\(title)”'s folder changed since you allowed it. Turn it on again in Settings › Scripts.") }
+        guard let real = ScriptScanner.realPath(script.url), real.hasPrefix(approved.resolvedPath + "/"),
+            LibraryArchive.fileKind(real) == S_IFREG
+        else { return refuse("“\(title)” isn't a file inside its allowed folder anymore.") }
+        guard case .command(var current)? = ScriptScanner.inspect(script.url, directory: record, root: approved.resolvedPath),
+            current.metadata == script.metadata, current.id == script.id
+        else { return refuse("“\(title)” changed since OpenRay read it. Try again.") }
+        // Launch the file that was checked: the resolved path in place of a link's.
+        if current.launch.last == script.url.path { current.launch[current.launch.count - 1] = real }
+        current.url = URL(fileURLWithPath: real)
+        return current
+    }
+
     /// The timeout for a script: its `commandPreferences` override, else its mode's default.
     func timeout(for script: ScriptCommand, in model: LauncherModel) -> Duration {
         if let raw = model.store.database.commandPreferences[script.id]?[Self.timeoutKey], let seconds = Int(raw),
@@ -287,6 +321,7 @@ final class ScriptCommandProvider: CommandProvider {
             model.feedback = .error("An argument contains a NUL character, so the script wasn't run.")
             return nil
         }
+        guard let script = authorize(script, in: model, quietly: false) else { return nil }
         if let running = runner.runningJob(for: script.id) {
             if script.mode == .fullOutput {
                 present(running, in: model)
@@ -342,6 +377,7 @@ final class ScriptCommandProvider: CommandProvider {
     ) -> ScriptJob? {
         guard runner.runningJob(for: script.id) == nil else { return nil }
         inline.lastRun[script.id] = now
+        guard let script = authorize(script, in: model, quietly: !reportsFailure) else { return nil }
         let title = script.title
         return runner.run(script, values: values, timeout: min(timeout(for: script, in: model), .seconds(60))) {
             [weak self, weak model] _, execution in
@@ -608,13 +644,14 @@ final class ScriptCommandProvider: CommandProvider {
     }
 
     /// Turns a folder on or off. Turning it on is the person's approval, on this Mac, of the
-    /// folder as it is now (Settings asks first, showing its resolved path); off forgets it.
+    /// folder Settings showed them (`shown`: its resolved path, device and inode); if the folder
+    /// changed while they decided, nothing is approved. Off forgets the approval.
     @discardableResult
-    func setDirectory(_ id: UUID, enabled: Bool, in model: LauncherModel) -> Bool {
+    func setDirectory(_ id: UUID, enabled: Bool, approving shown: FolderIdentity? = nil, in model: LauncherModel) -> Bool {
         guard let record = model.store.database.scriptDirectories.first(where: { $0.id == id }) else { return false }
         if enabled {
-            guard approvals(for: model).approve(record) else {
-                model.feedback = .error("That folder isn't there anymore.")
+            guard approvals(for: model).approve(record, as: shown) else {
+                model.feedback = .error("That folder changed or isn't there anymore. Review it again before allowing it.")
                 return false
             }
         } else {

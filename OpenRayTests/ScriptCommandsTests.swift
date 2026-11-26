@@ -1037,3 +1037,102 @@ extension ScriptRunnerTests {
         #expect(throws: SideEffectGuard.Blocked.self) { try live.checkAllowed(invocation(script)) }
     }
 }
+
+// MARK: - The launch boundary (re-review fixes)
+
+extension ScriptCommandLauncherTests {
+    @Test("A stale scan never decides: every launch re-checks the folder record, approval, file and header")
+    func launchBoundary() async throws {
+        let h = try harness()
+        try h.folder.script("one.sh", title: "One", body: "echo 1")
+        try h.folder.script(
+            "find.sh", title: "Find", extra: [#"argument1 { "type": "text", "placeholder": "Query" }"#], body: "echo \"$1\"")
+        try h.folder.script("clock.sh", title: "Clock", mode: "inline", extra: ["refreshTime 10s"], body: "date")
+        let record = load(h)
+        let find = try #require(h.provider.catalog.commands.first { $0.title == "Find" })
+        h.provider.setFallback(true, for: find.id, in: h.model)
+        let rows = try ["One", "Find", "Clock"].map { try row($0, in: h) }
+        let fallback = try #require(h.provider.fallbackItems(for: "query", in: h.model).first)
+
+        // The folder's record goes (as a Replace import would) while the catalog still lists its scripts.
+        h.model.store.update { $0.scriptDirectories = [] }
+        #expect(h.provider.catalog.commands.count == 3, "The scan is still the old one")
+        h.model.perform(rows[0])
+        #expect(h.model.feedback?.text.contains("turned off or removed") == true)
+        h.model.perform(fallback)
+        h.provider.refreshDueInlineScripts(in: h.model)
+        #expect(h.provider.runner.jobs.isEmpty)
+
+        // Back, but replaced by another folder at the same path: not the folder that was allowed.
+        h.model.store.update { $0.scriptDirectories = [record] }
+        let aside = h.folder.url.deletingLastPathComponent().appending(path: "aside-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: aside) }
+        try FileManager.default.moveItem(at: h.folder.url, to: aside)
+        try FileManager.default.createDirectory(at: h.folder.url, withIntermediateDirectories: true)
+        for name in ["one.sh", "find.sh", "clock.sh"] {
+            try FileManager.default.copyItem(at: aside.appending(path: name), to: h.folder.url.appending(path: name))
+        }
+        h.model.perform(rows[0])
+        #expect(h.model.feedback?.text.contains("changed since you allowed it") == true)
+        h.provider.refreshDueInlineScripts(in: h.model)
+        #expect(h.provider.runner.jobs.isEmpty)
+    }
+
+    @Test("A header changed since the scan is refused at launch, so new confirmations and arguments apply")
+    func changedHeader() async throws {
+        let h = try harness()
+        try h.folder.script("one.sh", title: "One", body: "echo 1")
+        load(h)
+        let item = try row("One", in: h)
+        try h.folder.script("one.sh", title: "One", extra: ["needsConfirmation true"], body: "echo 1")
+        h.model.perform(item)
+        #expect(h.model.feedback?.text.contains("changed since OpenRay read it") == true)
+        #expect(h.provider.runner.jobs.isEmpty)
+        // The rescan it asked for brings the new header, which now asks first.
+        h.provider.catalog.reloadNow()
+        h.model.perform(try row("One", in: h))
+        #expect(h.model.confirmation != nil)
+    }
+
+    @Test("A script that's a link runs only while it leads inside its folder, and runs the file it leads to")
+    func linkedScripts() async throws {
+        let h = try harness()
+        let real = try h.folder.script("real.sh", title: "Real", body: "echo real")
+        let outside = try ScriptFolder()
+        let stray = try outside.script("stray.sh", title: "Stray", body: "echo stray")
+        try FileManager.default.createSymbolicLink(at: h.folder.url.appending(path: "alias.sh"), withDestinationURL: stray)
+        load(h)
+        #expect(h.provider.catalog.commands.map(\.title) == ["Real"])
+        #expect(h.provider.catalog.issues.first?.problems.first?.contains("outside its folder") == true)
+
+        // A link inside the folder is fine, and launches the real file.
+        try FileManager.default.removeItem(at: h.folder.url.appending(path: "alias.sh"))
+        try FileManager.default.createSymbolicLink(at: h.folder.url.appending(path: "inner.sh"), withDestinationURL: real)
+        h.provider.catalog.reloadNow()
+        let inner = try #require(h.provider.catalog.commands.first { $0.url.lastPathComponent == "inner.sh" })
+        let authorized = try #require(h.provider.authorize(inner, in: h.model, quietly: true))
+        #expect(authorized.launch.last == ScriptScanner.realPath(real))
+
+        // Pointed outside after the scan: refused at launch.
+        try FileManager.default.removeItem(at: h.folder.url.appending(path: "inner.sh"))
+        try FileManager.default.createSymbolicLink(at: h.folder.url.appending(path: "inner.sh"), withDestinationURL: stray)
+        #expect(h.provider.authorize(inner, in: h.model, quietly: true) == nil)
+    }
+
+    @Test("Allowing a folder approves exactly the folder the alert showed")
+    func approvalMatchesShownFolder() throws {
+        let h = try harness()
+        try h.folder.script("one.sh", title: "One", body: "echo 1")
+        let record = h.folder.record
+        h.model.store.update { $0.scriptDirectories = [record] }
+        let shown = try #require(h.folder.identity)
+        // While the alert is up, the folder is replaced.
+        let aside = h.folder.url.deletingLastPathComponent().appending(path: "aside-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: aside) }
+        try FileManager.default.moveItem(at: h.folder.url, to: aside)
+        try FileManager.default.createDirectory(at: h.folder.url, withIntermediateDirectories: true)
+        #expect(!h.provider.setDirectory(record.id, enabled: true, approving: shown, in: h.model))
+        #expect(LocalApprovalStore.for(h.model.store).approvals.scriptFolders[record.id] == nil)
+        #expect(h.provider.setDirectory(record.id, enabled: true, approving: h.folder.identity, in: h.model))
+    }
+}

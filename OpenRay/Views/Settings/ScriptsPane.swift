@@ -18,7 +18,8 @@ struct ScriptsPane: View {
 
     struct FolderApproval: Identifiable {
         var record: ScriptDirectoryRecord
-        var resolvedPath: String
+        var identity: FolderIdentity
+        var resolvedPath: String { identity.resolvedPath }
         var id: UUID { record.id }
     }
 
@@ -50,7 +51,8 @@ struct ScriptsPane: View {
                     "OpenRay will run scripts from \(approval.resolvedPath) when you use them, and inline scripts there refresh on their own. Allow only folders you trust. If the folder is moved or replaced, OpenRay asks again."
                 ),
                 primaryButton: .default(Text("Allow")) {
-                    provider?.setDirectory(approval.record.id, enabled: true, in: model)
+                    // Approves exactly the folder this alert showed, or nothing.
+                    provider?.setDirectory(approval.record.id, enabled: true, approving: approval.identity, in: model)
                 },
                 secondaryButton: .cancel())
         }
@@ -79,7 +81,7 @@ struct ScriptsPane: View {
                                             model.feedback = .error("That folder isn't there anymore.")
                                             return
                                         }
-                                        approving = FolderApproval(record: record, resolvedPath: identity.resolvedPath)
+                                        approving = FolderApproval(record: record, identity: identity)
                                     } else {
                                         provider.setDirectory(record.id, enabled: false, in: model)
                                     }
