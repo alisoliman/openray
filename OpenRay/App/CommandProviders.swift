@@ -28,5 +28,8 @@ enum CommandProviders {
         MenuBarCommandProvider.registration,
         // Slice 7: AI commands, agents
         // Slice 8: script commands
+        ScriptCommandProvider.registration,
+        DeepLinkRouter.registration,
+        LibraryArchiveProvider.registration,
     ]
 }

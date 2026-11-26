@@ -485,6 +485,11 @@ final class OpenRayDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
+    /// openray:// links. The deeplink router asks before running anything.
+    func application(_ application: NSApplication, open urls: [URL]) {
+        DeepLinkRouter.open(urls, source: .currentAppleEventSender(), in: model)
+    }
+
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
         panelController?.show()
         return true

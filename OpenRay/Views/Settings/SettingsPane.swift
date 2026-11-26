@@ -74,6 +74,7 @@ extension SettingsPane {
         .focus,
         .menuBar,
         // Slice 8: scripts
+        .scripts,
     ]
 
     static let secondary: [SettingsPane] = [.permissions, .library, .about]

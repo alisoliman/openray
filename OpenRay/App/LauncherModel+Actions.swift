@@ -869,6 +869,7 @@ extension LauncherModel {
                     ) { [weak self] in self?.copy(url.path, label: Self.shortenedPath(url)) })
             }
             addFileAndApplicationActions(to: &entries, for: item)
+            entries += deepLinkActions(for: item)
             if item.canEdit {
                 entries.append(
                     ActionEntry(
