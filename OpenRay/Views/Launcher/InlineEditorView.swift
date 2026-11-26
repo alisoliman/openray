@@ -39,11 +39,12 @@ struct InlineEditorView: View {
 
     @ViewBuilder private var bar: some View {
         ActionBar(
-            feedback: model.feedback ?? draft.saveError.map { .error($0) }, confirmation: model.confirmation,
+            feedback: model.feedback ?? draft.saveError.map { .error($0) }, confirmation: model.confirmation, confirmationInstance: model.confirmationInstanceID,
             context: { context },
             actions: { actions },
             onCancelConfirmation: { model.confirmation = nil },
-            onConfirm: { if let confirmation = model.confirmation { model.confirm(confirmation) } })
+            onConfirm: { if let confirmation = model.confirmation { model.confirm(confirmation) } },
+            onConfirmationShown: model.confirmationDidAppear, onApprove: model.approveConfirmation)
     }
 
     @ViewBuilder private var context: some View {

@@ -30,7 +30,7 @@ private struct MenuBarContent: View {
     var body: some View {
         let preferences = model.store.database.preferences
         Button("Open OpenRay") { model.panel?.show(section: .home) }
-            .menuShortcut(preferences.hotKey.shortcut)
+            .menuShortcut(model.launcherShortcutInUse)
         Button("Clipboard History") { model.panel?.show(section: .clipboard) }
             .menuShortcut(model.store.database.binding(for: "section.clipboard")?.shortcut)
         Button("Ask AI") {

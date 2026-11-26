@@ -794,9 +794,11 @@ struct ScriptCommandLauncherTests {
             body: "echo \"[$1][$2]\"")
         load(h)
         var item = try row("Args", in: h)
+        // Without its required argument, the command opens its argument fields instead of running.
         h.model.perform(item)
-        #expect(h.model.feedback?.style == .warning)
+        #expect(h.model.argumentSession != nil)
         #expect(h.provider.runner.jobs.isEmpty)
+        h.model.cancelArguments()
         guard case .provided(var ref) = item.action else { return }
         ref.arguments = ["argument1": "a b&c"]
         item.action = .provided(ref)
@@ -963,7 +965,8 @@ extension ScriptCommandLauncherTests {
         h.model.confirm(try #require(h.model.confirmation))
         try await finish(h, "Ask")
         let job = try #require(h.provider.runner.jobs.first)
-        let again = try #require(h.model.actions(for: try #require(h.model.results.first)).first { $0.id == "script.runAgain" })
+        let output = try #require(h.model.results.first)
+        let again = try #require(h.model.actions(for: output).first { $0.id == "script.runAgain" })
         again.perform()
         #expect(h.model.confirmation != nil, "The confirmation is asked again")
         #expect(h.provider.runner.jobs.count == 1)

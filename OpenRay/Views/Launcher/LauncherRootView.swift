@@ -7,8 +7,10 @@ enum PanelGeometry {
     static let topMargin: CGFloat = 36
     static let sideMargin: CGFloat = 76
     static let bottomMargin: CGFloat = 120
-    static let windowSize = CGSize(
-        width: OR.Metric.panelWidth + sideMargin * 2, height: OR.Detent.full + topMargin + bottomMargin)
+    /// Follows the interface size, so it's read each time the panel is placed.
+    static var windowSize: CGSize {
+        CGSize(width: OR.Metric.panelWidth + sideMargin * 2, height: OR.Detent.full + topMargin + bottomMargin)
+    }
 }
 
 struct LauncherRootView: View {
