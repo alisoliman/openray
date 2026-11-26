@@ -270,16 +270,21 @@ enum KeystrokeScript {
         case unconfirmed
     }
 
-    /// True when the keyword is right before the caret, or when the field can't say
-    /// and the base checks (`isUnchanged`) carry the decision.
+    /// True when the keyword is right before the caret, or when the field never reports
+    /// its text and the base checks (`isUnchanged`) carry the decision. Once a read has
+    /// shown different text or a selection, only the expected text confirms: a later
+    /// unreadable answer refuses.
     @MainActor static func confirm(_ plan: SnippetExpansionPlan, on target: some KeystrokeTarget) -> Bool {
+        var sawEvidence = false
         for attempt in 0..<confirmationAttempts {
             switch target.precedingText(utf16Count: plan.deleteUTF16Count) {
-            case .unreadable: return true
+            case .unreadable:
+                if !sawEvidence { return true }
             case .text(let text) where text == plan.deletedText: return true
             case .text, .selection:
-                if attempt < confirmationAttempts - 1 { target.settle() }
+                sawEvidence = true
             }
+            if attempt < confirmationAttempts - 1 { target.settle() }
         }
         return false
     }
@@ -326,9 +331,9 @@ enum KeystrokeScript {
 /// Performs an expansion in another app.
 @MainActor
 protocol SnippetInserting {
-    /// Notes where the person is typing, the moment a keyword completes and before
-    /// anything is rendered, so a later focus change is caught.
-    func target(for processID: pid_t) -> any KeystrokeTarget
+    /// The target for a completed keyword: `field` is the focused field sampled while it
+    /// was typed (nil where the app doesn't report one), so a later change is caught.
+    func target(for processID: pid_t, field: FocusedField?) -> any KeystrokeTarget
     func insert(_ plan: SnippetExpansionPlan, on target: any KeystrokeTarget) throws -> KeystrokeScript.Result
 }
 
@@ -346,7 +351,9 @@ enum SnippetInserters {
 struct InertSnippetInserter: SnippetInserting {
     var sideEffects = SideEffectGuard.current
 
-    func target(for processID: pid_t) -> any KeystrokeTarget { InertKeystrokeTarget(sideEffects: sideEffects) }
+    func target(for processID: pid_t, field: FocusedField?) -> any KeystrokeTarget {
+        InertKeystrokeTarget(sideEffects: sideEffects)
+    }
 
     func insert(_ plan: SnippetExpansionPlan, on target: any KeystrokeTarget) throws -> KeystrokeScript.Result {
         throw SideEffectGuard.Blocked(what: "typing into other apps", mode: sideEffects.mode)
@@ -371,11 +378,11 @@ struct InertKeystrokeTarget: KeystrokeTarget {
 struct LiveSnippetInserter: SnippetInserting {
     var sideEffects = SideEffectGuard.current
 
-    /// Reads the app's focused element now; it never sends anything.
-    func target(for processID: pid_t) -> any KeystrokeTarget {
+    /// Never sends anything.
+    func target(for processID: pid_t, field: FocusedField?) -> any KeystrokeTarget {
         let sideEffects = sideEffects.restrictedByProcess
         guard !sideEffects.isInert else { return InertKeystrokeTarget(sideEffects: sideEffects) }
-        return AccessibilityKeystrokeTarget(processID: processID, sideEffects: sideEffects)
+        return AccessibilityKeystrokeTarget(processID: processID, field: field, sideEffects: sideEffects)
     }
 
     func insert(_ plan: SnippetExpansionPlan, on target: any KeystrokeTarget) throws -> KeystrokeScript.Result {
@@ -393,11 +400,18 @@ final class AccessibilityKeystrokeTarget: KeystrokeTarget {
     private let application: AXUIElement
     private let focused: AXUIElement?
 
-    init(processID: pid_t, sideEffects: SideEffectGuard = .current) {
+    /// `field` is the focused field sampled while the keyword was typed. Without one,
+    /// only the app is checked, as for fields that don't report focus.
+    init(processID: pid_t, field: FocusedField?, sideEffects: SideEffectGuard = .current) {
         self.processID = processID
         self.sideEffects = sideEffects.restrictedByProcess
         application = AXUIElementCreateApplication(processID)
-        focused = Self.focusedElement(in: application)
+        focused = field?.element
+    }
+
+    /// The focused field of `processID` right now, or nil where it can't be read.
+    static func sampleField(processID: pid_t) -> FocusedField? {
+        focusedElement(in: AXUIElementCreateApplication(processID)).map { FocusedField(element: $0) }
     }
 
     func isUnchanged() -> Bool {
@@ -511,10 +525,12 @@ extension PlaceholderValues {
     static func snippetLookup(_ database: LibraryDatabase) -> (String) -> String? {
         var exact: [String: String] = [:]
         var folded: [String: String] = [:]
+        let now = Date.now
         for snippet in database.snippets {
-            if exact[snippet.name] == nil { exact[snippet.name] = snippet.content }
+            let source = snippet.referenceSource(now: now)
+            if exact[snippet.name] == nil { exact[snippet.name] = source }
             let key = snippet.name.lowercased()
-            if folded[key] == nil { folded[key] = snippet.content }
+            if folded[key] == nil { folded[key] = source }
         }
         return { name in exact[name] ?? folded[name.lowercased()] }
     }
@@ -533,6 +549,39 @@ enum SnippetExpansionOutcome: Equatable, Sendable {
     case failed(SnippetExpansionPlan, String)
 }
 
+/// The field that had focus when a key arrived. Its identity is compared from key to
+/// key; live input also keeps the Accessibility element, to read and check it later.
+struct FocusedField: Hashable, @unchecked Sendable {
+    private enum Identity {
+        case element(AXUIElement)
+        case stand(Int)
+    }
+
+    private let identity: Identity
+
+    init(element: AXUIElement) { identity = .element(element) }
+
+    /// A stand-in for tests.
+    init(id: Int) { identity = .stand(id) }
+
+    var element: AXUIElement? { if case .element(let element) = identity { element } else { nil } }
+
+    static func == (a: FocusedField, b: FocusedField) -> Bool {
+        switch (a.identity, b.identity) {
+        case (.element(let x), .element(let y)): CFEqual(x, y)
+        case (.stand(let x), .stand(let y)): x == y
+        default: false
+        }
+    }
+
+    func hash(into hasher: inout Hasher) {
+        switch identity {
+        case .element(let element): hasher.combine(CFHash(element))
+        case .stand(let id): hasher.combine(id)
+        }
+    }
+}
+
 /// One key press, reduced to what expansion needs. Built from an `NSEvent` in the
 /// app and by hand in tests.
 struct SnippetKeyInput: Equatable, Sendable {
@@ -543,6 +592,8 @@ struct SnippetKeyInput: Equatable, Sendable {
     var isSynthetic = false
     var processID: pid_t
     var bundleIdentifier: String?
+    /// The focused field when the key arrived, nil where the app doesn't report one.
+    var field: FocusedField?
 }
 
 @MainActor
@@ -566,6 +617,7 @@ final class SnippetExpander {
     private var mouseMonitor: Any?
     private var matcher = SnippetMatcher()
     private var previousPID: pid_t?
+    private var previousField: FocusedField?
 
     /// Overrides the saved expansion options; nil uses `AppPreferences.snippetExpansion`,
     /// which defaults to OpenRay's original behavior.
@@ -597,7 +649,8 @@ final class SnippetExpander {
     }
 
     static func alertSound(sideEffects: SideEffectGuard) -> @MainActor () -> Void {
-        {
+        let sideEffects = sideEffects.restrictedByProcess
+        return {
             guard (try? sideEffects.check("playing the alert sound")) != nil else { return }
             NSSound.beep()
         }
@@ -629,12 +682,14 @@ final class SnippetExpander {
             matcher.reset()
             return
         }
+        let isSynthetic = event.cgEvent?.getIntegerValueField(.eventSourceUserData) == SyntheticInput.marker
         handle(
             SnippetKeyInput(
                 characters: event.characters,
                 hasShortcutModifiers: !event.modifierFlags.intersection([.command, .control, .option]).isEmpty,
-                isSynthetic: event.cgEvent?.getIntegerValueField(.eventSourceUserData) == SyntheticInput.marker,
-                processID: app.processIdentifier, bundleIdentifier: app.bundleIdentifier))
+                isSynthetic: isSynthetic, processID: app.processIdentifier, bundleIdentifier: app.bundleIdentifier,
+                // Sampled with every key, so a keyword counts only if it was typed in one field.
+                field: isSynthetic ? nil : AccessibilityKeystrokeTarget.sampleField(processID: app.processIdentifier)))
     }
 
     /// Feeds one key press. When it completes a keyword, plans and renders the
@@ -650,9 +705,11 @@ final class SnippetExpander {
             matcher.reset()
             return nil
         }
-        if previousPID != input.processID {
+        // A keyword counts only if it was typed in one app and one field.
+        if previousPID != input.processID || previousField != input.field {
             matcher.reset()
             previousPID = input.processID
+            previousField = input.field
         }
         guard
             ClipboardPolicy.shouldCapture(
@@ -669,12 +726,17 @@ final class SnippetExpander {
         }
         guard let trigger = matcher.trigger(for: text, snippets: database.snippets.filter(\.expandsAsYouType))
         else { return nil }
-        // Where the keyword was typed, noted before anything is read or rendered.
-        let target = inserter.target(for: input.processID)
+        // Where the keyword was typed: the field sampled with its keys, before anything renders.
+        let target = inserter.target(for: input.processID, field: input.field)
+        // Old snippets expand exactly as they always did.
+        guard let template = trigger.snippet.dynamicTemplate else {
+            let rendering = PlaceholderRendering(
+                text: trigger.snippet.legacyExpanded(), cursorUTF16Offset: nil, arguments: [], issues: [])
+            return insert(SnippetExpansionPlan(trigger: trigger, rendering: rendering, mode: settings.mode), on: target, pid: input.processID)
+        }
         // Arguments can't be asked for mid-typing: optional ones take their
         // defaults, and a required one refuses the expansion.
-        let plan = PlaceholderTemplate(trigger.snippet.content, context: .snippet)
-            .plan(snippets: PlaceholderValues.snippetLookup(database))
+        let plan = template.plan(snippets: PlaceholderValues.snippetLookup(database))
         // Nothing is read for a template that can't run.
         guard plan.blockingIssues.isEmpty else {
             failureFeedback()
@@ -690,6 +752,16 @@ final class SnippetExpander {
         guard blocking.isEmpty else {
             failureFeedback()
             return .refused(blocking)
+        }
+        return insert(expansion, on: target, pid: input.processID)
+    }
+
+    private func insert(_ expansion: SnippetExpansionPlan, on target: any KeystrokeTarget, pid: pid_t)
+        -> SnippetExpansionOutcome
+    {
+        guard !expansion.exceedsLimit else {
+            failureFeedback()
+            return .refused([.outputTooLong])
         }
         do {
             switch try inserter.insert(expansion, on: target) {

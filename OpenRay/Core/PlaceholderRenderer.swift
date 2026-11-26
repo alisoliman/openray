@@ -93,6 +93,8 @@ private struct PlanBuilder {
     private var expandedNodes = 0
     /// Each referenced snippet is parsed and planned once, then reused.
     private var snippetBodies: [String: (nodes: [PlaceholderPlan.Node]?, weight: Int)] = [:]
+    /// Membership for `requirements.snippets`, which keeps the order.
+    private var requiredSnippets = Set<String>()
 
     /// Referenced snippets plan one level deep; calculator expressions two.
     private static let maximumDepth = 2
@@ -162,7 +164,7 @@ private struct PlanBuilder {
                     nodes.append(.literal(placeholder.source))
                 }
             case .snippet(let name):
-                if !requirements.snippets.contains(name) { requirements.snippets.append(name) }
+                if requiredSnippets.insert(name).inserted { requirements.snippets.append(name) }
                 guard depth == 0 else {
                     issues.append(.nestedSnippet(name))
                     nodes.append(.snippet(placeholder, nil))

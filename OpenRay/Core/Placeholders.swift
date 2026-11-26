@@ -347,6 +347,9 @@ enum PlaceholderIssue: Hashable, Sendable {
     /// Planning stopped: referenced snippets expand to more than `PlaceholderPlan.maximumNodes`
     /// placeholders and text runs. Nothing is read or rendered.
     case tooComplex
+    /// A malformed placeholder whose quoted text is never closed, or that runs past the
+    /// scan limit. What follows can't be told apart from what's inside it, so it blocks.
+    case unterminated(String)
 
     /// Whether a command should refuse to run. Missing inputs it can't make up,
     /// failed lookups and oversized output block. Invalid syntax stays literal and
@@ -355,7 +358,7 @@ enum PlaceholderIssue: Hashable, Sendable {
     var blocksExecution: Bool {
         switch self {
         case .tooManyArguments, .missingSnippet, .nestedSnippet, .missingArgument, .calculationFailed, .outputTooLong,
-            .tooComplex:
+            .tooComplex, .unterminated:
             true
         case .invalid, .notHonored, .unsupported, .duplicateCursor, .unavailable:
             false
@@ -379,6 +382,7 @@ extension PlaceholderIssue {
         case .unavailable(let kind): "\(kind.title) wasn't available."
         case .outputTooLong: "The result is too long."
         case .tooComplex: "This template expands to too much text. Use fewer snippet references."
+        case .unterminated(let text): "“\(text)” is never closed. Close its quotes and brace, or escape the brace with \\."
         }
     }
 }

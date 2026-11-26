@@ -26,7 +26,18 @@ struct PlaceholderParser {
         case placeholder(Placeholder)
         /// The text to report and, for a closed token, where its literal span ends.
         case invalid(String, end: String.Index?)
+        /// A malformed token whose quoted text never closes, or that runs past the scan limit.
+        case unterminated(String)
         case notAPlaceholder
+    }
+
+    /// Where recovery found the end of a malformed token.
+    private enum Recovery {
+        case closed(String.Index)
+        /// The line ended, or an unquoted `{` started another token: only the `{` is literal.
+        case open
+        /// A quote never closed, or the scan limit ran out: what follows is ambiguous.
+        case unterminated
     }
 
     func parse() -> ([PlaceholderTemplate.Segment], [PlaceholderIssue]) {
@@ -66,6 +77,10 @@ struct PlaceholderParser {
                 flush()
                 segments.append(.placeholder(placeholder))
                 index = placeholder.range.upperBound
+            case .unterminated(let text):
+                issues.append(.unterminated(text))
+                literal.append(character)
+                index = source.index(after: index)
             case .invalid(let text, let end):
                 issues.append(.invalid(text))
                 if let end {
@@ -150,8 +165,11 @@ struct PlaceholderParser {
         }
         guard let kind else { return .notAPlaceholder }
         guard !failed else {
-            if let end = closingEnd(from: start) { return .invalid(String(source[start..<end]), end: end) }
-            return .invalid(Self.excerpt(of: source, from: start), end: nil)
+            switch recover(from: start) {
+            case .closed(let end): return .invalid(String(source[start..<end]), end: end)
+            case .open: return .invalid(Self.excerpt(of: source, from: start), end: nil)
+            case .unterminated: return .unterminated(Self.excerpt(of: source, from: start))
+            }
         }
         let range = start..<cursor.index
         let text = String(source[range])
@@ -164,15 +182,17 @@ struct PlaceholderParser {
     }
 
     /// The end of a malformed token, just past its closing brace, found by skipping
-    /// quoted text on the same line. Nil when unclosed or when an unquoted `{`
-    /// comes first; stopping there keeps the scan short on hostile input.
-    private func closingEnd(from start: String.Index) -> String.Index? {
+    /// quoted text on the same line with the scanner's escapes. Stopping at an unquoted
+    /// `{` keeps the scan short on hostile input.
+    private func recover(from start: String.Index) -> Recovery {
         var index = source.index(after: start)
         var quote: Character?
         var scanned = 0
-        while index < source.endIndex, scanned <= Self.maximumLength {
+        var previous: Character = "{"
+        while index < source.endIndex {
+            guard scanned <= Self.maximumLength else { return .unterminated }
             let character = source[index]
-            guard !character.isNewline else { return nil }
+            guard !character.isNewline else { return quote == nil ? .open : .unterminated }
             if let open = quote {
                 // The same escapes as quoted values: \" and \\ never close a double-quoted run.
                 if open == "\"", character == "\\", source.index(after: index) < source.endIndex,
@@ -185,16 +205,19 @@ struct PlaceholderParser {
                 }
             } else {
                 switch character {
-                case "\"", "“", "”", "'": quote = character == "'" ? "'" : "\""
-                case "{": return nil
-                case "}": return source.index(after: index)
+                case "\"", "“", "”": quote = "\""
+                // A single quote opens a value only after `=`; elsewhere it's an apostrophe.
+                case "'" where previous == "=": quote = "'"
+                case "{": return .open
+                case "}": return .closed(source.index(after: index))
                 default: break
                 }
             }
+            if !character.isWhitespace { previous = character }
             index = source.index(after: index)
             scanned += 1
         }
-        return nil
+        return quote == nil ? .open : .unterminated
     }
 
     /// `source` rewritten so the engine renders it as earlier OpenRay did: every

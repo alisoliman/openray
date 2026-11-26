@@ -9,10 +9,12 @@ private final class RecordingInserter: SnippetInserting {
     var result = KeystrokeScript.Result.completed
     /// Shared with the values provider, to check what happens first.
     var log: [String] = []
+    var fields: [FocusedField?] = []
     private var processID: pid_t = 0
 
-    func target(for processID: pid_t) -> any KeystrokeTarget {
+    func target(for processID: pid_t, field: FocusedField?) -> any KeystrokeTarget {
         log.append("target")
+        fields.append(field)
         self.processID = processID
         return FakeEditor(text: "")
     }
@@ -41,6 +43,8 @@ private final class FakeEditor: KeystrokeTarget {
     /// Typed text the app hasn't shown yet; it appears after the first pause.
     var lagging = ""
     var selectionLength = 0
+    /// Reports its text until the first pause, then stops answering.
+    var goesUnreadableAfterPause = false
     private(set) var pauses = 0
     /// The focus changes once this many events have been sent.
     var focusLostAfter: Int?
@@ -79,6 +83,7 @@ private final class FakeEditor: KeystrokeTarget {
 
     func settle() {
         pauses += 1
+        if goesUnreadableAfterPause { readsText = false }
         guard !lagging.isEmpty else { return }
         text += lagging
         caret = text.utf16.count
@@ -270,6 +275,17 @@ struct KeystrokeScriptTests {
         #expect(match.text == "x Hello!")
     }
 
+    @Test func aMismatchSeenOnceIsNeverOverruledByAnUnreadableAnswer() throws {
+        let editor = FakeEditor(text: "other text")
+        editor.goesUnreadableAfterPause = true
+        #expect(try KeystrokeScript.run(SnippetExpansionPlan(deletedText: ";hi", text: "Hello!"), on: editor) == .unconfirmed)
+        #expect(editor.events.isEmpty)
+        let selected = FakeEditor(text: "x ;hi")
+        selected.selectionLength = 1
+        selected.goesUnreadableAfterPause = true
+        #expect(try KeystrokeScript.run(SnippetExpansionPlan(deletedText: ";hi", text: "Hello!"), on: selected) == .unconfirmed)
+    }
+
     @Test func aFieldThatShowsTheLastKeyLateStillExpands() throws {
         let editor = FakeEditor(text: "x ;h")
         editor.lagging = "i"
@@ -394,6 +410,31 @@ struct SnippetExpanderTests {
         #expect(counter.failures == 0)
     }
 
+    @Test func aKeywordCountsOnlyWhenTypedInOneField() {
+        let store = LibraryStore(fileURL: nil)
+        store.update {
+            $0.preferences.snippetExpansionEnabled = true
+            $0.snippets = [greeting]
+        }
+        let inserter = RecordingInserter()
+        let expander = SnippetExpander(store: store, inserter: inserter, isSecureInputEnabled: { false })
+        func key(_ text: String, field: Int?) -> SnippetExpansionOutcome? {
+            expander.handle(
+                SnippetKeyInput(characters: text, processID: 3, bundleIdentifier: "com.apple.Notes", field: field.map(FocusedField.init(id:))))
+        }
+        // Started in one field, finished in another of the same app: no expansion.
+        #expect(key(";h", field: 1) == nil)
+        #expect(key("i", field: 2) == nil)
+        #expect(inserter.plans.isEmpty)
+        // Typed in one field: the target is that field.
+        #expect(key(" ;h", field: 2) == nil)
+        #expect(key("i", field: 2) != nil)
+        #expect(inserter.fields == [FocusedField(id: 2)])
+        // Apps that don't report a field keep the base behavior.
+        #expect(key(" ;hi", field: nil) != nil)
+        #expect(inserter.fields.last == .some(nil))
+    }
+
     @Test func theTargetIsNotedBeforeAnythingIsRendered() {
         let store = LibraryStore(fileURL: nil)
         store.update {
@@ -515,7 +556,7 @@ struct SnippetExpanderTests {
         #expect(SnippetInserters.makeDefault(sideEffects: sideEffects) is InertSnippetInserter)
         #expect(throws: SideEffectGuard.Blocked(what: "typing into other apps", mode: mode)) {
             let inserter = InertSnippetInserter(sideEffects: sideEffects)
-            _ = try inserter.insert(SnippetExpansionPlan(deletedText: "x", text: "x"), on: inserter.target(for: 1))
+            _ = try inserter.insert(SnippetExpansionPlan(deletedText: "x", text: "x"), on: inserter.target(for: 1, field: nil))
         }
         // A default expander reaches only the inert inserter and never reads the real clipboard.
         let store = LibraryStore(fileURL: nil)
@@ -540,7 +581,7 @@ struct SnippetExpanderTests {
         #expect(throws: SideEffectGuard.Blocked.self) {
             let live = LiveSnippetInserter(sideEffects: SideEffectGuard(mode: .live))
             // Inert here, so the target it notes reads nothing from other apps.
-            let target = live.target(for: 1)
+            let target = live.target(for: 1, field: nil)
             #expect(target is InertKeystrokeTarget)
             _ = try live.insert(SnippetExpansionPlan(deletedText: "x", text: "y"), on: target)
         }

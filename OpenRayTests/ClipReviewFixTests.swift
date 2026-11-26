@@ -254,6 +254,15 @@ struct ClipDataLossTests {
         #expect(model.feedback?.text == "Imported snippets: 2 added, 1 skipped")
     }
 
+    /// Replacing in turn: the last row wins, even when it repeats an earlier, superseded one.
+    @Test func supersededReplacementsDontCountAsDuplicates() {
+        let holder = Snippet(name: "Email", keyword: "@@", content: "old")
+        let rows = ["A", "B", "A"].map { ImportedSnippet(name: "Email", text: $0, keyword: "@@") }
+        let plan = LibraryImport.plan(snippets: rows, existing: [holder], policy: .replaceExisting)
+        #expect(plan.replacements.map(\.snippet.text) == ["A"])
+        #expect(plan.duplicates.isEmpty)
+    }
+
     /// m4: OpenRay's own round trip keeps the exact app, even one that isn't installed now.
     @Test func openWithSurvivesARoundTrip() throws {
         let (source, _) = makeModel()
@@ -291,22 +300,26 @@ struct ClipGuardTests {
         #expect(SideEffectGuard(mode: .verification).restrictedByProcess.mode == .verification)
     }
 
-    /// B1: the editor's Test opens the sample link in its app through the guarded opener.
-    @Test func editorTestUsesTheGuardedOpenerWithSamplesAndApp() async throws {
+    /// B1, N1: the editor's Test opens exactly the URL its preview shows, which reads
+    /// nothing live, in its Open With app, through the guarded opener.
+    @Test func editorTestOpensThePreviewedURLWithoutLiveInputs() async throws {
         let (model, opener) = makeModel()
+        #expect(model.clipboard.copy("private clipboard"))
         let draft = EditorDraft(editor: .quicklink(Quicklink(name: "", template: "", keyword: "")), store: model.store)
         draft.name = "Repo"
-        draft.content = #"https://github.com/{argument name="org"}/{argument name="kind" options="issues, pulls"}"#
+        draft.content = #"https://github.com/{argument name="org"}/{argument name="kind" options="issues, pulls"}?c={clipboard}"#
         draft.openWith = QuicklinkApplication(bundleIdentifier: "com.apple.Safari", name: "Safari")
-        let sample = draft.quicklinkSample
-        #expect(draft.quicklinkPreview.url == "https://github.com/swift%20concurrency/issues")
-        await model.testQuicklink(sample.link, arguments: sample.arguments)?.value
-        #expect(opener.opened.map(\.0.absoluteString) == ["https://github.com/swift%20concurrency/issues"])
+        let test = try #require(draft.quicklinkTest)
+        #expect(draft.quicklinkPreview.url == "https://github.com/swift%20concurrency/issues?c=")
+        #expect(test.url.absoluteString == draft.quicklinkPreview.url)
+        #expect(test.openWith == draft.openWith)
+        await model.testQuicklink(test.url, openWith: test.openWith).value
+        #expect(opener.opened.map(\.0.absoluteString) == ["https://github.com/swift%20concurrency/issues?c="])
         #expect(model.store.database.usage.isEmpty)
 
         // The default opener is inert here.
         let inert = LauncherModel(store: LibraryStore(fileURL: nil), ai: AIChatModel(engine: TestAIEngine()), pasteboard: .withUniqueName())
-        await inert.testQuicklink(sample.link, arguments: sample.arguments)?.value
+        await inert.testQuicklink(test.url, openWith: nil).value
         #expect(inert.feedback?.style == .error)
     }
 }
@@ -500,5 +513,199 @@ struct ClipKeysAndPrivacyTests {
         #expect(preferences.effectiveClipboardRetention == .oneDay)
         #expect(preferences.clipboardRetentionDaysOrUnlimited == 1)
         #expect(AppPreferences().clipboardRetentionDaysOrUnlimited == 7)
+    }
+}
+
+// MARK: - Re-review
+
+@MainActor
+struct ClipRereviewTests {
+    /// N2: a referenced formatting file that can't be read is kept, and read again later.
+    @Test func unreadableFormattingIsKeptAndRetried() throws {
+        let directory = try temporaryDirectory()
+        defer {
+            try? FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: directory.appending(path: "ClipboardImages").path)
+            try? FileManager.default.removeItem(at: directory)
+        }
+        let library = directory.appending(path: "library.json")
+        let store = LibraryStore(fileURL: library)
+        store.update { $0.preferences.clipboardEnabled = true }
+        var entry = ClipboardEntry(text: "Bold", sourceName: "F")
+        entry.richText = ClipboardRichText(rtf: Data("{\\rtf1 Bold}".utf8))
+        #expect(store.capture(entry))
+        let digest = try #require(store.database.clipboard.first?.richTextDigest)
+        let side = directory.appending(path: "ClipboardImages/\(digest).rich")
+        try FileManager.default.setAttributes([.posixPermissions: 0o000], ofItemAtPath: side.path)
+
+        let reloaded = LibraryStore(fileURL: library)
+        #expect(reloaded.database.clipboard.first?.richText == nil)
+        #expect(reloaded.database.clipboard.first?.richTextDigest == digest)
+        #expect(reloaded.update { $0.preferences.rememberLastQuery = false })
+        #expect(FileManager.default.fileExists(atPath: side.path))
+
+        // Readable again: a copy picks it up.
+        try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: side.path)
+        let board = NSPasteboard.withUniqueName()
+        defer { board.releaseGlobally() }
+        let service = ClipboardService(store: reloaded, pasteboard: board)
+        #expect(service.copy(try #require(reloaded.database.clipboard.first)))
+        #expect(board.data(forType: .rtf) == entry.richText?.rtf)
+    }
+
+    /// N3: old snippets keep their exact text and old behavior, at any valid length.
+    @Test func oldSnippetsAreNeverRewritten() throws {
+        let directory = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let library = directory.appending(path: "library.json")
+        let long = String(repeating: "x", count: 64_994) + "{uuid}"
+        let exact = #"\{date} {argument default="{date}"} {time}"#
+        var old = LibraryDatabase()
+        old.snippets = [Snippet(name: "Long", keyword: "", content: long), Snippet(name: "Exact", keyword: ";ex", content: exact)]
+        var json = try #require(JSONSerialization.jsonObject(with: JSONEncoder().encode(old)) as? [String: Any])
+        json["schemaVersion"] = 4
+        json["snippets"] = (json["snippets"] as? [[String: Any]])?.map { snippet in
+            var snippet = snippet
+            snippet.removeValue(forKey: "placeholderVersion")
+            return snippet
+        }
+        try JSONSerialization.data(withJSONObject: json).write(to: library)
+
+        let store = LibraryStore(fileURL: library)
+        #expect(!store.isReadOnly)
+        #expect(store.database.snippets.map(\.content) == [long, exact])
+        #expect(store.database.snippets.allSatisfy { !$0.usesDynamicPlaceholders })
+        let date = Date(timeIntervalSince1970: 0)
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US")
+        formatter.timeZone = .gmt
+        formatter.dateStyle = .medium
+        let day = formatter.string(from: date)
+        formatter.dateStyle = .none
+        formatter.timeStyle = .short
+        let time = formatter.string(from: date)
+        let rendered = store.database.snippets[1].expanded(at: date, locale: Locale(identifier: "en_US"), timeZone: .gmt)
+        #expect(rendered == "\\\(day) {argument default=\"\(day)\"} \(time)")
+        #expect(store.database.snippets[0].expanded().hasSuffix("{uuid}"))
+
+        // It saves and reloads as it was.
+        #expect(store.update { $0.preferences.rememberLastQuery = false })
+        #expect(LibraryStore(fileURL: library).database.snippets.map(\.content) == [long, exact])
+
+        // The editor opens it in the new syntax and saves it as version 2.
+        let draft = EditorDraft(editor: .snippet(store.database.snippets[1]), store: store)
+        #expect(draft.content == Snippet.migratingLegacyContent(exact))
+        #expect(draft.save())
+        #expect(store.database.snippets[1].usesDynamicPlaceholders)
+
+        // A new snippet referencing an old one gets its old output, as literal text.
+        let old1 = Snippet(name: "Old", keyword: "", content: "{clipboard} on {date}", placeholderVersion: 1)
+        let lookup = PlaceholderValues.snippetLookup({ var d = LibraryDatabase(); d.snippets = [old1]; return d }())
+        let plan = PlaceholderTemplate(#"[{snippet name="Old"}]"#, context: .text).plan(snippets: lookup)
+        #expect(!plan.requirements.clipboard)
+        #expect(plan.render(PlaceholderValues(clipboard: ["private"])).text.hasPrefix("[{clipboard} on "))
+    }
+
+    /// N4: with a linked library file, the folder the store really uses is protected.
+    @Test func exportsProtectTheDataFolderOfALinkedLibrary() throws {
+        let configured = try temporaryDirectory()
+        let real = try temporaryDirectory()
+        defer {
+            try? FileManager.default.removeItem(at: configured)
+            try? FileManager.default.removeItem(at: real)
+        }
+        let target = real.appending(path: "library.json")
+        #expect(LibraryStore(fileURL: target).update { $0.preferences.clipboardEnabled = true })
+        let link = configured.appending(path: "library.json")
+        try FileManager.default.createSymbolicLink(at: link, withDestinationURL: target)
+        let store = LibraryStore(fileURL: link)
+        store.update { $0.preferences.clipboardEnabled = true }
+        let prepared = try ClipboardImageCodec.prepare(ClipboardFixtures.image())
+        #expect(store.captureImage(prepared, sourceName: "F"))
+        let payload = configured.appending(path: "ClipboardImages/\(prepared.image.id).png")
+        #expect(FileManager.default.fileExists(atPath: payload.path))
+        let before = try Data(contentsOf: payload)
+
+        let files = Files()
+        let (model, _) = makeModel(store: store, files: files)
+        for kind in LibraryTransferKind.allCases {
+            for destination in [payload, real.appending(path: "ClipboardImages/x.json")] {
+                files.exportURL = destination
+                model.runExport(kind, files: files)
+                #expect(model.feedback?.style == .error, "\(kind) → \(destination.path)")
+            }
+        }
+        #expect(try Data(contentsOf: payload) == before)
+    }
+
+    /// N5: thousands of distinct references plan in linear time.
+    @Test func distinctReferencesPlanQuickly() {
+        let template = (0..<20_000).map { #"{snippet name="n\#($0)"}"# }.joined()
+        let clock = ContinuousClock()
+        let start = clock.now
+        let plan = PlaceholderTemplate(template, context: .text).plan { _ in nil }
+        #expect(plan.requirements.snippets.count == 20_000)
+        #expect(plan.requirements.snippets.first == "n0" && plan.requirements.snippets.last == "n19999")
+        #expect(clock.now - start < .seconds(5))
+    }
+
+    /// N6: repairing an over-budget referenced snippet brings its fields back.
+    @Test func repairedReferencesGetTheirFieldsBack() {
+        let (model, _) = makeModel()
+        // A valid 60,000-character body, referenced six times: over the plan budget.
+        let link = Quicklink(
+            name: "L", template: #"x://{argument name="a"}/"# + String(repeating: #"{snippet name="Body"}"#, count: 6), keyword: "")
+        let huge = String(repeating: "{uuid}", count: 10_000)
+        #expect(model.store.update {
+            $0.snippets = [Snippet(name: "Body", keyword: "", content: huge)]
+            $0.quicklinks = [link]
+        })
+        #expect(model.quicklinkPlan(link).issues == [.tooComplex])
+        #expect(model.quicklinkCommand(for: link) == nil)
+        #expect(model.store.update { $0.snippets[0].content = #"{argument name="b"}"# })
+        #expect(model.quicklinkCommand(for: link) != nil)
+    }
+
+    /// M3: a malformed token that runs out inside a quote, or past the scan limit, blocks.
+    @Test func unterminatedRecoveryBlocks() {
+        let overlong = "{argument typo \"" + String(repeating: "a", count: 2_050) + "{clipboard}\"}"
+        let plan = PlaceholderTemplate(overlong, context: .aiCommand).plan { _ in nil }
+        #expect(plan.blockingIssues.contains { if case .unterminated = $0 { true } else { false } })
+        let open = PlaceholderTemplate(#"{date x "never closed {clipboard}"#, context: .text).plan { _ in nil }
+        #expect(open.blockingIssues.contains { if case .unterminated = $0 { true } else { false } })
+        // Prose apostrophes and plain unclosed braces don't block.
+        for text in ["{day it's late} {clipboard}", "if x {date = y", "{date x y"] {
+            #expect(PlaceholderTemplate(text, context: .snippet).plan { _ in nil }.blockingIssues.isEmpty, "\(text)")
+        }
+    }
+
+    /// M8: quicklinks never send a copy the capture poll hasn't attributed to an app yet.
+    @Test func freshUnattributedCopiesStayOutOfQuicklinks() async {
+        let board = NSPasteboard(name: .init("OpenRayTests.\(UUID())"))
+        defer { board.releaseGlobally() }
+        let store = LibraryStore(fileURL: nil)
+        store.update { $0.preferences.clipboardEnabled = true }
+        let service = ClipboardService(
+            store: store, pasteboard: board,
+            captureContext: { .init(sourceName: "Notes", sourceBundleID: "com.apple.Notes", secureInput: false) })
+        board.clearContents()
+        board.setString("just copied", forType: .string)
+        // Before the poll: strict reads refuse, others allow.
+        #expect(service.placeholderText(unattributedIsExcluded: true) == nil)
+        #expect(service.placeholderText() == "just copied")
+        await service.poll()
+        #expect(service.placeholderText(unattributedIsExcluded: true) == "just copied")
+        // OpenRay's own copies are attributed.
+        #expect(service.copy("from OpenRay"))
+        #expect(service.placeholderText(unattributedIsExcluded: true) == "from OpenRay")
+    }
+
+    /// M8: quicklinks read strictly, and OpenRay's own copies still reach them.
+    @Test func quicklinksStillUseOpenRaysOwnCopies() async {
+        let (model, opener) = makeModel()
+        let link = Quicklink(name: "C", template: "https://x.com/?c={clipboard}", keyword: "")
+        model.store.update { $0.quicklinks = [link] }
+        #expect(model.clipboard.copy("attributed"))
+        await model.openQuicklink(link, query: "")?.value
+        #expect(opener.opened.last?.0.absoluteString == "https://x.com/?c=attributed")
     }
 }
