@@ -144,6 +144,17 @@ final class NotesWindowModel {
     @ObservationIgnored private var autosaveTask: Task<Void, Never>?
     /// A click in the `/` menu. The editor sets it, since it owns the text view.
     @ObservationIgnored var onPickSlashCommand: ((NoteSlashCommand) -> Void)?
+    /// A note was saved here, so another editor showing it can refresh. Set by `NotesCenter`.
+    @ObservationIgnored var onSaved: ((UUID) -> Void)?
+    /// Note text open in other editors (the launcher's inline editor), whose images a purge keeps.
+    @ObservationIgnored var externalTexts: () -> [String] = { [] }
+    /// False keeps an inert launch (tests, verification) from purging an on-disk library.
+    @ObservationIgnored var mayPurgeLibraryOnDisk = !SideEffectGuard.isInert
+    /// Every image the editor's Undo history can bring back since this note opened. A purge keeps
+    /// these files until another note opens and that history is gone.
+    @ObservationIgnored private var undoReachableImages = Set<String>()
+    /// Set once the person has been told about recovered text this launch.
+    @ObservationIgnored private var didAnnounceRecovery = false
 
     init(
         store: LibraryStore, assets: NoteAssetStore, now: @escaping () -> Date = { .now },
@@ -162,7 +173,11 @@ final class NotesWindowModel {
     var notes: [QuickNote] { store.database.notes }
     var orderedNotes: [QuickNote] { NoteCollection.ordered(notes) }
     var pinnedNotes: [QuickNote] { NoteCollection.pinned(notes) }
-    var deletedNotes: [QuickNote] { NoteCollection.deleted(notes) }
+    /// Recently Deleted, without notes past their 60 days, even before a purge removes them.
+    var deletedNotes: [QuickNote] {
+        let expired = Set(NoteCollection.expired(notes, now: now()).map(\.id))
+        return NoteCollection.deleted(notes).filter { !expired.contains($0.id) }
+    }
 
     /// The open note as saved, or the draft.
     var currentNote: QuickNote? {
@@ -215,9 +230,18 @@ final class NotesWindowModel {
         } else {
             reloadIfChangedElsewhere()
             if currentNote == nil || currentNote?.isDeleted == true {
-                if let first = orderedNotes.first { load(first) } else { startDraft() }
+                if hasUnsavedText {
+                    // The note went away elsewhere while its words waited to save. They become a
+                    // note of their own, or stay here with the save error; never replaced.
+                    flush()
+                } else if let first = orderedNotes.first {
+                    load(first)
+                } else {
+                    startDraft()
+                }
             }
         }
+        announceRecoveredText()
         return presenter?.show() ?? false
     }
 
@@ -313,6 +337,7 @@ final class NotesWindowModel {
         baseContent = note.content
         hasUnsavedText = false
         saveFailed = false
+        resetUndoReachableImages()
         slashMenu = nil
         textRevision += 1
     }
@@ -325,6 +350,7 @@ final class NotesWindowModel {
         baseContent = nil
         hasUnsavedText = false
         saveFailed = false
+        resetUndoReachableImages()
         slashMenu = nil
         textRevision += 1
     }
@@ -355,6 +381,9 @@ final class NotesWindowModel {
     func edit(_ newText: String) {
         guard newText != text || hasUnsavedText else { return }
         text = newText
+        if newText.contains(NoteAssetStore.folderName + "/") {
+            undoReachableImages.formUnion(NoteAssetStore.referencedNames(inTexts: [newText]))
+        }
         hasUnsavedText = true
         autosaveTask?.cancel()
         let delay = autosaveDelay
@@ -427,6 +456,7 @@ final class NotesWindowModel {
         baseContent = content
         hasUnsavedText = false
         saveFailed = false
+        if let currentID { onSaved?(currentID) }
     }
 
     private func failSave(_ message: String?) -> Bool {
@@ -455,8 +485,15 @@ final class NotesWindowModel {
             hasUnsavedText = false
             saveFailed = false
             textRevision += 1
-        } else if let id = currentID, let note = notes.first(where: { $0.id == id }) {
+        } else if let id = currentID, let note = notes.first(where: { $0.id == id }), !note.isDeleted {
             load(note)
+        } else {
+            // Its note was deleted or purged meanwhile: show another one.
+            hasUnsavedText = false
+            saveFailed = false
+            if let currentID { history.remove(currentID) }
+            currentID = nil
+            openFallbackNote()
         }
         notice = .info("Changes discarded")
     }
@@ -488,6 +525,13 @@ final class NotesWindowModel {
         // A title-only note (OpenRay 0.1 saved those) stays as it is; so does one you emptied
         // that has a title of its own.
         guard note.titleFollowsContent, hasUnsavedText else { return flush() }
+        // Another editor saved newer words since this buffer loaded: those stay, and the empty
+        // buffer here is let go rather than trashing them.
+        guard note.content == baseContent else {
+            hasUnsavedText = false
+            saveFailed = false
+            return true
+        }
         // Emptied: nothing is left of it, so it moves to Recently Deleted with its last saved words.
         let moved = store.update { NoteCollection.moveToRecentlyDeleted(id, at: self.now(), in: &$0.notes) }
         guard moved else { return failSave(store.errorMessage ?? "This note couldn't be moved to Recently Deleted.") }
@@ -541,16 +585,20 @@ final class NotesWindowModel {
 
     /// Moves the open note to Recently Deleted and opens the next one.
     func deleteCurrentNote() {
-        if draft != nil {
+        if draft != nil, isBlank(text) {
             draft = nil
             text = ""
             hasUnsavedText = false
+            saveFailed = false
             openFallbackNote()
             return
         }
-        guard let id = currentID, let note = notes.first(where: { $0.id == id }) else { return }
         // Words that can't be saved aren't thrown away by deleting: the save error shows instead.
+        // A new note with words is saved first, so it goes to Recently Deleted like any other.
         guard flush() else { return }
+        // Read after saving: a conflict can have moved these words to a new note, and that's the
+        // one on screen, so it's the one deleted, never the other editor's.
+        guard draft == nil, let id = currentID, let note = notes.first(where: { $0.id == id }), !note.isDeleted else { return }
         let moved = store.update { database in
             NoteCollection.moveToRecentlyDeleted(id, at: self.now(), in: &database.notes)
         }
@@ -605,7 +653,7 @@ final class NotesWindowModel {
     @discardableResult
     func emptyRecentlyDeleted() -> Bool {
         confirmsEmptyingDeleted = false
-        let deleted = deletedNotes
+        let deleted = NoteCollection.deleted(notes)
         guard !deleted.isEmpty else { return true }
         guard removeForGood(deleted, failure: "Recently Deleted couldn't be emptied.") else { return false }
         notice = .success("Recently Deleted is empty")
@@ -617,7 +665,7 @@ final class NotesWindowModel {
     @discardableResult
     func purgeExpired() -> Int {
         let expired = NoteCollection.expired(notes, now: now())
-        guard !expired.isEmpty, !store.isReadOnly else { return 0 }
+        guard !expired.isEmpty, !store.isReadOnly, store.fileURL == nil || mayPurgeLibraryOnDisk else { return 0 }
         return removeForGood(expired, failure: nil) ? expired.count : 0
     }
 
@@ -637,8 +685,74 @@ final class NotesWindowModel {
             if let failure { notice = .error(store.errorMessage ?? failure) }
             return false
         }
-        assets.removeAssets(referencedBy: purged, keeping: notes, protecting: [text] + (draft.map { [$0.content] } ?? []))
+        let result = assets.reclaim(
+            NoteAssetStore.referencedNames(in: purged), keeping: notes, protecting: protectedImages)
+        if !result.failed.isEmpty {
+            notice = .warning("Some images couldn't be removed. OpenRay tries again with the next purge.")
+        }
         return true
+    }
+
+    /// Images a purge must keep: in the editor now, in its Undo history, in a new note not saved
+    /// yet, or open in another editor.
+    private var protectedImages: Set<String> {
+        undoReachableImages.union(
+            NoteAssetStore.referencedNames(inTexts: [text] + (draft.map { [$0.content] } ?? []) + externalTexts()))
+    }
+
+    /// Another note opened, so the editor's Undo history starts over; images only it could bring
+    /// back can go, if a purge left them waiting.
+    private func resetUndoReachableImages() {
+        undoReachableImages = NoteAssetStore.referencedNames(inTexts: [text])
+        guard assets.hasPendingRemovals else { return }
+        assets.reclaim([], keeping: notes, protecting: protectedImages)
+    }
+
+    // MARK: Quitting
+
+    /// Where words that couldn't be saved before quitting are kept: `NoteRecovery` beside the library.
+    var recoveryDirectory: URL {
+        assets.directory.deletingLastPathComponent().appending(path: "NoteRecovery", directoryHint: .isDirectory)
+    }
+
+    var recoveredFiles: [URL] {
+        ((try? FileManager.default.contentsOfDirectory(at: recoveryDirectory, includingPropertiesForKeys: nil)) ?? [])
+            .filter { $0.pathExtension == "md" }.sorted { $0.lastPathComponent < $1.lastPathComponent }
+    }
+
+    /// Before OpenRay quits: saves what's typed, or, when that fails, writes it to a recovery file
+    /// so nothing typed is lost. Returns that file.
+    @discardableResult
+    func prepareForTermination() -> URL? {
+        guard hasUnsavedText, !flush(), !isBlank(text) else { return nil }
+        return writeRecoveryCopy()
+    }
+
+    func writeRecoveryCopy() -> URL? {
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.dateFormat = "yyyy-MM-dd HH.mm.ss"
+        let base = NoteExporter.suggestedFileName(for: QuickNote(title: Self.title(for: text), content: text), format: .markdown)
+        let url = recoveryDirectory.appending(path: "\(formatter.string(from: now())) \(base)")
+        do {
+            try FileManager.default.createDirectory(
+                at: recoveryDirectory, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
+            try Data(text.utf8).write(to: url, options: [.atomic])
+            try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: url.path)
+            return url
+        } catch {
+            return nil
+        }
+    }
+
+    /// Once a launch, says where recovered text is.
+    private func announceRecoveredText() {
+        guard !didAnnounceRecovery else { return }
+        didAnnounceRecovery = true
+        let count = recoveredFiles.count
+        guard count > 0, notice == nil else { return }
+        notice = .warning(
+            "\(count) note\(count == 1 ? "" : "s") that couldn't be saved before quitting \(count == 1 ? "is" : "are") in Settings › Notes.")
     }
 
     // MARK: Browser

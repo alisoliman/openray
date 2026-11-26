@@ -188,44 +188,98 @@ final class EditorDraft {
             && content.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     }
 
+    /// Once this editor's words had to go to a note of their own (both editors changed the same
+    /// field, or the note was deleted elsewhere), saves go there.
+    @ObservationIgnored private var redirectedNoteID: UUID?
+
+    /// The library note this editor writes to.
+    var noteID: UUID? {
+        guard case .note(let note) = editor else { return nil }
+        return redirectedNoteID ?? note.id
+    }
+
+    /// Shows what another editor saved, in the fields not edited here since the last save.
+    func refreshCleanFields() {
+        guard let store, let id = noteID, let stored = store.database.notes.first(where: { $0.id == id }), !stored.isDeleted
+        else { return }
+        if name == original[0], stored.title != name {
+            name = stored.title
+            original[0] = stored.title
+        }
+        if content == original[2], stored.content != content {
+            content = stored.content
+            original[2] = stored.content
+        }
+    }
+
     /// Saves the note if it changed since the last save. Empty notes are skipped,
     /// so clearing the text mid-edit never deletes anything.
+    ///
+    /// It writes only the fields changed here onto the note as saved now, so a pin, or newer
+    /// words from the Notes window, stay. When the Notes window changed the same field since this
+    /// editor's last save, or the note was deleted elsewhere, these words become a new note
+    /// instead, so neither version is lost and nothing deleted comes back.
     @discardableResult
     func saveNote() -> Bool {
         autosaveTask?.cancel()
-        guard case .note(var note) = editor, let store else { return false }
+        guard case .note(let opened) = editor, let store else { return false }
         guard !isEmptyNote else { return true }
         guard isDirty || savedAt == nil else { return true }
         let snapshot = currentValues
-        // Start from the note as saved now and write only what changed here, so a pin, Recently
-        // Deleted, or newer words from the Notes window aren't reverted.
-        let stored = store.database.notes.first { $0.id == note.id }
-        if let stored { note = stored }
-        if stored == nil || name != original[0] { note.title = name.trimmingCharacters(in: .whitespacesAndNewlines) }
-        if stored == nil || content != original[2] { note.content = content }
+        let title = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        let targetID = redirectedNoteID ?? opened.id
+        let wasSaved = !isNew || savedAt != nil || redirectedNoteID != nil
+        var note: QuickNote
+        var message: String?
+        if let stored = store.database.notes.first(where: { $0.id == targetID }), !stored.isDeleted {
+            let titleHere = name != original[0]
+            let bodyHere = content != original[2]
+            let titleClash = titleHere && stored.title != original[0].trimmingCharacters(in: .whitespacesAndNewlines)
+                && stored.title != title
+            let bodyClash = bodyHere && stored.content != original[2] && stored.content != content
+            if titleClash || bodyClash {
+                note = QuickNote(title: title, content: content)
+                message = "This note changed in the Notes window, so these edits were saved as a new note."
+            } else {
+                note = stored
+                if titleHere { note.title = title }
+                if bodyHere { note.content = content }
+            }
+        } else if wasSaved {
+            note = QuickNote(title: title, content: content)
+            message = "This note was deleted elsewhere, so these edits were saved as a new note."
+        } else {
+            note = opened
+            note.title = title
+            note.content = content
+        }
         if store.save(note) {
+            if note.id != opened.id { redirectedNoteID = note.id }
             // The saved text is the new baseline, so editing back to it saves again.
             original = snapshot
             savedAt = .now
-            saveError = nil
+            saveError = message
             return true
         }
         saveError = store.errorMessage ?? "This note couldn't be saved."
         return false
     }
 
-    /// Called as the note editor closes. Saves the note, or removes a stored
-    /// note that was emptied. Returns false, with the reason in `saveError`,
-    /// when neither worked.
+    /// Called as the note editor closes. Saves the note, or moves a stored note that was emptied
+    /// to Recently Deleted, unless another editor saved it since, which keeps that version.
+    /// Returns false, with the reason in `saveError`, when neither worked.
     @discardableResult
     func finishNote() -> Bool {
         autosaveTask?.cancel()
-        guard case .note(let note) = editor, let store else { return false }
+        guard isNote, let store, let id = noteID else { return false }
         guard isEmptyNote else { return saveNote() }
-        guard store.database.notes.contains(where: { $0.id == note.id }) else { return true }
-        let itemID = "note.\(note.id)"
+        guard let stored = store.database.notes.first(where: { $0.id == id }), !stored.isDeleted else { return true }
+        // Newer words saved elsewhere since this editor's last save stay. (Only the body is compared:
+        // the library derives a title this editor never typed.)
+        guard stored.content == original[2] else { return true }
+        let itemID = "note.\(id)"
         let removed = store.update { database in
-            database.notes.removeAll { $0.id == note.id }
+            database.moveNoteToRecentlyDeleted(id)
             database.favoriteIDs.remove(itemID)
             database.usage.removeAll { $0.id == itemID }
         }

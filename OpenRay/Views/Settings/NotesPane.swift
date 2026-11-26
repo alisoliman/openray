@@ -54,6 +54,17 @@ struct NotesPane: View {
             } header: {
                 Text("Recently Deleted")
             }
+            if !recovered.isEmpty {
+                Section("Recovered text") {
+                    LabeledContent {
+                        Button("Show in Finder") { reveal(recovered) }
+                    } label: {
+                        SettingRowLabel(
+                            title: "\(recovered.count) recovered note\(recovered.count == 1 ? "" : "s")",
+                            detail: "Words that couldn't be saved when OpenRay quit, kept as Markdown files. Copy what you need into a note.")
+                    }
+                }
+            }
             Section("Storage") {
                 LabeledContent {
                     Button("Show in Finder") { revealAssets() }
@@ -81,10 +92,16 @@ struct NotesPane: View {
             set: { MenuBarExtras.setShown($0, commandID: NotesCommandProvider.menuBarID, in: model.store) })
     }
 
+    private var recovered: [URL] { NotesCenter.shared.model(for: model.store).recoveredFiles }
+
     private func revealAssets() {
-        guard (try? SideEffectGuard.check("showing Finder")) != nil else { return }
         let assets = NoteAssetStore(libraryURL: model.store.fileURL)
         try? FileManager.default.createDirectory(at: assets.directory, withIntermediateDirectories: true)
-        NSWorkspace.shared.activateFileViewerSelecting([assets.directory])
+        reveal([assets.directory])
+    }
+
+    private func reveal(_ urls: [URL]) {
+        guard (try? SideEffectGuard.check("showing Finder")) != nil else { return }
+        NSWorkspace.shared.activateFileViewerSelecting(urls)
     }
 }

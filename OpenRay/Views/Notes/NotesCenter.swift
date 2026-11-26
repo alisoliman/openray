@@ -35,6 +35,16 @@ final class NotesCenter {
             }
         }
         model.presenter = presenter
+        // The launcher's inline editor, when it shows the same note, follows saves made here, and
+        // its words keep their images through a purge.
+        model.onSaved = { [weak self] id in
+            guard let draft = self?.launcher?.draft, draft.noteID == id else { return }
+            draft.refreshCleanFields()
+        }
+        model.externalTexts = { [weak self] in
+            guard let draft = self?.launcher?.draft, draft.isNote else { return [] }
+            return [draft.content]
+        }
         self.presenter = presenter
         current = model
         return model
@@ -42,9 +52,10 @@ final class NotesCenter {
 
     var isWindowVisible: Bool { current?.isWindowVisible ?? false }
 
-    /// Saves typed text before the app quits.
-    func flush() {
-        current?.flush()
+    /// Before the app quits: saves typed text, or writes what can't be saved to a recovery file.
+    @discardableResult
+    func prepareForTermination() -> URL? {
+        current?.prepareForTermination()
     }
 
     /// Moves a note from the inline editor to the floating window: the editor closes, the

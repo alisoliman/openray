@@ -398,14 +398,69 @@ struct NoteAssetStore: Sendable, Equatable {
         referencedNames(in: purged).subtracting(referencedNames(in: retained)).subtracting(referencedNames(inTexts: texts))
     }
 
+    /// What `reclaim` did.
+    struct Reclaim: Equatable, Sendable {
+        var removed: [String] = []
+        /// Kept for now, because an editor (or its Undo) can still bring them back.
+        var deferred: [String] = []
+        /// Couldn't be removed; tried again later.
+        var failed: [String] = []
+    }
+
+    /// Images whose removal is waiting: an editor could still restore them, or removing them
+    /// failed. Kept in a hidden file in the folder, so a later purge, or another launch, retries.
+    private var pendingURL: URL { directory.appending(path: ".pending-removal") }
+
+    func pendingRemovals() -> Set<String> {
+        guard let text = try? String(contentsOf: pendingURL, encoding: .utf8) else { return [] }
+        return Set(text.split(separator: "\n").map(String.init).filter { Self.fileName(in: "\(Self.folderName)/\($0)") != nil })
+    }
+
+    var hasPendingRemovals: Bool { FileManager.default.fileExists(atPath: pendingURL.path) }
+
+    private func savePendingRemovals(_ names: Set<String>) {
+        if names.isEmpty {
+            try? FileManager.default.removeItem(at: pendingURL)
+        } else {
+            try? Data(names.sorted().joined(separator: "\n").utf8).write(to: pendingURL, options: [.atomic])
+        }
+    }
+
+    /// Removes `candidates`, and earlier pending ones, that no note references any more. A name
+    /// in `protected` (still in an editor or its Undo history) waits; a failed removal is
+    /// retried. Names a note references again are dropped from the list, since they're in use.
+    @discardableResult
+    func reclaim(_ candidates: Set<String>, keeping retained: [QuickNote], protecting protected: Set<String>) -> Reclaim {
+        let all = candidates.union(pendingRemovals())
+        guard !all.isEmpty else { return Reclaim() }
+        let inUse = Self.referencedNames(in: retained)
+        var result = Reclaim()
+        for name in all.sorted() where !inUse.contains(name) {
+            if protected.contains(name) {
+                result.deferred.append(name)
+                continue
+            }
+            let url = directory.appending(path: name)
+            guard FileManager.default.fileExists(atPath: url.path) else { continue }
+            do {
+                try FileManager.default.removeItem(at: url)
+                result.removed.append(name)
+            } catch {
+                result.failed.append(name)
+            }
+        }
+        savePendingRemovals(Set(result.deferred + result.failed))
+        return result
+    }
+
     /// Deletes `orphans(of:keeping:protecting:)` and returns the names removed.
     @discardableResult
     func removeAssets(referencedBy purged: [QuickNote], keeping retained: [QuickNote], protecting texts: [String] = [])
         -> [String]
     {
-        Self.orphans(of: purged, keeping: retained, protecting: texts).sorted().filter { name in
-            (try? FileManager.default.removeItem(at: directory.appending(path: name))) != nil
-        }
+        reclaim(
+            Self.referencedNames(in: purged), keeping: retained, protecting: Self.referencedNames(inTexts: texts)
+        ).removed
     }
 
     /// PNG or JPEG data from a pasteboard: the file's own bytes when it holds an image file,

@@ -382,7 +382,7 @@ final class OpenRayDelegate: NSObject, NSApplicationDelegate {
 
     func applicationWillTerminate(_ notification: Notification) {
         NSWorkspace.shared.notificationCenter.removeObserver(self)
-        NotesCenter.shared.flush()
+        NotesCenter.shared.prepareForTermination()
         MenuBarExtrasController.shared.stop()
         model.stop()
     }
