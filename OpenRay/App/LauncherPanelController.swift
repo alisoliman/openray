@@ -200,7 +200,8 @@ final class LauncherPanelController: NSObject, NSWindowDelegate {
         window.orderOut(nil)
         if isQuickLookVisible { QLPreviewPanel.shared().orderOut(nil) }
         model.files.stop()
-        if restoreFocus { model.previousApplication?.activate() }
+        // Inert launches (tests, isolated verification) never activate another app.
+        if restoreFocus, !SideEffectGuard.isInert { model.previousApplication?.activate() }
     }
 
     /// Previews a file in the shared Quick Look panel above the launcher, or closes it.

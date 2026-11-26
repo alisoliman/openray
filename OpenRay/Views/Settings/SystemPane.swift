@@ -75,16 +75,18 @@ struct SystemPane: View {
                     symbol: "gearshape.2")
                 IconRow("Toggle Wi-Fi needs an administrator when Wi-Fi settings require one.", symbol: "wifi")
                 LabeledContent {
-                    Button("Open Automation Settings") {
-                        if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Automation") {
-                            NSWorkspace.shared.open(url)
-                        }
-                    }
+                    Button("Open Automation Settings") { Self.openAutomationSettings() }
                 } label: {
                     SettingRowLabel(title: "Automation", detail: "Review which apps OpenRay may control.")
                 }
             }
         }
+    }
+
+    /// Through the shared guard: inert launches never open System Settings.
+    @discardableResult
+    static func openAutomationSettings(opener: ExternalOpener = .live()) -> Bool {
+        opener.open(ExternalOpener.automationSettings)
     }
 
     struct AddableApp: Identifiable, Hashable {
