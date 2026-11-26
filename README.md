@@ -66,8 +66,8 @@ Irreversible commands (Empty Trash, Shut Down, Restart, Log Out, Quit All, Quit 
 | --- | --- |
 | **⌥ Space** | Show or hide OpenRay; configurable in Settings. |
 | **↑ / ↓**, **← / →** | Select a result; arrows move in two dimensions in the favorites strip and the windows grid. |
-| **Return** | Open, run, or copy the selected result. The action bar always names what Return does. |
-| **⌘Return** | Send the result into the app you came from, such as **Paste to Mail**; send a message in AI; replace the selection after a writing command. |
+| **Return** | Open, run, or copy the selected result. The action bar always names what Return does. In AI: send, or with an empty field use a finished writing result. |
+| **⌘Return** | Send the result into the app you came from, such as **Paste to Mail**. In AI: add a new line, as **⇧Return** does. |
 | **Tab** | Enter the selected command's scope, start a quicklink's search term, or ask AI with the current search. |
 | **Delete** on an empty field | Leave the current scope or quicklink search term. |
 | **⌘K** | Search every action for the selection; each shows its own shortcut. |
@@ -83,11 +83,11 @@ In AI, the keys follow the conversation (an owner decision taken from the Septem
 
 ### Command aliases and hotkeys
 
-In **Settings → Shortcuts**, type an alias or record a shortcut directly in a command's row; clear a shortcut with its **×** button. Bindings are available for Applications, Files, Clipboard History, Snippets, Quicklinks, Notes, Calculator, Window Management, Ask AI, Pomodoro, Start Pomodoro, Caffeinate, Start Caffeinate, Stop Caffeinate, Toggle Caffeinate, the writing commands (Summarize Text, Improve Writing, Fix Spelling & Grammar, Make Shorter, and Extract Action Items), Settings, and these window commands: Left Half, Right Half, Maximize, Center, and Restore Window. In the launcher, select a command and choose **Assign Alias or Shortcut…** from **⌘K** to jump to its row. Bindings are saved in your local library. Individual apps, snippets, quicklinks, and clipboard entries do not have command bindings.
+In **Settings → Shortcuts** and **Settings → Commands**, type an alias or record a shortcut directly in a command's row; clear a shortcut with its **×** button. Every command can have one, including Pomodoro, Start Pomodoro, Caffeinate, Start Caffeinate, Stop Caffeinate and Toggle Caffeinate, and so can individual apps, quicklinks and snippets. In the launcher, select a row and choose **Assign Alias or Shortcut…** from **⌘K** to jump to its row. Bindings are saved in your local library. Clipboard entries don't take bindings.
 
 Type an exact alias in any search section to bring its command to the top. Matching ignores case and surrounding whitespace. Aliases must be a single token of up to 32 characters and unique across command aliases, quicklink keywords, and snippet keywords.
 
-Shortcuts combine a physical key with Command, Control, Option, and/or Shift; labels follow the keyboard layout. Modifier-only gestures, separate left/right modifiers, and all-four-modifier Hyper shortcuts are unsupported. Reserved macOS shortcuts are blocked; other detected conflicts are explained on the row and require **Keep Anyway**. A saved shortcut may remain inactive if it conflicts, with an explanation in Settings. The launcher shortcut has priority, followed by command bindings in saved order. Recording temporarily pauses OpenRay's shortcuts, and saving or removing a binding updates them immediately. **Menu bar → Open OpenRay** remains available if a shortcut fails. Window commands still require Accessibility and an accessible focused window.
+Shortcuts combine a physical key with Command, Control, Option, and/or Shift; labels follow the keyboard layout. A shortcut can also be a modifier-only gesture, a double tap, a left- or right-side modifier, F13–F20 alone, or a key with all four modifiers (the opt-in Hyper key in **Settings → Keyboard**). Reserved macOS shortcuts are blocked; other detected conflicts are explained on the row and require **Keep Anyway**. A saved shortcut may remain inactive if it conflicts, with an explanation in Settings. The launcher shortcut has priority, followed by command bindings in saved order. Recording temporarily pauses OpenRay's shortcuts, and saving or removing a binding updates them immediately. **Menu bar → Open OpenRay** remains available if a shortcut fails. Window commands still require Accessibility and an accessible focused window.
 
 ## Pomodoro
 
