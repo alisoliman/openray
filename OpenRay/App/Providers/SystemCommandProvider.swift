@@ -127,9 +127,12 @@ final class SystemCommandProvider: CommandProvider {
             case .quitAllApps: "Apps can ask to save first. Apps excluded in Settings › System keep running."
             case .quitAllAppsExceptFrontmost:
                 (kept ?? "") + "Apps can ask to save first. Apps excluded in Settings › System keep running."
+            case .hideOtherApps: (kept ?? "") + "Unhide All Apps brings the others back."
             default: ""
             }
-        return CommandConfirmation(question: text.title, detail: detail, confirmTitle: text.button)
+        // Every system question loses something or affects every app: danger-styled, approved
+        // only by a fresh press while the prompt is on screen.
+        return CommandConfirmation(question: text.title, detail: detail, confirmTitle: text.button, isDestructive: true)
     }
 
     func primaryTitle(for item: LauncherItem, ref: ProvidedRef, in model: LauncherModel) -> String? {
@@ -164,7 +167,7 @@ final class SystemCommandProvider: CommandProvider {
             // The question names this app and these exclusions. Approval runs exactly this
             // action, and only if neither changed while the question was open.
             model.selectedID = item.id
-            model.confirmation = .provided(
+            model.presentConfirmation(.provided(
                 ProvidedConfirmation(id: id.itemID, Self.confirmation(text, for: id, context: context)) {
                     [weak self, weak model] in
                     guard let self, let model else { return }
@@ -175,7 +178,7 @@ final class SystemCommandProvider: CommandProvider {
                     }
                     model.store.recordUse(of: item.id)
                     self.run(action, reporting: command, in: model)
-                })
+                }))
             return
         }
         switch ref.id {

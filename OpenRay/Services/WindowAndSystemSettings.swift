@@ -40,7 +40,7 @@ struct SystemCommandSettings: Equatable, Sendable {
 
     /// Empty Trash asks first. On by default.
     var confirmsEmptyingTrash = true
-    /// Quit All Apps and Quit Others ask first. On by default.
+    /// Quit All Apps, Quit Others and Hide Others ask first. On by default.
     var confirmsQuittingApps = true
     /// Bundle identifiers Quit All Apps leaves running, in the order they were added.
     var quitExclusions: [String] = []
@@ -72,7 +72,7 @@ struct SystemCommandSettings: Equatable, Sendable {
     func asksFirst(_ id: SystemCommand.ID) -> Bool {
         switch id {
         case .emptyTrash: confirmsEmptyingTrash
-        case .quitAllApps, .quitAllAppsExceptFrontmost: confirmsQuittingApps
+        case .quitAllApps, .quitAllAppsExceptFrontmost, .hideOtherApps: confirmsQuittingApps
         default: SystemCommand.command(id).needsConfirmation
         }
     }

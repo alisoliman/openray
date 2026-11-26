@@ -58,7 +58,9 @@ struct SystemCommandsTests {
     @Test func onlyDestructiveCommandsAskForConfirmation() {
         let confirming = Set(SystemCommand.all.filter(\.needsConfirmation).map(\.id))
         #expect(
-            confirming == [.restart, .shutDown, .logOut, .emptyTrash, .quitAllApps, .quitAllAppsExceptFrontmost])
+            confirming == [
+                .restart, .shutDown, .logOut, .emptyTrash, .quitAllApps, .quitAllAppsExceptFrontmost, .hideOtherApps,
+            ])
         for command in SystemCommand.all where command.needsConfirmation {
             #expect(command.confirmation?.title.hasSuffix("?") == true)
             #expect(command.confirmation?.button.isEmpty == false)

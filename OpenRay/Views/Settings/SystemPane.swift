@@ -25,7 +25,8 @@ struct SystemPane: View {
                 .settingsSwitch()
                 Toggle(isOn: binding(\.confirmsQuittingApps)) {
                     SettingRowLabel(
-                        title: "Confirm before quitting apps", detail: "Quit All Apps and Quit Others ask in the action bar first.")
+                        title: "Confirm before hiding or quitting apps",
+                        detail: "Quit All Apps, Quit Others and Hide Others ask in the action bar first.")
                 }
                 .settingsSwitch()
             } header: {

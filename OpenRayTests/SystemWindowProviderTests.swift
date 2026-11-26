@@ -355,7 +355,7 @@ struct SystemWindowProviderTests {
         defer { h.model.stop() }
         let emptyTrash = try command("system.emptyTrash", in: h.model)
         h.model.perform(emptyTrash)
-        #expect(h.model.confirmation?.id == "provided.system.emptyTrash")
+        #expect(h.model.confirmation?.id.hasPrefix("provided.system.emptyTrash") == true)
         #expect(h.model.confirmation?.question == "Permanently erase the items in the Trash?")
         #expect(h.model.confirmation?.confirmTitle == "Empty Trash")
         #expect(h.model.confirmation?.detail == "This can't be undone.")
@@ -365,6 +365,7 @@ struct SystemWindowProviderTests {
         #expect(h.actions.actions.isEmpty && h.systemCommands.pendingTask == nil)
         // ↩ confirms.
         h.model.perform(emptyTrash)
+        h.model.showPendingPromptLongEnough()
         h.model.performSelected()
         await h.systemCommands.pendingTask?.value
         #expect(h.actions.actions == [.emptyTrash])
@@ -381,8 +382,9 @@ struct SystemWindowProviderTests {
         let shortcut = CommandShortcut(keyCode: 15, modifiers: [.control, .option])
         #expect(h.model.store.saveCommandBinding(CommandBinding(targetID: "system.restart", shortcut: shortcut)))
         h.model.performBoundCommand(targetID: "system.restart")
-        #expect(h.model.confirmation?.id == "provided.system.restart")
+        #expect(h.model.confirmation?.id.hasPrefix("provided.system.restart") == true)
         #expect(h.actions.actions.isEmpty)
+        h.model.showPendingPromptLongEnough()
         h.model.performSelected()
         await h.systemCommands.pendingTask?.value
         #expect(h.actions.actions == [.restart])
@@ -399,7 +401,7 @@ struct SystemWindowProviderTests {
         await h.systemCommands.pendingTask?.value
         #expect(h.actions.actions == [.emptyTrash])
         h.model.perform(try command("system.restart", in: h.model))
-        #expect(h.model.confirmation?.id == "provided.system.restart")
+        #expect(h.model.confirmation?.id.hasPrefix("provided.system.restart") == true)
     }
 
     @Test func quitOthersWithoutAForegroundAppSaysSoAndRunsNothing() throws {
@@ -548,7 +550,8 @@ struct SystemWindowProviderTests {
             #expect(!opener.open(ExternalOpener.automationSettings))
             #expect(recorder.opened.isEmpty)
         }
-        #expect(LauncherDismissal.restoresFocus(true, sideEffects: SideEffectGuard(mode: .live)))
+        // An injected live guard can't override this inert process either.
+        #expect(!LauncherDismissal.restoresFocus(true, sideEffects: SideEffectGuard(mode: .live)))
         #expect(!LauncherDismissal.restoresFocus(false, sideEffects: SideEffectGuard(mode: .live)))
         // The Settings button uses the same guarded opener; in the test host it opens nothing.
         #expect(!SystemPane.openAutomationSettings())
@@ -582,6 +585,7 @@ struct SystemWindowProviderTests {
         #expect(model.foregroundApplication?.processIdentifier == finder.processIdentifier)
         model.perform(try command("system.quitAllAppsExceptFrontmost", in: model))
         #expect(model.confirmation?.question == "Quit every app except \(finder.localizedName ?? "the app")?")
+        model.showPendingPromptLongEnough()
         model.performSelected()
         await provider.pendingTask?.value
         #expect(actions.actions == [.quitOtherApps(keeping: AppIdentity(finder), excluded: [])])
@@ -594,6 +598,7 @@ struct SystemWindowProviderTests {
         #expect(h.model.confirmation != nil)
         // The launcher reopened over another app before ↩.
         h.recorder.foreground = AppIdentity(pid: 300, bundleIdentifier: "com.example.mail", name: "Mail", launchDate: nil)
+        h.model.showPendingPromptLongEnough()
         h.model.performSelected()
         #expect(h.model.feedback?.style == .warning)
         #expect(h.actions.actions.isEmpty && h.systemCommands.pendingTask == nil)
@@ -606,6 +611,7 @@ struct SystemWindowProviderTests {
         defer { h.model.stop() }
         h.model.perform(try command("system.quitAllAppsExceptFrontmost", in: h.model))
         #expect(h.model.confirmation?.detail.hasPrefix("Keeps Notes (com.example.work.notes) running.") == true)
+        h.model.showPendingPromptLongEnough()
         h.model.performSelected()
         await h.systemCommands.pendingTask?.value
         #expect(h.actions.actions == [.quitOtherApps(keeping: work, excluded: [])])
@@ -629,12 +635,14 @@ struct SystemWindowProviderTests {
         #expect(h.system.events.isEmpty)
         // Edited while the question was open: nothing runs.
         #expect(h.model.store.update { $0.windowLayouts[0].otherWindows = .minimize })
+        h.model.showPendingPromptLongEnough()
         h.model.performSelected()
         #expect(h.model.feedback?.style == .warning)
         #expect(h.windows.pendingTask == nil)
         // Ask again and approve.
         #expect(h.model.store.update { $0.windowLayouts[0].otherWindows = .close })
         h.model.perform(try command(layout.id, in: h.model))
+        h.model.showPendingPromptLongEnough()
         h.model.performSelected()
         await h.windows.pendingTask?.value
         #expect(h.system.events.contains(.close(2)))
@@ -655,6 +663,7 @@ struct SystemWindowProviderTests {
             slots: [.init(bundleIdentifier: "com.example.mail", appName: "Mail", displayIndex: 0, region: .full)])
         #expect(h.model.store.update { $0.windowLayouts = [older, newer] })
         h.model.perform(try command(WindowCommandProvider.layoutPrefix + older.id.uuidString, in: h.model))
+        h.model.showPendingPromptLongEnough()
         h.model.performSelected()
         let first = h.windows.pendingTask
         try await waitUntil { h.launcher.launched == ["com.example.slow"] }
@@ -775,6 +784,174 @@ struct SystemWindowProviderTests {
         h.model.navigate(to: .provided(SystemCommandProvider.volumeScope))
         let level = try #require(h.model.results.first)
         #expect(!h.model.actions(for: level).contains { $0.id == "assign" })
+    }
+
+
+    // MARK: Panel-level confirmation (blocker 2)
+
+    /// Slice 1's prompt gate, driven by the test: a clock, whether the panel's surface is
+    /// visible, and whether the current key press is fresh.
+    @MainActor final class PromptGate {
+        var now = Date(timeIntervalSinceReferenceDate: 1_000)
+        var visibleSince: Date?
+        var fresh = true
+
+        func install(on model: LauncherModel) {
+            model.promptClock = { [unowned self] in self.now }
+            model.confirmationSurfaceVisibleSince = { [unowned self] in self.visibleSince }
+            model.currentKeyPressIsFresh = { [unowned self] in self.fresh }
+        }
+    }
+
+    @Test(arguments: [
+        "system.shutDown", "system.restart", "system.logOut", "system.emptyTrash", "system.quitAllApps",
+        "system.quitAllAppsExceptFrontmost", "system.hideOtherApps",
+    ])
+    func everyDestructiveSystemQuestionIsMarkedSo(_ id: String) throws {
+        let h = harness()
+        defer { h.model.stop() }
+        h.model.perform(try command(id, in: h.model))
+        let confirmation = try #require(h.model.confirmation)
+        #expect(confirmation.isDestructive && confirmation.requiresVisibleApproval, "\(id)")
+        #expect(h.actions.actions.isEmpty)
+    }
+
+    @Test func aHeldReturnNeverApprovesShutDown() async throws {
+        let h = harness()
+        defer { h.model.stop() }
+        let gate = PromptGate()
+        gate.install(on: h.model)
+        gate.visibleSince = gate.now
+        // The press that ran the command keeps repeating while Return is held.
+        h.model.perform(try command("system.shutDown", in: h.model))
+        gate.fresh = false
+        for _ in 0..<5 {
+            #expect(h.model.confirmFromReturn(isRepeat: true))
+            h.model.performSelected()
+        }
+        #expect(h.actions.actions.isEmpty)
+        // Shown, on screen long enough, but still the held key: nothing.
+        h.model.confirmationDidAppear(try #require(h.model.confirmationInstanceID))
+        gate.now += LauncherModel.minimumPromptExposure
+        #expect(h.model.confirmFromReturn(isRepeat: true))
+        h.model.performSelected()
+        #expect(h.actions.actions.isEmpty)
+        #expect(h.model.confirmation?.id.hasPrefix("provided.system.shutDown") == true)
+        // A fresh press answers it.
+        gate.fresh = true
+        #expect(h.model.confirmFromReturn(isRepeat: false))
+        await h.systemCommands.pendingTask?.value
+        #expect(h.actions.actions == [.shutDown])
+    }
+
+    @Test func emptyTrashWaitsUntilItsPromptHasBeenOnScreenLongEnough() async throws {
+        let h = harness()
+        defer { h.model.stop() }
+        let gate = PromptGate()
+        gate.install(on: h.model)
+        gate.visibleSince = gate.now
+        h.model.perform(try command("system.emptyTrash", in: h.model))
+        // A fresh press before the prompt was drawn approves nothing.
+        #expect(h.model.confirmFromReturn(isRepeat: false))
+        h.model.confirmationDidAppear(try #require(h.model.confirmationInstanceID))
+        gate.now += LauncherModel.minimumPromptExposure / 2
+        #expect(h.model.confirmFromReturn(isRepeat: false))
+        #expect(h.actions.actions.isEmpty)
+        gate.now += LauncherModel.minimumPromptExposure
+        #expect(h.model.confirmFromReturn(isRepeat: false))
+        await h.systemCommands.pendingTask?.value
+        #expect(h.actions.actions == [.emptyTrash])
+    }
+
+    @Test func aHotkeyWhileThePanelIsHiddenCanOnlyBeAnsweredOnceThePromptIsVisible() async throws {
+        let h = harness(hotKey: GlobalHotKey(backend: RecordingHotKeyBackend(), reservedShortcuts: { [] }))
+        defer { h.model.stop() }
+        let gate = PromptGate()
+        gate.install(on: h.model)
+        let shortcut = CommandShortcut(keyCode: 15, modifiers: [.control, .option])
+        #expect(h.model.store.saveCommandBinding(CommandBinding(targetID: "system.restart", shortcut: shortcut)))
+        h.model.performBoundCommand(targetID: "system.restart")
+        let instance = try #require(h.model.confirmationInstanceID)
+        // Hidden: even a fresh press long after doesn't answer a prompt nobody can see.
+        h.model.confirmationDidAppear(instance)
+        gate.now += 10
+        #expect(h.model.confirmFromReturn(isRepeat: false))
+        #expect(h.actions.actions.isEmpty)
+        // The panel shows; the prompt must then be on screen long enough.
+        gate.visibleSince = gate.now
+        #expect(h.model.confirmFromReturn(isRepeat: false))
+        #expect(h.actions.actions.isEmpty)
+        gate.now += LauncherModel.minimumPromptExposure
+        #expect(h.model.confirmFromReturn(isRepeat: false))
+        await h.systemCommands.pendingTask?.value
+        #expect(h.actions.actions == [.restart])
+    }
+
+    @Test func aHotkeyDuringOnboardingAsksVisiblyAndReturnDoesNotSkipAhead() async throws {
+        let directory = FileManager.default.temporaryDirectory.appending(path: "OpenRaySystemOnboarding-\(UUID())")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let h = harness(store: LibraryStore(fileURL: directory.appending(path: "library.json")))
+        defer { h.model.stop() }
+        h.model.beginOnboardingIfNeeded()
+        let step = try #require(h.model.onboarding)
+        let gate = PromptGate()
+        gate.install(on: h.model)
+        gate.visibleSince = gate.now
+        let shortcut = CommandShortcut(keyCode: 14, modifiers: [.control, .option])
+        #expect(h.model.store.saveCommandBinding(CommandBinding(targetID: "system.emptyTrash", shortcut: shortcut)))
+        h.model.performBoundCommand(targetID: "system.emptyTrash")
+        #expect(h.model.confirmation?.id.hasPrefix("provided.system.emptyTrash") == true)
+        // Return goes to the prompt, not to the onboarding step, and can't approve it unseen.
+        h.model.performSelected()
+        #expect(h.model.onboarding == step)
+        #expect(h.actions.actions.isEmpty)
+        // Onboarding shows the prompt in its action bar; once seen long enough, a fresh press answers it.
+        h.model.confirmationDidAppear(try #require(h.model.confirmationInstanceID))
+        gate.now += LauncherModel.minimumPromptExposure
+        h.model.performSelected()
+        await h.systemCommands.pendingTask?.value
+        #expect(h.actions.actions == [.emptyTrash])
+        #expect(h.model.onboarding == step)
+    }
+
+    @Test func aHotkeyOnTheClipboardOptInAsksVisiblyAndReturnDoesNotTurnOnHistory() async throws {
+        let h = harness(hotKey: GlobalHotKey(backend: RecordingHotKeyBackend(), reservedShortcuts: { [] }))
+        defer { h.model.stop() }
+        h.model.navigate(to: .clipboard)
+        #expect(h.model.showsClipboardOptIn)
+        let gate = PromptGate()
+        gate.install(on: h.model)
+        gate.visibleSince = gate.now
+        let shortcut = CommandShortcut(keyCode: 12, modifiers: [.control, .option])
+        #expect(h.model.store.saveCommandBinding(CommandBinding(targetID: "system.quitAllApps", shortcut: shortcut)))
+        h.model.performBoundCommand(targetID: "system.quitAllApps")
+        #expect(h.model.confirmation?.id.hasPrefix("provided.system.quitAllApps") == true)
+        h.model.performSelected()
+        #expect(!h.model.store.database.preferences.clipboardEnabled)
+        #expect(h.actions.actions.isEmpty)
+        h.model.confirmationDidAppear(try #require(h.model.confirmationInstanceID))
+        gate.now += LauncherModel.minimumPromptExposure
+        h.model.performSelected()
+        await h.systemCommands.pendingTask?.value
+        #expect(h.actions.actions == [.quitAllApps(excluded: [])])
+        #expect(!h.model.store.database.preferences.clipboardEnabled)
+    }
+
+    @Test func aCloseOthersLayoutQuestionIsDestructiveAndGatedToo() throws {
+        let h = harness()
+        defer { h.model.stop() }
+        let record = WindowLayoutRecord(
+            name: "Focus", slots: [.init(bundleIdentifier: "com.example.notes", appName: "Notes", displayIndex: 0, region: .full)],
+            otherWindows: .close)
+        #expect(h.model.store.update { $0.windowLayouts = [record] })
+        let gate = PromptGate()
+        gate.install(on: h.model)
+        gate.fresh = false
+        h.model.perform(try command(WindowCommandProvider.layoutPrefix + record.id.uuidString, in: h.model))
+        #expect(h.model.confirmation?.isDestructive == true)
+        #expect(h.model.confirmFromReturn(isRepeat: true))
+        #expect(h.windows.pendingTask == nil && h.system.events.isEmpty)
     }
 
     private static func ref(of item: LauncherItem) -> ProvidedRef? {

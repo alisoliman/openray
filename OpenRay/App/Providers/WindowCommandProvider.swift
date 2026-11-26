@@ -276,13 +276,13 @@ final class WindowCommandProvider: CommandProvider {
         // Closing windows the layout doesn't place is never silent. Approval checks the layout
         // again, so an edit made while the question was open can't slip through.
         model.selectedID = item.id
-        model.confirmation = .provided(
+        model.presentConfirmation(.provided(
             ProvidedConfirmation(
                 id: ref.id,
                 CommandConfirmation(
                     question: "Close other windows?",
                     detail: "“\(record.displayName)” closes the windows it doesn't place on its displays.",
-                    confirmTitle: "Apply Layout")
+                    confirmTitle: "Apply Layout", isDestructive: true)
             ) { [weak self, weak model] in
                 guard let self, let model else { return }
                 guard model.store.database.windowLayouts.first(where: { $0.id == record.id }) == record else {
@@ -290,7 +290,7 @@ final class WindowCommandProvider: CommandProvider {
                     return
                 }
                 self.startLayout(record, item: item, in: model)
-            })
+            }))
     }
 
     private func startLayout(_ record: WindowLayoutRecord, item: LauncherItem, in model: LauncherModel) {
