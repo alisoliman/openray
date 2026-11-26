@@ -26,6 +26,9 @@ final class LauncherPanel: NSPanel {
         }
     }
     var onQuickLookEnd: (() -> Void)?
+    /// Launcher keys that aren't text editing (⌘Esc, ⌘W, Vim ⌃J/⌃K), by key code and modifiers.
+    /// Returns whether the key was used.
+    var keyCommand: ((UInt16, ShortcutModifiers) -> Bool)?
 
     override var canBecomeKey: Bool { true }
     override var canBecomeMain: Bool { true }
@@ -40,6 +43,11 @@ final class LauncherPanel: NSPanel {
 
     override func sendEvent(_ event: NSEvent) {
         if handleEscapeKey(event) { return }
+        if event.type == .keyDown, attachedSheet == nil, !((firstResponder as? NSTextView)?.hasMarkedText() ?? false),
+            keyCommand?(event.keyCode, Self.modifiers(of: event)) == true
+        {
+            return
+        }
         if event.type == .keyDown, [36, 76].contains(event.keyCode),
             event.modifierFlags.intersection([.command, .control, .option, .shift]).isEmpty,
             !((firstResponder as? NSTextView)?.hasMarkedText() ?? false), confirmAction?(event.isARepeat) == true
@@ -61,6 +69,15 @@ final class LauncherPanel: NSPanel {
             return
         }
         super.sendEvent(event)
+    }
+
+    static func modifiers(of event: NSEvent) -> ShortcutModifiers {
+        var modifiers: ShortcutModifiers = []
+        if event.modifierFlags.contains(.command) { modifiers.insert(.command) }
+        if event.modifierFlags.contains(.control) { modifiers.insert(.control) }
+        if event.modifierFlags.contains(.option) { modifiers.insert(.option) }
+        if event.modifierFlags.contains(.shift) { modifiers.insert(.shift) }
+        return modifiers
     }
 
     static func firstTextInput(in view: NSView?) -> NSView? {
@@ -239,10 +256,10 @@ final class LauncherPanelController: NSObject, NSWindowDelegate {
         }
     }
 
-    /// The upper third of the screen under the pointer, with a fixed top edge.
+    /// The upper third of the chosen screen, with a fixed top edge: the screen with the
+    /// pointer, the one with the active window, or the primary one.
     private func position(_ window: NSWindow) {
-        let screen = NSScreen.screens.first(where: { $0.frame.contains(NSEvent.mouseLocation) }) ?? NSScreen.main
-        guard let frame = screen?.visibleFrame else { return }
+        guard let frame = Self.screen(for: model.store.database.preferences.screen)?.visibleFrame else { return }
         let size = PanelGeometry.windowSize
         let panelTop = frame.maxY - max(40, frame.height * 0.13)
         window.setFrame(
@@ -251,6 +268,38 @@ final class LauncherPanelController: NSObject, NSWindowDelegate {
                 y: (panelTop + PanelGeometry.topMargin - size.height).rounded(),
                 width: size.width, height: size.height),
             display: false)
+    }
+
+    static func screen(for choice: LauncherScreen) -> NSScreen? {
+        let pointer = NSScreen.screens.first { $0.frame.contains(NSEvent.mouseLocation) } ?? NSScreen.main
+        switch choice {
+        case .mouse:
+            return pointer
+        case .primary:
+            return NSScreen.screens.first ?? pointer
+        case .focusedWindow:
+            guard let frame = frontmostWindowFrame() else { return pointer }
+            let center = CGPoint(x: frame.midX, y: frame.midY)
+            return NSScreen.screens.first { $0.frame.contains(center) } ?? pointer
+        }
+    }
+
+    /// The frontmost app's front window, in AppKit screen coordinates. Window bounds need no
+    /// permission; titles aren't read.
+    private static func frontmostWindowFrame() -> CGRect? {
+        guard let app = NSWorkspace.shared.frontmostApplication,
+            let windows = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID)
+                as? [[String: Any]],
+            let info = windows.first(where: {
+                ($0[kCGWindowOwnerPID as String] as? pid_t) == app.processIdentifier
+                    && ($0[kCGWindowLayer as String] as? Int) == 0
+            }),
+            let bounds = info[kCGWindowBounds as String] as? NSDictionary,
+            let rect = CGRect(dictionaryRepresentation: bounds)
+        else { return nil }
+        // Quartz measures from the top of the primary screen; AppKit from its bottom.
+        let primaryHeight = NSScreen.screens.first?.frame.height ?? 0
+        return CGRect(x: rect.minX, y: primaryHeight - rect.maxY, width: rect.width, height: rect.height)
     }
 
     func applyAppearance() {
@@ -305,12 +354,19 @@ final class LauncherPanelController: NSObject, NSWindowDelegate {
         panel.hasShadow = false
         panel.isMovableByWindowBackground = false
         panel.animationBehavior = .none
-        panel.onCancel = { [weak model] in model?.goBack() }
+        panel.onCancel = { [weak model] in model?.escape() }
         panel.delegate = self
         panel.escapeAction = { [weak model] in
             guard let model else { return false }
-            model.goBack()
+            model.escape()
             return true
+        }
+        panel.keyCommand = { [weak model] keyCode, modifiers in
+            guard let model,
+                let command = LauncherKeyCommand.command(
+                    keyCode: keyCode, modifiers: modifiers, vim: model.store.database.preferences.usesVimNavigation)
+            else { return false }
+            return model.handle(command)
         }
         panel.panelRect = { [weak model] in
             guard let model else { return .zero }

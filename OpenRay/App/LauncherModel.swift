@@ -91,6 +91,14 @@ final class LauncherModel {
     /// True while a provider's live search for the current query is running.
     var isLoadingProvidedItems: Bool { !pendingLiveProviderIDs.isEmpty }
     @ObservationIgnored private var providedLiveTasks: [Task<Void, Never>] = []
+    /// Query picks and search history; see LauncherModel+Launcher.
+    let memory: LauncherMemoryStore
+    /// Open argument fields. Set through `beginArguments(…)`, cleared by run or cancel.
+    var argumentSession: ArgumentSession?
+    /// Open action-panel submenus, outermost first.
+    var actionPath: [ActionEntry] = []
+    /// The search history entry ↑ last recalled.
+    @ObservationIgnored var historyCursor: Int?
     /// Bumped whenever live searches restart or stop, so a late answer for an earlier query is dropped.
     @ObservationIgnored private var liveGeneration = 0
     let applications = ApplicationCatalog()
@@ -132,6 +140,7 @@ final class LauncherModel {
     ) {
         self.store = store
         self.registry = registry
+        memory = LauncherMemoryStore(fileURL: LauncherMemoryStore.fileURL(besideLibrary: store.fileURL))
         self.hotKey = hotKey ?? GlobalHotKey()
         usesInjectedHotKey = hotKey != nil
         self.ai = ai
@@ -151,6 +160,7 @@ final class LauncherModel {
 
     var results: [LauncherItem] {
         guard query.count <= 512 else { return [] }
+        if let session = argumentSession { return [session.item] }
         if let link = argumentLink { return argumentItems(for: link) }
         // Aliases are a single global namespace, independent of section, usage,
         // favorites, quicklink arguments and calculator interpretation.
@@ -162,7 +172,7 @@ final class LauncherModel {
         var items: [LauncherItem] = []
         switch section {
         case .home:
-            items = commandItems + applicationItems + quicklinkItems + snippetItems + noteItems + savedFileItems
+            items = withoutDisabledCommands(commandItems) + applicationItems + quicklinkItems + snippetItems + noteItems + savedFileItems
             items += clipboardItems.filter { store.database.favoriteIDs.contains($0.id) }
             items += registry.rootItems(for: query.trimmingCharacters(in: .whitespacesAndNewlines), in: self)
             if query.count >= 2 { items += fileItems }
@@ -190,6 +200,8 @@ final class LauncherModel {
         if !trimmed.isEmpty, section.providedScope?.ranksItems ?? true {
             let now = Date.now
             let favorites = store.database.favoriteIDs
+            let learned = memory.memory.picks[LauncherMemory.normalize(trimmed)] ?? [:]
+            let hasAliases = section == .home && store.database.commandBindings.contains { $0.alias != nil }
             let usage = Dictionary(store.database.usage.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
             items = items.compactMap { item -> (LauncherItem, Int)? in
                 if case .quicklink(let link, let argument) = item.action, link.argument(in: trimmed) != nil {
@@ -200,7 +212,9 @@ final class LauncherModel {
                 let titleScore = SearchMatcher.score(trimmed, in: item.title)
                 // Keywords match by word, prefix or substring only; scattered letters are noise there.
                 let keywordScore = SearchMatcher.score(trimmed, in: item.keywords).flatMap { $0 >= 450 ? $0 - 80 : nil }
-                guard let score = [titleScore, keywordScore].compactMap({ $0 }).max() else { return nil }
+                // An alias the query starts ranks just below an exact title.
+                let aliasScore = hasAliases ? aliasPrefixScore(for: item, query: trimmed) : nil
+                guard let score = [titleScore, keywordScore, aliasScore].compactMap({ $0 }).max() else { return nil }
                 let appBoost: Int
                 if case .application = item.action { appBoost = 70 } else { appBoost = 0 }
                 let commandBoost = item.isBuiltInCommand && titleScore == 1_000 ? 200 : 0
@@ -211,7 +225,9 @@ final class LauncherModel {
                         let age = now.timeIntervalSince(record.lastUsed)
                         return min(record.count, 10) * 3 + (age < 86_400 ? 25 : age < 604_800 ? 12 : 0)
                     } ?? 0
-                return (item, score + appBoost + commandBoost + favoriteBoost + usageBoost)
+                // What you picked for this query before comes first among similar matches.
+                let learnedBoost = Self.learnedBoost(learned[item.id] ?? 0)
+                return (item, score + appBoost + commandBoost + favoriteBoost + usageBoost + learnedBoost)
             }.sorted {
                 if $0.1 != $1.1 { return $0.1 > $1.1 }
                 let comparison = $0.0.title.localizedStandardCompare($1.0.title)
@@ -287,23 +303,29 @@ final class LauncherModel {
     /// Up to sixteen favorites (⌘1–⌘8 open the first eight) and four recents.
     var favoriteItems: [LauncherItem] {
         let index = Dictionary(
-            (commandItems + applicationItems + quicklinkItems + snippetItems + noteItems + savedFileItems
-                + clipboardItems).map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
-        return store.database.orderedFavoriteIDs.compactMap { index[$0] ?? registry.item(withID: $0, in: self) }
-            .prefix(16).map { $0 }
+            (withoutDisabledCommands(commandItems) + applicationItems + quicklinkItems + snippetItems + noteItems
+                + savedFileItems + clipboardItems).map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
+        let disabled = store.database.disabledCommandIDs
+        return store.database.orderedFavoriteIDs.compactMap {
+            index[$0] ?? (disabled.contains($0) ? nil : registry.item(withID: $0, in: self))
+        }
+        .prefix(16).map { $0 }
     }
 
     private var homeGroups: [LauncherResultGroup] {
         let favorites = favoriteItems
         let favoriteIDs = Set(favorites.map(\.id))
         let index = Dictionary(
-            (commandItems + applicationItems + quicklinkItems + snippetItems + noteItems + savedFileItems).map {
+            (withoutDisabledCommands(commandItems) + applicationItems + quicklinkItems + snippetItems + noteItems
+                + savedFileItems).map {
                 ($0.id, $0)
             }, uniquingKeysWith: { first, _ in first })
+        let disabled = store.database.disabledCommandIDs
         // Clipboard entries stay out of Everything unless they are favorites.
         let recent = store.database.usage.sorted { $0.lastUsed > $1.lastUsed }
             .filter { !favoriteIDs.contains($0.id) && !$0.id.hasPrefix("clipboard.") }
-            .compactMap { index[$0.id] ?? registry.item(withID: $0.id, in: self) }.prefix(4)
+            .compactMap { index[$0.id] ?? (disabled.contains($0.id) ? nil : registry.item(withID: $0.id, in: self)) }
+            .prefix(4)
         return [
             LauncherResultGroup(
                 id: "favorites", title: "Favorites", trailing: favorites.count > 1 ? "⌘1 – ⌘\(min(8, favorites.count))" : nil,
@@ -359,26 +381,11 @@ final class LauncherModel {
         return groups.filter { !$0.items.isEmpty || $0.isLoading }
     }
 
+    /// Ask AI and the web search unless the person chose others; see LauncherModel+Launcher.
     private var fallbackItems: [LauncherItem] {
         let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return [] }
-        var items = [
-            LauncherItem(
-                id: "fallback.ai", title: "Ask AI", subtitle: ai.availability.isAvailable ? "" : "Not available yet",
-                symbol: "sparkles", kind: .ai, badge: "Ask AI", action: .askAI(trimmed))
-        ]
-        if let web = webSearchLink {
-            items.append(
-                LauncherItem(
-                    id: "fallback.web", title: web.name, subtitle: Self.siteName(for: web),
-                    symbol: "globe", kind: .quicklink, badge: "Quicklink", action: .quicklink(web, trimmed)))
-        }
-        return items + registry.fallbackItems(for: trimmed, in: self)
-    }
-
-    private var webSearchLink: Quicklink? {
-        let links = store.database.quicklinks.filter(\.needsQuery)
-        return links.first { $0.keyword.lowercased() == "web" } ?? links.first
+        return orderedFallbackItems(for: trimmed)
     }
 
     private func clipboardGroups(_ items: [LauncherItem]) -> [LauncherResultGroup] {
@@ -476,9 +483,9 @@ final class LauncherModel {
     /// Called just before the panel appears.
     func panelWillShow() {
         presentation += 1
+        let delay = store.database.preferences.popToRootDelay.interval
         let remembered =
-            store.database.preferences.remembersLastQuery
-            && (lastHiddenAt.map { Date().timeIntervalSince($0) <= OR.Timing.rememberQuery } ?? true)
+            delay != 0 && (lastHiddenAt.map { hidden in delay.map { Date().timeIntervalSince(hidden) <= $0 } ?? true } ?? true)
         if !remembered, draft?.isDirty != true, onboarding == nil {
             resetToHome()
         } else if !query.isEmpty {
@@ -695,7 +702,10 @@ final class LauncherModel {
         } else if showShortcuts {
             showShortcuts = false
         } else if showActions {
-            showActions = false
+            // Esc leaves a submenu before it closes the panel.
+            if !closeActionSubmenu() { showActions = false }
+        } else if argumentSession != nil {
+            cancelArguments()
         } else if showsAttachmentPreview {
             showsAttachmentPreview = false
         } else if editor != nil {
@@ -717,6 +727,7 @@ final class LauncherModel {
 
     /// ⌫ on an empty field removes the token: first the argument, then the scope.
     func deleteBackwardOnEmptyField() -> Bool {
+        if deleteBackwardInArguments() { return true }
         if argumentLink != nil {
             clearArgument(restoreKeyword: true)
             return true
@@ -736,11 +747,19 @@ final class LauncherModel {
     /// A query asks AI from any scope, and Esc returns to that scope with it.
     func handleTab() {
         guard confirmation == nil, !showActions else { return }
+        if argumentSession != nil {
+            moveArgumentFocus(1)
+            return
+        }
         let item = selectedItem
+        if let item, argumentLink == nil, beginArguments(for: item) { return }
         switch item?.action {
         case .section(let target)? where section == .home && !query.isEmpty:
             store.recordUse(of: item!.id)
             navigate(to: target)
+        case .provided(let ref)? where section == .home && !query.isEmpty && Self.opensScope(registry.descriptor(for: ref, in: self)):
+            // Tab steps into a provider's list, as it does into a built-in scope.
+            perform(item!)
         case .quicklink(let link, let argument)? where link.needsQuery && argument.isEmpty && argumentLink == nil:
             beginArgument(link)
         case .clipboard(let entry)?:
@@ -822,6 +841,8 @@ final class LauncherModel {
     /// Vertical movement. Grids move by row; lists move by one and wrap.
     func moveSelection(_ offset: Int) {
         guard !showActions else { return }
+        // ↑ at the top of an empty Everything recalls earlier searches.
+        if recallSearchHistory(offset) { return }
         let groups = groups
         let items = groups.flatMap(\.items)
         guard !items.isEmpty else { return }
@@ -943,6 +964,16 @@ final class LauncherModel {
             argumentLink = link
             query = argument
             return
+        }
+        // So does an alias and a space, for a command that takes arguments.
+        if section == .home, destination == .search, argumentLink == nil, argumentSession == nil,
+            query.last?.isWhitespace == true, beginArgumentsFromAlias(in: query)
+        {
+            return
+        }
+        // Typing over a recalled search starts a new one.
+        if let cursor = historyCursor, memory.memory.history.indices.contains(cursor) ? memory.memory.history[cursor] != query : true {
+            historyCursor = nil
         }
         if argumentLink == nil, section == .home || section == .files {
             files.search(query, showRecent: section == .files, scope: section == .files ? fileScope : .home)

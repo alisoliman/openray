@@ -53,6 +53,7 @@ extension SettingsPane {
         .general,
         // Slice 1: keyboard
         .shortcuts,
+        .commands,
         // Slice 2: clipboard, snippets
         .clipboard,
         .snippets,

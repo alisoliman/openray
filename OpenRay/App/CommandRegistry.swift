@@ -64,6 +64,8 @@ struct GridTileRenderer {
 protocol CommandProvider: AnyObject {
     /// Matches the registration's id.
     var id: String { get }
+    /// The heading Settings › Commands lists this provider's commands under. Defaults to the id.
+    var title: String { get }
 
     /// The commands this provider offers. Each becomes a root-search row that can be a favorite,
     /// a recent, and the target of an alias or hotkey (if the registration accepts its id).
@@ -134,6 +136,9 @@ protocol CommandProvider: AnyObject {
 }
 
 extension CommandProvider {
+    var title: String {
+        id.split(separator: ".").map { $0.prefix(1).uppercased() + $0.dropFirst() }.joined(separator: " ")
+    }
     func rootItems(for query: String, in model: LauncherModel) -> [LauncherItem] { [] }
     func item(withID id: String, in model: LauncherModel) -> LauncherItem? { nil }
     func scopeItems(_ scope: ProvidedScope, query: String, in model: LauncherModel) -> [LauncherItem] { [] }

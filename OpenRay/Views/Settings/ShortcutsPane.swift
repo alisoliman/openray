@@ -16,6 +16,8 @@ struct ShortcutsPane: View {
     @State private var reservedShortcuts: Set<CommandShortcut> = []
     @State private var hotKeyPickerRevision = 0
     @State private var highlightedCommandID: String?
+    /// An app, quicklink or snippet Settings was opened for, listed until the pane closes.
+    @State private var extraRowID: String?
 
     var body: some View {
         ScrollViewReader { proxy in
@@ -70,7 +72,7 @@ struct ShortcutsPane: View {
     /// While searching, only the commands whose title or alias matches. All of them when
     /// none do, because then the pane itself matched.
     private var commands: [LauncherItem] {
-        let all = model.bindableCommands
+        let all = model.bindingRows(focusing: extraRowID)
         let query = navigation.search.trimmingCharacters(in: .whitespaces)
         guard !query.isEmpty else { return all }
         let matching = all.filter { SettingsSearch.wordPrefixScore(query, in: model.settingsSearchText(for: $0)) != nil }
@@ -88,7 +90,8 @@ struct ShortcutsPane: View {
     private func focusRequestedCommand(_ proxy: ScrollViewProxy) {
         guard let id = navigation.focusCommandID else { return }
         navigation.focusCommandID = nil
-        guard model.bindableCommands.contains(where: { $0.id == id }) else { return }
+        guard model.bindingRows(focusing: id).contains(where: { $0.id == id }) else { return }
+        extraRowID = id
         if !commands.contains(where: { $0.id == id }) { navigation.search = "" }
         // Wait a turn, so the rows exist when the pane has only just appeared.
         Task { @MainActor in

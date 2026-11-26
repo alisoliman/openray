@@ -283,15 +283,18 @@ struct GlobalHotKeyTests {
     }
 
     @Test func unsupportedTargetsAreNeverRegistered() {
-        let backend = FakeHotKeyBackend()
-        let registry = GlobalHotKey(backend: backend, reservedShortcuts: { [] })
-        let issues = registry.synchronize(
-            launcher: .optionSpace, bindings: [.init(targetID: "snippet.deleted", shortcut: shortcut)],
-            onLauncher: {}, onCommand: { _ in })
-        #expect(issues.map(\.targetID) == ["snippet.deleted"])
-        #expect(backend.identifier(for: shortcut) == nil)
-        #expect(backend.active.count == 1)
-        registry.unregister()
+        // Only the legacy registrations: the launcher's own makes snippets bindable.
+        CuratedCommand.$registrations.withValue([AIWritingCommandProvider.registration]) {
+            let backend = FakeHotKeyBackend()
+            let registry = GlobalHotKey(backend: backend, reservedShortcuts: { [] })
+            let issues = registry.synchronize(
+                launcher: .optionSpace, bindings: [.init(targetID: "snippet.deleted", shortcut: shortcut)],
+                onLauncher: {}, onCommand: { _ in })
+            #expect(issues.map(\.targetID) == ["snippet.deleted"])
+            #expect(backend.identifier(for: shortcut) == nil)
+            #expect(backend.active.count == 1)
+            registry.unregister()
+        }
     }
 
     @Test func releasingRegistryRemovesAllRegistrationsAndTheHandler() {

@@ -48,6 +48,12 @@ extension LauncherModel {
         showActions = false
         confirmation = nil
         feedback = nil
+        // A command that still needs an argument opens its fields instead of failing.
+        if argumentSession == nil, argumentSpecs(for: item).contains(where: { !$0.isOptional && $0.defaultValue == nil }) {
+            beginArguments(for: item)
+            return
+        }
+        noteQueryPick(for: item)
         switch item.action {
         case .application(let app):
             Task {
@@ -559,6 +565,7 @@ extension LauncherModel {
     // MARK: - Action panel
 
     func actionsDidToggle() {
+        actionPath = []
         if showActions {
             actionEntries = actions(for: selectedItem)
             actionFilter = ""
@@ -571,11 +578,8 @@ extension LauncherModel {
         }
     }
 
-    var filteredActionEntries: [ActionEntry] {
-        let filter = actionFilter.trimmingCharacters(in: .whitespaces)
-        guard !filter.isEmpty else { return actionEntries }
-        return actionEntries.filter { SearchMatcher.score(filter, in: $0.title) != nil }
-    }
+    /// The current level's entries, or every match including submenu entries while filtering.
+    var filteredActionEntries: [ActionEntry] { actionEntriesMatching(actionFilter) }
 
     /// Arrow keys in ⌘K. VoiceOver hears each action as the keyboard reaches it;
     /// hover moves the highlight too, so the announcement lives here, not in the view.
@@ -598,7 +602,12 @@ extension LauncherModel {
         performAction(entries[actionSelection])
     }
 
+    /// Runs an entry, or opens it when it's a submenu.
     func performAction(_ entry: ActionEntry) {
+        if !entry.children.isEmpty, showActions {
+            openActionSubmenu(entry)
+            return
+        }
         showActions = false
         entry.perform()
     }
@@ -748,6 +757,42 @@ extension LauncherModel {
                         symbol: favorite ? "star.slash" : "star", shortcut: .command("F", shift: true), key: "f",
                         modifiers: [.command, .shift], group: .organize
                     ) { [weak self] in self?.toggleFavorite(item) })
+                if favorite {
+                    if canMoveFavorite(item, by: -1) {
+                        entries.append(
+                            ActionEntry(
+                                id: "favoriteUp", title: "Move Favorite Up", symbol: "arrow.up",
+                                shortcut: KeyShortcut(["⌥", "⌘", "↑"]), key: .upArrow, modifiers: [.command, .option],
+                                group: .organize, section: "Favorites"
+                            ) { [weak self] in self?.moveFavorite(item, by: -1) })
+                    }
+                    if canMoveFavorite(item, by: 1) {
+                        entries.append(
+                            ActionEntry(
+                                id: "favoriteDown", title: "Move Favorite Down", symbol: "arrow.down",
+                                shortcut: KeyShortcut(["⌥", "⌘", "↓"]), key: .downArrow, modifiers: [.command, .option],
+                                group: .organize, section: "Favorites"
+                            ) { [weak self] in self?.moveFavorite(item, by: 1) })
+                    }
+                }
+            }
+            entries += fallbackActions(for: item)
+            if canResetRanking(item) {
+                entries.append(
+                    ActionEntry(id: "resetRanking", title: "Reset Ranking", symbol: "arrow.counterclockwise", group: .organize)
+                    { [weak self] in self?.resetRanking(for: item) })
+            }
+            if isDisableable(item) {
+                entries.append(
+                    ActionEntry(
+                        id: "configure", title: "Configure Command", symbol: "slider.horizontal.3",
+                        shortcut: KeyShortcut(["⇧", "⌘", ","]), key: ",", modifiers: [.command, .shift],
+                        group: .organize, section: "Command"
+                    ) { [weak self] in self?.openSettings(.commands, focusing: item.id) })
+                entries.append(
+                    ActionEntry(
+                        id: "disable", title: "Disable Command", symbol: "nosign", group: .organize, section: "Command"
+                    ) { [weak self] in self?.disableCommand(item) })
             }
             if item.canDelete {
                 let noun: String =
@@ -800,7 +845,7 @@ extension LauncherModel {
         entries.append(
             ActionEntry(id: "shortcuts", title: "Show Shortcuts", symbol: "keyboard", shortcut: .command("/"), group: .panel)
             { [weak self] in self?.showShortcuts = true })
-        return entries
+        return markingTertiary(entries)
     }
 
     private func aiActions() -> [ActionEntry] {

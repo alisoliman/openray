@@ -9,6 +9,7 @@ enum CommandProviders {
     static let all: [CommandProviderRegistration] = [
         AIWritingCommandProvider.registration,
         // Slice 1: launcher core
+        LauncherCommandProvider.registration,
         // Slice 2: clipboard, snippets, quicklinks
         // Slice 3: calculator, emoji, translator
         // Slice 4: files, screenshots, applications

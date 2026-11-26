@@ -13,10 +13,13 @@ struct ActionPanel: View {
                 Image(systemName: "magnifyingglass").font(.system(size: 12, weight: .medium))
                     .foregroundStyle(OR.Color.text2)
                 LauncherSearchInput(
-                    text: $model.actionFilter, placeholder: "Search actions", focusRequest: focus,
+                    text: $model.actionFilter,
+                    placeholder: model.actionPath.last.map { "Search \($0.title)" } ?? "Search actions",
+                    focusRequest: focus,
                     submit: model.performActionSelection, move: model.moveActionSelection,
                     // Esc closes the top layer, which is ⌘/ when it's open over this panel.
                     cancel: model.goBack, paste: performCommandReturnEntry,
+                    moveHorizontally: model.moveActionSelectionHorizontally, tertiary: model.performTertiary,
                     fontSize: 13, accessibilityLabel: "Search actions", identifier: "actions.search")
             }
             .padding(.horizontal, 14).frame(height: 38)
@@ -25,6 +28,10 @@ struct ActionPanel: View {
             ScrollViewReader { proxy in
                 ScrollView {
                     VStack(alignment: .leading, spacing: 0) {
+                        if let parent = model.actionPath.last {
+                            ActionPanelBreadcrumb(title: parent.title) { model.closeActionSubmenu() }
+                            Hairline().padding(.vertical, 2).padding(.horizontal, 2)
+                        }
                         if entries.isEmpty {
                             Text("No matching actions").font(OR.Font.body).foregroundStyle(OR.Color.text2)
                                 .frame(maxWidth: .infinity).padding(.vertical, 18)
@@ -32,6 +39,10 @@ struct ActionPanel: View {
                         ForEach(Array(entries.enumerated()), id: \.element.id) { index, entry in
                             if index > 0, entries[index - 1].group != entry.group {
                                 Hairline().padding(.vertical, 4).padding(.horizontal, 2)
+                            }
+                            // A titled section starts where the title changes.
+                            if let section = entry.section, index == 0 || entries[index - 1].section != section {
+                                ActionPanelSectionHeader(title: section)
                             }
                             row(entry, selected: index == model.actionSelection).id(entry.id)
                         }
@@ -72,6 +83,10 @@ struct ActionPanel: View {
                     .lineLimit(1)
                 Spacer(minLength: 8)
                 if let shortcut = entry.shortcut { KeyCaps(shortcut, size: .small) }
+                if !entry.children.isEmpty {
+                    Image(systemName: "chevron.right").font(.system(size: 11, weight: .semibold))
+                        .foregroundStyle(OR.Color.text2)
+                }
             }
             .padding(.leading, 8).padding(.trailing, 6).frame(height: 32)
             .background(selected ? OR.Color.fill2 : .clear, in: .rect(cornerRadius: 10, style: .continuous))
@@ -80,7 +95,7 @@ struct ActionPanel: View {
         .buttonStyle(.plain)
         .onHover { if $0, let index = model.filteredActionEntries.firstIndex(where: { $0.id == entry.id }) { model.actionSelection = index } }
         .accessibilityLabel(entry.title)
-        .accessibilityHint(entry.shortcut?.spoken ?? "")
+        .accessibilityHint(entry.children.isEmpty ? entry.shortcut?.spoken ?? "" : "Opens \(entry.children.count) more actions")
         .accessibilityAddTraits(selected ? .isSelected : [])
         .accessibilityIdentifier("action.\(entry.id)")
     }
@@ -254,9 +269,17 @@ struct ShortcutsOverlay: View {
     /// What Tab does for the selection, following LauncherModel.handleTab.
     private var tabRow: (String, [String])? {
         guard model.argumentLink == nil else { return nil }
+        if model.argumentSession != nil { return ("Next Argument", ["Tab"]) }
+        if let selected, !model.argumentSpecs(for: selected).isEmpty { return ("Enter Arguments", ["Tab"]) }
         switch selected?.action {
         case .section(let target)? where model.section == .home && !model.query.isEmpty:
             return ("Open \(target.title)", ["Tab"])
+        case .provided(let ref)? where model.section == .home && !model.query.isEmpty:
+            // A provider's list opens with Tab, as a built-in scope does.
+            if case .view(let scope)? = model.registry.descriptor(for: ref, in: model)?.mode {
+                return ("Open \(scope.title)", ["Tab"])
+            }
+            return ("Ask AI", ["Tab"])
         case .quicklink(let link, let argument)? where link.needsQuery && argument.isEmpty:
             return ("Enter Search Term", ["Tab"])
         case .clipboard(let entry)?:

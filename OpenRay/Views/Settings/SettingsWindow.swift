@@ -55,7 +55,9 @@ struct SettingsWindowView: View {
 
     private var query: String { navigation.search.trimmingCharacters(in: .whitespaces) }
 
-    private var commandSearchTexts: [String] { model.bindableCommands.map { model.settingsSearchText(for: $0) } }
+    private var commandSearchTexts: [String] {
+        model.commandCatalog.flatMap(\.commands).map { model.settingsSearchText(for: $0) }
+    }
 
     /// A library that failed to load can't save anything, so every pane says so once, at the top.
     private var storeError: String? {
@@ -103,7 +105,8 @@ enum SettingsSearch {
         // Keyword and command matches rank below the same kind of match on a pane title.
         let keywords = wordPrefixScore(query, in: pane.title + " " + pane.keywords).map { $0 - 50 }
         let command =
-            pane == .shortcuts ? commands.compactMap { wordPrefixScore(query, in: $0) }.max().map { $0 - 150 } : nil
+            pane == .shortcuts || pane == .commands
+            ? commands.compactMap { wordPrefixScore(query, in: $0) }.max().map { $0 - 150 } : nil
         return [title, keywords, command].compactMap { $0 }.max()
     }
 

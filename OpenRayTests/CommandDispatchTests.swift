@@ -31,12 +31,13 @@ struct CommandDispatchTests {
         #expect(model.results.map(\.id) == ["section.notes"])
     }
 
-    @Test func aliasMatchingIsExactAndActionsKeepTheirExistingRouting() {
+    @Test func aliasPrefixesRankFirstExactAliasesWinAndActionsKeepTheirRouting() {
         let model = model()
         defer { model.stop() }
         #expect(model.store.saveCommandBinding(CommandBinding(targetID: "section.clipboard", alias: "zzclip")))
+        // A prefix of an alias ranks its command first; only the exact alias makes it the sole result.
         model.query = "zzcli"
-        #expect(model.results.isEmpty)
+        #expect(model.results.first?.id == "section.clipboard")
         model.query = "zzclip"
         model.showActions = true
         model.performSelected()

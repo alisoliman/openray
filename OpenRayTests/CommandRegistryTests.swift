@@ -281,7 +281,13 @@ struct CommandRegistryTests {
         let model = model([fake])
         defer { model.stop() }
         let item = try #require(model.commandItems.first { $0.id == "test.args" })
+        // Without its required argument, the command opens its argument fields instead of running.
         model.perform(item)
+        #expect(fake.performed.isEmpty)
+        #expect(model.argumentSession?.item.id == "test.args")
+        model.cancelArguments()
+        // A stale row that skips the fields is still refused by the registry.
+        model.registry.perform(item, ref: ProvidedRef(provider: "test.fake", id: "test.args", traits: [.descriptor]), in: model)
         #expect(fake.performed.isEmpty)
         #expect(model.feedback?.style == .warning)
         var filled = item

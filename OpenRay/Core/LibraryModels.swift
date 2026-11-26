@@ -206,12 +206,42 @@ struct AppPreferences: Codable, Equatable, Sendable {
     // Whether capture was paused (true) or turned off (false) while it isn't
     // running. Nil until either is chosen; see LibraryDatabase.clipboardIsPaused.
     var clipboardPaused: Bool? = nil
+    // Added by the launcher slice (Slice 1). Optional, so earlier libraries keep decoding; nil
+    // means the default. Read them through the computed properties below.
+    /// Supersedes `rememberLastQuery` once set.
+    var popToRoot: PopToRootDelay? = nil
+    var escapeBehavior: EscapeBehavior? = nil
+    /// ⌃J and ⌃K move the selection, as ⌃N and ⌃P already do.
+    var vimNavigation: Bool? = nil
+    var launcherScreen: LauncherScreen? = nil
+    var interfaceSize: InterfaceSize? = nil
+    /// Slices 2 and 3 read `primaryActionPastes` for what ↩ does with copyable rows.
+    var primaryAction: PrimaryAction? = nil
+    /// A recorded launcher shortcut. Supersedes the `hotKey` preset once set.
+    var launcherShortcut: CommandShortcut? = nil
+    /// True once fallbacks were chosen by hand; `LibraryDatabase.fallbackOrder` then lists them.
+    var customFallbacks: Bool? = nil
+    var hyperKey: HyperKeySettings? = nil
+    /// Whether searches are remembered for ↑ in an empty field.
+    var searchHistory: Bool? = nil
 
     var capturesClipboardImages: Bool { clipboardImagesEnabled ?? false }
     var capturesClipboardFiles: Bool { clipboardFilesEnabled ?? false }
     var remembersLastQuery: Bool { rememberLastQuery ?? true }
     var usesBarMode: Bool { barMode ?? false }
     var needsFirstRun: Bool { firstRunCompleted == false }
+    var popToRootDelay: PopToRootDelay { popToRoot ?? (remembersLastQuery ? .seconds90 : .immediately) }
+    var escapeClosesWindow: Bool { escapeBehavior == .closeWindow }
+    var usesVimNavigation: Bool { vimNavigation ?? false }
+    var screen: LauncherScreen { launcherScreen ?? .mouse }
+    var size: InterfaceSize { interfaceSize ?? .standard }
+    /// True when ↩ pastes copyable rows and ⌘↩ copies them; false (the default) for the reverse.
+    var primaryActionPastes: Bool { primaryAction == .paste }
+    /// The shortcut that opens the launcher: a recorded one, else the preset.
+    var launcherHotKeyShortcut: CommandShortcut { launcherShortcut ?? hotKey.shortcut }
+    var usesCustomFallbacks: Bool { customFallbacks ?? false }
+    var hyper: HyperKeySettings { hyperKey ?? HyperKeySettings() }
+    var remembersSearchHistory: Bool { searchHistory ?? true }
 
     /// The apps capture and expansion skip. Built-in password managers always
     /// apply, even if the saved list no longer contains them.

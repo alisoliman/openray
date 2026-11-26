@@ -179,6 +179,59 @@ struct PlaceholderChip: View {
     }
 }
 
+// MARK: - Action panel and search field parts
+
+/// A titled section in the action panel, such as “Fallbacks” or “Paste As”.
+struct ActionPanelSectionHeader: View {
+    var title: String
+    var body: some View {
+        Text(title)
+            .font(.system(size: 11.5, weight: .semibold)).foregroundStyle(OR.Color.text2)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(.leading, 8).padding(.top, 6).padding(.bottom, 2)
+            .accessibilityAddTraits(.isHeader)
+    }
+}
+
+/// The row above an open submenu: its parent's title, with ← or esc to go back.
+struct ActionPanelBreadcrumb: View {
+    var title: String
+    var onBack: () -> Void
+    var body: some View {
+        Button(action: onBack) {
+            HStack(spacing: 6) {
+                Image(systemName: "chevron.left").font(.system(size: 11, weight: .semibold))
+                Text(title).font(OR.Font.calloutEmphasis).lineLimit(1)
+                Spacer(minLength: 8)
+                KeyCaps(["←"], size: .small)
+            }
+            .foregroundStyle(OR.Color.text2)
+            .padding(.horizontal, 8).frame(height: 28)
+            .contentShape(.rect)
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel("Back from \(title)")
+    }
+}
+
+/// One inline argument in the search bar: a compact well holding a field, accented while it
+/// has the keyboard. Optional arguments say so in the placeholder.
+struct ArgumentFieldWell<Field: View>: View {
+    var isFocused: Bool
+    var isMissing = false
+    @ViewBuilder var field: Field
+    var body: some View {
+        field
+            .padding(.horizontal, 8).frame(height: 30)
+            .frame(minWidth: 90, maxWidth: 200)
+            .background(OR.Color.fill1, in: .rect(cornerRadius: 8, style: .continuous))
+            .overlay {
+                RoundedRectangle(cornerRadius: 8, style: .continuous)
+                    .strokeBorder(isMissing ? OR.Color.warning : isFocused ? OR.Color.accentFill : OR.Color.separator)
+            }
+    }
+}
+
 /// The small circular clear button.
 struct ClearButton: View {
     var label = "Clear"
