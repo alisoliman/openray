@@ -322,7 +322,7 @@ final class MenuBarReader: Sendable {
     func snapshot(
         of pid: pid_t, includeAppleMenu: Bool = false, limits: MenuItemCollector.Limits = .init()
     ) async throws -> MenuSnapshot {
-        let flag = MenuReadCancellation()
+        let flag = BackgroundReadCancellation()
         let source = source
         let queue = queue
         return try await withTaskCancellationHandler {
@@ -364,7 +364,8 @@ final class MenuBarReader: Sendable {
     }
 }
 
-private final class MenuReadCancellation: @unchecked Sendable {
+/// A flag a cancelled task sets and a background read checks between steps.
+final class BackgroundReadCancellation: @unchecked Sendable {
     private let lock = NSLock()
     private var value = false
 

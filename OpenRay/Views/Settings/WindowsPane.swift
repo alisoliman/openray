@@ -162,9 +162,18 @@ struct WindowLayoutSettingsRow: View {
     }
 
     private func delete() {
-        let id = record.id
-        guard model.store.update({ $0.windowLayouts.removeAll { $0.id == id } }) else { return }
-        _ = model.store.forget(itemIDs: [WindowCommandProvider.layoutPrefix + id.uuidString])
-        model.commandCatalogDidChange()
+        if Self.delete(record.id, in: model.store) { model.commandCatalogDidChange() }
+    }
+
+    /// One save: the layout goes with its favorite and usage records, or nothing changes (the
+    /// pane shows the store's error). A binding stays, inactive, as for any missing command.
+    @discardableResult
+    static func delete(_ id: UUID, in store: LibraryStore) -> Bool {
+        let itemID = WindowCommandProvider.layoutPrefix + id.uuidString
+        return store.update { database in
+            database.windowLayouts.removeAll { $0.id == id }
+            database.favoriteIDs.remove(itemID)
+            database.usage.removeAll { $0.id == itemID }
+        }
     }
 }

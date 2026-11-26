@@ -29,7 +29,10 @@ final class InertWindowServerListing: WindowServerListing {
 final class CGWindowServerListing: WindowServerListing {
     nonisolated init() {}
 
-    func onScreenWindows() -> [WindowServerEntry] {
+    func onScreenWindows() -> [WindowServerEntry] { Self.read() }
+
+    /// The window server's list, front to back. Safe off the main actor.
+    nonisolated static func read() -> [WindowServerEntry] {
         guard
             let info = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID)
                 as? [[String: Any]]
@@ -48,7 +51,7 @@ final class CGWindowServerListing: WindowServerListing {
 }
 
 /// A row in Switch Windows.
-struct SwitchableWindow: Identifiable, Equatable {
+struct SwitchableWindow: Identifiable, Equatable, Sendable {
     var snapshot: WindowSnapshot
     /// The window server's number, when the window is on screen in the current Space.
     var windowNumber: UInt32?
@@ -78,16 +81,23 @@ enum WindowSwitcherOrdering {
     static func order(
         _ windows: [WindowSnapshot], entries: [WindowServerEntry], primaryHeight: CGFloat
     ) -> [SwitchableWindow] {
+        func matches(_ window: WindowSnapshot, _ entry: WindowServerEntry) -> Bool {
+            guard window.pid == entry.pid, !window.isMinimized, let frame = window.frame else { return false }
+            return WindowGeometry.approximatelyEqual(
+                ScreenCoordinates.flip(frame, primaryHeight: primaryHeight), entry.bounds, tolerance: 2)
+        }
+        let normal = entries.filter { $0.layer == 0 }
         var remaining = windows
         var onScreen: [SwitchableWindow] = []
-        for entry in entries where entry.layer == 0 {
-            guard
-                let index = remaining.firstIndex(where: { window in
-                    guard window.pid == entry.pid, !window.isMinimized, let frame = window.frame else { return false }
-                    return WindowGeometry.approximatelyEqual(
-                        ScreenCoordinates.flip(frame, primaryHeight: primaryHeight), entry.bounds, tolerance: 2)
-                })
-            else { continue }
+        for entry in normal {
+            let candidates = remaining.indices.filter { matches(remaining[$0], entry) }
+            guard let index = candidates.first else { continue }
+            // Two same-sized windows of one app can sit on different Spaces. Only when every
+            // candidate has its own on-screen entry is the match certain; otherwise skip them all.
+            let sameBounds = normal.filter { other in
+                other.pid == entry.pid && WindowGeometry.approximatelyEqual(other.bounds, entry.bounds, tolerance: 2)
+            }
+            guard candidates.count <= sameBounds.count else { continue }
             onScreen.append(SwitchableWindow(snapshot: remaining.remove(at: index), windowNumber: entry.number))
         }
         let elsewhere = remaining.filter { !$0.isMinimized }.map { SwitchableWindow(snapshot: $0) }
@@ -208,6 +218,140 @@ final class WindowSwitcher {
         }
         guard window.snapshot.pid != system.ownPID, system.isRunning(window.snapshot.pid) else {
             throw LibraryValidationError("That window's app has quit.")
+        }
+    }
+}
+
+// MARK: - Background snapshots
+
+/// An app to read windows from, gathered on the main actor.
+struct WindowAppRecord: Equatable, Sendable {
+    var pid: pid_t
+    var name: String
+    var bundleIdentifier: String?
+    var bundleURL: URL?
+}
+
+/// Reads windows for Switch Windows off the main actor. `AXWindowSnapshotSource` is the real
+/// one; inert launches get an empty one, and tests use fakes.
+protocol WindowSnapshotSource: Sendable {
+    var isTrusted: Bool { get }
+    /// Regular apps other than OpenRay, by name.
+    @MainActor func applications() -> [WindowAppRecord]
+    /// Standard windows of these apps, front to back within each, stopping when `shouldStop` says so.
+    func windows(
+        of apps: [WindowAppRecord], includeMinimized: Bool, primaryHeight: CGFloat, shouldStop: () -> Bool
+    ) -> [WindowSnapshot]
+    func onScreenWindows() -> [WindowServerEntry]
+}
+
+extension WindowSystemEnvironment {
+    /// Accessibility in a normal launch; nothing in inert launches.
+    static func makeSnapshotSource(sideEffects: SideEffectGuard = .current) -> any WindowSnapshotSource {
+        sideEffects.isInert ? InertWindowSnapshotSource() : AXWindowSnapshotSource()
+    }
+}
+
+final class InertWindowSnapshotSource: WindowSnapshotSource {
+    init() {}
+    var isTrusted: Bool { false }
+    @MainActor func applications() -> [WindowAppRecord] { [] }
+    func windows(
+        of apps: [WindowAppRecord], includeMinimized: Bool, primaryHeight: CGFloat, shouldStop: () -> Bool
+    ) -> [WindowSnapshot] { [] }
+    func onScreenWindows() -> [WindowServerEntry] { [] }
+}
+
+/// The real snapshot: Accessibility for titles, the window server for stacking.
+final class AXWindowSnapshotSource: WindowSnapshotSource {
+    /// One hung app costs at most this per call, and the read as a whole has its own budget.
+    private static let timeout: Float = 0.25
+
+    init() {}
+
+    var isTrusted: Bool { AXIsProcessTrusted() }
+
+    @MainActor func applications() -> [WindowAppRecord] {
+        let ownPID = ProcessInfo.processInfo.processIdentifier
+        return NSWorkspace.shared.runningApplications.filter {
+            $0.activationPolicy == .regular && $0.processIdentifier != ownPID && !$0.isTerminated
+        }.sorted { ($0.localizedName ?? "").localizedStandardCompare($1.localizedName ?? "") == .orderedAscending }
+            .map {
+                WindowAppRecord(
+                    pid: $0.processIdentifier, name: $0.localizedName ?? "App", bundleIdentifier: $0.bundleIdentifier,
+                    bundleURL: $0.bundleURL)
+            }
+    }
+
+    func windows(
+        of apps: [WindowAppRecord], includeMinimized: Bool, primaryHeight: CGFloat, shouldStop: () -> Bool
+    ) -> [WindowSnapshot] {
+        guard isTrusted else { return [] }
+        var windows: [WindowSnapshot] = []
+        for app in apps {
+            guard !shouldStop() else { break }
+            let element = AXUIElementCreateApplication(app.pid)
+            AXUIElementSetMessagingTimeout(element, Self.timeout)
+            guard let elements = AXWindowReading.attribute(kAXWindowsAttribute, of: element) as? [AXUIElement] else {
+                continue
+            }
+            for window in elements {
+                guard !shouldStop() else { break }
+                AXUIElementSetMessagingTimeout(window, Self.timeout)
+                guard AXWindowReading.attribute(kAXSubroleAttribute, of: window) as? String == kAXStandardWindowSubrole
+                else { continue }
+                let minimized = AXWindowReading.attribute(kAXMinimizedAttribute, of: window) as? Bool == true
+                if minimized && !includeMinimized { continue }
+                let frame = (try? AXWindowReading.frame(of: window)).map {
+                    ScreenCoordinates.flip($0, primaryHeight: primaryHeight)
+                }
+                windows.append(
+                    WindowSnapshot(
+                        handle: WindowHandle(pid: app.pid, element: window), appName: app.name,
+                        bundleIdentifier: app.bundleIdentifier, bundleURL: app.bundleURL,
+                        title: AXWindowReading.attribute(kAXTitleAttribute, of: window) as? String ?? "", frame: frame,
+                        isMinimized: minimized))
+            }
+        }
+        return windows
+    }
+
+    func onScreenWindows() -> [WindowServerEntry] { CGWindowServerListing.read() }
+}
+
+/// Reads Switch Windows' snapshot on its own serial queue, so unresponsive apps can't hold
+/// the launcher. A read stops when its task is cancelled or its time budget runs out.
+final class WindowSnapshotReader: Sendable {
+    let source: any WindowSnapshotSource
+    private let queue = DispatchQueue(label: "app.openray.window-snapshot-reader", qos: .userInitiated)
+
+    init(source: any WindowSnapshotSource) {
+        self.source = source
+    }
+
+    /// The apps' windows, ordered by the window server. Throws CancellationError when cancelled.
+    func windows(
+        of apps: [WindowAppRecord], primaryHeight: CGFloat, timeBudget: Duration = .seconds(2)
+    ) async throws -> [SwitchableWindow] {
+        let flag = BackgroundReadCancellation()
+        let source = source
+        let queue = queue
+        return try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<[SwitchableWindow], any Error>) in
+                queue.async {
+                    let start = ContinuousClock.now
+                    let snapshots = source.windows(
+                        of: apps, includeMinimized: true, primaryHeight: primaryHeight,
+                        shouldStop: { flag.isSet || ContinuousClock.now - start > timeBudget })
+                    guard !flag.isSet else { return continuation.resume(throwing: CancellationError()) }
+                    let entries = source.onScreenWindows()
+                    guard !flag.isSet else { return continuation.resume(throwing: CancellationError()) }
+                    continuation.resume(
+                        returning: WindowSwitcherOrdering.order(snapshots, entries: entries, primaryHeight: primaryHeight))
+                }
+            }
+        } onCancel: {
+            flag.set()
         }
     }
 }

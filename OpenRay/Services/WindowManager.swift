@@ -81,7 +81,8 @@ struct WindowFramePlan {
 // MARK: - Window system
 
 /// Another app's window: an Accessibility element in the app, a plain token in tests.
-struct WindowHandle: Hashable {
+/// AXUIElement is an immutable reference that Accessibility accepts from any thread.
+struct WindowHandle: Hashable, @unchecked Sendable {
     let pid: pid_t
     let token: Int
     let element: AXUIElement?
@@ -123,7 +124,7 @@ struct DisplaySnapshot: Equatable, Sendable {
 }
 
 /// A window of another app as Accessibility reports it.
-struct WindowSnapshot: Equatable {
+struct WindowSnapshot: Equatable, Sendable {
     var handle: WindowHandle
     var appName: String
     var bundleIdentifier: String?
@@ -379,12 +380,24 @@ final class AXWindowSystem: WindowSystem {
     }
 
     private func attribute(_ name: String, of element: AXUIElement) -> CFTypeRef? {
+        AXWindowReading.attribute(name, of: element)
+    }
+
+    private func readFrame(_ window: AXUIElement) throws -> CGRect {
+        try AXWindowReading.frame(of: window)
+    }
+}
+
+/// Accessibility reads shared by the main-actor window system and the background snapshot reader.
+enum AXWindowReading {
+    static func attribute(_ name: String, of element: AXUIElement) -> CFTypeRef? {
         var value: CFTypeRef?
         guard AXUIElementCopyAttributeValue(element, name as CFString, &value) == .success else { return nil }
         return value
     }
 
-    private func readFrame(_ window: AXUIElement) throws -> CGRect {
+    /// The window's frame in Accessibility's top-left coordinates.
+    static func frame(of window: AXUIElement) throws -> CGRect {
         var positionValue: CFTypeRef?
         var sizeValue: CFTypeRef?
         let position = AXUIElementCopyAttributeValue(window, kAXPositionAttribute as CFString, &positionValue)
@@ -408,8 +421,10 @@ final class AXWindowSystem: WindowSystem {
         }
         return CGRect(origin: point, size: size)
     }
+}
 
-    private func writeFrame(_ rect: CGRect, from current: CGRect, to window: AXUIElement) throws {
+extension AXWindowSystem {
+    fileprivate func writeFrame(_ rect: CGRect, from current: CGRect, to window: AXUIElement) throws {
         let plan = WindowFramePlan(current: current, target: rect)
         if !plan.movesPosition && !plan.changesSize { return }
         var movable: DarwinBoolean = false
@@ -660,6 +675,16 @@ final class WindowManager {
                 if move.unminimize { try system.setMinimized(false, of: move.window) }
                 let current = try system.frame(of: move.window)
                 try apply(move.frame, to: move.window, from: current, focus: false)
+                // An app can accept the write and keep the window where it was. Only a window
+                // that really ended up on its display counts, and only that can clear the display.
+                let actual = try system.frame(of: move.window)
+                guard displays.indices.contains(move.displayIndex),
+                    DisplayArrangement.index(of: actual, in: displays.map(\.frame)) == move.displayIndex,
+                    !displays[move.displayIndex].frame.intersection(actual).isNull
+                else {
+                    failedSlots.insert(move.slotID)
+                    continue
+                }
                 placed.append(move)
             } catch let error as SideEffectGuard.Blocked {
                 throw error
@@ -669,10 +694,13 @@ final class WindowManager {
         }
         var cleanupFailures = 0
         if layout.otherWindows != .leave && !placed.isEmpty {
+            // A superseded or cancelled apply must never touch windows another layout placed.
+            try Task.checkCancellation()
             let targets = WindowLayoutPlanner.cleanupTargets(
                 visible: visibleWindows(), claimed: Set(plan.moves.map(\.window)), displays: displays,
                 placedDisplays: Set(placed.map(\.displayIndex)))
             for window in targets {
+                try Task.checkCancellation()
                 do {
                     switch layout.otherWindows {
                     case .leave: break

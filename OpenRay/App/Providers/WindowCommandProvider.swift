@@ -63,27 +63,41 @@ final class WindowCommandProvider: CommandProvider {
     let windows: WindowManager
     let launcher: any ApplicationLaunching
     let hud: HUDController
-    /// The app whose focused window commands act on: the one OpenRay opened over.
+    /// The app whose focused window commands act on: the one OpenRay opened over, or the one
+    /// whose window the target chip chose.
     let foregroundPID: @MainActor (LauncherModel) -> pid_t?
-    /// The last layout apply, so tests can wait for it.
+    let dismissal: LauncherDismissal
+    let opener: ExternalOpener
+    /// Reads Switch Windows' snapshot off the main actor.
+    let switchReader: WindowSnapshotReader
+    /// The last task started, so tests can wait for it.
     private(set) var pendingTask: Task<Void, Never>?
-    /// Switch Windows rows, read once when the scope opens and filtered after.
+    /// The running layout. A newer layout cancels it before it can move or close anything else.
+    private var layoutTask: Task<Void, Never>?
+    /// Switch Windows rows, read once per visit and filtered after.
     private var switchable: [SwitchableWindow] = []
 
     convenience init() {
-        self.init(windows: WindowManager(), launcher: WorkspaceApplicationLauncher(), hud: .shared)
+        self.init(
+            windows: WindowManager(), launcher: WorkspaceApplicationLauncher(), hud: .shared,
+            switchReader: WindowSnapshotReader(source: WindowSystemEnvironment.makeSnapshotSource()))
     }
 
     init(
         windows: WindowManager, launcher: any ApplicationLaunching, hud: HUDController,
+        switchReader: WindowSnapshotReader,
         foregroundPID: @escaping @MainActor (LauncherModel) -> pid_t? = { model in
             model.previousApplication.flatMap { $0.isTerminated ? nil : $0.processIdentifier }
-        }
+        },
+        dismissal: LauncherDismissal = .live(), opener: ExternalOpener = .live()
     ) {
         self.windows = windows
         self.launcher = launcher
         self.hud = hud
+        self.switchReader = switchReader
         self.foregroundPID = foregroundPID
+        self.dismissal = dismissal
+        self.opener = opener
     }
 
     var id: String { Self.providerID }
@@ -172,10 +186,7 @@ final class WindowCommandProvider: CommandProvider {
         }
         switch ref.id {
         case Self.focusNextID, Self.focusPreviousID:
-            run(item: item, in: model) { manager, _, pid in
-                try WindowSwitcher(system: manager.system, listing: manager.listing)
-                    .focusAdjacentWindow(of: pid, forward: ref.id == Self.focusNextID)
-            }
+            focusAdjacentWindow(item, forward: ref.id == Self.focusNextID, in: model)
         case Self.switchRowID:
             focusSwitchable(id: ref.payload, in: model)
         case Self.resizeRowID, Self.moveRowID:
@@ -203,7 +214,7 @@ final class WindowCommandProvider: CommandProvider {
         do {
             try body(windows, target, foregroundPID(model))
             model.store.recordUse(of: item.id)
-            model.panel?.dismiss(restoreFocus: false)
+            dismissal.dismiss(model, false)
         } catch {
             // A chosen window that has closed stops being the target.
             if let chosen = model.targetWindow, !windows.listWindows().contains(where: { $0.id == chosen.id }) {
@@ -217,7 +228,7 @@ final class WindowCommandProvider: CommandProvider {
     private func requireAccess(in model: LauncherModel) -> Bool {
         guard model.accessibilityAllowed || windows.hasPermission else {
             windows.requestPermission()
-            if !SideEffectGuard.isInert { SystemSettingsLink.open(.accessibility) }
+            _ = opener.open(ExternalOpener.accessibilitySettings)
             model.feedback = .info("Allow OpenRay in Accessibility, then try again.")
             return false
         }
@@ -237,7 +248,7 @@ final class WindowCommandProvider: CommandProvider {
             }
             model.store.recordUse(of: item.id)
             model.commandCatalogDidChange()
-            model.panel?.dismiss(restoreFocus: true)
+            dismissal.dismiss(model, true)
             let count = layout.slots.count
             hud.show(
                 HUDMessage(
@@ -253,18 +264,45 @@ final class WindowCommandProvider: CommandProvider {
             model.feedback = .error("This layout no longer exists.")
             return
         }
-        let layout = record.layout
-        do { try layout.validate() } catch {
+        do { try record.layout.validate() } catch {
             model.feedback = .warning("\(error.localizedDescription) Edit it in Settings › Windows.")
             return
         }
         guard requireAccess(in: model) else { return }
+        guard record.otherWindows == .close else {
+            startLayout(record, item: item, in: model)
+            return
+        }
+        // Closing windows the layout doesn't place is never silent. Approval checks the layout
+        // again, so an edit made while the question was open can't slip through.
+        model.selectedID = item.id
+        model.confirmation = .provided(
+            ProvidedConfirmation(
+                id: ref.id,
+                CommandConfirmation(
+                    question: "Close other windows?",
+                    detail: "“\(record.displayName)” closes the windows it doesn't place on its displays.",
+                    confirmTitle: "Apply Layout")
+            ) { [weak self, weak model] in
+                guard let self, let model else { return }
+                guard model.store.database.windowLayouts.first(where: { $0.id == record.id }) == record else {
+                    model.feedback = .warning("“\(record.displayName)” changed while the question was open. Run it again.")
+                    return
+                }
+                self.startLayout(record, item: item, in: model)
+            })
+    }
+
+    private func startLayout(_ record: WindowLayoutRecord, item: LauncherItem, in model: LauncherModel) {
         model.store.recordUse(of: item.id)
-        model.panel?.dismiss(restoreFocus: false)
+        dismissal.dismiss(model, false)
+        // One layout at a time: a newer one stops an older one before its next launch, move or close.
+        layoutTask?.cancel()
+        let layout = record.layout
         let windows = windows
         let launcher = launcher
         let hud = hud
-        pendingTask = Task { @MainActor in
+        let task = Task { @MainActor in
             do {
                 let outcome = try await windows.apply(layout, launcher: launcher)
                 hud.show(
@@ -276,6 +314,8 @@ final class WindowCommandProvider: CommandProvider {
                 hud.show(HUDMessage(error.localizedDescription, symbol: "exclamationmark.triangle.fill", style: .error))
             }
         }
+        layoutTask = task
+        pendingTask = task
     }
 
     /// "Layout 1", "Layout 2", … the first number no saved layout uses.
@@ -290,12 +330,53 @@ final class WindowCommandProvider: CommandProvider {
 
     var providesLiveItems: Bool { true }
 
+    /// Reads every window once per visit, off the main actor and within a time budget, then
+    /// filters locally. Leaving the scope or typing cancels a read that's still running.
     func liveItems(for query: String, scope: ProvidedScope?, in model: LauncherModel) async -> [LauncherItem] {
         guard scope?.id == Self.switchScope.id else { return [] }
         if query.isEmpty || switchable.isEmpty {
-            switchable = WindowSwitcher(system: windows.system, listing: windows.listing).windows()
+            switchable = []
+            let apps = switchReader.source.applications()
+            let primaryHeight = windows.system.displays().first?.frame.maxY ?? 0
+            do {
+                let read = try await switchReader.windows(of: apps, primaryHeight: primaryHeight)
+                guard !Task.isCancelled else { return [] }
+                switchable = read
+            } catch {
+                return []
+            }
         }
         return switchable.map(switchRow)
+    }
+
+    private func focusAdjacentWindow(_ item: LauncherItem, forward: Bool, in model: LauncherModel) {
+        guard requireAccess(in: model) else { return }
+        guard let pid = foregroundPID(model), pid != windows.system.ownPID else {
+            model.feedback = .warning("Focus a window in another app, then open OpenRay and try again.")
+            return
+        }
+        let current = windows.system.focusedWindow(of: pid)
+        let apps = switchReader.source.applications().filter { $0.pid == pid }
+        let primaryHeight = windows.system.displays().first?.frame.maxY ?? 0
+        model.store.recordUse(of: item.id)
+        dismissal.dismiss(model, false)
+        let reader = switchReader
+        let switcher = WindowSwitcher(system: windows.system, listing: windows.listing)
+        let hud = hud
+        pendingTask = Task { @MainActor in
+            do {
+                let list = try await reader.windows(of: apps, primaryHeight: primaryHeight)
+                guard let next = WindowSwitcherOrdering.adjacent(in: list, pid: pid, current: current, forward: forward)
+                else {
+                    hud.show(HUDMessage("This app has no other window", symbol: "macwindow", style: .info))
+                    return
+                }
+                try switcher.focus(next)
+            } catch is CancellationError {
+            } catch {
+                hud.show(HUDMessage(error.localizedDescription, symbol: "exclamationmark.triangle.fill", style: .error))
+            }
+        }
     }
 
     private func switchRow(_ window: SwitchableWindow) -> LauncherItem {
@@ -316,7 +397,7 @@ final class WindowCommandProvider: CommandProvider {
         }
         do {
             try WindowSwitcher(system: windows.system, listing: windows.listing).focus(window)
-            model.panel?.dismiss(restoreFocus: false)
+            dismissal.dismiss(model, false)
         } catch {
             model.feedback = .error(error.localizedDescription)
         }
@@ -332,7 +413,8 @@ final class WindowCommandProvider: CommandProvider {
                 guard let self, let model else { return }
                 do {
                     try body(switcher, window)
-                    self.switchable = switcher.windows()
+                    // Read the list again in the background.
+                    self.switchable = []
                     model.refreshProvidedLiveItems()
                 } catch {
                     model.feedback = .error(error.localizedDescription)
@@ -376,7 +458,10 @@ final class WindowCommandProvider: CommandProvider {
     func scopeItems(_ scope: ProvidedScope, query: String, in model: LauncherModel) -> [LauncherItem] {
         switch scope.id {
         case Self.resizeScope.id:
-            let typed = WindowArgumentParser.pair(query) ?? WindowArgumentParser.pair(scope.arguments["width"], scope.arguments["height"])
+            let typed =
+                query.isEmpty
+                ? WindowArgumentParser.pair(scope.arguments["width"], scope.arguments["height"])
+                : WindowArgumentParser.pair(query)
             guard let typed, typed.0 > 0, typed.1 > 0 else { return [] }
             let (width, height) = typed
             return [
@@ -389,7 +474,10 @@ final class WindowCommandProvider: CommandProvider {
                         ProvidedRef(provider: id, id: Self.resizeRowID, payload: "resize:\(width)x\(height)", traits: [])))
             ]
         case Self.moveScope.id:
-            let typed = WindowArgumentParser.pair(query) ?? WindowArgumentParser.pair(scope.arguments["x"], scope.arguments["y"])
+            let typed =
+                query.isEmpty
+                ? WindowArgumentParser.pair(scope.arguments["x"], scope.arguments["y"])
+                : WindowArgumentParser.pair(query)
             guard let typed else { return [] }
             let (x, y) = typed
             return [
@@ -419,23 +507,28 @@ final class WindowCommandProvider: CommandProvider {
 }
 
 /// Reads two numbers typed for exact Move and Resize: "1200x800", "1200 × 800", "100, 50".
+/// Values outside what a display could hold are refused before any row is built.
 enum WindowArgumentParser {
+    /// The same bound `CustomWindowCommand.validate()` applies to points.
+    static let limit: Double = 20_000
+
     static func pair(_ text: String) -> (Double, Double)? {
         let numbers = text.split { "x×X, \t".contains($0) }.map(String.init)
-        guard numbers.count == 2, let first = Double(numbers[0]), let second = Double(numbers[1]),
-            first.isFinite, second.isFinite
-        else { return nil }
-        return (first, second)
+        guard numbers.count == 2 else { return nil }
+        return pair(numbers[0], numbers[1])
     }
 
     static func pair(_ first: String?, _ second: String?) -> (Double, Double)? {
         guard let first = first.flatMap(Double.init), let second = second.flatMap(Double.init),
-            first.isFinite, second.isFinite
+            first.isFinite, second.isFinite, abs(first) <= limit, abs(second) <= limit
         else { return nil }
         return (first, second)
     }
 
+    /// Whole numbers without a decimal point, fractions to two places. Never traps.
     static func format(_ value: Double) -> String {
-        value == value.rounded() ? String(Int(value)) : String(value)
+        // The parser reads a period, so rows show one too.
+        value.formatted(
+            .number.grouping(.never).precision(.fractionLength(0...2)).locale(Locale(identifier: "en_US_POSIX")))
     }
 }

@@ -614,7 +614,8 @@ struct CustomWindowCommand: Codable, Equatable, Identifiable, Sendable {
         let width = width?.resolve(against: screen.width) ?? current.width
         let height = height?.resolve(against: screen.height) ?? current.height
         guard width > 0, height > 0 else { throw LibraryValidationError("Sizes must be above zero.") }
-        guard width <= screen.width + 0.5, height <= screen.height + 0.5 else {
+        // Only a requested size must fit; Move keeps a window that's already larger as it is.
+        guard self.width == nil || width <= screen.width + 0.5, self.height == nil || height <= screen.height + 0.5 else {
             throw LibraryValidationError(
                 "This display has room for up to \(Int(screen.width)) × \(Int(screen.height)) points. Choose a smaller size.")
         }
