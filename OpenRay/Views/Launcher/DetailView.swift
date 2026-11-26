@@ -60,6 +60,8 @@ struct DetailView: View {
 
     /// The view draws at most this much of the body's end; Copy Output still copies all of it.
     static let renderLimit = 200_000
+    /// Taller than the list detent leaves room for, so the panel opens to it.
+    static let preferredHeight: CGFloat = 440
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -110,8 +112,9 @@ struct DetailView: View {
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
-        .frame(minHeight: 400)
-        .reportsContentHeight()
+        // A document wants the tallest list detent. Measuring itself would keep whatever height
+        // the panel had before, since the view fills what it's given.
+        .preference(key: ContentHeightKey.self, value: Self.preferredHeight)
         .accessibilityElement(children: .contain)
         .accessibilityLabel(content.title)
         .accessibilityIdentifier("detail.view")

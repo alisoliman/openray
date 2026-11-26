@@ -850,6 +850,15 @@ struct ScriptCommandLauncherTests {
         #expect(try row("Long", in: h).badge == "Script")
     }
 
+    @Test("Copy Output copies the text without escape codes")
+    func plainOutput() throws {
+        let job = ScriptJob(command: try command("# @raycast.schemaVersion 1\n# @raycast.title J\n# @raycast.mode fullOutput\n"), arguments: [], values: [:])
+        job.append("\u{1B}[1mbold\u{1B}[0m\n")
+        #expect(job.plainOutput == "bold\n")
+        job.append("more\n")
+        #expect(job.plainOutput == "bold\nmore\n")
+    }
+
     @Test("Canned results work without any process, for the provider's own logic")
     func canned() async throws {
         let h = try harness(

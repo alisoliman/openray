@@ -262,7 +262,7 @@ private struct CreateScriptSheet: View {
         do {
             let url = try provider.createScript(draft, in: folderID, model: model)
             dismiss()
-            if (try? SideEffectGuard.check("opening scripts in an editor")) != nil { NSWorkspace.shared.open(url) }
+            try? ScriptCommandProvider.openInEditor(url)
         } catch {
             self.error = error.localizedDescription
         }

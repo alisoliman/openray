@@ -361,7 +361,18 @@ final class ScriptJob: Identifiable {
         self.startedAt = startedAt
     }
 
+    @ObservationIgnored private var plainCache: (count: Int, text: String)?
+
     var isRunning: Bool { execution == nil }
+
+    /// The output without ANSI codes, as Copy Output copies it. Cached until the output grows.
+    var plainOutput: String {
+        let count = output.utf8.count
+        if let plainCache, plainCache.count == count { return plainCache.text }
+        let text = ANSIText.strip(output)
+        plainCache = (count, text)
+        return text
+    }
 
     func append(_ text: String, limit: Int = ScriptRunner.outputLimit) {
         guard execution == nil else { return }

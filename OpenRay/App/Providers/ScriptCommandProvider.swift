@@ -247,7 +247,7 @@ final class ScriptCommandProvider: CommandProvider {
             model.openSettings(.scripts)
         case Self.outputRowID:
             guard let job = ref.payload.flatMap(UUID.init(uuidString:)).flatMap(runner.job(withID:)) else { return }
-            model.copy(job.output, label: "output of \(job.command.title)")
+            model.copy(job.plainOutput, label: "output of \(job.command.title)")
         default:
             guard let script = catalog.command(withID: ref.id) else {
                 model.feedback = .error("“\(item.title.truncatedForFeedback)” is no longer available.")
@@ -387,7 +387,7 @@ final class ScriptCommandProvider: CommandProvider {
             action: .provided(
                 ProvidedRef(
                     provider: id, id: Self.outputRowID, payload: job.id.uuidString,
-                    copyText: ANSIText.strip(job.output), primaryTitle: "Copy Output", traits: [.paste])))
+                    copyText: job.plainOutput, primaryTitle: "Copy Output", traits: [.paste])))
     }
 
     static func status(of job: ScriptJob) -> String {
@@ -499,8 +499,7 @@ final class ScriptCommandProvider: CommandProvider {
                 modifiers: .command, group: .item
             ) { [weak model] in
                 do {
-                    try SideEffectGuard.check("opening scripts in an editor")
-                    NSWorkspace.shared.open(script.url)
+                    try Self.openInEditor(script.url)
                     model?.panel?.dismiss(restoreFocus: false)
                 } catch {
                     model?.feedback = .error(error.localizedDescription)
@@ -522,6 +521,19 @@ final class ScriptCommandProvider: CommandProvider {
                 shortcut: .command("C", shift: true), key: "c", modifiers: [.command, .shift], group: .item
             ) { [weak model] in model?.copy(script.url.path, label: script.url.lastPathComponent) },
         ]
+    }
+
+    /// Opens a script in the person's source code editor. Never `NSWorkspace.open(url)` alone:
+    /// an executable script's default app can be Terminal, which would run it.
+    static func openInEditor(_ url: URL) throws {
+        try SideEffectGuard.check("opening scripts in an editor")
+        let workspace = NSWorkspace.shared
+        guard
+            let editor = workspace.urlForApplication(toOpen: .sourceCode)
+                ?? workspace.urlForApplication(toOpen: .plainText)
+                ?? workspace.urlForApplication(withBundleIdentifier: "com.apple.TextEdit")
+        else { throw LibraryValidationError("No text editor was found to open the script.") }
+        workspace.open([url], withApplicationAt: editor, configuration: NSWorkspace.OpenConfiguration())
     }
 
     // MARK: Folders and new scripts (Settings › Scripts)
