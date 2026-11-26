@@ -31,6 +31,8 @@ struct SystemCommandsTests {
         let executor = SystemActionEnvironment.makeDefault(sideEffects: SideEffectGuard(mode: mode))
         #expect(executor is InertSystemActions)
         for command in SystemCommand.all {
+            // Quit All and Quit Others don't use the executor; they route to Applications.
+            if case .quitApps = try? command.route(argument: "50", context: context) { continue }
             await #expect(throws: SideEffectGuard.Blocked(what: "system commands", mode: mode), "\(command.id)") {
                 _ = try await command.run(with: executor, argument: "50", context: context)
             }
@@ -101,16 +103,20 @@ struct SystemCommandsTests {
             .toggleMicrophoneMute: .toggleMicrophoneMute, .showDesktop: .showDesktop,
             .toggleAppearance: .toggleAppearance, .openTrash: .openTrash, .emptyTrash: .emptyTrash,
             .ejectAllDisks: .ejectAllDisks, .toggleHiddenFiles: .toggleHiddenFiles,
-            .hideOtherApps: .hideOtherApps(keeping: mail), .unhideAllApps: .unhideApps,
-            .quitAllApps: .quitAllApps(excluded: ["com.example.music"]),
-            .quitAllAppsExceptFrontmost: .quitOtherApps(keeping: mail, excluded: ["com.example.music"]),
+            .hideOtherApps: .hideOtherApps(keeping: mail, excluded: ["com.example.music"]), .unhideAllApps: .unhideApps,
             .restartFrontmostApp: .restartApp(mail), .dismissNotifications: .dismissNotifications,
             .toggleWiFi: .toggleWiFi,
         ]
-        #expect(Set(expected.keys) == Set(SystemCommand.ID.allCases))
-        for command in SystemCommand.all {
+        let quitting: Set<SystemCommand.ID> = [.quitAllApps, .quitAllAppsExceptFrontmost]
+        #expect(Set(expected.keys).union(quitting) == Set(SystemCommand.ID.allCases))
+        for command in SystemCommand.all where !quitting.contains(command.id) {
             #expect(try command.action(argument: "40", context: context) == expected[command.id], "\(command.id)")
+            #expect(try command.route(argument: "40", context: context) == .action(expected[command.id]!))
         }
+        // The one Quit All route: Applications' batch flow, sparing the foreground app for Quit Others.
+        #expect(try SystemCommand.command(.quitAllApps).route(context: context) == .quitApps(sparing: nil))
+        #expect(try SystemCommand.command(.quitAllAppsExceptFrontmost).route(context: context) == .quitApps(sparing: mail))
+        #expect(throws: LibraryValidationError.self) { try SystemCommand.command(.quitAllApps).action(context: context) }
     }
 
     @Test(arguments: [SystemCommand.ID.hideOtherApps, .quitAllAppsExceptFrontmost, .restartFrontmostApp])
@@ -188,8 +194,6 @@ struct SystemCommandsTests {
         #expect(hud(.hideOtherApps, .apps(count: 3)) == "Hid 3 apps")
         #expect(hud(.hideOtherApps, .apps(count: 0)) == "No other apps to hide")
         #expect(hud(.unhideAllApps, .apps(count: 1)) == "Unhid 1 app")
-        #expect(hud(.quitAllApps, .apps(count: 4)) == "Quitting 4 apps")
-        #expect(hud(.quitAllAppsExceptFrontmost, .apps(count: 0)) == "No apps to quit")
         #expect(hud(.restartFrontmostApp, .app("Mail")) == "Restarted Mail")
         #expect(hud(.dismissNotifications, .notifications(count: 0)) == "No notifications to dismiss")
         #expect(hud(.dismissNotifications, .notifications(count: 2)) == "Notifications dismissed")
@@ -222,16 +226,10 @@ struct SystemCommandsTests {
         ]
     }
 
-    @Test func hideAndUnhideSkipOpenRayHelpersAndTheKeptApp() throws {
+    @Test func hideAndUnhideSkipOpenRayHelpersTheKeptAppAndKeepRunningApps() throws {
         #expect(try AppSelection.hideTargets(apps, keeping: mail, ownPID: 1).map(\.pid) == [2, 6])
+        #expect(try AppSelection.hideTargets(apps, keeping: mail, excluded: ["com.apple.finder"], ownPID: 1).map(\.pid) == [6])
         #expect(AppSelection.unhideTargets(apps, ownPID: 1).map(\.pid) == [4])
-    }
-
-    @Test func quitSkipsOpenRayFinderExclusionsAndTheKeptApp() throws {
-        #expect(try AppSelection.quitTargets(apps, keeping: nil, excluded: [], ownPID: 1).map(\.pid) == [4242, 4, 6])
-        #expect(
-            try AppSelection.quitTargets(apps, keeping: mail, excluded: ["com.example.music"], ownPID: 1).map(\.pid)
-                == [6])
     }
 
     @Test func aStaleOrReusedTargetChangesNothing() {
@@ -239,16 +237,11 @@ struct SystemCommandsTests {
         var reused = apps
         reused[2] = RunningAppInfo(
             pid: 4242, bundleIdentifier: "com.example.other", name: "Other", isRegular: true, isHidden: false)
-        #expect(throws: LibraryValidationError.self) {
-            try AppSelection.quitTargets(reused, keeping: mail, excluded: [], ownPID: 1)
-        }
         #expect(throws: LibraryValidationError.self) { try AppSelection.hideTargets(reused, keeping: mail, ownPID: 1) }
         // Mail quit and relaunched: same bundle, new launch.
         var relaunched = apps
         relaunched[2].launchDate = Date(timeIntervalSince1970: 2_000)
-        #expect(throws: LibraryValidationError.self) {
-            try AppSelection.quitTargets(relaunched, keeping: mail, excluded: [], ownPID: 1)
-        }
+        #expect(throws: LibraryValidationError.self) { try AppSelection.hideTargets(relaunched, keeping: mail, ownPID: 1) }
         // Mail is gone entirely.
         #expect(throws: LibraryValidationError.self) {
             try AppSelection.hideTargets(apps.filter { $0.pid != 4242 }, keeping: mail, ownPID: 1)
@@ -262,9 +255,8 @@ struct SystemCommandsTests {
         // The window chip may point at another app's window; the context only carries
         // the app that was frontmost when the launcher opened.
         let foreground = SystemCommandContext(foregroundApplication: mail)
-        let action = try SystemCommand.command(.quitAllAppsExceptFrontmost).action(context: foreground)
-        #expect(action == .quitOtherApps(keeping: mail, excluded: []))
-        #expect(try AppSelection.quitTargets(apps, keeping: mail, excluded: [], ownPID: 1).map(\.pid) == [4, 6])
+        #expect(try SystemCommand.command(.quitAllAppsExceptFrontmost).route(context: foreground) == .quitApps(sparing: mail))
+        #expect(try SystemCommand.command(.hideOtherApps).action(context: foreground) == .hideOtherApps(keeping: mail, excluded: []))
     }
 
     // MARK: Pure helpers

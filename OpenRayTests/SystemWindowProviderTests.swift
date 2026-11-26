@@ -40,6 +40,8 @@ struct SystemWindowProviderTests {
         let audio: FakeAudioDevices
         let menus: FakeMenuTree
         let launcher: FakeApplicationLauncher
+        /// Applications' running apps, behind Quit All and Quit Others.
+        let running: FakeRunningApplications
 
         @MainActor var hudTexts: [String] { presenter.presented.map { $0.message.text } }
     }
@@ -53,7 +55,7 @@ struct SystemWindowProviderTests {
         ],
         foreground: AppIdentity? = notes, store: LibraryStore = LibraryStore(fileURL: nil), hotKey: GlobalHotKey? = nil,
         snapshotSource: FakeWindowSnapshotSource? = nil, menus: FakeMenuTree? = nil,
-        menuLimits: MenuItemCollector.Limits = .init()
+        menuLimits: MenuItemCollector.Limits = .init(), running: [RunningApp] = defaultRunning
     ) -> Harness {
         let recorder = Recorder(foreground: foreground)
         let system = FakeWindowSystem(displays: [WindowFixture.laptop], windows: windows)
@@ -76,13 +78,40 @@ struct SystemWindowProviderTests {
         let systemProvider = SystemCommandProvider(
             executor: actions, audio: audio, menuSearch: MenuItemSearch(source: menus), hud: hud,
             foreground: { _ in recorder.foreground }, dismissal: dismissal, menuLimits: menuLimits)
+        let controller = FakeRunningApplications(running)
+        let applications = Self.applicationsProvider(controller)
         let model = LauncherModel(
             store: store, ai: AIChatModel(engine: TestAIEngine()), pasteboard: NSPasteboard.withUniqueName(),
-            registry: CommandRegistry(providers: [AIWritingCommandProvider(), systemProvider, windowsProvider]),
+            registry: CommandRegistry(providers: [AIWritingCommandProvider(), systemProvider, windowsProvider, applications]),
             hotKey: hotKey)
         return Harness(
             model: model, recorder: recorder, system: system, windows: windowsProvider, systemCommands: systemProvider, actions: actions,
-            presenter: presenter, audio: audio, menus: menus, launcher: launcher)
+            presenter: presenter, audio: audio, menus: menus, launcher: launcher, running: controller)
+    }
+
+    nonisolated static let ownBundleID = "com.example.openray"
+
+    nonisolated static func app(_ pid: pid_t, _ bundleID: String, _ name: String) -> RunningApp {
+        RunningApp(
+            pid: pid, bundleID: bundleID, name: name, bundleURL: URL(fileURLWithPath: "/Applications/\(name).app"),
+            launchDate: Date(timeIntervalSince1970: 1_000))
+    }
+
+    /// Notes is the app OpenRay opened over; Finder is never quit; OpenRay is itself.
+    nonisolated static let defaultRunning = [
+        app(100, "com.example.notes", "Notes"), app(200, "com.example.mail", "Mail"),
+        app(300, "com.example.music", "Music"), app(3, "com.apple.finder", "Finder"), app(1, ownBundleID, "OpenRay"),
+    ]
+
+    /// Slice 4's Applications provider on a fake: the one Quit All route.
+    static func applicationsProvider(_ controller: FakeRunningApplications) -> ApplicationsCommandProvider {
+        let provider = ApplicationsCommandProvider(
+            controller: controller, workspace: FakeFileWorkspace(), sideEffects: SideEffectGuard(mode: .testHost),
+            library: FileManager.default.temporaryDirectory.appending(path: "NoLibrary-\(UUID())"),
+            ownBundleID: ownBundleID)
+        provider.running.sleep = { _ in await Task.yield() }
+        provider.installedCopies = { _ in [] }
+        return provider
     }
 
     private func command(_ id: String, in model: LauncherModel) throws -> LauncherItem {
@@ -372,8 +401,8 @@ struct SystemWindowProviderTests {
         #expect(h.hudTexts == ["Trash emptied"])
         // Quit Others names the app it keeps.
         h.model.perform(try command("system.quitAllAppsExceptFrontmost", in: h.model))
-        #expect(h.model.confirmation?.question == "Quit every app except Notes?")
-        #expect(h.model.confirmation?.detail.hasPrefix("Keeps Notes (com.example.notes) running.") == true)
+        #expect(h.model.confirmation?.question == "Quit 2 apps except Notes?")
+        #expect(h.model.confirmation?.detail.hasPrefix("Mail, Music.") == true)
     }
 
     @Test func aHotkeyAsksTheSameQuestionBeforeRunning() async throws {
@@ -394,7 +423,7 @@ struct SystemWindowProviderTests {
         let h = harness()
         defer { h.model.stop() }
         #expect(h.model.store.update {
-            $0.systemCommandSettings = SystemCommandSettings(confirmsEmptyingTrash: false, confirmsQuittingApps: false)
+            $0.systemCommandSettings = SystemCommandSettings(confirmsEmptyingTrash: false, confirmsHidingOtherApps: false)
         })
         h.model.perform(try command("system.emptyTrash", in: h.model))
         #expect(h.model.confirmation == nil)
@@ -411,17 +440,90 @@ struct SystemWindowProviderTests {
         #expect(h.model.confirmation == nil)
         #expect(h.model.feedback?.style == .warning)
         #expect(h.actions.actions.isEmpty && h.systemCommands.pendingTask == nil)
+        #expect(h.running.quit.isEmpty)
     }
 
-    @Test func quitAllHonoursTheExclusionsFromSettings() async throws {
+    @Test func quitAllKeepsEveryKeepRunningAppIncludingOnesSavedBeforeTheListsWereOne() throws {
         let h = harness()
         defer { h.model.stop() }
+        // An earlier build saved Music in Settings › System; Settings › Applications keeps Mail.
+        var applications = ApplicationSettings()
+        applications.keepRunningBundleIDs = ["com.example.mail"]
         #expect(h.model.store.update {
-            $0.systemCommandSettings = SystemCommandSettings(confirmsQuittingApps: false, quitExclusions: ["com.example.music"])
+            $0.commandPreferences[ApplicationSettings.key] = applications.values
+            $0.commandPreferences[SystemCommandSettings.storageKey] = ["quitExclusions": "com.example.music"]
         })
         h.model.perform(try command("system.quitAllApps", in: h.model))
+        #expect(h.model.confirmation?.id.hasPrefix("provided.applications.quitAll") == true)
+        #expect(h.model.confirmation?.question == "Quit 1 app?")
+        h.model.approvePromptAsShown()
+        #expect(h.running.quit == [100])
+        #expect(h.actions.actions.isEmpty)
+    }
+
+    @Test func quitAllFromSearchAndFromApplicationsIsOneRoute() throws {
+        let h = harness()
+        defer { h.model.stop() }
+        h.model.perform(try command("system.quitAllApps", in: h.model))
+        let fromSearch = try #require(h.model.confirmation)
+        h.model.goBack()
+        h.model.navigate(to: .applications)
+        try #require(h.model.actions(for: nil).first { $0.id == "apps.quitAll" }).perform()
+        let fromApplications = try #require(h.model.confirmation)
+        #expect(fromSearch.id.hasPrefix("provided.applications.quitAll"))
+        #expect(fromApplications.id.hasPrefix("provided.applications.quitAll"))
+        #expect(fromSearch.question == fromApplications.question)
+        #expect(fromSearch.isDestructive && fromApplications.isDestructive)
+    }
+
+    @Test func thereIsOneQuitAllRootCommand() {
+        // The app's real registry, with the test host's inert services.
+        let model = LauncherModel(
+            store: LibraryStore(fileURL: nil), ai: AIChatModel(engine: TestAIEngine()),
+            pasteboard: NSPasteboard.withUniqueName())
+        defer { model.stop() }
+        let quitting = model.commandItems.filter { $0.title.localizedCaseInsensitiveContains("quit all") }
+        #expect(quitting.map(\.id) == ["system.quitAllApps", "system.quitAllAppsExceptFrontmost"])
+        let ids = model.commandItems.map(\.id)
+        #expect(Set(ids).count == ids.count)
+    }
+
+    @Test func keepRunningReadsBothSavedListsAndWritesOne() {
+        var database = LibraryStore(fileURL: nil).database
+        var applications = ApplicationSettings()
+        applications.keepRunningBundleIDs = ["com.example.mail", "com.example.music"]
+        database.commandPreferences[ApplicationSettings.key] = applications.values
+        database.commandPreferences[SystemCommandSettings.storageKey] = [
+            "quitExclusions": "com.example.music\ncom.example.radio", "confirmEmptyTrash": "false",
+        ]
+        // Both lists, Applications' first, without repeats.
+        #expect(database.keepRunningBundleIDs == ["com.example.mail", "com.example.music", "com.example.radio"])
+        // Saving the System settings moves the older list into Keep Running before writing.
+        var settings = database.systemCommandSettings
+        #expect(!settings.confirmsEmptyingTrash)
+        settings.confirmsHidingOtherApps = false
+        database.systemCommandSettings = settings
+        #expect(database.commandPreferences[SystemCommandSettings.storageKey]?["quitExclusions"] == nil)
+        #expect(
+            ApplicationSettings(database.commandPreferences[ApplicationSettings.key]).keepRunningBundleIDs
+                == ["com.example.mail", "com.example.music", "com.example.radio"])
+        #expect(!database.systemCommandSettings.confirmsHidingOtherApps)
+        // Writing the shared list writes one place.
+        database.keepRunningBundleIDs = ["com.example.radio", "com.example.radio", "com.example.mail"]
+        #expect(database.keepRunningBundleIDs == ["com.example.radio", "com.example.mail"])
+        #expect(SystemPane.keepRunningSummary(database.keepRunningBundleIDs) == "2 apps kept running")
+    }
+
+    @Test func hideOthersLeavesKeepRunningAppsAlone() async throws {
+        let h = harness()
+        defer { h.model.stop() }
+        #expect(h.model.store.update { $0.keepRunningBundleIDs = ["com.example.music"] })
+        h.model.perform(try command("system.hideOtherApps", in: h.model))
+        #expect(h.model.confirmation?.isDestructive == true)
+        h.model.showPendingPromptLongEnough()
+        h.model.performSelected()
         await h.systemCommands.pendingTask?.value
-        #expect(h.actions.actions == [.quitAllApps(excluded: ["com.example.music"])])
+        #expect(h.actions.actions == [.hideOtherApps(keeping: Self.notes, excluded: ["com.example.music"])])
     }
 
     @Test func setVolumeFromAHotkeyAsksForTheLevelInsteadOfFailing() async throws {
@@ -511,10 +613,9 @@ struct SystemWindowProviderTests {
         #expect(database.windowManagementSettings.gaps == WindowGaps(window: WindowGaps.maximum, screen: 0))
         #expect(!database.windowManagementSettings.cyclesHalves)
         #expect(database.systemCommandSettings == SystemCommandSettings())
-        database.systemCommandSettings = SystemCommandSettings(
-            confirmsEmptyingTrash: false, quitExclusions: ["com.example.music", "com.example.music", "com.example.mail"])
-        #expect(database.systemCommandSettings.quitExclusions == ["com.example.music", "com.example.mail"])
+        database.systemCommandSettings = SystemCommandSettings(confirmsEmptyingTrash: false)
         #expect(!database.systemCommandSettings.asksFirst(.emptyTrash))
+        #expect(database.systemCommandSettings.asksFirst(.hideOtherApps))
         #expect(database.systemCommandSettings.asksFirst(.shutDown))
         #expect(!database.systemCommandSettings.asksFirst(.lockScreen))
     }
@@ -572,9 +673,14 @@ struct SystemWindowProviderTests {
             executor: actions, audio: FakeAudioDevices(), menuSearch: MenuItemSearch(source: FakeMenuTree(bars: [:])),
             hud: HUDController(presenter: presenter, screenFrame: { nil }, schedule: { _, _ in }),
             dismissal: LauncherDismissal { _, _ in })
+        // A fake app list where the foreground app's process is one Quit Others must spare.
+        let controller = FakeRunningApplications([
+            Self.app(finder.processIdentifier, "com.example.front", "Front"), Self.app(999, "com.example.other", "Other"),
+        ])
         let model = LauncherModel(
             store: LibraryStore(fileURL: nil), ai: AIChatModel(engine: TestAIEngine()),
-            pasteboard: NSPasteboard.withUniqueName(), registry: CommandRegistry(providers: [provider]))
+            pasteboard: NSPasteboard.withUniqueName(),
+            registry: CommandRegistry(providers: [provider, Self.applicationsProvider(controller)]))
         defer { model.stop() }
         model.previousApplication = finder
         model.selectTargetWindow(
@@ -584,17 +690,16 @@ struct SystemWindowProviderTests {
         #expect(model.previousApplication?.processIdentifier == dock.processIdentifier)
         #expect(model.foregroundApplication?.processIdentifier == finder.processIdentifier)
         model.perform(try command("system.quitAllAppsExceptFrontmost", in: model))
-        #expect(model.confirmation?.question == "Quit every app except \(finder.localizedName ?? "the app")?")
-        model.showPendingPromptLongEnough()
-        model.performSelected()
-        await provider.pendingTask?.value
-        #expect(actions.actions == [.quitOtherApps(keeping: AppIdentity(finder), excluded: [])])
+        #expect(model.confirmation?.question == "Quit 1 app except \(finder.localizedName ?? "the app")?")
+        model.approvePromptAsShown()
+        #expect(controller.quit == [999])
+        #expect(actions.actions.isEmpty)
     }
 
     @Test func aQuestionWhoseAppChangedWhileOpenRunsNothing() throws {
         let h = harness()
         defer { h.model.stop() }
-        h.model.perform(try command("system.quitAllAppsExceptFrontmost", in: h.model))
+        h.model.perform(try command("system.hideOtherApps", in: h.model))
         #expect(h.model.confirmation != nil)
         // The launcher reopened over another app before ↩.
         h.recorder.foreground = AppIdentity(pid: 300, bundleIdentifier: "com.example.mail", name: "Mail", launchDate: nil)
@@ -607,19 +712,18 @@ struct SystemWindowProviderTests {
     @Test func twoAppsWithTheSameNameAreToldApartByIdentity() async throws {
         let personal = AppIdentity(pid: 100, bundleIdentifier: "com.example.notes", name: "Notes", launchDate: nil)
         let work = AppIdentity(pid: 101, bundleIdentifier: "com.example.work.notes", name: "Notes", launchDate: nil)
-        let h = harness(foreground: work)
+        let h = harness(
+            foreground: work,
+            running: [Self.app(100, personal.bundleIdentifier!, "Notes"), Self.app(101, work.bundleIdentifier!, "Notes")])
         defer { h.model.stop() }
+        // Quit Others spares the exact process, not every app with the same name.
         h.model.perform(try command("system.quitAllAppsExceptFrontmost", in: h.model))
+        #expect(h.model.confirmation?.question == "Quit 1 app except Notes?")
+        h.model.approvePromptAsShown()
+        #expect(h.running.quit == [100])
+        // Hide Others names the bundle in its question, so the two can be told apart there too.
+        h.model.perform(try command("system.hideOtherApps", in: h.model))
         #expect(h.model.confirmation?.detail.hasPrefix("Keeps Notes (com.example.work.notes) running.") == true)
-        h.model.showPendingPromptLongEnough()
-        h.model.performSelected()
-        await h.systemCommands.pendingTask?.value
-        #expect(h.actions.actions == [.quitOtherApps(keeping: work, excluded: [])])
-        let running = [
-            RunningAppInfo(pid: 100, bundleIdentifier: personal.bundleIdentifier, name: "Notes", isRegular: true, isHidden: false),
-            RunningAppInfo(pid: 101, bundleIdentifier: work.bundleIdentifier, name: "Notes", isRegular: true, isHidden: false),
-        ]
-        #expect(try AppSelection.quitTargets(running, keeping: work, excluded: [], ownPID: 1).map(\.pid) == [100])
     }
 
     @Test func closeOthersLayoutsAskFirstAndCheckTheLayoutAgainOnApproval() async throws {
@@ -926,15 +1030,14 @@ struct SystemWindowProviderTests {
         let shortcut = CommandShortcut(keyCode: 12, modifiers: [.control, .option])
         #expect(h.model.store.saveCommandBinding(CommandBinding(targetID: "system.quitAllApps", shortcut: shortcut)))
         h.model.performBoundCommand(targetID: "system.quitAllApps")
-        #expect(h.model.confirmation?.id.hasPrefix("provided.system.quitAllApps") == true)
+        #expect(h.model.confirmation?.id.hasPrefix("provided.applications.quitAll") == true)
         h.model.performSelected()
         #expect(!h.model.store.database.preferences.clipboardEnabled)
-        #expect(h.actions.actions.isEmpty)
+        #expect(h.running.quit.isEmpty)
         h.model.confirmationDidAppear(try #require(h.model.confirmationInstanceID))
         gate.now += LauncherModel.minimumPromptExposure
         h.model.performSelected()
-        await h.systemCommands.pendingTask?.value
-        #expect(h.actions.actions == [.quitAllApps(excluded: [])])
+        #expect(h.running.quit == [100, 200, 300])
         #expect(!h.model.store.database.preferences.clipboardEnabled)
     }
 
