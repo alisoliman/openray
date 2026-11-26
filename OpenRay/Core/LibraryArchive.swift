@@ -26,6 +26,9 @@ import Observation
 enum LibraryArchiveCategory: String, CaseIterable, Codable, Identifiable, Hashable, Sendable {
     case settings, shortcuts, favorites, quicklinks, snippets, notes, clipboard, scripts, ai, windowLayouts, focus,
         history, otherData
+    // main: pomodoro, caffeinate. Its own category, so an archive made before Pomodoro existed
+    // (whose manifest can't list it) never replaces the timer or its sessions.
+    case pomodoro
 
     var id: String { rawValue }
 
@@ -42,7 +45,8 @@ enum LibraryArchiveCategory: String, CaseIterable, Codable, Identifiable, Hashab
         case .ai: "AI Commands and Agents"
         case .windowLayouts: "Window Layouts"
         case .focus: "Focus Categories"
-        case .history: "Calculator, Emoji and Pomodoro History"
+        case .history: "Calculator and Emoji History"
+        case .pomodoro: "Pomodoro"
         case .otherData: "Other Data"
         }
     }
@@ -59,7 +63,8 @@ enum LibraryArchiveCategory: String, CaseIterable, Codable, Identifiable, Hashab
         case .ai: "Your AI commands and agents"
         case .windowLayouts: "Saved multi-app window layouts"
         case .focus: "App groups that focus sessions block"
-        case .history: "Kept calculations, recently used emoji, and Pomodoro's timer and sessions"
+        case .history: "Kept calculations and recently used emoji"
+        case .pomodoro: "Pomodoro settings, the current timer and completed focus sessions"
         case .otherData: "Other files OpenRay keeps beside the library, such as chats"
         }
     }
@@ -78,6 +83,7 @@ enum LibraryArchiveCategory: String, CaseIterable, Codable, Identifiable, Hashab
         case .windowLayouts: "rectangle.3.group"
         case .focus: "moon"
         case .history: "clock.arrow.circlepath"
+        case .pomodoro: "timer"
         case .otherData: "folder"
         }
     }
@@ -269,8 +275,8 @@ enum LibraryArchive {
             case .history:
                 result.calculatorHistory = []
                 result.emojiUsage = []
-                // main: pomodoro, caffeinate. Pomodoro travels whole: its timer must match its settings.
-                result.pomodoro = empty.pomodoro
+            // Pomodoro travels whole: its timer must match its settings.
+            case .pomodoro: result.pomodoro = empty.pomodoro
             case .otherData: break
             }
         }
@@ -300,7 +306,8 @@ enum LibraryArchive {
         case .ai: database.aiCommands.count + database.agents.count
         case .windowLayouts: database.windowLayouts.count
         case .focus: database.focusCategories.count
-        case .history: database.calculatorHistory.count + database.emojiUsage.count + database.pomodoro.sessions.count
+        case .history: database.calculatorHistory.count + database.emojiUsage.count
+        case .pomodoro: database.pomodoro.sessions.count
         }
     }
 
@@ -668,8 +675,10 @@ enum LibraryArchive {
                     replacing
                     ? incoming.calculatorHistory : mergeByKey(result.calculatorHistory, incoming.calculatorHistory, key: \.id)
                 result.emojiUsage = replacing ? incoming.emojiUsage : mergeByKey(result.emojiUsage, incoming.emojiUsage, key: \.id)
-                // main: pomodoro, caffeinate. Merging keeps this Mac's settings and running timer and
-                // adds the imported sessions; replacing takes the archive's Pomodoro whole.
+            case .pomodoro:
+                // Merging keeps this Mac's settings and running timer and adds the imported sessions;
+                // replacing takes the archive's Pomodoro whole. Only an archive that lists Pomodoro
+                // gets here: `importArchive` intersects the choice with the manifest's categories.
                 if replacing {
                     result.pomodoro = incoming.pomodoro
                 } else {
