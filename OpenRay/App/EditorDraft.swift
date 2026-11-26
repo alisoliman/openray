@@ -12,6 +12,10 @@ final class EditorDraft {
     var keyword: String { didSet { changed() } }
     var content: String { didSet { changed() } }
     var expandsKeyword: Bool { didSet { changed() } }
+    /// Comma-separated tags for snippets and quicklinks.
+    var tags: String { didSet { changed() } }
+    /// The app a quicklink opens in; nil for the default.
+    var openWith: QuicklinkApplication? = nil { didSet { changed() } }
     private(set) var saveError: String?
     private(set) var savedAt: Date?
     private(set) var attemptedSave = false
@@ -28,14 +32,20 @@ final class EditorDraft {
         self.editor = editor
         self.store = store
         let values: (name: String, keyword: String, content: String, expands: Bool, isNew: Bool, saved: Date?)
+        var tags: [String] = []
+        var application: QuicklinkApplication?
         switch editor {
         case .quicklink(let item):
             values = (item.name, item.keyword, item.template, true, !store.database.quicklinks.contains { $0.id == item.id }, nil)
+            tags = item.tagList
+            application = item.openWith
         case .snippet(let item):
+            // Old snippets open in the new syntax, escaped, so saving keeps their text literal.
             values = (
-                item.name, item.keyword, item.content, item.expandsAsYouType,
+                item.name, item.keyword, item.editableContent, item.expandsAsYouType,
                 !store.database.snippets.contains { $0.id == item.id }, nil
             )
+            tags = item.tagList
         case .note(let item):
             let isNew = !store.database.notes.contains { $0.id == item.id }
             values = (item.title, "", item.content, false, isNew, isNew ? nil : item.modifiedAt)
@@ -44,9 +54,15 @@ final class EditorDraft {
         keyword = values.keyword
         content = values.content
         expandsKeyword = values.expands
+        let tagText = tags.joined(separator: ", ")
+        self.tags = tagText
+        openWith = application
         isNew = values.isNew
         savedAt = values.saved
-        original = [values.name, values.keyword, values.content, String(values.expands)]
+        original = [
+            values.name, values.keyword, values.content, String(values.expands), tagText,
+            application?.bundleIdentifier ?? "",
+        ]
     }
 
     var isNote: Bool { if case .note = editor { true } else { false } }
@@ -55,7 +71,9 @@ final class EditorDraft {
 
     var isDirty: Bool { currentValues != original }
 
-    private var currentValues: [String] { [name, keyword, content, String(expandsKeyword)] }
+    private var currentValues: [String] {
+        [name, keyword, content, String(expandsKeyword), tags, openWith?.bundleIdentifier ?? ""]
+    }
 
     var title: String {
         switch editor {
@@ -79,10 +97,8 @@ final class EditorDraft {
         let keyword = keyword.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !keyword.isEmpty, !isNote, let store else { return nil }
         if isSnippet {
-            let allowed = CharacterSet(
-                charactersIn: "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789;:/._-")
-            guard keyword.unicodeScalars.allSatisfy(allowed.contains) else {
-                return "Use letters, numbers and ; : / . _ - without spaces."
+            guard SnippetKeywordRules.isValid(keyword) || keyword.count > SnippetKeywordRules.maximumLength else {
+                return "Use letters, numbers, punctuation or symbols, without spaces, quotes or brackets."
             }
             guard keyword.count >= 2 || !attemptedSave else { return "Use at least 2 characters." }
             guard keyword.count <= 32 else { return "Use at most 32 characters." }
@@ -131,23 +147,61 @@ final class EditorDraft {
         case .snippet:
             guard attemptedSave else { return nil }
             if content.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { return "Add the text to paste." }
-            return content.count > 32_000 ? "Snippets support up to 32,000 characters." : nil
+            if content.count > Snippet.maximumLength { return "Snippets support up to 65,000 characters." }
+            return PlaceholderTemplate(content, context: .snippet).validationIssues.first(where: \.blocksExecution)?.message
         case .note:
             return content.count > 100_000 ? "Notes support up to 100,000 characters." : nil
         }
     }
 
-    var canSave: Bool { keywordError == nil && (contentError == nil || !attemptedSave) }
+    var tagsError: String? {
+        guard !isNote else { return nil }
+        do {
+            try LibraryTags.validate(LibraryTags.normalized(tags))
+            return nil
+        } catch {
+            return error.localizedDescription
+        }
+    }
+
+    /// Placeholder problems an editor shows under the text, e.g. a misspelled modifier.
+    var placeholderNotes: [String] {
+        guard !isNote else { return [] }
+        let template = PlaceholderTemplate(content, context: isSnippet ? .snippet : .quicklink)
+        return template.validationIssues.map(\.message)
+    }
+
+    var canSave: Bool { keywordError == nil && tagsError == nil && (contentError == nil || !attemptedSave) }
 
     // MARK: Previews
 
     var snippetPreview: String { Snippet(name: name, keyword: keyword, content: content).expanded() }
 
+    /// The draft as a link, with a sample for every field of its full plan: the field's
+    /// first option, or a search term. The preview and Test both use it.
+    var quicklinkSample: (link: Quicklink, arguments: [String: String]) {
+        var link = Quicklink(name: name, template: content, keyword: keyword)
+        link.openWith = openWith
+        let database = store?.database ?? LibraryDatabase()
+        let fields = link.plan(snippets: PlaceholderValues.snippetLookup(database)).arguments
+        let samples = Dictionary(
+            fields.map { ($0.id.specName, $0.options.first ?? "swift concurrency") }, uniquingKeysWith: { first, _ in first })
+        return (link, samples)
+    }
+
+    /// The link the preview shows and Test opens, resolved with the samples and
+    /// nothing live: clipboard, selection and history placeholders render empty.
+    var quicklinkTest: (url: URL, openWith: QuicklinkApplication?)? {
+        let sample = quicklinkSample
+        let snippets = Dictionary(
+            (store?.database.snippets ?? []).map { ($0.name, $0.referenceSource()) }, uniquingKeysWith: { first, _ in first })
+        guard let url = try? sample.link.resolution(arguments: sample.arguments, values: PlaceholderValues(snippets: snippets)).url
+        else { return nil }
+        return (url, sample.link.openWith)
+    }
+
     var quicklinkPreview: (url: String, valid: Bool) {
-        let link = Quicklink(name: name, template: content, keyword: keyword)
-        if let url = try? link.resolvedURL(query: link.needsQuery ? "swift concurrency" : "") {
-            return (url.absoluteString, true)
-        }
+        if let test = quicklinkTest { return (test.url.absoluteString, true) }
         return (content.isEmpty ? "https://example.com/search?q={query}" : content, false)
     }
 
@@ -157,24 +211,29 @@ final class EditorDraft {
     func save() -> Bool {
         attemptedSave = true
         guard let store else { return false }
-        if nameError != nil || keywordError != nil || contentError != nil {
+        if nameError != nil || keywordError != nil || contentError != nil || tagsError != nil {
             invalidFocusRequest += 1
             return false
         }
         let keyword = keyword.trimmingCharacters(in: .whitespacesAndNewlines)
         let name = name.trimmingCharacters(in: .whitespacesAndNewlines)
         let saved: Bool
+        let tagList = LibraryTags.normalized(tags)
         switch editor {
         case .quicklink(var item):
             item.name = name
             item.keyword = keyword
             item.template = content.trimmingCharacters(in: .whitespacesAndNewlines)
+            item.tags = tagList.isEmpty ? nil : tagList
+            item.openWith = openWith
             saved = store.save(item)
         case .snippet(var item):
             item.name = name
             item.keyword = keyword
             item.content = content
             item.expandsKeyword = expandsKeyword ? nil : false
+            item.tags = tagList.isEmpty ? nil : tagList
+            item.placeholderVersion = Snippet.currentPlaceholderVersion
             saved = store.save(item)
         case .note:
             return saveNote()

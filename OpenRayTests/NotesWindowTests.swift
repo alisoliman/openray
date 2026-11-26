@@ -42,7 +42,7 @@ final class FakeImagePicker: NoteImagePicking {
     func chooseImage() async -> URL? { url }
 }
 
-final class TestClock: @unchecked Sendable {
+final class NotesTestClock: @unchecked Sendable {
     var now = Date(timeIntervalSince1970: 1_800_000_000)
     func advance(days: Double) { now = now.addingTimeInterval(days * 86_400) }
     func advance(minutes: Double) { now = now.addingTimeInterval(minutes * 60) }
@@ -55,10 +55,10 @@ struct NotesHarness {
     let presenter = FakeNotesPresenter()
     let export = FakeNoteExport()
     let picker = FakeImagePicker()
-    let clock: TestClock
+    let clock: NotesTestClock
     let assetsDirectory: URL
 
-    init(store: LibraryStore = LibraryStore(fileURL: nil), clock: TestClock = TestClock()) {
+    init(store: LibraryStore = LibraryStore(fileURL: nil), clock: NotesTestClock = NotesTestClock()) {
         self.store = store
         self.clock = clock
         // A folder of its own, so NoteRecovery beside NoteAssets is per test too.
@@ -164,7 +164,7 @@ struct NotesWindowTests {
     // MARK: Recently Deleted
 
     @Test func recentlyDeletedExpiresAfterSixtyDaysOnTheInjectedClock() {
-        let clock = TestClock()
+        let clock = NotesTestClock()
         var notes = [QuickNote(title: "Gone", content: "x"), QuickNote(title: "Fresh", content: "y")]
         NoteCollection.moveToRecentlyDeleted(notes[0].id, at: clock.now, in: &notes)
         clock.advance(days: 30)

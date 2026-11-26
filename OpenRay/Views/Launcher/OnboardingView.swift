@@ -23,9 +23,12 @@ struct OnboardingView: View {
             .id(step)
 
             ActionBar(
-                feedback: model.feedback, confirmation: nil,
+                feedback: model.feedback, confirmation: model.confirmation, confirmationInstance: model.confirmationInstanceID,
                 context: { StepDots(current: step.rawValue, count: LauncherModel.OnboardingStep.allCases.count) },
-                actions: { actions })
+                actions: { actions },
+                onCancelConfirmation: { model.confirmation = nil },
+                onConfirm: { if let confirmation = model.confirmation { model.confirm(confirmation) } },
+                onConfirmationShown: model.confirmationDidAppear, onApprove: model.approveConfirmation)
         }
         .animation(OR.Motion.resolve(OR.Motion.standard, reduceMotion: reduceMotion), value: step)
         .background {
@@ -76,7 +79,6 @@ private struct ShortcutStep: View {
     @Bindable var model: LauncherModel
 
     var body: some View {
-        let hotKey = model.store.database.preferences.hotKey
         // A shortcut that couldn't be registered never shows as learned.
         let pressed = model.onboardingHotKeyPressed && model.shortcutError == nil
         VStack(alignment: .leading, spacing: 0) {
@@ -87,7 +89,7 @@ private struct ShortcutStep: View {
                 .font(OR.Font.body).lineSpacing(3).foregroundStyle(OR.Color.text2).padding(.top, 6)
                 .fixedSize(horizontal: false, vertical: true)
             HStack(spacing: 8) {
-                ForEach(Self.caps(for: hotKey), id: \.self) { cap in
+                ForEach(Self.caps(for: model), id: \.self) { cap in
                     Text(cap)
                         .font(.system(size: 18, weight: .medium))
                         .foregroundStyle(pressed ? OR.Color.accent : OR.Color.text)
@@ -105,7 +107,7 @@ private struct ShortcutStep: View {
             .frame(maxWidth: .infinity).padding(.top, 22).padding(.bottom, 10)
             .animation(OR.Motion.quick, value: pressed)
             .accessibilityElement()
-            .accessibilityLabel("Shortcut: \(KeyShortcut(Self.caps(for: hotKey)).spoken)")
+            .accessibilityLabel("Shortcut: \(KeyShortcut(Self.caps(for: model)).spoken)")
             Group {
                 if let error = model.launcherHotKeyRefusal ?? model.shortcutError {
                     Label(error, systemImage: "exclamationmark.triangle.fill")
@@ -115,7 +117,7 @@ private struct ShortcutStep: View {
                     Label("That's it. You'll use this every day.", systemImage: "checkmark.circle.fill")
                         .foregroundStyle(OR.Color.success)
                 } else {
-                    Text("Waiting for \(hotKey.title)…").foregroundStyle(OR.Color.text2)
+                    Text("Waiting for \(model.launcherShortcutInUse.title)…").foregroundStyle(OR.Color.text2)
                 }
             }
             .font(.system(size: 12.5, weight: .semibold))
@@ -136,6 +138,20 @@ private struct ShortcutStep: View {
             .frame(maxWidth: .infinity)
         }
         .announce(model.launcherHotKeyRefusal ?? model.shortcutError)
+    }
+
+    /// The shortcut that opens OpenRay: a recorded one as recorded, otherwise the preset.
+    static func caps(for preferences: AppPreferences) -> [String] {
+        preferences.launcherShortcut?.caps ?? caps(for: preferences.hotKey)
+    }
+
+    /// The shortcut that opens OpenRay right now, which a fallback can make differ from the saved one.
+    @MainActor static func caps(for model: LauncherModel) -> [String] {
+        let preferences = model.store.database.preferences
+        guard let active = model.activeLauncherShortcut, active != preferences.launcherHotKeyShortcut else {
+            return caps(for: preferences)
+        }
+        return LauncherHotKey.allCases.first { $0.shortcut == active }.map(caps(for:)) ?? active.caps
     }
 
     static func caps(for hotKey: LauncherHotKey) -> [String] {
@@ -194,7 +210,7 @@ private struct FeaturesStep: View {
                 }
                 Hairline()
                 feature(
-                    .system, "Open at login", detail: "Keeps \(model.store.database.preferences.hotKey.title) ready after a restart",
+                    .system, "Open at login", detail: "Keeps \(model.launcherShortcutInUse.title) ready after a restart",
                     symbol: "bolt", isOn: Binding(get: { model.loginEnabled }, set: { model.setLaunchAtLogin($0) }))
             }
             .background(OR.Color.fill1, in: .rect(cornerRadius: OR.Radius.card, style: .continuous))
@@ -207,7 +223,7 @@ private struct FeaturesStep: View {
     private var accessibilityDetail: String {
         if model.accessibilityAllowed { return "Accessibility is on." }
         return requestedAccessibility
-            ? "Turn on OpenRay in System Settings, then press \(model.store.database.preferences.hotKey.title) to come back."
+            ? "Turn on OpenRay in System Settings, then press \(model.launcherShortcutInUse.title) to come back."
             : "Needs Accessibility, which macOS will ask about"
     }
 

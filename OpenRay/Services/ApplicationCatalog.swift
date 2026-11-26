@@ -8,36 +8,217 @@ struct InstalledApplication: Identifiable, Equatable, Sendable {
     var id: String { "app.\(bundleIdentifier ?? url.path)" }
 }
 
-@MainActor
-@Observable
-final class ApplicationCatalog {
-    private(set) var applications: [InstalledApplication] = []
-    private(set) var isLoading = false
+/// Settings › Applications, kept in `commandPreferences[ApplicationSettings.key]`.
+struct ApplicationSettings: Equatable, Sendable {
+    static let key = "settings.applications"
+    /// Auto Quit's choices, in minutes.
+    static let autoQuitChoices = [1, 3, 5, 10, 15]
 
-    func refresh() async {
-        guard !isLoading else { return }
-        isLoading = true
-        defer { isLoading = false }
-        applications = await Task.detached(priority: .userInitiated) { Self.scan() }.value
+    /// Folders searched for apps beyond the standard ones.
+    var extraFolders: [String] = []
+    /// Look up to three levels inside the extra folders, for apps kept in nested subfolders.
+    var deepSearch = false
+    /// Item ids (`app.<bundle id>`) kept out of search.
+    var hiddenAppIDs: [String] = []
+    /// Apps Auto Quit quits once idle: one chosen copy each, by bundle id and canonical path.
+    /// Nil minutes follow the default.
+    var autoQuit: [AutoQuitTarget: Int?] = [:]
+    var autoQuitDefaultMinutes = 3
+    /// Bundle ids Hide All and Quit All never touch.
+    var keepRunningBundleIDs: [String] = []
+
+    init() {}
+
+    init(_ values: [String: String]?) {
+        let values = values ?? [:]
+        extraFolders = PreferenceValues.list(values["folders"])
+        deepSearch = PreferenceValues.flag(values["deepSearch"], default: false)
+        hiddenAppIDs = PreferenceValues.list(values["hidden"])
+        keepRunningBundleIDs = PreferenceValues.list(values["keepRunning"])
+        if let minutes = values["autoQuitMinutes"].flatMap(Int.init), Self.autoQuitChoices.contains(minutes) {
+            autoQuitDefaultMinutes = minutes
+        }
+        for line in PreferenceValues.list(values["autoQuit"]) {
+            func minutes(_ text: String?) -> Int? {
+                text.flatMap(Int.init).flatMap { Self.autoQuitChoices.contains($0) ? $0 : nil }
+            }
+            if line.contains("\t") {
+                // bundle id, tab, canonical path, tab, minutes (empty for the default).
+                let parts = line.split(separator: "\t", omittingEmptySubsequences: false).map(String.init)
+                guard parts.count >= 2, !parts[0].isEmpty, !parts[1].isEmpty else { continue }
+                autoQuit[AutoQuitTarget(bundleID: parts[0], path: parts[1])] = .some(minutes(parts.count > 2 ? parts[2] : nil))
+            } else {
+                // Saved before copies were told apart: kept, but inactive until a copy is chosen.
+                let parts = line.split(separator: "=", maxSplits: 1).map(String.init)
+                guard let bundleID = parts.first, !bundleID.isEmpty else { continue }
+                autoQuit[AutoQuitTarget(bundleID: bundleID, path: nil)] = .some(minutes(parts.count == 2 ? parts[1] : nil))
+            }
+        }
     }
 
-    private nonisolated static func scan() -> [InstalledApplication] {
-        let manager = FileManager.default
-        let roots = [
-            manager.homeDirectoryForCurrentUser.appending(path: "Applications"),
+    var values: [String: String] {
+        var values: [String: String] = [:]
+        values["folders"] = PreferenceValues.string(extraFolders)
+        if deepSearch { values["deepSearch"] = "true" }
+        values["hidden"] = PreferenceValues.string(hiddenAppIDs)
+        values["keepRunning"] = PreferenceValues.string(keepRunningBundleIDs)
+        if autoQuitDefaultMinutes != 3 { values["autoQuitMinutes"] = String(autoQuitDefaultMinutes) }
+        values["autoQuit"] = PreferenceValues.string(
+            autoQuit.keys.sorted().map { target in
+                let minutes = (autoQuit[target] ?? nil).map(String.init)
+                guard let path = target.path else { return minutes.map { "\(target.bundleID)=\($0)" } ?? target.bundleID }
+                return [target.bundleID, path, minutes ?? ""].joined(separator: "\t")
+            })
+        return values
+    }
+
+    /// The idle minutes before Auto Quit quits a running app, or nil when it's off for it. Both
+    /// the bundle id and the copy on disk must match a rule; another installed copy never does.
+    func autoQuitMinutes(for bundleID: String, at bundleURL: URL?) -> Int? {
+        guard hasAutoQuitRule(forBundleID: bundleID), let bundleURL else { return nil }
+        let target = AutoQuitTarget(bundleID: bundleID, path: AutoQuitTarget.canonicalPath(bundleURL))
+        guard let entry = autoQuit[target] else { return nil }
+        return entry ?? autoQuitDefaultMinutes
+    }
+
+    /// Whether any rule names this bundle id, before resolving paths.
+    func hasAutoQuitRule(forBundleID bundleID: String) -> Bool {
+        autoQuit.keys.contains { $0.bundleID == bundleID && $0.path != nil }
+    }
+
+    /// The rule for an installed app's copy, if it has one.
+    func autoQuitTarget(for app: InstalledApplication) -> AutoQuitTarget? {
+        guard let bundleID = app.bundleIdentifier else { return nil }
+        let target = AutoQuitTarget(bundleID: bundleID, path: AutoQuitTarget.canonicalPath(app.url))
+        return autoQuit[target] != nil ? target : nil
+    }
+
+    /// Rules saved with a bundle id only. They do nothing until a copy is chosen in Settings.
+    var ambiguousAutoQuitTargets: [AutoQuitTarget] { autoQuit.keys.filter { $0.path == nil }.sorted() }
+
+    var scanConfiguration: ApplicationScanConfiguration {
+        ApplicationScanConfiguration(
+            extraFolders: extraFolders.map { URL(fileURLWithPath: ($0 as NSString).expandingTildeInPath, isDirectory: true) },
+            deepSearch: deepSearch)
+    }
+}
+
+/// One app Auto Quit watches: a bundle id and the copy chosen, by canonical path.
+struct AutoQuitTarget: Hashable, Comparable, Sendable {
+    var bundleID: String
+    /// Nil for a rule saved before copies were told apart.
+    var path: String?
+
+    /// The copy's path with symlinks resolved, so two spellings of one bundle compare equal.
+    static func canonicalPath(_ url: URL) -> String { url.standardizedFileURL.resolvingSymlinksInPath().path }
+
+    init(bundleID: String, path: String?) {
+        self.bundleID = bundleID
+        self.path = path
+    }
+
+    init(bundleID: String, url: URL) {
+        self.init(bundleID: bundleID, path: Self.canonicalPath(url))
+    }
+
+    static func < (lhs: AutoQuitTarget, rhs: AutoQuitTarget) -> Bool {
+        (lhs.bundleID, lhs.path ?? "") < (rhs.bundleID, rhs.path ?? "")
+    }
+}
+
+/// Where the catalog looks for apps.
+struct ApplicationScanConfiguration: Equatable, Sendable {
+    var extraFolders: [URL] = []
+    var deepSearch = false
+
+    /// How far inside an extra folder apps are found: directly inside, or three levels with Deep Search.
+    var extraFolderDepth: Int { deepSearch ? 3 : 1 }
+
+    static var standardRoots: [URL] {
+        [
+            FileManager.default.homeDirectoryForCurrentUser.appending(path: "Applications"),
             URL(fileURLWithPath: "/Applications"),
             URL(fileURLWithPath: "/System/Applications"),
             URL(fileURLWithPath: "/System/Library/CoreServices/Applications"),
         ]
+    }
+}
+
+@MainActor
+@Observable
+final class ApplicationCatalog {
+    private(set) var applications: [InstalledApplication] = []
+    /// Every copy the last scan found, by bundle id. `applications` keeps one per id; Uninstall
+    /// needs them all to tell whether support files are shared.
+    private(set) var copies: [String: [URL]] = [:]
+    private(set) var isLoading = false
+    /// Settings › Applications' folders, read at the start of each scan.
+    @ObservationIgnored var configuration: @MainActor () -> ApplicationScanConfiguration = { .init() }
+    /// The folders always searched, all the way down. Tests replace them with fixtures.
+    @ObservationIgnored var standardRoots = ApplicationScanConfiguration.standardRoots
+    @ObservationIgnored var includesFinder = true
+    /// A refresh asked for while one runs, such as after adding a folder, scans again when it ends.
+    @ObservationIgnored private var refreshAgain = false
+    @ObservationIgnored private var refreshTask: Task<Void, Never>?
+
+    /// Scans the app folders. A call while a scan runs waits for a fresh scan, not the stale one.
+    func refresh() async {
+        if let refreshTask {
+            refreshAgain = true
+            await refreshTask.value
+            return
+        }
+        let task = Task {
+            isLoading = true
+            repeat {
+                refreshAgain = false
+                let configuration = configuration()
+                let roots = standardRoots
+                let finder = includesFinder
+                let scanned = await Task.detached(priority: .userInitiated) {
+                    Self.scanAll(configuration, standardRoots: roots, includesFinder: finder)
+                }.value
+                applications = scanned.apps
+                copies = scanned.copies
+            } while refreshAgain
+            isLoading = false
+            // Cleared in the same turn as the last check, so a later call starts a new scan.
+            refreshTask = nil
+        }
+        refreshTask = task
+        await task.value
+    }
+
+    nonisolated static func scan(
+        _ configuration: ApplicationScanConfiguration, standardRoots: [URL], includesFinder: Bool = true
+    ) -> [InstalledApplication] {
+        scanAll(configuration, standardRoots: standardRoots, includesFinder: includesFinder).apps
+    }
+
+    /// The apps, one per id, and every copy found of each bundle id.
+    nonisolated static func scanAll(
+        _ configuration: ApplicationScanConfiguration, standardRoots: [URL], includesFinder: Bool = true
+    ) -> (apps: [InstalledApplication], copies: [String: [URL]]) {
+        let manager = FileManager.default
         var apps: [String: InstalledApplication] = [:]
-        for root in roots {
+        var copies: [String: [URL]] = [:]
+        // Standard folders are searched all the way down; extra folders as deep as configured.
+        // Extra folders can hold anything, so only real app bundles count there.
+        let roots =
+            standardRoots.map { ($0, Int.max, false) }
+            + configuration.extraFolders.map { ($0, configuration.extraFolderDepth, true) }
+        for (root, depth, requiresBundle) in roots {
             guard
                 let enumerator = manager.enumerator(
                     at: root, includingPropertiesForKeys: [.isDirectoryKey],
                     options: [.skipsHiddenFiles, .skipsPackageDescendants])
             else { continue }
             for case let url as URL in enumerator {
-                guard url.pathExtension.lowercased() == "app" else { continue }
+                guard url.pathExtension.lowercased() == "app" else {
+                    if enumerator.level >= depth { enumerator.skipDescendants() }
+                    continue
+                }
+                if requiresBundle, !ApplicationBundle.isValid(url) { continue }
                 let bundle = Bundle(url: url)
                 guard bundle?.bundleIdentifier != Bundle.main.bundleIdentifier else { continue }
                 let name =
@@ -46,15 +227,17 @@ final class ApplicationCatalog {
                     ?? url.deletingPathExtension().lastPathComponent
                 let app = InstalledApplication(name: name, url: url, bundleIdentifier: bundle?.bundleIdentifier)
                 if apps[app.id] == nil { apps[app.id] = app }
+                if let bundleID = app.bundleIdentifier { copies[bundleID, default: []].append(url) }
             }
         }
         // Finder lives outside the standard Applications directories.
         let finderURL = URL(fileURLWithPath: "/System/Library/CoreServices/Finder.app")
-        if manager.fileExists(atPath: finderURL.path) {
+        if includesFinder, manager.fileExists(atPath: finderURL.path) {
             let finder = InstalledApplication(name: "Finder", url: finderURL, bundleIdentifier: "com.apple.finder")
             apps[finder.id] = finder
         }
-        return apps.values.sorted { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
+        let sorted = apps.values.sorted { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
+        return (sorted, copies)
     }
 }
 
@@ -71,5 +254,117 @@ final class FileIconCache {
         image.size = NSSize(width: 32, height: 32)
         cache.setObject(image, forKey: url as NSURL)
         return image
+    }
+}
+
+/// Whether a folder is a real application bundle: an `APPL` Info.plist with a bundle id and an
+/// executable that exists. A plain folder named `Archive.app` isn't one.
+enum ApplicationBundle {
+    nonisolated static func isValid(_ url: URL) -> Bool {
+        guard let bundle = Bundle(url: url), let info = bundle.infoDictionary, !info.isEmpty,
+            let identifier = bundle.bundleIdentifier, !identifier.isEmpty
+        else { return false }
+        if let type = info["CFBundlePackageType"] as? String, type != "APPL" { return false }
+        guard let executable = bundle.executableURL else { return false }
+        return FileManager.default.isExecutableFile(atPath: executable.path)
+    }
+}
+
+/// What Uninstall would move to the Trash: the app, and the files it keeps in `~/Library` that
+/// provably belong to it alone. Each is reviewed and ticked by hand before anything moves.
+struct UninstallPlan: Equatable, Sendable {
+    var app: InstalledApplication
+    var supportFiles: [URL]
+    /// Why support files aren't offered, such as another installed copy that shares them.
+    var supportFilesNote: String?
+    /// The app bundle as it was when the review was built.
+    var appIdentity: FileIdentity?
+    /// The bundle id read from the bundle on disk when the review was built.
+    var bundleID: String?
+    /// Each support file as it was when the review was built, by path.
+    var supportIdentities: [String: FileIdentity] = [:]
+
+    /// The bundle id in the bundle's Info.plist right now, read fresh rather than from a cache.
+    static func bundleIdentifier(at url: URL) -> String? {
+        guard let data = try? Data(contentsOf: url.appending(path: "Contents/Info.plist")),
+            let plist = try? PropertyListSerialization.propertyList(from: data, format: nil) as? [String: Any]
+        else { return nil }
+        return plist["CFBundleIdentifier"] as? String
+    }
+
+    /// Whether a support file sits in a folder that's really inside Library, symlinks resolved.
+    static func isContained(_ url: URL, in library: URL) -> Bool {
+        let root = library.standardizedFileURL.resolvingSymlinksInPath().path
+        return url.deletingLastPathComponent().resolvingSymlinksInPath().path.hasPrefix(root + "/")
+    }
+
+    /// Why an app can't be uninstalled from OpenRay, or nil when it can.
+    static func refusal(for app: InstalledApplication, ownBundleID: String? = Bundle.main.bundleIdentifier) -> String? {
+        let path = app.url.standardizedFileURL.path
+        if path.hasPrefix("/System/") || app.bundleIdentifier?.hasPrefix("com.apple.") == true {
+            return "\(app.name) is part of macOS and can't be uninstalled."
+        }
+        if let ownBundleID, app.bundleIdentifier == ownBundleID { return "OpenRay can't uninstall itself." }
+        guard ApplicationBundle.isValid(app.url) else {
+            return "“\(app.url.lastPathComponent)” isn't an app bundle OpenRay can uninstall."
+        }
+        return nil
+    }
+
+    /// A bundle id safe to use as a file name: reverse-DNS letters, digits, dots and hyphens.
+    static func isPlainBundleID(_ id: String) -> Bool {
+        let allowed = CharacterSet.alphanumerics.union(CharacterSet(charactersIn: ".-"))
+        return id.count <= 255 && id.contains(".") && !id.hasPrefix(".") && !id.hasSuffix(".") && !id.contains("..")
+            && id.unicodeScalars.allSatisfy { allowed.contains($0) && $0.isASCII }
+    }
+
+    /// The support files that exist for an app under `library` (normally `~/Library`), named by
+    /// its bundle id. Folders named only by the app's name, and group containers that other apps
+    /// can share, are never offered: their owner can't be proven. Every candidate must sit
+    /// directly in its Library folder once symlinks are resolved.
+    static func supportFiles(bundleID: String?, library: URL, fileManager: FileManager = .default) -> [URL] {
+        guard let bundleID, isPlainBundleID(bundleID) else { return [] }
+        let names: [(folder: String, name: String)] = [
+            ("Application Support", bundleID), ("Caches", bundleID), ("Containers", bundleID),
+            ("Logs", bundleID), ("HTTPStorages", bundleID), ("HTTPStorages", "\(bundleID).binarycookies"),
+            ("WebKit", bundleID), ("Application Scripts", bundleID), ("Preferences", "\(bundleID).plist"),
+            ("Saved Application State", "\(bundleID).savedState"), ("Cookies", "\(bundleID).binarycookies"),
+            ("LaunchAgents", "\(bundleID).plist"),
+        ]
+        var candidates = names.map { library.appending(path: $0.folder).appending(path: $0.name) }
+        let byHost = library.appending(path: "Preferences/ByHost")
+        for entry in (try? fileManager.contentsOfDirectory(atPath: byHost.path)) ?? []
+        where entry.hasPrefix("\(bundleID).") && entry.hasSuffix(".plist")
+            && !entry.dropFirst(bundleID.count + 1).dropLast(6).contains(".")
+        {
+            candidates.append(byHost.appending(path: entry))
+        }
+        var seen = Set<String>()
+        return candidates.filter { url in
+            guard seen.insert(url.standardizedFileURL.path).inserted, FileIdentity.of(url) != nil else { return false }
+            // The folder it sits in must really be inside Library, whatever symlinks say.
+            return isContained(url, in: library)
+        }
+    }
+
+    /// The plan for an app. When another copy with the same bundle id is installed, the
+    /// support files are shared with it, so none are offered.
+    /// Builds the review: the app and the support files offered, each with its identity now.
+    static func make(for app: InstalledApplication, library: URL, otherCopies: [URL]) -> UninstallPlan {
+        var plan = UninstallPlan(
+            app: app, supportFiles: [], appIdentity: FileIdentity.of(app.url), bundleID: bundleIdentifier(at: app.url))
+        if !others(than: app.url, in: otherCopies).isEmpty {
+            plan.supportFilesNote = "Another copy of \(app.name) is installed, so its support files stay."
+            return plan
+        }
+        plan.supportFiles = supportFiles(bundleID: plan.bundleID, library: library)
+        for url in plan.supportFiles { plan.supportIdentities[url.path] = FileIdentity.of(url) }
+        return plan
+    }
+
+    /// The copies that aren't this one, compared by canonical path.
+    static func others(than url: URL, in copies: [URL]) -> [URL] {
+        let path = url.standardizedFileURL.resolvingSymlinksInPath().path
+        return copies.filter { $0.standardizedFileURL.resolvingSymlinksInPath().path != path }
     }
 }

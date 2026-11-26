@@ -5,6 +5,19 @@ import SwiftUI
 /// opacities, so every surface stays correct in light, dark, Increase Contrast
 /// and Reduce Transparency. See design/design-system.html §03.
 enum OR {
+    /// Settings › General › Interface size: the launcher sets it before it draws. Fonts and the
+    /// launcher's lengths (field, rows, action bar, panel and preview widths, detents) scale with
+    /// it; 1 is the design's own size. Written only on the main thread.
+    nonisolated(unsafe) static var interfaceScale: CGFloat = 1
+
+    /// A font size at the interface size.
+    static func scaled(_ size: CGFloat) -> CGFloat { size * interfaceScale }
+
+    /// A length at the interface size, on whole points once scaled.
+    static func scaledLength(_ length: CGFloat) -> CGFloat {
+        interfaceScale == 1 ? length : (length * interfaceScale).rounded()
+    }
+
     enum Ray {
         static let r50 = NSColor(hex: 0xFFF2F0)
         static let r100 = NSColor(hex: 0xFFDDD8)
@@ -150,44 +163,44 @@ enum OR {
     }
 
     enum Metric {
-        static let field: CGFloat = 60
-        static let row: CGFloat = 44
-        static let tallRow: CGFloat = 56
-        static let actionBar: CGFloat = 44
-        static let panelWidth: CGFloat = 760
-        static let onboardingSize: CGFloat = 470
-        static let preview: CGFloat = 300
-        static let listInset: CGFloat = 10
+        static var field: CGFloat { OR.scaledLength(60) }
+        static var row: CGFloat { OR.scaledLength(44) }
+        static var tallRow: CGFloat { OR.scaledLength(56) }
+        static var actionBar: CGFloat { OR.scaledLength(44) }
+        static var panelWidth: CGFloat { OR.scaledLength(760) }
+        static var onboardingSize: CGFloat { OR.scaledLength(470) }
+        static var preview: CGFloat { OR.scaledLength(300) }
+        static var listInset: CGFloat { OR.scaledLength(10) }
     }
 
     enum Detent {
-        static let bar: CGFloat = 60
-        static let list: CGFloat = 480
-        static let full: CGFloat = 560
+        static var bar: CGFloat { OR.scaledLength(60) }
+        static var list: CGFloat { OR.scaledLength(480) }
+        static var full: CGFloat { OR.scaledLength(560) }
     }
 
     /// SF Pro at macOS sizes. 11 pt is the floor; 550 sits between Medium and Semibold.
     enum Font {
-        static let search = SwiftUI.Font(NSFont.systemFont(ofSize: 20, weight: .regular))
-        static let display = SwiftUI.Font(NSFont.systemFont(ofSize: 22, weight: .w650))
-        static let title = SwiftUI.Font(NSFont.systemFont(ofSize: 15, weight: .w650))
-        static let headline = SwiftUI.Font(NSFont.systemFont(ofSize: 13, weight: .w650))
-        static let rowTitle = SwiftUI.Font(NSFont.systemFont(ofSize: 13, weight: .w550))
-        static let body = SwiftUI.Font(NSFont.systemFont(ofSize: 13, weight: .regular))
-        static let bodyEmphasis = SwiftUI.Font(NSFont.systemFont(ofSize: 13, weight: .w550))
-        static let callout = SwiftUI.Font(NSFont.systemFont(ofSize: 12, weight: .regular))
-        static let calloutEmphasis = SwiftUI.Font(NSFont.systemFont(ofSize: 12, weight: .w550))
-        static let button = SwiftUI.Font(NSFont.systemFont(ofSize: 12.5, weight: .w550))
-        static let buttonLarge = SwiftUI.Font(NSFont.systemFont(ofSize: 13, weight: .w550))
-        static let token = SwiftUI.Font(NSFont.systemFont(ofSize: 14, weight: .w550))
-        static let sectionHeader = SwiftUI.Font(NSFont.systemFont(ofSize: 12, weight: .semibold))
-        static let caption = SwiftUI.Font(NSFont.systemFont(ofSize: 11, weight: .w550))
-        static let key = SwiftUI.Font(NSFont.systemFont(ofSize: 11, weight: .w550))
-        static let mono = SwiftUI.Font.system(size: 12, design: .monospaced)
-        static let monoSmall = SwiftUI.Font.system(size: 11, weight: .medium, design: .monospaced)
-        static let result = SwiftUI.Font(NSFont.systemFont(ofSize: 28, weight: .semibold)).monospacedDigit()
-        static let resultInput = SwiftUI.Font(NSFont.systemFont(ofSize: 28, weight: .medium)).monospacedDigit()
-        static let reading = SwiftUI.Font(NSFont.systemFont(ofSize: 14, weight: .regular))
+        static var search: SwiftUI.Font { SwiftUI.Font(NSFont.systemFont(ofSize: OR.scaled(20), weight: .regular)) }
+        static var display: SwiftUI.Font { SwiftUI.Font(NSFont.systemFont(ofSize: OR.scaled(22), weight: .w650)) }
+        static var title: SwiftUI.Font { SwiftUI.Font(NSFont.systemFont(ofSize: OR.scaled(15), weight: .w650)) }
+        static var headline: SwiftUI.Font { SwiftUI.Font(NSFont.systemFont(ofSize: OR.scaled(13), weight: .w650)) }
+        static var rowTitle: SwiftUI.Font { SwiftUI.Font(NSFont.systemFont(ofSize: OR.scaled(13), weight: .w550)) }
+        static var body: SwiftUI.Font { SwiftUI.Font(NSFont.systemFont(ofSize: OR.scaled(13), weight: .regular)) }
+        static var bodyEmphasis: SwiftUI.Font { SwiftUI.Font(NSFont.systemFont(ofSize: OR.scaled(13), weight: .w550)) }
+        static var callout: SwiftUI.Font { SwiftUI.Font(NSFont.systemFont(ofSize: OR.scaled(12), weight: .regular)) }
+        static var calloutEmphasis: SwiftUI.Font { SwiftUI.Font(NSFont.systemFont(ofSize: OR.scaled(12), weight: .w550)) }
+        static var button: SwiftUI.Font { SwiftUI.Font(NSFont.systemFont(ofSize: OR.scaled(12.5), weight: .w550)) }
+        static var buttonLarge: SwiftUI.Font { SwiftUI.Font(NSFont.systemFont(ofSize: OR.scaled(13), weight: .w550)) }
+        static var token: SwiftUI.Font { SwiftUI.Font(NSFont.systemFont(ofSize: OR.scaled(14), weight: .w550)) }
+        static var sectionHeader: SwiftUI.Font { SwiftUI.Font(NSFont.systemFont(ofSize: OR.scaled(12), weight: .semibold)) }
+        static var caption: SwiftUI.Font { SwiftUI.Font(NSFont.systemFont(ofSize: OR.scaled(11), weight: .w550)) }
+        static var key: SwiftUI.Font { SwiftUI.Font(NSFont.systemFont(ofSize: OR.scaled(11), weight: .w550)) }
+        static var mono: SwiftUI.Font { SwiftUI.Font.system(size: OR.scaled(12), design: .monospaced) }
+        static var monoSmall: SwiftUI.Font { SwiftUI.Font.system(size: OR.scaled(11), weight: .medium, design: .monospaced) }
+        static var result: SwiftUI.Font { SwiftUI.Font(NSFont.systemFont(ofSize: OR.scaled(28), weight: .semibold)).monospacedDigit() }
+        static var resultInput: SwiftUI.Font { SwiftUI.Font(NSFont.systemFont(ofSize: OR.scaled(28), weight: .medium)).monospacedDigit() }
+        static var reading: SwiftUI.Font { SwiftUI.Font(NSFont.systemFont(ofSize: OR.scaled(14), weight: .regular)) }
     }
 
     /// Keyboard interactions are instant; only layout changes animate.

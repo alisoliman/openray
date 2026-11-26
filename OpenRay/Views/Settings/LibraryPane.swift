@@ -7,7 +7,7 @@ extension SettingsPane {
         id: "library", title: "Library",
         subtitle: "Your notes, snippets, quicklinks and history, stored on this Mac.",
         kind: .system, symbol: "books.vertical",
-        keywords: "reveal finder export data location backup json"
+        keywords: "reveal finder export import data location backup json snippets quicklinks text replacements"
     ) { model, _ in AnyView(LibraryPane(model: model)) }
 }
 
@@ -46,6 +46,7 @@ struct LibraryPane: View {
                 Text("library.json and the ClipboardImages and NoteAssets folders are readable only by your account, but OpenRay doesn't encrypt them. Export saves library.json only, so back up all three together.")
                     .font(.system(size: 12)).foregroundStyle(.secondary)
             }
+            LibraryTransferSection(model: model)
         }
     }
 

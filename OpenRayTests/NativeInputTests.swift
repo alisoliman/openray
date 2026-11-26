@@ -78,7 +78,8 @@ struct NativeInputTests {
         #expect(model.actionEntries.first?.shortcut == .return)
         #expect(model.actionEntries.contains { $0.id == "favorite" && $0.shortcut?.caps == ["⇧", "⌘", "F"] })
         model.actionFilter = "favor"
-        #expect(model.filteredActionEntries.map(\.id) == ["favorite"])
+        // Move Favorite Up matches too; the toggle comes first and is highlighted.
+        #expect(model.filteredActionEntries.first?.id == "favorite")
         let wasFavorite = model.store.database.favoriteIDs.contains("section.snippets")
         model.performActionSelection()
         #expect(!model.showActions)

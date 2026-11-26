@@ -52,13 +52,20 @@ extension SettingsPane {
     static let primary: [SettingsPane] = [
         .general,
         // Slice 1: keyboard
+        .keyboard,
         .shortcuts,
+        .commands,
         // Slice 2: clipboard, snippets
         .clipboard,
         .snippets,
         // Slice 3: calculator, emoji, translator
+        .calculator,
+        .emoji,
+        .translator,
         .files,
         // Slice 4: applications
+        .applications,
+        .screenshots,
         .ai,
         // Slice 5: windows, system
         // Slice 6: notes, calendar, focus

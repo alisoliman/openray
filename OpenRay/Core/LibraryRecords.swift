@@ -54,12 +54,32 @@ struct FocusCategoryRecord: Codable, Identifiable, Hashable, Sendable {
 
 // MARK: Slice 3: Emoji and Calculator
 
-/// How often and how recently an emoji was used. `id` is the emoji itself.
+/// How often and how recently an emoji was used, and whether it's pinned or has custom
+/// keywords. `id` is the emoji itself, without a skin tone. Every other field is optional,
+/// so a record holds only what applies; `EmojiPreferences(records:)` reads them.
 struct EmojiUsageRecord: Codable, Identifiable, Hashable, Sendable {
     var id: String
+    /// The decayed use score as of `lastUsed` (see `EmojiUsage`).
+    var score: Double? = nil
+    var count: Int? = nil
+    var lastUsed: Date? = nil
+    /// The emoji's place among pinned emoji, when it's pinned.
+    var pinOrder: Int? = nil
+    /// Extra search words.
+    var keywords: [String]? = nil
 }
 
-/// A calculation the person kept.
+/// A calculation the person copied or pasted, kept for three months (`CalculatorHistory`).
+/// Records missing an expression, answer or date are skipped when read.
 struct CalculatorHistoryRecord: Codable, Identifiable, Hashable, Sendable {
     var id: UUID = UUID()
+    /// What was typed, such as "10 km in mi".
+    var expression: String? = nil
+    /// The answer as shown, such as "6.21371 mi".
+    var result: String? = nil
+    /// The answer ↩ copies, such as "6.21371192237".
+    var value: String? = nil
+    /// `Calculation.Kind`'s raw value.
+    var kind: String? = nil
+    var date: Date? = nil
 }

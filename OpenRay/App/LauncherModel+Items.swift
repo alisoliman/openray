@@ -6,14 +6,71 @@ extension LauncherModel {
     /// order. Settings, aliases, hotkey titles and hotkey registration all use this one list.
     var bindableCommands: [LauncherItem] {
         let registered = registry.bindableCommandItems(in: self)
+        // Built-in rows resolve by id. Provided rows count only through the registry's catalog, so
+        // a descriptor's `isBindable = false` holds even under one of the original twenty ids.
+        let builtIn = commandItems.filter { item in
+            if case .provided = item.action { return false }
+            return true
+        }
         let index = Dictionary(
-            (commandItems + registered).map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
+            (builtIn + registered).map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
         let curatedIDs = Set(CuratedCommand.targetIDs)
-        return CuratedCommand.targetIDs.compactMap { index[$0] } + registered.filter { !curatedIDs.contains($0.id) }
+        let commands = CuratedCommand.targetIDs.compactMap { index[$0] } + registered.filter { !curatedIDs.contains($0.id) }
+        // Disabled commands keep their bindings but answer to neither aliases nor hotkeys.
+        return withoutDisabledCommands(commands) + boundContentItems
+    }
+
+    /// Apps, quicklinks and snippets that hold an alias or hotkey, in the order they were bound.
+    /// Unbound ones aren't listed, so Settings doesn't list every app.
+    private var boundContentItems: [LauncherItem] {
+        let bound = store.database.commandBindings.map(\.targetID).filter { id in
+            ["app.", "quicklink.", "snippet."].contains { id.hasPrefix($0) }
+        }
+        guard !bound.isEmpty else { return [] }
+        let index = Dictionary(
+            (applicationItems + quicklinkItems + snippetItems).map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
+        return bound.compactMap { index[$0] }.filter(isBindableContent)
+    }
+
+    /// Content rows that can hold an alias or hotkey once their registration accepts them.
+    func isBindableContent(_ item: LauncherItem) -> Bool {
+        guard !item.id.hasPrefix("fallback."), !item.id.hasPrefix("argument.") else { return false }
+        switch item.action {
+        case .application, .snippet: return true
+        case .quicklink: return item.id.hasPrefix("quicklink.")
+        default: return false
+        }
+    }
+
+    /// Whether a row can hold an alias or hotkey right now: the one runtime check behind the
+    /// row's alias chip and shortcut, ⌘K's Assign entry, and Settings › Shortcuts.
+    func canBind(_ item: LauncherItem) -> Bool {
+        if isBindableContent(item) { return CuratedCommand.supports(item.id) }
+        return bindableCommands.contains { $0.id == item.id }
+    }
+
+    /// Whether a new alias or hotkey can be saved for this id now: a bindable command, or an
+    /// app, quicklink or snippet that exists and whose registration accepts it, bound or not.
+    func isBindableTarget(_ id: String) -> Bool {
+        if bindableCommands.contains(where: { $0.id == id }) { return true }
+        return (applicationItems + quicklinkItems + snippetItems).contains { $0.id == id && canBind($0) }
+    }
+
+    /// The rows Settings › Shortcuts lists: every bindable command, plus the row it was opened
+    /// for when that's an app, quicklink or snippet without a binding yet.
+    func bindingRows(focusing id: String?) -> [LauncherItem] {
+        var rows = bindableCommands
+        if let id, !rows.contains(where: { $0.id == id }),
+            let item = (applicationItems + quicklinkItems + snippetItems).first(where: { $0.id == id }), canBind(item)
+        {
+            rows.append(item)
+        }
+        return rows
     }
 
     var applicationItems: [LauncherItem] {
-        applications.applications.map { app in
+        let hidden = Set(applicationSettings.hiddenAppIDs)
+        return applications.applications.filter { !hidden.contains($0.id) }.map { app in
             LauncherItem(
                 id: app.id, title: app.name, subtitle: Self.shortenedPath(app.url.deletingLastPathComponent()),
                 symbol: "app", kind: .system, badge: "Application", keywords: app.bundleIdentifier ?? "",
@@ -22,12 +79,7 @@ extension LauncherModel {
     }
 
     var fileItems: [LauncherItem] {
-        files.results.map { file in
-            LauncherItem(
-                id: file.id, title: file.name, subtitle: Self.shortenedPath(file.url.deletingLastPathComponent()),
-                symbol: file.url.hasDirectoryPath ? "folder" : "doc", kind: .file, badge: Self.fileKind(file.url),
-                iconURL: file.url, action: .file(file.url), isLiveResult: true)
-        }
+        files.results.map(fileRow)
     }
 
     var savedFileItems: [LauncherItem] {
@@ -65,7 +117,7 @@ extension LauncherModel {
                     ? (keywordMatch ? "Keyword match · \(destination)" : destination) : "Search for “\(argument)”",
                 // One glyph wherever a quicklink appears: token, action bar, retarget rows.
                 symbol: "link", kind: .quicklink, badge: "Quicklink",
-                keywords: link.keyword, action: .quicklink(link, argument))
+                keywords: ([link.keyword] + link.tagList).joined(separator: " "), action: .quicklink(link, argument))
         }
     }
 
@@ -75,7 +127,8 @@ extension LauncherModel {
             return LauncherItem(
                 id: "snippet.\(snippet.id)", title: snippet.name, subtitle: firstLine,
                 symbol: "curlybraces", kind: .snippet, badge: "Snippet",
-                keywords: snippet.keyword + " " + snippet.content, action: .snippet(snippet))
+                keywords: ([snippet.keyword] + snippet.tagList + [snippet.content]).joined(separator: " "),
+                action: .snippet(snippet))
         }
     }
 
@@ -202,18 +255,20 @@ extension LauncherModel {
 
     /// Alias or keyword chip for a row, if any.
     func aliasChip(for item: LauncherItem) -> String? {
+        let alias = { self.store.database.binding(for: item.id).flatMap { self.canBind(item) ? $0.alias : nil } }
         switch item.action {
-        case .snippet(let snippet): snippet.keyword.isEmpty ? nil : snippet.keyword
+        // A keyword shows first; a snippet or quicklink without one shows its alias.
+        case .snippet(let snippet): return snippet.keyword.isEmpty ? alias() : snippet.keyword
         // Retarget rows show their keyword; the primary argument row and fallbacks don't.
         case .quicklink(let link, _)
         where item.id != argumentLink.map({ "argument.\($0.id)" }) && !item.id.hasPrefix("fallback."):
-            link.keyword.isEmpty ? nil : link.keyword
-        default: store.database.binding(for: item.id)?.alias
+            return link.keyword.isEmpty ? alias() : link.keyword
+        default: return alias()
         }
     }
 
     func boundShortcut(for item: LauncherItem) -> CommandShortcut? {
-        store.database.binding(for: item.id)?.shortcut
+        store.database.binding(for: item.id).flatMap { canBind(item) ? $0.shortcut : nil }
     }
 
     func isFavorite(_ item: LauncherItem) -> Bool { store.database.favoriteIDs.contains(item.id) }

@@ -31,19 +31,117 @@ struct ShortcutModifiers: OptionSet, Codable, Hashable, Sendable {
     }
 }
 
+/// A shortcut made of modifier keys alone, which Carbon can't register. `ModifierHotKeys`
+/// detects them from modifier changes.
+enum ShortcutGesture: String, Codable, Hashable, Sendable {
+    /// Press the modifiers together and release them without another key: ⌥⌘, or Right ⌘.
+    case modifiersOnly
+    /// Tap one modifier twice quickly: ⌘ ⌘.
+    case doubleTap
+}
+
+/// Physical modifier keys, for gestures where the side matters (Right ⌘ rather than either ⌘).
+struct ModifierSides: OptionSet, Codable, Hashable, Sendable {
+    let rawValue: UInt32
+
+    static let leftCommand = Self(rawValue: 1 << 0)
+    static let rightCommand = Self(rawValue: 1 << 1)
+    static let leftOption = Self(rawValue: 1 << 2)
+    static let rightOption = Self(rawValue: 1 << 3)
+    static let leftControl = Self(rawValue: 1 << 4)
+    static let rightControl = Self(rawValue: 1 << 5)
+    static let leftShift = Self(rawValue: 1 << 6)
+    static let rightShift = Self(rawValue: 1 << 7)
+
+    init(rawValue: UInt32) { self.rawValue = rawValue }
+
+    /// Every key, in ⌃ ⌥ ⇧ ⌘ order, left before right.
+    static let ordered: [(side: ModifierSides, modifier: ShortcutModifiers, symbol: String, isRight: Bool)] = [
+        (.leftControl, .control, "⌃", false), (.rightControl, .control, "⌃", true),
+        (.leftOption, .option, "⌥", false), (.rightOption, .option, "⌥", true),
+        (.leftShift, .shift, "⇧", false), (.rightShift, .shift, "⇧", true),
+        (.leftCommand, .command, "⌘", false), (.rightCommand, .command, "⌘", true),
+    ]
+
+    /// The modifiers these keys hold, whichever side.
+    var modifiers: ShortcutModifiers {
+        Self.ordered.reduce(into: []) { result, entry in if contains(entry.side) { result.insert(entry.modifier) } }
+    }
+
+    /// How many physical keys are down.
+    var count: Int { rawValue.nonzeroBitCount }
+}
+
 struct CommandShortcut: Codable, Hashable, Sendable {
     var keyCode: UInt32
     var modifiers: ShortcutModifiers
+    /// Nil for a key with modifiers, which Carbon registers. Otherwise a gesture of modifier keys alone.
+    var gesture: ShortcutGesture? = nil
+    /// For a gesture, the physical keys when the side matters; nil means either side.
+    var sides: ModifierSides? = nil
 
-    var usesPrintableKey: Bool { Self.printableKeyCodes.contains(keyCode) }
+    /// The key code gestures store, since they have no key.
+    static let gestureKeyCode: UInt32 = 0xFFFF
 
+    static func modifiersOnly(_ modifiers: ShortcutModifiers, sides: ModifierSides? = nil) -> CommandShortcut {
+        CommandShortcut(keyCode: gestureKeyCode, modifiers: modifiers, gesture: .modifiersOnly, sides: sides)
+    }
+
+    static func doubleTap(_ modifier: ShortcutModifiers, side: ModifierSides? = nil) -> CommandShortcut {
+        CommandShortcut(keyCode: gestureKeyCode, modifiers: modifier, gesture: .doubleTap, sides: side)
+    }
+
+    /// Whether Carbon can register it: a key, with or without modifiers.
+    var isKeyChord: Bool { gesture == nil }
+
+    /// Whether a press of exactly these keys completes this gesture. The gesture detector's rule:
+    /// a sided gesture needs exactly its keys; an unsided one takes either side of each of its
+    /// modifiers, and no other key.
+    func isMatched(byPress pressed: ModifierSides) -> Bool {
+        guard gesture != nil else { return false }
+        if let sides { return sides == pressed }
+        return pressed.modifiers == modifiers && pressed.count == modifiers.rawValue.nonzeroBitCount
+    }
+
+    /// Every press that completes this gesture.
+    var matchingPresses: [ModifierSides] {
+        guard gesture != nil else { return [] }
+        if let sides { return [sides] }
+        var presses: [ModifierSides] = [[]]
+        for entry in ModifierSides.ordered where !entry.isRight && modifiers.contains(entry.modifier) {
+            guard let right = ModifierSides.ordered.first(where: { $0.modifier == entry.modifier && $0.isRight })
+            else { continue }
+            presses = presses.flatMap { [$0.union(entry.side), $0.union(right.side)] }
+        }
+        return presses
+    }
+
+    /// Whether two modifier gestures would both fire from one press, by the detector's own rule:
+    /// two of the same kind that some press completes, or a double tap and a single-key gesture
+    /// its second tap completes. Only one of such a pair can work.
+    func gestureOverlaps(_ other: CommandShortcut) -> Bool {
+        guard let gesture, let otherGesture = other.gesture else { return false }
+        let shared = matchingPresses.filter(other.isMatched(byPress:))
+        if gesture == otherGesture { return !shared.isEmpty }
+        // A double tap fires only for one key, on a press that is also a single tap.
+        return shared.contains { $0.count == 1 }
+    }
+
+    var usesPrintableKey: Bool { isKeyChord && Self.printableKeyCodes.contains(keyCode) }
+
+    /// Worded keys (“⌘ Return”), for messages. Gestures use their caps.
     var title: String {
-        (modifierSymbols + [keyTitle]).joined(separator: " ")
+        gesture == nil ? (modifierSymbols + [keyTitle]).joined(separator: " ") : caps.joined(separator: " ")
     }
 
     /// Keycaps: the modifiers in ⌃ ⌥ ⇧ ⌘ order, then one cap for the key, so
     /// “Page Up” and “Keypad 1” stay whole and Return, Delete and Esc use their glyphs.
+    /// Gestures show their modifiers, sided ones as “Right ⌘”, and a double tap twice.
     var caps: [String] {
+        if let gesture {
+            let symbols = gestureSymbols
+            return gesture == .doubleTap ? symbols + symbols : symbols
+        }
         let key =
             switch keyCode {
             case 36: "↩"
@@ -87,23 +185,56 @@ struct CommandShortcut: Codable, Hashable, Sendable {
         return symbols.compactMap { modifiers.contains($0.0) ? $0.1 : nil }
     }
 
+    /// A gesture's keys: sided ones say which side, others as plain modifiers.
+    private var gestureSymbols: [String] {
+        guard let sides else { return modifierSymbols }
+        return ModifierSides.ordered.compactMap { entry in
+            sides.contains(entry.side) ? (entry.isRight ? "Right \(entry.symbol)" : "Left \(entry.symbol)") : nil
+        }
+    }
+
     private var keyTitle: String {
         layoutCharacter?.uppercased() ?? Self.keyNames[keyCode] ?? "Unknown Key"
     }
 
     func validate() throws {
-        guard !modifiers.isEmpty, modifiers.subtracting(.all).isEmpty,
-            Self.keyNames[keyCode] != nil
-        else {
+        guard modifiers.subtracting(.all).isEmpty else {
+            throw LibraryValidationError("Use Command, Control, Option or Shift.")
+        }
+        if let gesture {
+            guard keyCode == Self.gestureKeyCode, !modifiers.isEmpty,
+                sides.map({ $0.modifiers == modifiers }) ?? true
+            else {
+                throw LibraryValidationError("This modifier shortcut isn't complete. Record it again.")
+            }
+            switch gesture {
+            case .doubleTap:
+                guard modifiers.rawValue.nonzeroBitCount == 1, (sides?.count ?? 1) == 1 else {
+                    throw LibraryValidationError("Double-tap one modifier key, such as ⌘ ⌘.")
+                }
+            case .modifiersOnly:
+                // A single modifier on its own would fire on every use of it, unless one side is chosen.
+                guard modifiers.rawValue.nonzeroBitCount >= 2 || sides?.count == 1 else {
+                    throw LibraryValidationError("Use two modifiers together, or one side of a modifier, such as Right ⌘.")
+                }
+            }
+            return
+        }
+        guard Self.keyNames[keyCode] != nil else {
             throw LibraryValidationError("Use Command, Control, Option or Shift together with a standard key.")
         }
-        guard modifiers != .all else {
-            throw LibraryValidationError("Hyper Key shortcuts with all four modifiers are not supported.")
+        // A key alone works only for the keys nothing types: F13 to F20.
+        guard !modifiers.isEmpty || Self.bareFunctionKeys.contains(keyCode) else {
+            throw LibraryValidationError(
+                "Use Command, Control, Option or Shift together with a standard key, or F13 to F20 alone.")
         }
         guard !CommandShortcutPolicy.fixedReservedShortcuts.contains(self) else {
             throw LibraryValidationError("\(title) is reserved by macOS. Choose another shortcut.")
         }
     }
+
+    /// F13–F20, which can be shortcuts on their own.
+    static let bareFunctionKeys = Set<UInt32>([kVK_F13, kVK_F14, kVK_F15, kVK_F16, kVK_F17, kVK_F18, kVK_F19, kVK_F20].map(UInt32.init))
 
     // Hardware key codes are persisted, so identities never depend on localized key labels.
     // Modifier keys, Fn/Globe, and media keys are deliberately absent.
@@ -197,6 +328,11 @@ enum CommandShortcutPolicy {
     }
 
     static func conflictWarnings(for shortcut: CommandShortcut) -> [String] {
+        if shortcut.gesture == .modifiersOnly, shortcut.sides == nil {
+            return [
+                "\(shortcut.title) fires whenever you press and release those modifiers without another key, even while you're working in another app."
+            ]
+        }
         if shortcut.usesPrintableKey, [.shift, .option, [.shift, .option]].contains(shortcut.modifiers) {
             return [
                 "\(shortcut.title) is also used for typing. Saving it may prevent that character from being typed while OpenRay is running."
