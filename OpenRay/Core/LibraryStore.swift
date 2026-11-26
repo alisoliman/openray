@@ -116,6 +116,13 @@ final class LibraryStore {
         return update { _ in }
     }
 
+    /// Replaces the whole library in one validated save, as an archive import does. The current
+    /// library stays when the new one is invalid or can't be saved.
+    @discardableResult
+    func replaceLibrary(with replacement: LibraryDatabase) -> Bool {
+        update { $0 = replacement }
+    }
+
     @discardableResult
     func saveCommandBinding(_ binding: CommandBinding) -> Bool {
         update { database in
