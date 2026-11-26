@@ -253,6 +253,11 @@ struct FocusControllerTests {
         let live = WorkspaceFocusAppControl(guardrail: SideEffectGuard(mode: .testHost))
         live.startObserving()
         #expect(live.runningApplications().isEmpty)
+        // An injected live guard follows the process's rule for reads too.
+        let injectedLive = WorkspaceFocusAppControl(guardrail: SideEffectGuard(mode: .live))
+        injectedLive.startObserving()
+        #expect(injectedLive.runningApplications().isEmpty)
+        #expect(throws: SideEffectGuard.Blocked.self) { try injectedLive.hide(FocusFixture.slack) }
         #expect(throws: SideEffectGuard.Blocked.self) { try live.hide(FocusFixture.slack) }
         let notices = FocusNoticeCenter(guardrail: SideEffectGuard(mode: .verification))
         notices.showBlocked(appName: "Slack", goal: "Write")

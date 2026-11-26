@@ -141,6 +141,8 @@ final class NotesWindowModel {
     var slashMenu: NoteSlashMenu?
     /// Asked before Empty Recently Deleted; ↩ confirms.
     var confirmsEmptyingDeleted = false
+    /// Asked before deleting one note in Recently Deleted for good.
+    var confirmsDeletingNow: UUID?
     @ObservationIgnored private var autosaveTask: Task<Void, Never>?
     /// A click in the `/` menu. The editor sets it, since it owns the text view.
     @ObservationIgnored var onPickSlashCommand: ((NoteSlashCommand) -> Void)?
@@ -270,6 +272,7 @@ final class NotesWindowModel {
         browser = nil
         slashMenu = nil
         confirmsEmptyingDeleted = false
+        confirmsDeletingNow = nil
     }
 
     // MARK: Navigation
@@ -646,7 +649,8 @@ final class NotesWindowModel {
     /// Removes a note from Recently Deleted for good, with any images only it used.
     @discardableResult
     func deletePermanently(_ id: UUID) -> Bool {
-        removeForGood(notes.filter { $0.id == id && $0.isDeleted }, failure: "This note couldn't be deleted.")
+        confirmsDeletingNow = nil
+        return removeForGood(notes.filter { $0.id == id && $0.isDeleted }, failure: "This note couldn't be deleted.")
     }
 
     /// Empties Recently Deleted. Asks first, through `confirmsEmptyingDeleted`.
@@ -777,6 +781,7 @@ final class NotesWindowModel {
         let first = browserResults.first?.id
         browser?.selection = first
         confirmsEmptyingDeleted = false
+        confirmsDeletingNow = nil
     }
 
     func setBrowserQuery(_ query: String) {

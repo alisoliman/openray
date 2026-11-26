@@ -12,6 +12,8 @@ final class MenuBarCommandProvider: CommandProvider {
     static let settingsID = "menubar.settings"
 
     var id: String { Self.registration.id }
+    /// The heading in Settings › Commands.
+    var title: String { "Menu Bar" }
 
     init() {}
 

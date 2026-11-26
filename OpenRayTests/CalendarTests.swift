@@ -303,6 +303,9 @@ struct CalendarServiceTests {
         #expect(throws: (any Error).self) { try source.events(from: .now, to: .now.addingTimeInterval(60)) }
         #expect(throws: (any Error).self) { try source.createEvent(title: "x", start: .now, end: .now) }
         #expect(source.calendars().isEmpty)
+        // An injected live guard can't read past the process's own rule either.
+        let injectedLive = EventKitCalendarSource(guardrail: SideEffectGuard(mode: .live))
+        #expect(injectedLive.access == .unavailable)
         let opener = WorkspaceURLOpener(guardrail: SideEffectGuard(mode: .verification))
         #expect(throws: SideEffectGuard.Blocked.self) { try opener.open(URL(string: "https://zoom.us/j/1")!) }
     }
@@ -498,6 +501,20 @@ struct CalendarProviderTests {
         source.failsToRead = true
         model.perform(command)
         #expect(model.confirmation == nil)
+    }
+
+    @Test func aHeldReturnNeverApprovesBlockTime() throws {
+        let (model, service, source, _) = make()
+        service.refresh()
+        let command = try #require(model.commandItems.first { $0.id == CalendarCommandProvider.blockTimeID })
+        model.perform(command)
+        let prompt = try #require(model.confirmation)
+        #expect(!prompt.isDestructive)
+        #expect(model.confirmFromReturn(isRepeat: true))
+        #expect(source.created.isEmpty && model.confirmation != nil)
+        // A fresh press approves it.
+        #expect(model.confirmFromReturn(isRepeat: false))
+        #expect(source.created.count == 1)
     }
 
     @Test func copyAvailabilityCopiesAndSaysSo() throws {

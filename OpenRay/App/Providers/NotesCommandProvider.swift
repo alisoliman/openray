@@ -187,17 +187,19 @@ final class NotesCommandProvider: CommandProvider, MenuBarExtraProviding {
                 isDestructive: true
             ) { [weak model] in
                 guard let model else { return }
+                // Destructive: Return approves only once the prompt has been on screen, and a held
+                // Return never does.
                 let question = CommandConfirmation(
                     question: "Delete all \(count) notes in Recently Deleted?", detail: "You can't undo this.",
-                    confirmTitle: "Empty", symbol: "trash")
-                model.confirmation = .provided(
+                    confirmTitle: "Empty", symbol: "trash", isDestructive: true)
+                model.presentConfirmation(.provided(
                     ProvidedConfirmation(id: "notes.empty", question) { [weak model] in
                         if notes.emptyRecentlyDeleted() {
                             model?.toast("Recently Deleted is empty")
                         } else {
                             model?.feedback = .error(notes.notice?.text ?? "Recently Deleted couldn't be emptied.")
                         }
-                    })
+                    }))
             },
         ]
     }

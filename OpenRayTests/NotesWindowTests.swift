@@ -1019,6 +1019,42 @@ struct NotesLauncherTests {
         #expect(!model.store.database.notes.contains { $0.id == expired.id })
     }
 
+    @Test func recentlyDeletedCopyAndPasteStayOffTheSystemClipboardWithTheInMemoryFlagAlone() throws {
+        // `--in-memory-library` alone launches inert, so the launcher gets a private pasteboard.
+        let pasteboard = RuntimeMode.launchPasteboard(
+            arguments: ["--in-memory-library"], sideEffects: SideEffectGuard(mode: .verification))
+        #expect(pasteboard.name != .general)
+        let model = LauncherModel(
+            store: LibraryStore(fileURL: nil), ai: AIChatModel(engine: TestAIEngine()), pasteboard: pasteboard,
+            registry: CommandRegistry(providers: [NotesCommandProvider(center: fakeCenter(FakeNotesPresenter()))]))
+        model.store.update { $0.notes = [QuickNote(title: "Kept words", content: "Kept words", deletedAt: .now)] }
+        model.navigate(to: .provided(NotesCommandProvider.deletedScope))
+        let row = try #require(model.results.first)
+        try #require(model.actions(for: row).first { $0.id == "notes.copy" }).perform()
+        #expect(pasteboard.string(forType: .string) == "Kept words")
+        // Paste copies to that board and stops: it never activates another app or types into it.
+        model.paste(row)
+        #expect(!model.canPasteDirectly)
+        #expect(model.clipboard.usesGeneralPasteboard == false)
+    }
+
+    @Test func emptyingRecentlyDeletedIsDestructiveAndAHeldReturnNeverApprovesIt() throws {
+        let model = makeModel(center: fakeCenter(FakeNotesPresenter()))
+        model.store.update { $0.notes = [QuickNote(title: "Trash", content: "x", deletedAt: .now)] }
+        model.navigate(to: .provided(NotesCommandProvider.deletedScope))
+        let row = try #require(model.results.first)
+        try #require(model.actions(for: row).first { $0.id == "notes.empty" }).perform()
+        let prompt = try #require(model.confirmation)
+        #expect(prompt.isDestructive && prompt.requiresVisibleApproval)
+        // A held Return is consumed, and a fresh one can't approve a prompt that was never seen.
+        #expect(model.confirmFromReturn(isRepeat: true))
+        #expect(model.confirmFromReturn(isRepeat: false))
+        #expect(model.store.database.notes.count == 1)
+        // The person's own approval, once it's on screen, empties it.
+        model.confirm(prompt)
+        #expect(model.store.database.notes.isEmpty)
+    }
+
     @Test func settingsListsTheSliceSixPanesInOrder() {
         let mine: [SettingsPane] = [.notes, .calendar, .focus, .menuBar]
         #expect(SettingsPane.primary.filter(mine.contains) == mine)

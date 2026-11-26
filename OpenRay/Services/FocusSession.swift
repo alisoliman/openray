@@ -414,8 +414,8 @@ final class WorkspaceFocusAppControl: FocusAppControlling {
     }
 
     func startObserving() {
-        // The stricter of the injected and the process rule (`effective` after the a4e845d merge).
-        guard observer == nil, !guardrail.isInert, !SideEffectGuard.isInert else { return }
+        // The stricter of the injected and the process rule.
+        guard observer == nil, !guardrail.effective.isInert else { return }
         observer = NSWorkspace.shared.notificationCenter.addObserver(
             forName: NSWorkspace.didActivateApplicationNotification, object: nil, queue: .main
         ) { [weak self] notification in
@@ -433,7 +433,7 @@ final class WorkspaceFocusAppControl: FocusAppControlling {
     }
 
     func runningApplications() -> [FocusRunningApp] {
-        guard !guardrail.isInert, !SideEffectGuard.isInert else { return [] }
+        guard !guardrail.effective.isInert else { return [] }
         return NSWorkspace.shared.runningApplications.filter { $0.activationPolicy == .regular && !$0.isHidden }.map {
             FocusRunningApp(bundleID: $0.bundleIdentifier, name: $0.localizedName ?? "", processIdentifier: $0.processIdentifier)
         }

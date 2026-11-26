@@ -498,18 +498,27 @@ private struct NotesBrowserView: View {
             }
             if browser.showsDeleted {
                 Hairline()
+                // Deleting for good is approved only by a click on the button the question shows,
+                // never by Return, so a held or stray key can't erase notes.
                 HStack(spacing: 8) {
                     if model.confirmsEmptyingDeleted {
                         Text("Delete \(model.deletedNotes.count) notes for good?").foregroundStyle(OR.Color.text)
                         Spacer()
                         Button("Cancel") { model.confirmsEmptyingDeleted = false }.buttonStyle(.orGhost)
                         Button("Empty") { model.emptyRecentlyDeleted() }.buttonStyle(.orDestructive)
-                            .keyboardShortcut(.defaultAction)
+                    } else if let id = model.confirmsDeletingNow,
+                        let note = model.deletedNotes.first(where: { $0.id == id })
+                    {
+                        Text("Delete “\(note.title.truncatedForFeedback)” for good?").foregroundStyle(OR.Color.text)
+                            .lineLimit(1)
+                        Spacer()
+                        Button("Cancel") { model.confirmsDeletingNow = nil }.buttonStyle(.orGhost)
+                        Button("Delete") { model.deletePermanently(id) }.buttonStyle(.orDestructive)
                     } else {
                         Text("Notes stay here for 60 days.").foregroundStyle(OR.Color.text3)
                         Spacer()
                         if let id = browser.selection {
-                            Button("Delete Now") { model.deletePermanently(id) }.buttonStyle(.orGhost)
+                            Button("Delete Now…") { model.confirmsDeletingNow = id }.buttonStyle(.orGhost)
                         }
                         Button("Empty…") { model.confirmsEmptyingDeleted = true }.buttonStyle(.orSecondary)
                             .disabled(model.deletedNotes.isEmpty)

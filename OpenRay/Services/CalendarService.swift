@@ -423,8 +423,8 @@ final class EventKitCalendarSource: CalendarEventSource {
     }
 
     var access: CalendarAccess {
-        // The stricter of the injected and the process rule (`effective` after the a4e845d merge).
-        guard !guardrail.isInert, !SideEffectGuard.isInert else { return .unavailable }
+        // The stricter of the injected and the process rule.
+        guard !guardrail.effective.isInert else { return .unavailable }
         switch EKEventStore.authorizationStatus(for: .event) {
         case .notDetermined: return .notDetermined
         case .restricted: return .restricted

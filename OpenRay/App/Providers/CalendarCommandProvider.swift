@@ -449,7 +449,8 @@ final class CalendarCommandProvider: CommandProvider, MenuBarExtraProviding {
         let question = CommandConfirmation(
             question: retry ? "That time is no longer free. Block \(length) \(when) instead?" : "Block \(length) \(when)?",
             detail: "Adds “\(name)” to your default calendar.", confirmTitle: "Block Time", symbol: "calendar.badge.plus")
-        model.confirmation = .provided(
+        // A fresh key press or the button approves it; a held Return never does.
+        model.presentConfirmation(.provided(
             ProvidedConfirmation(id: "calendar.blockTime.confirm", question) { [weak self, weak model] in
                 guard let self, let model else { return }
                 // The calendar, the clock and access can all change while the question is up, so
@@ -469,7 +470,7 @@ final class CalendarCommandProvider: CommandProvider, MenuBarExtraProviding {
                 } catch {
                     model.feedback = .error(error.localizedDescription)
                 }
-            })
+            }))
     }
 
     /// “today, 2:15 – 3:15 PM” or “Fri, Nov 27, 9:00 – 10:00 AM”.
