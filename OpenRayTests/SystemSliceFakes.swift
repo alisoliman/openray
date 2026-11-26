@@ -245,8 +245,35 @@ final class FakeWindowSnapshotSource: WindowSnapshotSource, @unchecked Sendable 
 @MainActor
 final class FakeWindowServerListing: WindowServerListing {
     var entries: [WindowServerEntry]
-    init(_ entries: [WindowServerEntry] = []) { self.entries = entries }
-    func onScreenWindows() -> [WindowServerEntry] { entries }
+    /// When set, the listing follows this system like the real window server: it lists every
+    /// window that isn't minimized or in `offSpace`, at its current frame. Windows in `entries`
+    /// come first, in that order (front to back), then the rest as the system lists them.
+    /// Unset, `entries` are returned as they are.
+    weak var following: FakeWindowSystem?
+    /// While following: windows on another Space, which the window server doesn't list.
+    var offSpace: Set<Int> = []
+
+    init(_ entries: [WindowServerEntry] = [], following: FakeWindowSystem? = nil, offSpace: Set<Int> = []) {
+        self.entries = entries
+        self.following = following
+        self.offSpace = offSpace
+    }
+
+    func onScreenWindows() -> [WindowServerEntry] {
+        guard let system = following else { return entries }
+        let primaryHeight = system.displayList.first?.frame.maxY ?? 0
+        func rank(_ window: WindowSnapshot) -> Int {
+            entries.firstIndex { $0.pid == window.pid && $0.number == UInt32(window.handle.token) } ?? entries.count
+        }
+        let shown = system.windowList.enumerated().filter { _, window in
+            !window.isMinimized && window.frame != nil && !offSpace.contains(window.handle.token)
+        }
+        return shown.sorted { (rank($0.element), $0.offset) < (rank($1.element), $1.offset) }.map { _, window in
+            WindowServerEntry(
+                number: UInt32(window.handle.token), pid: window.pid,
+                bounds: ScreenCoordinates.flip(window.frame ?? .zero, primaryHeight: primaryHeight), layer: 0)
+        }
+    }
 }
 
 // MARK: - System actions

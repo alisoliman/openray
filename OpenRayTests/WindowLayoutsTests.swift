@@ -24,13 +24,17 @@ struct WindowLayoutsTests {
         ]
     }
 
-    /// A manager whose window server sees `onScreen` front to back (all of the desk by default).
+    /// A manager whose window server sees `onScreen` front to back (all of the desk by default),
+    /// and follows the windows as they move, unminimize or appear. Windows left out of
+    /// `onScreen` are on another Space.
     private func makeManager(
         windows: [WindowSnapshot]? = nil, onScreen: [WindowSnapshot]? = nil
     ) -> (WindowManager, FakeWindowSystem) {
         let windows = windows ?? desk()
         let system = FakeWindowSystem(displays: displays, windows: windows)
-        let listing = FakeWindowServerListing(WindowFixture.entries(for: onScreen ?? windows.filter { !$0.isMinimized }))
+        let shown = onScreen ?? windows.filter { !$0.isMinimized }
+        let offSpace = Set(windows.filter { !$0.isMinimized && !shown.contains($0) }.map(\.handle.token))
+        let listing = FakeWindowServerListing(WindowFixture.entries(for: shown), following: system, offSpace: offSpace)
         return (WindowManager(system: system, listing: listing), system)
     }
 
@@ -240,7 +244,8 @@ struct WindowLayoutsTests {
         layout.otherWindows = .close
         let outcome = try await manager.apply(
             layout, launcher: FakeApplicationLauncher(), launchTimeout: .milliseconds(250), sleep: { _ in })
-        #expect(outcome == WindowLayoutOutcome(requested: 1, placed: 0, missing: ["Gone"]))
+        #expect(outcome == WindowLayoutOutcome(requested: 1, placed: 0, missing: ["Gone"], otherWindowsLeft: .close))
+        #expect(outcome.message == "Arranged 0 of 1 window. No window for Gone. Other windows weren't closed.")
         #expect(system.events.isEmpty)
     }
 
@@ -252,9 +257,9 @@ struct WindowLayoutsTests {
             slots: [slot("com.example.editor", app: "Editor", display: 1), slot("com.example.chat", app: "Chat", display: 0)])
         layout.otherWindows = .close
         let outcome = try await manager.apply(layout, launcher: FakeApplicationLauncher(), sleep: { _ in })
-        #expect(outcome == WindowLayoutOutcome(requested: 2, placed: 1, failed: ["Editor"]))
-        #expect(outcome.message == "Arranged 1 of 2 windows. Editor didn't move.")
-        // Only Chat's display had a placement, and nothing else is visible there.
+        #expect(outcome == WindowLayoutOutcome(requested: 2, placed: 1, failed: ["Editor"], otherWindowsLeft: .close))
+        #expect(outcome.message == "Arranged 1 of 2 windows. Editor didn't move. Other windows weren't closed.")
+        // The layout isn't in place, so no other window is touched, on any display.
         #expect(!system.events.contains { if case .close = $0 { return true } else { return false } })
         #expect(!system.events.contains(.focus(1)))
         #expect(system.events.contains(.focus(3)))
@@ -322,7 +327,7 @@ struct WindowLayoutsTests {
         var layout = SavedWindowLayout(name: "Chat here", slots: [slot("com.example.chat", app: "Chat", title: "Team", display: 1)])
         layout.otherWindows = .close
         let outcome = try await manager.apply(layout, launcher: FakeApplicationLauncher(), sleep: { _ in })
-        #expect(outcome == WindowLayoutOutcome(requested: 1, placed: 0, failed: ["Chat"]))
+        #expect(outcome == WindowLayoutOutcome(requested: 1, placed: 0, failed: ["Chat"], otherWindowsLeft: .close))
         #expect(!system.events.contains { if case .close = $0 { return true } else { return false } })
         #expect(!system.events.contains(.focus(3)))
     }
@@ -340,6 +345,115 @@ struct WindowLayoutsTests {
         layout.otherWindows = .close
         _ = try await manager.apply(layout, launcher: FakeApplicationLauncher(), sleep: { _ in })
         #expect(!system.events.contains(.close(5)) && !system.events.contains(.close(6)))
+    }
+
+    @Test func closeOthersLeavesEveryWindowWhenAPlacementMissesItsRequestedFrame() async throws {
+        let (manager, system) = makeManager()
+        // Browser lands on the right display but keeps its own size.
+        system.clampedSizes = [2: CGSize(width: 700, height: 800)]
+        var layout = SavedWindowLayout(name: "Browser", slots: [slot("com.example.browser", app: "Browser", display: 1)])
+        layout.otherWindows = .close
+        let outcome = try await manager.apply(layout, launcher: FakeApplicationLauncher(), sleep: { _ in })
+        #expect(
+            outcome
+                == WindowLayoutOutcome(
+                    requested: 1, placed: 1, otherWindowsLeft: .close, unconfirmed: ["Browser"]))
+        #expect(
+            outcome.message
+                == "Arranged 1 of 1 window. Other windows weren't closed: Browser couldn't be confirmed in place.")
+        #expect(!system.events.contains { if case .close = $0 { return true } else { return false } })
+        // It's still raised: only cleanup waits for confirmation.
+        #expect(system.events.last == .focus(2))
+    }
+
+    @Test func closeOthersLeavesEveryWindowWhenThePlacedWindowIsOnAnotherSpace() async throws {
+        let desk = desk()
+        // Browser is on another Space: Accessibility moves it, the window server never shows it.
+        let (manager, system) = makeManager(windows: desk, onScreen: desk.filter { $0.handle.token != 2 && !$0.isMinimized })
+        var layout = SavedWindowLayout(name: "Browser", slots: [slot("com.example.browser", app: "Browser", display: 1)])
+        layout.otherWindows = .minimize
+        let log = SleepLog()
+        let outcome = try await manager.apply(layout, launcher: FakeApplicationLauncher(), sleep: { log.record($0) })
+        #expect(outcome.otherWindowsLeft == .minimize && outcome.unconfirmed == ["Browser"])
+        #expect(outcome.message.hasSuffix("Other windows weren't minimized: Browser couldn't be confirmed in place."))
+        #expect(!system.events.contains(.minimized(1, true)))
+        // It checked again a moment later before giving up, in case the window server trailed.
+        #expect(log.durations == Array(repeating: WindowManager.placementCheckInterval, count: WindowManager.placementChecks - 1))
+    }
+
+    @Test func closeOthersLeavesEveryWindowWhenThePlacedWindowCantBeToldApart() async throws {
+        let full = CGRect(x: 0, y: 76, width: 1440, height: 800)
+        let placedHere = WindowFixture.window(pid: 500, token: 5, app: "Docs", bundle: "com.example.docs", title: "Draft")
+        // Another Docs window already fills the screen, exactly where the layout puts "Draft".
+        let twin = WindowFixture.window(pid: 500, token: 6, app: "Docs", bundle: "com.example.docs", title: "Notes", frame: full)
+        let other = WindowFixture.window(pid: 700, token: 7, app: "Mail", bundle: "com.example.mail")
+        let (manager, system) = makeManager(windows: [placedHere, twin, other])
+        var layout = SavedWindowLayout(
+            name: "Draft", slots: [slot("com.example.docs", app: "Docs", title: "Draft", display: 1)])
+        layout.otherWindows = .close
+        let outcome = try await manager.apply(layout, launcher: FakeApplicationLauncher(), sleep: { _ in })
+        #expect(system.events.contains(.setFrame(5, full)))
+        #expect(outcome.otherWindowsLeft == .close && outcome.unconfirmed == ["Docs"])
+        #expect(!system.events.contains { if case .close = $0 { return true } else { return false } })
+    }
+
+    @Test func closeOthersCleansUpOnceEveryPlacementIsConfirmed() async throws {
+        let (manager, system) = makeManager()
+        var layout = SavedWindowLayout(name: "Browser", slots: [slot("com.example.browser", app: "Browser", display: 1)])
+        layout.otherWindows = .close
+        let outcome = try await manager.apply(layout, launcher: FakeApplicationLauncher(), sleep: { _ in })
+        #expect(outcome == WindowLayoutOutcome(requested: 1, placed: 1))
+        // Editor shares Browser's display; Chat's other window is on the secondary display.
+        #expect(system.events.contains(.close(1)) && !system.events.contains(.close(3)))
+    }
+
+    // MARK: Window server join
+
+    @Test func aNearbyEntryCannotVouchForAWindowOnAnotherSpace() {
+        let at100 = CGRect(x: 100, y: 200, width: 600, height: 400)
+        let windows = [
+            WindowFixture.window(pid: 500, token: 1, app: "Docs", frame: at100),
+            // Same size and place, on another Space.
+            WindowFixture.window(pid: 500, token: 2, app: "Docs", frame: at100),
+            WindowFixture.window(pid: 500, token: 3, app: "Docs", frame: at100.offsetBy(dx: 3, dy: 0)),
+        ]
+        // The window server shows two of the three, at x = 101 and x = 103.
+        let entries = [
+            WindowServerEntry(
+                number: 11, pid: 500, bounds: ScreenCoordinates.flip(at100.offsetBy(dx: 1, dy: 0), primaryHeight: 900),
+                layer: 0),
+            WindowServerEntry(
+                number: 13, pid: 500, bounds: ScreenCoordinates.flip(at100.offsetBy(dx: 3, dy: 0), primaryHeight: 900),
+                layer: 0),
+        ]
+        let join = WindowServerJoin(windows, entries: entries, primaryHeight: 900)
+        // Three windows fit two entries: which x = 100 window is on screen is unknown, so none is
+        // counted, and the x = 103 entry can't make up for it.
+        #expect(join.onScreen.isEmpty && join.unambiguous.isEmpty)
+        #expect(WindowSwitcherOrdering.order(windows, entries: entries, primaryHeight: 900).allSatisfy { !$0.isOnScreen })
+    }
+
+    @Test func windowsPairWithTheirOwnEntriesAndOnlyLoneMatchesAreUnambiguous() {
+        let frame = CGRect(x: 100, y: 200, width: 600, height: 400)
+        let windows = [
+            WindowFixture.window(pid: 500, token: 1, app: "Docs", frame: frame),
+            WindowFixture.window(pid: 500, token: 2, app: "Docs", frame: frame.offsetBy(dx: 2, dy: 0)),
+            WindowFixture.window(pid: 600, token: 3, app: "Mail", frame: frame),
+        ]
+        // Front to back: Docs at x = 102, Mail, Docs at x = 100.
+        let entries = [
+            WindowServerEntry(
+                number: 22, pid: 500, bounds: ScreenCoordinates.flip(frame.offsetBy(dx: 2, dy: 0), primaryHeight: 900),
+                layer: 0),
+            WindowServerEntry(number: 33, pid: 600, bounds: ScreenCoordinates.flip(frame, primaryHeight: 900), layer: 0),
+            WindowServerEntry(number: 11, pid: 500, bounds: ScreenCoordinates.flip(frame, primaryHeight: 900), layer: 0),
+        ]
+        let join = WindowServerJoin(windows, entries: entries, primaryHeight: 900)
+        #expect(join.onScreen[0]?.number == 11 && join.onScreen[1]?.number == 22 && join.onScreen[2]?.number == 33)
+        // The two Docs windows each fit both Docs entries; only Mail is matched one to one.
+        #expect(join.unambiguous == [2])
+        #expect(
+            WindowSwitcherOrdering.order(windows, entries: entries, primaryHeight: 900).map { $0.handle.token } == [2, 3, 1])
     }
 
     // MARK: Model

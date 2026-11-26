@@ -59,7 +59,8 @@ struct SystemWindowProviderTests {
     ) -> Harness {
         let recorder = Recorder(foreground: foreground)
         let system = FakeWindowSystem(displays: [WindowFixture.laptop], windows: windows)
-        let listing = FakeWindowServerListing(WindowFixture.entries(for: windows.filter { !$0.isMinimized }))
+        let listing = FakeWindowServerListing(
+            WindowFixture.entries(for: windows.filter { !$0.isMinimized }), following: system)
         let presenter = FakeHUDPresenter()
         let hud = HUDController(presenter: presenter, screenFrame: { WindowFixture.laptop.visibleFrame }, schedule: { _, _ in })
         let launcher = FakeApplicationLauncher()
@@ -419,18 +420,36 @@ struct SystemWindowProviderTests {
         #expect(h.actions.actions == [.restart])
     }
 
-    @Test func optionalConfirmationsFollowSettingsButRestartAlwaysAsks() async throws {
-        let h = harness()
+    @Test func irreversibleCommandsAskWhateverIsSavedAndOnlyHideOthersMaySkip() async throws {
+        let h = harness(hotKey: GlobalHotKey(backend: RecordingHotKeyBackend(), reservedShortcuts: { [] }))
         defer { h.model.stop() }
+        // What earlier builds saved to skip the Trash and quit/hide questions is ignored.
         #expect(h.model.store.update {
-            $0.systemCommandSettings = SystemCommandSettings(confirmsEmptyingTrash: false, confirmsHidingOtherApps: false)
+            $0.commandPreferences[SystemCommandSettings.storageKey] = ["confirmEmptyTrash": "false", "confirmQuitApps": "false"]
         })
+        for id in ["system.emptyTrash", "system.restart", "system.shutDown", "system.logOut", "system.hideOtherApps"] {
+            h.model.perform(try command(id, in: h.model))
+            #expect(h.model.confirmation?.id.hasPrefix("provided.\(id)") == true, "\(id)")
+            #expect(h.model.confirmation?.isDestructive == true, "\(id)")
+            h.model.goBack()
+        }
+        // From a hotkey too, with the panel hidden.
+        let shortcut = CommandShortcut(keyCode: 14, modifiers: [.control, .option])
+        #expect(h.model.store.saveCommandBinding(CommandBinding(targetID: "system.emptyTrash", shortcut: shortcut)))
+        h.model.performBoundCommand(targetID: "system.emptyTrash")
+        #expect(h.model.confirmation?.id.hasPrefix("provided.system.emptyTrash") == true)
+        h.model.goBack()
+        #expect(h.actions.actions.isEmpty)
+        // Hiding is undone by Unhide All Apps, so its question alone may be turned off.
+        #expect(h.model.store.update { $0.systemCommandSettings = SystemCommandSettings(confirmsHidingOtherApps: false) })
         h.model.perform(try command("system.emptyTrash", in: h.model))
+        #expect(h.model.confirmation?.id.hasPrefix("provided.system.emptyTrash") == true)
+        h.model.goBack()
+        h.model.perform(try command("system.hideOtherApps", in: h.model))
         #expect(h.model.confirmation == nil)
         await h.systemCommands.pendingTask?.value
-        #expect(h.actions.actions == [.emptyTrash])
-        h.model.perform(try command("system.restart", in: h.model))
-        #expect(h.model.confirmation?.id.hasPrefix("provided.system.restart") == true)
+        #expect(h.actions.actions.count == 1)
+        if case .hideOtherApps = h.actions.actions.first {} else { Issue.record("expected Hide Others, ran \(h.actions.actions)") }
     }
 
     @Test func quitOthersWithoutAForegroundAppSaysSoAndRunsNothing() throws {
@@ -495,15 +514,18 @@ struct SystemWindowProviderTests {
         database.commandPreferences[ApplicationSettings.key] = applications.values
         database.commandPreferences[SystemCommandSettings.storageKey] = [
             "quitExclusions": "com.example.music\ncom.example.radio", "confirmEmptyTrash": "false",
+            "confirmQuitApps": "false",
         ]
         // Both lists, Applications' first, without repeats.
         #expect(database.keepRunningBundleIDs == ["com.example.mail", "com.example.music", "com.example.radio"])
-        // Saving the System settings moves the older list into Keep Running before writing.
+        // The older confirmation switches are ignored: every question asks.
         var settings = database.systemCommandSettings
-        #expect(!settings.confirmsEmptyingTrash)
+        #expect(settings == SystemCommandSettings())
+        // Saving the System settings moves the older list into Keep Running before writing,
+        // and drops the older switches.
         settings.confirmsHidingOtherApps = false
         database.systemCommandSettings = settings
-        #expect(database.commandPreferences[SystemCommandSettings.storageKey]?["quitExclusions"] == nil)
+        #expect(database.commandPreferences[SystemCommandSettings.storageKey] == ["confirmHideOthers": "false"])
         #expect(
             ApplicationSettings(database.commandPreferences[ApplicationSettings.key]).keepRunningBundleIDs
                 == ["com.example.mail", "com.example.music", "com.example.radio"])
@@ -613,11 +635,19 @@ struct SystemWindowProviderTests {
         #expect(database.windowManagementSettings.gaps == WindowGaps(window: WindowGaps.maximum, screen: 0))
         #expect(!database.windowManagementSettings.cyclesHalves)
         #expect(database.systemCommandSettings == SystemCommandSettings())
-        database.systemCommandSettings = SystemCommandSettings(confirmsEmptyingTrash: false)
-        #expect(!database.systemCommandSettings.asksFirst(.emptyTrash))
-        #expect(database.systemCommandSettings.asksFirst(.hideOtherApps))
-        #expect(database.systemCommandSettings.asksFirst(.shutDown))
+        database.systemCommandSettings = SystemCommandSettings(confirmsHidingOtherApps: false)
+        #expect(!database.systemCommandSettings.asksFirst(.hideOtherApps))
         #expect(!database.systemCommandSettings.asksFirst(.lockScreen))
+        // Whatever is saved, commands that can't be undone ask.
+        database.commandPreferences[SystemCommandSettings.storageKey] = ["confirmEmptyTrash": "false", "confirmQuitApps": "false"]
+        #expect(database.systemCommandSettings.asksFirst(.hideOtherApps))
+        #expect(SystemCommandSettings.alwaysConfirmed == [
+            .emptyTrash, .shutDown, .restart, .logOut, .quitAllApps, .quitAllAppsExceptFrontmost,
+        ])
+        for id in SystemCommandSettings.alwaysConfirmed {
+            #expect(SystemCommandSettings(confirmsHidingOtherApps: false).asksFirst(id), "\(id)")
+            #expect(SystemCommand.command(id).needsConfirmation, "\(id)")
+        }
     }
 
     @Test func windowsAndSystemPanesSitInTheSliceFiveSlot() {
@@ -709,6 +739,45 @@ struct SystemWindowProviderTests {
         #expect(h.actions.actions.isEmpty && h.systemCommands.pendingTask == nil)
     }
 
+    @Test func quitOthersRefusesAndAsksAgainWhenTheAppItKeepsIsStale() throws {
+        let h = harness()
+        defer { h.model.stop() }
+        // The app it keeps quit while the question was open: nothing is quit, and with no app
+        // to keep now, nothing is asked.
+        h.model.perform(try command("system.quitAllAppsExceptFrontmost", in: h.model))
+        #expect(h.model.confirmation?.question == "Quit 2 apps except Notes?")
+        #expect(h.model.confirmation?.confirmTitle == "Quit Others")
+        #expect(h.model.confirmation?.detail.contains("Keeps Notes (com.example.notes) running.") == true)
+        h.recorder.foreground = nil
+        h.model.showPendingPromptLongEnough()
+        h.model.performSelected()
+        #expect(h.running.quit.isEmpty)
+        #expect(h.model.confirmation == nil)
+        #expect(h.model.feedback?.style == .warning)
+        #expect(h.model.feedback?.text.hasPrefix("Notes quit while the question was open, so nothing was quit.") == true)
+
+        // Replaced by another process: nothing is quit, and the question is asked again for the
+        // app OpenRay is over now, as a new prompt that needs its own approval.
+        h.recorder.foreground = Self.notes
+        h.model.perform(try command("system.quitAllAppsExceptFrontmost", in: h.model))
+        let first = try #require(h.model.confirmationInstanceID)
+        let mail = AppIdentity(pid: 200, bundleIdentifier: "com.example.mail", name: "Mail", launchDate: nil)
+        h.recorder.foreground = mail
+        h.model.showPendingPromptLongEnough()
+        h.model.performSelected()
+        #expect(h.running.quit.isEmpty)
+        #expect(h.model.confirmation?.question == "Quit 2 apps except Mail?")
+        #expect(h.model.confirmationInstanceID != first)
+        #expect(h.model.feedback?.text.hasSuffix("Asking again, keeping Mail.") == true)
+        // A press before the new prompt has been shown long enough approves nothing.
+        h.model.confirmationShown = nil
+        h.model.performSelected()
+        #expect(h.running.quit.isEmpty)
+        h.model.showPendingPromptLongEnough()
+        h.model.performSelected()
+        #expect(h.running.quit == [100, 300])
+    }
+
     @Test func twoAppsWithTheSameNameAreToldApartByIdentity() async throws {
         let personal = AppIdentity(pid: 100, bundleIdentifier: "com.example.notes", name: "Notes", launchDate: nil)
         let work = AppIdentity(pid: 101, bundleIdentifier: "com.example.work.notes", name: "Notes", launchDate: nil)
@@ -719,6 +788,7 @@ struct SystemWindowProviderTests {
         // Quit Others spares the exact process, not every app with the same name.
         h.model.perform(try command("system.quitAllAppsExceptFrontmost", in: h.model))
         #expect(h.model.confirmation?.question == "Quit 1 app except Notes?")
+        #expect(h.model.confirmation?.detail.contains("Keeps Notes (com.example.work.notes) running.") == true)
         h.model.approvePromptAsShown()
         #expect(h.running.quit == [100])
         // Hide Others names the bundle in its question, so the two can be told apart there too.
