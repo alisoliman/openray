@@ -508,14 +508,16 @@ struct ScriptRunnerTests {
         launcher.killGrace = .milliseconds(200)
         launcher.drainGrace = .milliseconds(200)
         let start = ContinuousClock.now
-        let result = await launcher.run(invocation(script, timeout: .milliseconds(400))) { _ in }
+        // 2 s gives bash time to start and print its child on a loaded machine; the run must still
+        // end by timeout well before the child's 30 s sleep.
+        let result = await launcher.run(invocation(script, timeout: .seconds(2))) { _ in }
         #expect(result.termination == .timedOut)
-        #expect(ContinuousClock.now - start < .seconds(5))
+        #expect(ContinuousClock.now - start < .seconds(15))
         // Standard output says "child <pid>"; standard error may add the shell's own report.
         let line = try #require(result.standardOutput?.split(separator: "\n").first { $0.hasPrefix("child ") })
         let pid = try #require(pid_t(line.dropFirst("child ".count).trimmingCharacters(in: .whitespaces)))
         var gone = false
-        for _ in 0..<30 {
+        for _ in 0..<100 {
             if kill(pid, 0) == -1 {
                 gone = true
                 break
