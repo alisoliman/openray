@@ -376,9 +376,11 @@ struct ProvidedCommandTests {
             let model = model([fake])
             defer { model.stop() }
             let command = try #require(model.commandItems.first { $0.id == "test.confirm" })
+            // Return pressed in the field, as a fresh key.
+            model.currentKeyPressIsFresh = { true }
             model.perform(command)
             #expect(fake.performed.isEmpty)
-            #expect(model.confirmation?.id == "provided.test.confirm")
+            #expect(model.confirmation?.id.hasPrefix("provided.test.confirm.") == true)
             #expect(model.confirmation?.question == "Really run it?")
             #expect(model.confirmation?.confirmTitle == "Run")
             model.performSelected()
@@ -390,7 +392,7 @@ struct ProvidedCommandTests {
             #expect(model.runsWithoutPanel(command))
             model.performBoundCommand(targetID: "test.confirm")
             #expect(fake.performed == ["test.confirm"])
-            #expect(model.confirmation?.id == "provided.test.confirm")
+            #expect(model.confirmation?.id.hasPrefix("provided.test.confirm.") == true)
             model.performSelected()
             #expect(fake.performed == ["test.confirm", "test.confirm"])
         }

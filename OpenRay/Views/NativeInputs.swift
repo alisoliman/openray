@@ -17,8 +17,21 @@ struct LauncherSearchInput: NSViewRepresentable {
     var deleteOnEmpty: () -> Bool = { false }
     /// ← and →. Return true when they moved a grid selection instead of the caret.
     var moveHorizontally: (Int) -> Bool = { _ in false }
+    /// ⌘↑ and ⌘↓: jump between result sections. Nil leaves them to the field.
+    var jump: ((Int) -> Void)? = nil
+    /// ⇧Tab. Nil leaves it to the field.
+    var backtab: (() -> Void)? = nil
+    /// ⌥↩. Nil makes it act like ↩.
+    var tertiary: (() -> Void)? = nil
     var selectsAllOnFocus = false
     var didSelectAll: () -> Void = {}
+    /// False for fields that should take the keyboard only when asked, such as all but the
+    /// focused argument field; otherwise each new field would take it as it appears.
+    var autoFocus = true
+    /// Masks the text, for password arguments.
+    var secure = false
+    /// Called when the field becomes first responder, as when it's clicked.
+    var onFocus: (() -> Void)? = nil
     /// Keeps keyboard focus for Return and Esc, but takes no text and shows no caret.
     var readOnly = false
     var fontSize: CGFloat = 20
@@ -28,7 +41,8 @@ struct LauncherSearchInput: NSViewRepresentable {
     func makeCoordinator() -> Coordinator { Coordinator(parent: self) }
 
     func makeNSView(context: Context) -> FocusedSearchField {
-        let field = FocusedSearchField()
+        let field = secure ? FocusedSecureSearchField() : FocusedSearchField()
+        field.takesFocusAutomatically = autoFocus
         context.coordinator.attach(to: field)
         field.font = .systemFont(ofSize: fontSize)
         field.textColor = OR.NS.text
@@ -47,6 +61,8 @@ struct LauncherSearchInput: NSViewRepresentable {
 
     func updateNSView(_ field: FocusedSearchField, context: Context) {
         context.coordinator.parent = self
+        field.takesFocusAutomatically = autoFocus
+        field.onBecomeFirstResponder = onFocus
         if field.isReadOnly != readOnly {
             field.isReadOnly = readOnly
             (field.currentEditor() as? NSTextView).map(field.configure)
@@ -79,7 +95,8 @@ struct LauncherSearchInput: NSViewRepresentable {
         }
         if field.focusRequest != focusRequest {
             field.focusRequest = focusRequest
-            field.focusIfNeeded()
+            // Only a field that should hold the keyboard takes it; a field losing focus never does.
+            if autoFocus { field.focusIfNeeded() }
             if selectsAllOnFocus, field.currentEditor() != nil {
                 field.currentEditor()?.selectAll(nil)
                 DispatchQueue.main.async { didSelectAll() }
@@ -142,6 +159,18 @@ struct LauncherSearchInput: NSViewRepresentable {
                 guard parent.moveHorizontally(1) else { return false }
             case #selector(NSResponder.cancelOperation(_:)): parent.cancel()
             case #selector(NSResponder.insertTab(_:)): parent.tab()
+            case #selector(NSResponder.insertBacktab(_:)):
+                guard let backtab = parent.backtab else { return false }
+                backtab()
+            case #selector(NSResponder.moveToBeginningOfDocument(_:)):
+                guard let jump = parent.jump else { return false }
+                jump(-1)
+            case #selector(NSResponder.moveToEndOfDocument(_:)):
+                guard let jump = parent.jump else { return false }
+                jump(1)
+            case #selector(NSResponder.insertNewlineIgnoringFieldEditor(_:)):
+                // ⌥↩ runs the tertiary action where there is one.
+                if let tertiary = parent.tertiary { tertiary() } else { submitted(control) }
             case #selector(NSResponder.deleteBackward(_:)):
                 guard textView.string.isEmpty else { return false }
                 // Holding ⌫ to clear the query must not go on to remove tokens.
@@ -176,8 +205,11 @@ struct LauncherSearchInput: NSViewRepresentable {
     }
 }
 
-final class FocusedSearchField: NSTextField {
+class FocusedSearchField: NSTextField {
     var focusRequest = -1
+    var onBecomeFirstResponder: (() -> Void)?
+    /// Whether the field takes the keyboard when it appears or its window becomes key.
+    var takesFocusAutomatically = true
     /// Keeps first responder, so Return, Esc and ⌫ still reach the delegate, but the
     /// field editor accepts no text or composition and shows no caret.
     var isReadOnly = false
@@ -196,12 +228,14 @@ final class FocusedSearchField: NSTextField {
                 self, selector: #selector(windowBecameKey(_:)),
                 name: NSWindow.didBecomeKeyNotification, object: window)
         }
-        focusIfNeeded()
+        if takesFocusAutomatically { focusIfNeeded() }
     }
 
     override func becomeFirstResponder() -> Bool {
         let became = super.becomeFirstResponder()
         if became, let editor = currentEditor() as? NSTextView { configure(editor) }
+        // Reported a turn later: focus can change during a view update, which mustn't mutate state.
+        if became, let report = onBecomeFirstResponder { DispatchQueue.main.async { report() } }
         return became
     }
 
@@ -212,7 +246,18 @@ final class FocusedSearchField: NSTextField {
         editor.selectedRange = NSRange(location: (editor.string as NSString).length, length: 0)
     }
 
-    @objc private func windowBecameKey(_ notification: Notification) { focusIfNeeded() }
+    @objc private func windowBecameKey(_ notification: Notification) {
+        if takesFocusAutomatically { focusIfNeeded() }
+    }
+}
+
+/// A search field that shows bullets, for password arguments. A secure cell gives it the
+/// secure field editor, which keeps the text out of the pasteboard and services.
+final class FocusedSecureSearchField: FocusedSearchField {
+    override class var cellClass: AnyClass? {
+        get { NSSecureTextFieldCell.self }
+        set {}
+    }
 }
 
 struct AIComposerInput: NSViewRepresentable {

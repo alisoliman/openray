@@ -40,7 +40,30 @@ final class LauncherModel {
     /// The writing command's attached text, shown in full over the AI view.
     var showsAttachmentPreview = false
     var feedback: Feedback? { didSet { scheduleFeedbackExpiry() } }
-    var confirmation: ActionConfirmation?
+    /// Every assignment is a new prompt instance, even when it asks the same question again, so
+    /// nothing armed for an earlier one carries over.
+    var confirmation: ActionConfirmation? {
+        didSet {
+            confirmationToken = UUID()
+            confirmationShown = nil
+        }
+    }
+    /// Identifies the current prompt instance; see `confirmationInstanceID`.
+    private(set) var confirmationToken = UUID()
+    /// The prompt instance a visible action bar last reported showing, and when. Only it can be
+    /// approved, and only once it has been on screen for `minimumPromptExposure`.
+    @ObservationIgnored var confirmationShown: (instance: String, at: Date)?
+    /// Since when the surface showing prompts has been on screen, opaque and key; nil while it
+    /// isn't. Nil asks the panel; tests set it.
+    @ObservationIgnored var confirmationSurfaceVisibleSince: (() -> Date?)?
+    /// Whether the key event being handled is a fresh press (not autorepeat, not synthesized
+    /// without a key). Every keyboard approval checks it. Tests set it.
+    @ObservationIgnored var currentKeyPressIsFresh: () -> Bool = {
+        guard let event = NSApp.currentEvent, event.type == .keyDown else { return false }
+        return !event.isARepeat
+    }
+    /// The clock prompt exposure is measured with. Tests set it.
+    @ObservationIgnored var promptClock: () -> Date = Date.init
     var focusRequest = 0
     /// Set when a remembered query returns; the field selects it so the next keystroke replaces it.
     var selectsQueryOnFocus = false
@@ -54,6 +77,9 @@ final class LauncherModel {
     @ObservationIgnored var panelSize = CGSize(width: OR.Metric.panelWidth, height: OR.Detent.list)
     /// Why the registered launcher shortcut isn't the saved one, or isn't working.
     var shortcutError: String?
+    /// The launcher shortcut registered right now, which can differ from the saved one when
+    /// registration fell back. Nil until registration runs, or while nothing is registered.
+    var activeLauncherShortcut: CommandShortcut?
     /// Why the last launcher shortcut choice was refused. The saved shortcut still works.
     var launcherHotKeyRefusal: String?
     var commandShortcutErrors: [String: String] = [:]
@@ -91,6 +117,14 @@ final class LauncherModel {
     /// True while a provider's live search for the current query is running.
     var isLoadingProvidedItems: Bool { !pendingLiveProviderIDs.isEmpty }
     @ObservationIgnored private var providedLiveTasks: [Task<Void, Never>] = []
+    /// Query picks and search history; see LauncherModel+Launcher.
+    let memory: LauncherMemoryStore
+    /// Open argument fields. Set through `beginArguments(…)`, cleared by run or cancel.
+    var argumentSession: ArgumentSession?
+    /// Open action-panel submenus, outermost first.
+    var actionPath: [ActionEntry] = []
+    /// The search history entry ↑ last recalled.
+    @ObservationIgnored var historyCursor: Int?
     /// Bumped whenever live searches restart or stop, so a late answer for an earlier query is dropped.
     @ObservationIgnored private var liveGeneration = 0
     let applications = ApplicationCatalog()
@@ -108,6 +142,10 @@ final class LauncherModel {
     /// A hotkey registry passed in by a test, backed by a fake. It may register while the
     /// pasteboard is isolated; the real Carbon one never does.
     @ObservationIgnored let usesInjectedHotKey: Bool
+    /// The Hyper key, when turned on. Applied only in a normal launch, never in tests.
+    @ObservationIgnored let hyperKey: HyperKey
+    /// This launch's rule for side effects on the Mac. Executors the model runs check it first.
+    @ObservationIgnored let sideEffects: SideEffectGuard
     @ObservationIgnored weak var panel: LauncherPanelController?
     @ObservationIgnored var previousApplication: NSRunningApplication? {
         didSet {
@@ -136,12 +174,23 @@ final class LauncherModel {
     /// Stands in for the Accessibility read of the selected text. Tests set it.
     @ObservationIgnored var selectionReader: (() throws -> String)?
 
+    /// Defaults follow `SideEffectGuard`: a normal launch uses the library on disk and the system
+    /// clipboard; the test host and verification mode get an in-memory library and a private,
+    /// uniquely named pasteboard, so a default-built model can't touch the person's data.
     init(
-        store: LibraryStore = LibraryStore(), ai: AIChatModel = AIChatModel(), pasteboard: NSPasteboard = .general,
-        registry: CommandRegistry = CommandRegistry(), hotKey: GlobalHotKey? = nil
+        store: LibraryStore? = nil, ai: AIChatModel = AIChatModel(), pasteboard: NSPasteboard? = nil,
+        registry: CommandRegistry = CommandRegistry(), hotKey: GlobalHotKey? = nil, hyperKey: HyperKey? = nil,
+        sideEffects: SideEffectGuard = .current
     ) {
+        // An injected live guard never makes an inert process (tests, verification) act for real.
+        let sideEffects = sideEffects.effective
+        self.sideEffects = sideEffects
+        let store = store ?? LibraryStore(fileURL: sideEffects.isInert ? nil : LibraryStore.defaultURL)
+        let pasteboard = pasteboard ?? (sideEffects.isInert ? NSPasteboard.withUniqueName() : .general)
+        self.hyperKey = hyperKey ?? HyperKey()
         self.store = store
         self.registry = registry
+        memory = LauncherMemoryStore(fileURL: LauncherMemoryStore.fileURL(besideLibrary: store.fileURL))
         self.hotKey = hotKey ?? GlobalHotKey()
         usesInjectedHotKey = hotKey != nil
         self.ai = ai
@@ -150,7 +199,23 @@ final class LauncherModel {
         // {clipboard} in expanded snippets reads through the service, which skips excluded copies.
         snippets.clipboardReader = { [clipboard] in clipboard.placeholderText() }
         fileScope = store.database.preferences.fileSearchScope ?? .home
+        connectFilesAndApplications()
         store.commandBindingsDidChange = { [weak self] in self?.synchronizeCommandHotKeys() }
+        reconcileJournaledCleanup()
+    }
+
+    /// Deletions an earlier session recorded but couldn't finish: cleans up after rows their
+    /// provider says are gone, drops the records of rows that still exist, and keeps the rest for
+    /// the next launch or catalog change.
+    func reconcileJournaledCleanup() {
+        guard !store.journaledCleanup.isEmpty else { return }
+        store.reconcileJournaledCleanup { [registry] id, provider in
+            switch registry.presence(ofItemWithID: id, provider: provider, in: self) {
+            case .gone: true
+            case .present: false
+            case .unknown: nil
+            }
+        }
     }
 
     /// Compatibility shim: the last error or notice, as text.
@@ -163,6 +228,7 @@ final class LauncherModel {
 
     var results: [LauncherItem] {
         guard query.count <= 512 else { return [] }
+        if let session = argumentSession { return [session.item] }
         if let link = argumentLink { return argumentItems(for: link) }
         // Aliases are a single global namespace, independent of section, usage,
         // favorites, quicklink arguments and calculator interpretation.
@@ -171,10 +237,12 @@ final class LauncherModel {
         {
             return [command]
         }
+        // A typed path, a content search and the Files scope rank their own rows.
+        if let rows = fileSearchRows { return rows }
         var items: [LauncherItem] = []
         switch section {
         case .home:
-            items = commandItems + applicationItems + quicklinkItems + snippetItems + noteItems + savedFileItems
+            items = withoutDisabledCommands(commandItems) + applicationItems + quicklinkItems + snippetItems + noteItems + savedFileItems
             let clipboardInSearch = store.database.preferences.showsClipboardInRootSearch
             items += clipboardItems.filter { clipboardInSearch || store.database.favoriteIDs.contains($0.id) }
             items += registry.rootItems(for: query.trimmingCharacters(in: .whitespacesAndNewlines), in: self)
@@ -203,6 +271,8 @@ final class LauncherModel {
         if !trimmed.isEmpty, section.providedScope?.ranksItems ?? true {
             let now = Date.now
             let favorites = store.database.favoriteIDs
+            let learned = memory.memory.picks[LauncherMemory.normalize(trimmed)] ?? [:]
+            let hasAliases = section == .home && store.database.commandBindings.contains { $0.alias != nil }
             let usage = Dictionary(store.database.usage.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
             items = items.compactMap { item -> (LauncherItem, Int)? in
                 if case .quicklink(let link, let argument) = item.action, link.argument(in: trimmed) != nil {
@@ -213,7 +283,9 @@ final class LauncherModel {
                 let titleScore = SearchMatcher.score(trimmed, in: item.title)
                 // Keywords match by word, prefix or substring only; scattered letters are noise there.
                 let keywordScore = SearchMatcher.score(trimmed, in: item.keywords).flatMap { $0 >= 450 ? $0 - 80 : nil }
-                guard let score = [titleScore, keywordScore].compactMap({ $0 }).max() else { return nil }
+                // An alias the query starts ranks just below an exact title.
+                let aliasScore = hasAliases ? aliasPrefixScore(for: item, query: trimmed) : nil
+                guard let score = [titleScore, keywordScore, aliasScore].compactMap({ $0 }).max() else { return nil }
                 let appBoost: Int
                 if case .application = item.action { appBoost = 70 } else { appBoost = 0 }
                 let commandBoost = item.isBuiltInCommand && titleScore == 1_000 ? 200 : 0
@@ -224,7 +296,9 @@ final class LauncherModel {
                         let age = now.timeIntervalSince(record.lastUsed)
                         return min(record.count, 10) * 3 + (age < 86_400 ? 25 : age < 604_800 ? 12 : 0)
                     } ?? 0
-                return (item, score + appBoost + commandBoost + favoriteBoost + usageBoost)
+                // What you picked for this query before comes first among similar matches.
+                let learnedBoost = Self.learnedBoost(learned[item.id] ?? 0)
+                return (item, score + appBoost + commandBoost + favoriteBoost + usageBoost + learnedBoost)
             }.sorted {
                 if $0.1 != $1.1 { return $0.1 > $1.1 }
                 let comparison = $0.0.title.localizedStandardCompare($1.0.title)
@@ -277,11 +351,16 @@ final class LauncherModel {
     /// be seen, such as a toast, an error or a delete prompt, expands it.
     var isCollapsedToBar: Bool {
         store.database.preferences.usesBarMode && destination == .search && editor == nil && onboarding == nil
-            && section == .home && isQueryBlank && argumentLink == nil && !showActions && feedback == nil
+            && section == .home && isQueryBlank && argumentLink == nil && argumentSession == nil && !showActions
+            && feedback == nil
             && confirmation == nil && store.errorMessage == nil && shortcutError == nil
     }
 
     var groups: [LauncherResultGroup] {
+        // Open argument fields own the list: their command, whatever the query or scope.
+        if let session = argumentSession {
+            return [LauncherResultGroup(id: "argument.session", title: nil, items: [session.item])]
+        }
         if let link = argumentLink {
             let items = argumentItems(for: link)
             return [
@@ -289,6 +368,7 @@ final class LauncherModel {
                 LauncherResultGroup(id: "elsewhere", title: "Same search elsewhere", items: Array(items.dropFirst())),
             ].filter { !$0.items.isEmpty }
         }
+        if let fileGroups = fileSearchGroups { return fileGroups }
         // An empty Home shows favorites and recents, so it never computes results.
         switch section {
         case .home where isQueryBlank: return homeGroups
@@ -321,23 +401,29 @@ final class LauncherModel {
     /// Up to sixteen favorites (⌘1–⌘8 open the first eight) and four recents.
     var favoriteItems: [LauncherItem] {
         let index = Dictionary(
-            (commandItems + applicationItems + quicklinkItems + snippetItems + noteItems + savedFileItems
-                + clipboardItems).map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
-        return store.database.orderedFavoriteIDs.compactMap { index[$0] ?? registry.item(withID: $0, in: self) }
-            .prefix(16).map { $0 }
+            (withoutDisabledCommands(commandItems) + applicationItems + quicklinkItems + snippetItems + noteItems
+                + savedFileItems + clipboardItems).map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
+        let disabled = store.database.disabledCommandIDs
+        return store.database.orderedFavoriteIDs.compactMap {
+            index[$0] ?? (disabled.contains($0) ? nil : registry.item(withID: $0, in: self))
+        }
+        .prefix(16).map { $0 }
     }
 
     private var homeGroups: [LauncherResultGroup] {
         let favorites = favoriteItems
         let favoriteIDs = Set(favorites.map(\.id))
         let index = Dictionary(
-            (commandItems + applicationItems + quicklinkItems + snippetItems + noteItems + savedFileItems).map {
+            (withoutDisabledCommands(commandItems) + applicationItems + quicklinkItems + snippetItems + noteItems
+                + savedFileItems).map {
                 ($0.id, $0)
             }, uniquingKeysWith: { first, _ in first })
+        let disabled = store.database.disabledCommandIDs
         // Clipboard entries stay out of Everything unless they are favorites.
         let recent = store.database.usage.sorted { $0.lastUsed > $1.lastUsed }
             .filter { !favoriteIDs.contains($0.id) && !$0.id.hasPrefix("clipboard.") }
-            .compactMap { index[$0.id] ?? registry.item(withID: $0.id, in: self) }.prefix(4)
+            .compactMap { index[$0.id] ?? (disabled.contains($0.id) ? nil : registry.item(withID: $0.id, in: self)) }
+            .prefix(4)
         return [
             LauncherResultGroup(
                 id: "favorites", title: "Favorites", trailing: favorites.count > 1 ? "⌘1 – ⌘\(min(8, favorites.count))" : nil,
@@ -399,26 +485,11 @@ final class LauncherModel {
         return groups.filter { !$0.items.isEmpty || $0.isLoading }
     }
 
+    /// Ask AI and the web search unless the person chose others; see LauncherModel+Launcher.
     private var fallbackItems: [LauncherItem] {
         let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return [] }
-        var items = [
-            LauncherItem(
-                id: "fallback.ai", title: "Ask AI", subtitle: ai.availability.isAvailable ? "" : "Not available yet",
-                symbol: "sparkles", kind: .ai, badge: "Ask AI", action: .askAI(trimmed))
-        ]
-        if let web = webSearchLink {
-            items.append(
-                LauncherItem(
-                    id: "fallback.web", title: web.name, subtitle: Self.siteName(for: web),
-                    symbol: "globe", kind: .quicklink, badge: "Quicklink", action: .quicklink(web, trimmed)))
-        }
-        return items + registry.fallbackItems(for: trimmed, in: self)
-    }
-
-    private var webSearchLink: Quicklink? {
-        let links = store.database.quicklinks.filter(\.needsQuery)
-        return links.first { $0.keyword.lowercased() == "web" } ?? links.first
+        return orderedFallbackItems(for: trimmed)
     }
 
     private func clipboardGroups(_ items: [LauncherItem]) -> [LauncherResultGroup] {
@@ -491,7 +562,14 @@ final class LauncherModel {
         isStarted = true
         applyPreferences()
         await applications.refresh()
-        synchronizeSelection()
+        // Apps can hold hotkeys, so register them once the catalog is known.
+        commandCatalogDidChange()
+    }
+
+    /// Rescans the app folders, then re-registers app hotkeys.
+    func refreshApplications() async {
+        await applications.refresh()
+        commandCatalogDidChange()
     }
 
     func stop() {
@@ -502,6 +580,7 @@ final class LauncherModel {
         snippets.stop()
         files.stop()
         cancelProvidedLiveItems()
+        hyperKey.stop()
         ai.cancel()
     }
 
@@ -516,9 +595,9 @@ final class LauncherModel {
     /// Called just before the panel appears.
     func panelWillShow() {
         presentation += 1
+        let delay = store.database.preferences.popToRootDelay.interval
         let remembered =
-            store.database.preferences.remembersLastQuery
-            && (lastHiddenAt.map { Date().timeIntervalSince($0) <= OR.Timing.rememberQuery } ?? true)
+            delay != 0 && (lastHiddenAt.map { hidden in delay.map { Date().timeIntervalSince(hidden) <= $0 } ?? true } ?? true)
         if !remembered, draft?.isDirty != true, onboarding == nil {
             resetToHome()
         } else if !query.isEmpty {
@@ -541,6 +620,7 @@ final class LauncherModel {
 
     private func resetToHome() {
         if editor != nil { editor = nil }
+        argumentSession = nil
         destination = .search
         argumentLink = nil
         section = .home
@@ -554,6 +634,10 @@ final class LauncherModel {
 
     func refreshPermissions() {
         accessibilityAllowed = windows.hasPermission
+        // The Hyper key follows its setting and Accessibility; inert launches never change keys.
+        if isStarted, !sideEffects.isInert {
+            hyperKey.apply(store.database.preferences.hyper, accessibilityAllowed: accessibilityAllowed)
+        }
         clipboard.refreshAccessStatus()
         loginEnabled = SMAppService.mainApp.status == .enabled
         loginNeedsApproval = SMAppService.mainApp.status == .requiresApproval
@@ -602,6 +686,7 @@ final class LauncherModel {
         if section == .home { scopeReturnQuery = nil }
         destination = .search
         argumentLink = nil
+        argumentSession = nil
         self.section = section
         query = ""
         searchChanged()
@@ -619,6 +704,7 @@ final class LauncherModel {
         scopeReturnQuery = nil
         destination = .search
         argumentLink = nil
+        argumentSession = nil
         section = .home
         query = restored
         searchChanged()
@@ -673,6 +759,7 @@ final class LauncherModel {
         ai.open(action)
         destination = .ai
         argumentLink = nil
+        argumentSession = nil
         files.stop()
         cancelProvidedLiveItems()
         showActions = false
@@ -754,7 +841,10 @@ final class LauncherModel {
         } else if showShortcuts {
             showShortcuts = false
         } else if showActions {
-            showActions = false
+            // Esc leaves a submenu before it closes the panel.
+            if !closeActionSubmenu() { showActions = false }
+        } else if argumentSession != nil {
+            cancelArguments()
         } else if showsAttachmentPreview {
             showsAttachmentPreview = false
         } else if editor != nil {
@@ -776,6 +866,7 @@ final class LauncherModel {
 
     /// ⌫ on an empty field removes the token: first the argument, then the scope.
     func deleteBackwardOnEmptyField() -> Bool {
+        if deleteBackwardInArguments() { return true }
         if argumentLink != nil {
             clearArgument(restoreKeyword: true)
             return true
@@ -795,17 +886,27 @@ final class LauncherModel {
     /// A query asks AI from any scope, and Esc returns to that scope with it.
     func handleTab() {
         guard confirmation == nil, !showActions else { return }
+        if argumentSession != nil {
+            moveArgumentFocus(1)
+            return
+        }
         let item = selectedItem
+        if let item, argumentLink == nil, beginArguments(for: item) { return }
         switch item?.action {
         case .section(let target)? where section == .home && !query.isEmpty:
             store.recordUse(of: item!.id)
             navigate(to: target)
+        case .provided(let ref)? where section == .home && !query.isEmpty && Self.opensScope(registry.descriptor(for: ref, in: self)):
+            // Tab steps into a provider's list, as it does into a built-in scope.
+            perform(item!)
         case .quicklink(let link, let argument)? where link.needsQuery && argument.isEmpty && argumentLink == nil:
             beginArgument(link)
         case .clipboard(let entry)?:
             if let text = entry.plainText {
                 openAI(.chat, attachment: AIAttachment(source: .clipboard, text: text, appName: entry.sourceName))
             }
+        case .file(let url)? where canEnterFilePath(url):
+            enterFilePath(url)
         default:
             guard argumentLink == nil else { return }
             let prompt = query.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -896,6 +997,8 @@ final class LauncherModel {
     /// Vertical movement. Grids move by row; lists move by one and wrap.
     func moveSelection(_ offset: Int) {
         guard !showActions else { return }
+        // ↑ at the top of an empty Everything recalls earlier searches.
+        if recallSearchHistory(offset) { return }
         let groups = groups
         let items = groups.flatMap(\.items)
         guard !items.isEmpty else { return }
@@ -979,7 +1082,11 @@ final class LauncherModel {
     var arrowsMoveSelection: Bool {
         guard destination == .search, argumentLink == nil, !showActions else { return false }
         if section == .windows || section.providedScope?.style == .grid { return true }
-        return section == .home && isQueryBlank
+        if section == .home && isQueryBlank { return true }
+        // Any grid the selection is in, such as a provider's grid group in a list scope.
+        let groups = groups
+        let selected = groups.first { group in group.items.contains { $0.id == selectedID } } ?? groups.first
+        return selected.flatMap { Self.columns(for: $0) } != nil
     }
 
     /// A group's grid width, shared by drawing and keyboard movement. Nil for lists.
@@ -1018,6 +1125,16 @@ final class LauncherModel {
             query = argument
             return
         }
+        // So does an alias and a space, for a command that takes arguments.
+        if section == .home, destination == .search, argumentLink == nil, argumentSession == nil,
+            query.last?.isWhitespace == true, beginArgumentsFromAlias(in: query)
+        {
+            return
+        }
+        // Typing over a recalled search starts a new one.
+        if let cursor = historyCursor, memory.memory.history.indices.contains(cursor) ? memory.memory.history[cursor] != query : true {
+            historyCursor = nil
+        }
         if argumentLink == nil, section == .home || section == .files {
             files.search(query, showRecent: section == .files, scope: section == .files ? fileScope : .home)
         } else {
@@ -1048,18 +1165,43 @@ final class LauncherModel {
             pendingLiveProviderIDs.insert(providerID)
             providedLiveTasks.append(
                 Task { [weak self] in
-                    guard let provider = self?.registry.provider(id: providerID), let model = self else { return }
+                    // A query that changed again before this task started never reaches the provider.
+                    guard !Task.isCancelled, let model = self, model.liveGeneration == generation,
+                        let provider = model.registry.provider(id: providerID)
+                    else { return }
                     let rows = await provider.liveItems(for: term, scope: scope, in: model)
                     guard let self, !Task.isCancelled, self.liveGeneration == generation else { return }
                     // Root-search rows never become the Top Hit; see searchGroups.
+                    // A row for a command keeps that identity, so it's refused rather than run
+                    // unconfirmed if the command is withdrawn while the row is still listed.
                     self.providedLiveItems[providerID] = rows.map { row in
-                        var row = row
+                        var row = self.markingCommandIdentity(row)
                         row.isLiveResult = scope == nil
                         return row
                     }
                     self.pendingLiveProviderIDs.remove(providerID)
                 })
         }
+    }
+
+    /// Forgets live rows that stand for a command the catalog no longer has. Rows are marked
+    /// with their command as they arrive, so this needs no new search (a provider that announces
+    /// catalog changes from its own search can't start a loop).
+    func dropLiveRowsForWithdrawnCommands() {
+        guard !providedLiveItems.isEmpty else { return }
+        var kept = providedLiveItems
+        var changed = false
+        for (providerID, rows) in providedLiveItems {
+            let remaining = rows.filter { row in
+                guard case .provided(let ref) = row.action, ref.has(.descriptor) else { return true }
+                return registry.descriptor(for: ref, in: self) != nil
+            }
+            if remaining.count != rows.count {
+                kept[providerID] = remaining
+                changed = true
+            }
+        }
+        if changed { providedLiveItems = kept }
     }
 
     /// Stops every live search and forgets its rows: on a new query, on hide, and on leaving search.

@@ -398,8 +398,26 @@ struct ClipEngineReviewTests {
         model.perform(
             LauncherItem(id: "quicklink.\(pair.id)", title: "Pair", subtitle: "", symbol: "link", kind: .quicklink,
                 badge: "Quicklink", action: .quicklink(pair, "")))
-        #expect(model.feedback?.style == .warning && model.feedback?.text == "Enter b.")
+        // Slice 1's fields ask, starting at the first value still missing.
+        let session = try #require(model.argumentSession)
+        #expect(session.specs.map(\.name) == ["a", "b"])
+        #expect(session.focus == 1)
         #expect(model.quicklinkCommand(for: pair) != nil)
+        model.cancelArguments()
+
+        // M4: a term typed after the keyword fills the first field and still opens the form for the
+        // missing second one, instead of failing with what's missing.
+        model.perform(
+            LauncherItem(id: "quicklink.\(pair.id)", title: "Pair", subtitle: "", symbol: "link", kind: .quicklink,
+                badge: "Quicklink", action: .quicklink(pair, "7")))
+        let prefilled = try #require(model.argumentSession)
+        #expect(prefilled.value(at: 0) == "7")
+        #expect(prefilled.focus == 1)
+        #expect(opener.opened.count == 1)
+        model.setArgumentValue("x", at: 1)
+        model.submitArguments()
+        for _ in 0..<50 where opener.opened.count < 2 { await Task.yield() }
+        #expect(opener.opened.map(\.0.absoluteString) == ["https://x.com/hits", "https://x.com/7/x"])
     }
 
     /// M4: fields stay right when a referenced snippet changes.
