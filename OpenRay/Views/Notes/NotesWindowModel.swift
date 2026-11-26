@@ -80,12 +80,19 @@ struct NoteSlashMenu: Equatable {
 @MainActor
 protocol NotesWindowPresenting: AnyObject {
     var isVisible: Bool { get }
+    /// Visible and taking keystrokes. A toggle hides a window that has focus and brings
+    /// forward one that's behind other apps.
+    var isKey: Bool { get }
     /// Shows the window and makes it key. False when this launch doesn't allow windows.
     @discardableResult func show() -> Bool
     func hide()
 }
 
 /// Where an export goes. The live one asks with a save panel.
+extension NotesWindowPresenting {
+    var isKey: Bool { isVisible }
+}
+
 @MainActor
 protocol NoteExportDestination: AnyObject {
     /// The file to write, or nil when the person cancelled or this launch can't ask.
@@ -161,6 +168,7 @@ final class NotesWindowModel {
 
     var isDraft: Bool { draft != nil }
     var isWindowVisible: Bool { presenter?.isVisible ?? false }
+    var isWindowKey: Bool { presenter?.isKey ?? false }
 
     /// What the window shows as the title: the note's title, or the first line as you type it.
     var displayTitle: String {
@@ -217,8 +225,9 @@ final class NotesWindowModel {
         return presenter?.show() ?? false
     }
 
+    /// Hides the window when it has focus; otherwise shows it, bringing it forward.
     func toggle() {
-        if isWindowVisible { hide() } else { show() }
+        if isWindowKey { hide() } else { show() }
     }
 
     func hide() {

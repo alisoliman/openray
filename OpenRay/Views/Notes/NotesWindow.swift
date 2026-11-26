@@ -89,6 +89,7 @@ final class NotesWindowController: NSObject, NSWindowDelegate, NotesWindowPresen
     }
 
     var isVisible: Bool { panel?.isVisible == true }
+    var isKey: Bool { isVisible && panel?.isKeyWindow == true && NSApp.isActive }
 
     @discardableResult
     func show() -> Bool {

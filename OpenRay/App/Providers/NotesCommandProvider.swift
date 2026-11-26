@@ -64,7 +64,9 @@ final class NotesCommandProvider: CommandProvider, MenuBarExtraProviding {
         switch ref.id {
         case Self.toggleID:
             model.store.recordUse(of: item.id)
-            if notes.isWindowVisible {
+            // From the launcher the window can't have focus, so a visible one hides; from a
+            // hotkey, one that's behind other apps comes forward instead.
+            if notes.isWindowKey || (notes.isWindowVisible && model.panel?.isVisible == true) {
                 notes.hide()
             } else {
                 model.panel?.dismiss(restoreFocus: false)

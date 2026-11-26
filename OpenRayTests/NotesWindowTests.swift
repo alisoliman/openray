@@ -10,7 +10,11 @@ import Testing
 final class FakeNotesPresenter: NotesWindowPresenting {
     var isVisible = false
     var allowsShowing = true
+    /// Set to model a window that's visible but behind other apps.
+    var keyOverride: Bool?
     private(set) var showCount = 0
+
+    var isKey: Bool { keyOverride ?? isVisible }
 
     func show() -> Bool {
         showCount += 1
@@ -345,6 +349,13 @@ struct NotesWindowTests {
         #expect(harness.presenter.isVisible)
         harness.model.toggle()
         #expect(!harness.presenter.isVisible)
+        // Visible but behind other apps: toggling brings it forward instead of hiding it.
+        harness.model.show()
+        harness.presenter.keyOverride = false
+        let shows = harness.presenter.showCount
+        harness.model.toggle()
+        #expect(harness.presenter.isVisible && harness.presenter.showCount == shows + 1)
+        harness.presenter.keyOverride = nil
         // A launch that refuses windows reports false, so the launcher can say why.
         harness.presenter.allowsShowing = false
         #expect(!harness.model.show())
