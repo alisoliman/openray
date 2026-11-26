@@ -714,7 +714,9 @@ extension LauncherModel {
                         self?.edit(item)
                     })
             }
-            if CuratedCommand.supports(item.id) {
+            // Only rows in the runtime binding catalog: transient rows under a bindable prefix
+            // (a device, a menu item) have nothing Settings could show or save.
+            if CuratedCommand.supports(item.id), bindableCommands.contains(where: { $0.id == item.id }) {
                 entries.append(
                     ActionEntry(
                         id: "assign", title: "Assign Alias or Shortcut…", symbol: "keyboard", group: .organize

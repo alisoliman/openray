@@ -40,12 +40,15 @@ final class SystemCommandProvider: CommandProvider {
     let audio: any AudioDeviceControlling
     let menuSearch: MenuItemSearch
     let hud: HUDController
-    /// The app that was frontmost when the launcher opened. Never the window-chip target.
+    /// The app that was frontmost when the launcher opened or a hotkey ran. Never the window-chip target.
     let foreground: @MainActor (LauncherModel) -> AppIdentity?
+    let dismissal: LauncherDismissal
+    let menuLimits: MenuItemCollector.Limits
     /// The last command run, so tests can wait for it.
     private(set) var pendingTask: Task<Void, Never>?
-    /// Menu items read when the scope opened, filtered locally after.
-    private var menuSnapshot: (pid: pid_t, snapshot: MenuSnapshot)?
+    /// This visit's menu items, read when the scope opened and filtered locally after.
+    private var menuState: (app: AppIdentity, generation: Int, snapshot: MenuSnapshot)?
+    private var menuGeneration = 0
     private var menuError: String?
 
     convenience init() {
@@ -58,14 +61,17 @@ final class SystemCommandProvider: CommandProvider {
         executor: any SystemActionPerforming, audio: any AudioDeviceControlling, menuSearch: MenuItemSearch,
         hud: HUDController,
         foreground: @escaping @MainActor (LauncherModel) -> AppIdentity? = { model in
-            model.previousApplication.flatMap { $0.isTerminated ? nil : AppIdentity($0) }
-        }
+            model.foregroundApplication.flatMap { $0.isTerminated ? nil : AppIdentity($0) }
+        },
+        dismissal: LauncherDismissal = .live(), menuLimits: MenuItemCollector.Limits = .init()
     ) {
         self.executor = executor
         self.audio = audio
         self.menuSearch = menuSearch
         self.hud = hud
         self.foreground = foreground
+        self.dismissal = dismissal
+        self.menuLimits = menuLimits
     }
 
     var id: String { Self.providerID }
@@ -79,22 +85,16 @@ final class SystemCommandProvider: CommandProvider {
     // MARK: Commands
 
     func commands(in model: LauncherModel) -> [CommandDescriptor] {
-        let settings = model.store.database.systemCommandSettings
-        let context = context(in: model)
-        // Commands about the app you were using can't run without one; they say so instead of asking.
-        let hasForeground = (try? context.requireForeground("")) != nil
-        let needsForeground: Set<SystemCommand.ID> = [.hideOtherApps, .quitAllAppsExceptFrontmost, .restartFrontmostApp]
+        // Questions are asked from `perform`, bound to the exact action they describe.
         var descriptors = SystemCommand.all.map { command in
-            let asks = settings.asksFirst(command.id) && (hasForeground || !needsForeground.contains(command.id))
-            return CommandDescriptor(
+            CommandDescriptor(
                 id: command.id.itemID, title: command.title, subtitle: command.subtitle, kind: .system,
                 symbol: command.symbol, keywords: command.keywords.split(separator: " ").map(String.init),
                 arguments: command.takesArgument
                     ? [ArgumentSpec(name: "level", placeholder: command.argumentPlaceholder ?? "Percent", isOptional: true)]
                     : [],
                 // Set Volume asks for its level in its own list, so a hotkey shows it rather than failing.
-                mode: command.id == .setVolume ? .view(.provided(Self.volumeScope)) : .noView, badge: "System",
-                confirmation: asks ? command.confirmation(for: context).map { Self.confirmation($0, for: command.id) } : nil)
+                mode: command.id == .setVolume ? .view(.provided(Self.volumeScope)) : .noView, badge: "System")
         }
         descriptors += [
             CommandDescriptor(
@@ -113,15 +113,20 @@ final class SystemCommandProvider: CommandProvider {
         return descriptors
     }
 
-    nonisolated static func confirmation(_ text: SystemCommand.Confirmation, for id: SystemCommand.ID)
-        -> CommandConfirmation
-    {
+    nonisolated static func confirmation(
+        _ text: SystemCommand.Confirmation, for id: SystemCommand.ID, context: SystemCommandContext
+    ) -> CommandConfirmation {
+        // Two apps can share a name; the bundle identifier says which one stays.
+        let kept = context.foregroundApplication.map { app in
+            "Keeps \(app.name)\(app.bundleIdentifier.map { " (\($0))" } ?? "") running. "
+        }
         let detail =
             switch id {
             case .restart, .shutDown, .logOut: "Open apps can ask to save their documents first."
             case .emptyTrash: "This can't be undone."
-            case .quitAllApps, .quitAllAppsExceptFrontmost:
-                "Apps can ask to save first. Apps excluded in Settings › System keep running."
+            case .quitAllApps: "Apps can ask to save first. Apps excluded in Settings › System keep running."
+            case .quitAllAppsExceptFrontmost:
+                (kept ?? "") + "Apps can ask to save first. Apps excluded in Settings › System keep running."
             default: ""
             }
         return CommandConfirmation(question: text.title, detail: detail, confirmTitle: text.button)
@@ -141,16 +146,36 @@ final class SystemCommandProvider: CommandProvider {
     func perform(_ item: LauncherItem, ref: ProvidedRef, in model: LauncherModel) {
         if let id = SystemCommand.ID(itemID: ref.id) {
             let command = SystemCommand.command(id)
+            let context = context(in: model)
             let action: SystemAction
             do {
-                action = try command.action(argument: ref.arguments["level"], context: context(in: model))
+                action = try command.action(argument: ref.arguments["level"], context: context)
             } catch {
                 // Said in the panel, before it closes: nothing has run.
                 model.feedback = .warning(error.localizedDescription)
                 return
             }
-            model.store.recordUse(of: item.id)
-            run(action, reporting: command, in: model)
+            guard model.store.database.systemCommandSettings.asksFirst(id), let text = command.confirmation(for: context)
+            else {
+                model.store.recordUse(of: item.id)
+                run(action, reporting: command, in: model)
+                return
+            }
+            // The question names this app and these exclusions. Approval runs exactly this
+            // action, and only if neither changed while the question was open.
+            model.selectedID = item.id
+            model.confirmation = .provided(
+                ProvidedConfirmation(id: id.itemID, Self.confirmation(text, for: id, context: context)) {
+                    [weak self, weak model] in
+                    guard let self, let model else { return }
+                    guard self.context(in: model) == context else {
+                        model.feedback = .warning(
+                            "The app you were using changed while the question was open, so nothing ran. Run \(command.title) again.")
+                        return
+                    }
+                    model.store.recordUse(of: item.id)
+                    self.run(action, reporting: command, in: model)
+                })
             return
         }
         switch ref.id {
@@ -168,7 +193,7 @@ final class SystemCommandProvider: CommandProvider {
 
     /// Closes the panel, then runs the action and shows what happened in the HUD.
     private func run(_ action: SystemAction, reporting command: SystemCommand, in model: LauncherModel) {
-        model.panel?.dismiss(restoreFocus: true)
+        dismissal.dismiss(model, true)
         let executor = executor
         let hud = hud
         pendingTask = Task { @MainActor in
@@ -241,7 +266,7 @@ final class SystemCommandProvider: CommandProvider {
         }
         do {
             try audio.setDefaultDevice(device, for: scope)
-            model.panel?.dismiss(restoreFocus: true)
+            dismissal.dismiss(model, true)
             hud.show(HUDMessage("\(scope.title): \(device.name)", symbol: device.symbol(for: scope)))
         } catch {
             model.feedback = .error(error.localizedDescription)
@@ -252,43 +277,65 @@ final class SystemCommandProvider: CommandProvider {
 
     var providesLiveItems: Bool { true }
 
-    /// Reads the menus once when the scope opens, off the main actor, then filters locally.
+    /// Reads the menus once per visit, off the main actor, then filters locally. An empty query
+    /// starts a new visit, so a read cancelled by typing never leaves an older snapshot behind.
     func liveItems(for query: String, scope: ProvidedScope?, in model: LauncherModel) async -> [LauncherItem] {
         guard scope?.id == Self.menuScope.id else { return [] }
-        guard let pid = foreground(model)?.pid else {
+        guard let app = foreground(model) else {
+            menuState = nil
             menuError = "Open OpenRay from the app whose menus you want to search."
             return []
         }
-        if query.isEmpty || menuSnapshot?.pid != pid {
+        if query.isEmpty || menuState?.app != app {
+            menuState = nil
+            menuGeneration += 1
+            let generation = menuGeneration
             do {
-                menuSnapshot = (pid, try await menuSearch.items(for: pid))
+                let snapshot = try await menuSearch.items(for: app.pid, limits: menuLimits)
+                guard generation == menuGeneration, !Task.isCancelled else { return [] }
+                menuState = (app, generation, snapshot)
                 menuError = nil
             } catch is CancellationError {
                 return []
             } catch {
-                menuSnapshot = nil
                 menuError = error.localizedDescription
                 return []
             }
         }
-        guard !Task.isCancelled, let snapshot = menuSnapshot?.snapshot else { return [] }
-        return MenuItemSearch.filter(snapshot.items, query: query).prefix(100).map { menuRow($0) }
+        guard !Task.isCancelled, let state = menuState else { return [] }
+        return MenuItemSearch.filter(state.snapshot.items, query: query).prefix(100).map {
+            menuRow($0, generation: state.generation)
+        }
     }
 
-    private func menuRow(_ item: MenuBarItem) -> LauncherItem {
+    /// A partial read says so above the rows.
+    func scopeGroups(_ scope: ProvidedScope, items: [LauncherItem], in model: LauncherModel) -> [LauncherResultGroup]? {
+        guard scope.id == Self.menuScope.id, let state = menuState, !state.snapshot.isComplete else { return nil }
+        return [
+            LauncherResultGroup(
+                id: Self.menuScope.id, title: "Some of \(state.app.name)'s menus weren't read; search to narrow them",
+                items: items)
+        ]
+    }
+
+    private func menuRow(_ item: MenuBarItem, generation: Int) -> LauncherItem {
         LauncherItem(
             id: "system.menu.\(item.id)", title: item.title, subtitle: item.menuText, symbol: "filemenu.and.selection",
             kind: .command, badge: item.shortcut?.joined() ?? "", keywords: item.pathText,
             action: .provided(
                 ProvidedRef(
-                    provider: id, id: Self.menuRowID, payload: item.id,
+                    provider: id, id: Self.menuRowID, payload: "\(generation)|\(item.id)",
                     primaryTitle: item.isEnabled ? "Run Menu Item" : "Unavailable Right Now",
                     traits: item.isEnabled ? [] : [.unavailable])))
     }
 
-    private func pressMenuItem(_ itemID: String?, in model: LauncherModel) {
-        guard let item = menuSnapshot?.snapshot.items.first(where: { $0.id == itemID }) else {
-            model.feedback = .error("That menu item is gone. Search again.")
+    private func pressMenuItem(_ payload: String?, in model: LauncherModel) {
+        let parts = (payload ?? "").split(separator: "|", maxSplits: 1).map(String.init)
+        // A row from an earlier read points at menus that may have changed since.
+        guard parts.count == 2, let state = menuState, String(state.generation) == parts[0],
+            let item = state.snapshot.items.first(where: { $0.id == parts[1] })
+        else {
+            model.feedback = .error("The menus changed. Search again.")
             return
         }
         guard item.isEnabled else {
@@ -296,7 +343,7 @@ final class SystemCommandProvider: CommandProvider {
             return
         }
         // Back in the app first, so the item acts on its window.
-        model.panel?.dismiss(restoreFocus: true)
+        dismissal.dismiss(model, true)
         let search = menuSearch
         let hud = hud
         pendingTask = Task { @MainActor in

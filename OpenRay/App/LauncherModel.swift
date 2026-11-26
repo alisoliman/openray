@@ -108,10 +108,15 @@ final class LauncherModel {
         didSet {
             // A new source app means a new context; a chosen window doesn't carry over.
             targetWindow = nil
+            if !isRetargetingWindow { foregroundApplication = previousApplication }
             if previousApplication != oldValue { previousApplicationName = previousApplication?.localizedName }
         }
     }
     private(set) var previousApplicationName: String?
+    /// The app that was frontmost when the launcher opened or a hotkey ran. Choosing a window
+    /// with the target chip changes `previousApplication`, never this.
+    @ObservationIgnored private(set) var foregroundApplication: NSRunningApplication?
+    @ObservationIgnored private var isRetargetingWindow = false
     /// Opens Settings at a pane and, optionally, at a command's row.
     @ObservationIgnored var presentSettings: ((SettingsPane?, String?) -> Void)?
     @ObservationIgnored var presentHelp: (() -> Void)?
@@ -547,7 +552,9 @@ final class LauncherModel {
 
     /// Layouts apply to this window until the source app changes.
     func selectTargetWindow(_ window: WindowManager.TargetWindow) {
-        // Set the app first: changing it clears any earlier choice.
+        // Set the app first: changing it clears any earlier choice. The foreground app stays.
+        isRetargetingWindow = true
+        defer { isRetargetingWindow = false }
         previousApplication = NSRunningApplication(processIdentifier: window.pid)
         targetWindow = window
         targetWindowTitle = window.title
