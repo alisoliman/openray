@@ -12,14 +12,46 @@ import Foundation
 
 // MARK: Slice 7: AI
 
-/// A user-defined AI command: a prompt with placeholders and an output mode.
+/// A user-defined AI command: a prompt with placeholders and an output mode. Every field is
+/// optional, and the settings are stored as raw strings, so a library written by a build that
+/// knows more values still loads (`AICommand(record:)` reads them, with defaults).
 struct AICommandRecord: Codable, Identifiable, Hashable, Sendable {
     var id: UUID = UUID()
+    var name: String? = nil
+    /// An SF Symbol name.
+    var symbol: String? = nil
+    /// The prompt template, with placeholders such as `{selection}` and `{argument name="tone"}`.
+    var prompt: String? = nil
+    /// `AICreativity`: none, low, medium, high, maximum.
+    var creativity: String? = nil
+    /// `AIReasoningLevel`: light, moderate, deep. Nil leaves it to the model.
+    var reasoning: String? = nil
+    /// `AIGuardrail`: standard or permissive.
+    var guardrail: String? = nil
+    /// `AICommandOutput`: show or replace.
+    var output: String? = nil
+    /// The built-in command this one was duplicated from, such as `ai.rewrite`.
+    var duplicatedFrom: String? = nil
+    var createdAt: Date? = nil
 }
 
-/// An agent (formerly a preset): instructions, tools and a model setting.
+/// An agent (formerly a preset): instructions, tools and a model setting. Every field is
+/// optional; `Agent(record:)` reads them, with defaults.
 struct AgentRecord: Codable, Identifiable, Hashable, Sendable {
     var id: UUID = UUID()
+    var name: String? = nil
+    /// An SF Symbol name.
+    var symbol: String? = nil
+    var instructions: String? = nil
+    /// Sampling temperature, 0–2. Nil uses the chat default.
+    var temperature: Double? = nil
+    /// `AIReasoningLevel`: light, moderate, deep. Nil leaves it to the model.
+    var reasoning: String? = nil
+    /// The ids of the tools the agent may use (`AIToolSpec.id`).
+    var toolIDs: [String]? = nil
+    /// `AIGuardrail`: standard or permissive.
+    var guardrail: String? = nil
+    var createdAt: Date? = nil
 }
 
 // MARK: Slice 8: Script Commands
