@@ -123,11 +123,27 @@ struct ActionContextMenu: View {
         let entries = model.actions(for: item).filter { $0.group != .panel }
         ForEach(Array(entries.enumerated()), id: \.element.id) { index, entry in
             if index > 0, entries[index - 1].group != entry.group { Divider() }
-            Button(role: entry.isDestructive ? .destructive : nil) {
-                model.selectedID = item.id
-                entry.perform()
-            } label: {
-                Label(entry.title, systemImage: entry.symbol)
+            if entry.children.isEmpty {
+                Button(role: entry.isDestructive ? .destructive : nil) {
+                    model.selectedID = item.id
+                    entry.perform()
+                } label: {
+                    Label(entry.title, systemImage: entry.symbol)
+                }
+            } else {
+                // Submenus, as in ⌘K.
+                Menu {
+                    ForEach(entry.children) { child in
+                        Button(role: child.isDestructive ? .destructive : nil) {
+                            model.selectedID = item.id
+                            child.perform()
+                        } label: {
+                            Label(child.title, systemImage: child.symbol)
+                        }
+                    }
+                } label: {
+                    Label(entry.title, systemImage: entry.symbol)
+                }
             }
         }
     }
@@ -340,6 +356,11 @@ struct ShortcutsOverlay: View {
             ? ("Leave AI", ["esc"]) : model.section == .home ? ("Clear Search", ["esc"]) : ("Leave Scope", ["⌫"])
         var rows = [("Actions", ["⌘", "K"]), leave]
         if !showsDiffModes { rows.append(("Favorites", ["⌘", "1–8"])) }
+        if model.destination == .search {
+            rows.append(("Jump Between Sections", ["⌘", "↑", "↓"]))
+            rows.append(("Back to Everything", ["⌘", "esc"]))
+        }
+        rows.append(("Close Window", ["⌘", "W"]))
         rows.append(("Settings", ["⌘", ","]))
         return rows
     }

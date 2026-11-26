@@ -26,6 +26,8 @@ struct ProvidedConfirmation {
     var detail: String
     var confirmTitle: String
     var symbol = "exclamationmark.triangle"
+    /// Drawn in the danger style; Return approves only while the prompt is on screen.
+    var isDestructive = false
     var perform: @MainActor () -> Void
 
     init(id: String, _ text: CommandConfirmation, perform: @escaping @MainActor () -> Void) {
@@ -34,6 +36,7 @@ struct ProvidedConfirmation {
         detail = text.detail
         confirmTitle = text.confirmTitle
         symbol = text.symbol
+        isDestructive = text.isDestructive
         self.perform = perform
     }
 }

@@ -158,6 +158,29 @@ struct Step0FollowUpTests {
         #expect(!model.confirmFromReturn(isRepeat: false))
     }
 
+    @Test func destructiveQuestionsAreMarkedAndOnlyAFreshReturnAnswersThem() throws {
+        let fake = FakeCommandProvider()
+        fake.confirmDestructive = true
+        let model = model([fake])
+        defer { model.stop() }
+        // The built-in prompts all lose something.
+        #expect(ActionConfirmation.discardChanges.isDestructive)
+        #expect(ActionConfirmation.clearClipboardHistory(pinnedCount: 0).isDestructive)
+        #expect(!CommandConfirmation(question: "Q?", detail: "", confirmTitle: "Go").isDestructive)
+        let command = try #require(model.commandItems.first { $0.id == "test.confirm" })
+        model.perform(command)
+        #expect(model.confirmation?.isDestructive == true)
+        #expect(model.isConfirmationVisible)
+        #expect(model.confirmFromReturn(isRepeat: true))
+        #expect(fake.performed.isEmpty)
+        #expect(model.confirmFromReturn(isRepeat: false))
+        #expect(fake.performed == ["test.confirm"])
+        // An ordinary question isn't drawn as a danger.
+        fake.confirmDestructive = false
+        model.perform(command)
+        #expect(model.confirmation?.isDestructive == false)
+    }
+
     @Test func approvalRechecksThatTheCommandStillExistsAndStillAsks() throws {
         let fake = FakeCommandProvider()
         let model = model([fake])

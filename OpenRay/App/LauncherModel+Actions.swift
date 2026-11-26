@@ -27,7 +27,8 @@ extension LauncherModel {
 
     func performSelected() {
         if let confirmation {
-            confirm(confirmation)
+            // A destructive prompt is answered only where it can be seen.
+            if !confirmation.isDestructive || isConfirmationVisible { confirm(confirmation) }
             return
         }
         guard !showActions else { return }
@@ -382,8 +383,14 @@ extension LauncherModel {
     /// key was handled, which is whenever a question is pending.
     func confirmFromReturn(isRepeat: Bool) -> Bool {
         guard let confirmation else { return false }
-        if !isRepeat { confirm(confirmation) }
+        if !isRepeat, !confirmation.isDestructive || isConfirmationVisible { confirm(confirmation) }
         return true
+    }
+
+    /// Whether a pending prompt is on screen: the panel is showing (there's no panel in tests),
+    /// and nothing covers its action bar.
+    var isConfirmationVisible: Bool {
+        confirmation != nil && panel?.isVisible != false && !showActions
     }
 
     func confirm(_ confirmation: ActionConfirmation) {

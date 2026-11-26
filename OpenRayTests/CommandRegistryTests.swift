@@ -45,6 +45,8 @@ final class FakeCommandProvider: CommandProvider {
     var confirmQuestion: String? = nil
     /// Makes test.run ask first, as if the provider started requiring it.
     var confirmRun = false
+    /// Makes test.confirm's question destructive, as Shut Down's is.
+    var confirmDestructive = false
     /// Adds commands that opt out of bindings: one under the accepted prefix, one under a curated id.
     var optOuts = false
 
@@ -57,6 +59,7 @@ final class FakeCommandProvider: CommandProvider {
     private var allCommands: [CommandDescriptor] {
         var confirmation = Self.confirmation
         if let confirmQuestion { confirmation.question = confirmQuestion }
+        confirmation.isDestructive = confirmDestructive
         let optOutCommands =
             optOuts
             ? [

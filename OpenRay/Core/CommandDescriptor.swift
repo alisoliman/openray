@@ -65,6 +65,9 @@ struct CommandConfirmation: Hashable, Sendable {
     /// The ↩ button's title: “Shut Down”.
     var confirmTitle: String
     var symbol = "exclamationmark.triangle"
+    /// Shut Down, Restart, Empty Trash and the like: the approve button is drawn in the danger
+    /// style, and Return approves only while the prompt is on screen.
+    var isDestructive = false
 }
 
 /// The payload of `LauncherItem.Action.provided`: which provider owns a row, and what the

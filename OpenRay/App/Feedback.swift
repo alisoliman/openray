@@ -75,6 +75,15 @@ enum ActionConfirmation: Identifiable {
         }
     }
 
+    /// Danger-styled, and approved by Return only while the prompt is on screen. The built-in
+    /// prompts all lose something; a provider's says so with `isDestructive`.
+    var isDestructive: Bool {
+        switch self {
+        case .delete, .discardChanges, .clearClipboardHistory: true
+        case .provided(let confirmation): confirmation.isDestructive
+        }
+    }
+
     var symbol: String {
         switch self {
         case .delete, .clearClipboardHistory: "trash"

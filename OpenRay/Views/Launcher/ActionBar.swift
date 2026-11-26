@@ -44,7 +44,9 @@ struct ActionBar<Context: View, Actions: View>: View {
 
             if let confirmation {
                 ActionBarButton(title: "Cancel", keys: ["esc"], style: .ghost, action: onCancelConfirmation)
-                ActionBarButton(title: confirmation.confirmTitle, keys: ["↩"], style: .danger, action: onConfirm)
+                ActionBarButton(
+                    title: confirmation.confirmTitle, keys: ["↩"], style: confirmation.isDestructive ? .danger : .accent,
+                    action: onConfirm)
             } else {
                 actions
             }
