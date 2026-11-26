@@ -45,15 +45,15 @@ struct LibraryPane: View {
                 Text("library.json and the ClipboardImages folder are readable only by your account, but OpenRay doesn't encrypt them. Export Archive saves both in one file, and can encrypt it.")
                     .font(.system(size: 12)).foregroundStyle(.secondary)
             }
-            LibraryTransferSection(model: model)
         }
     }
 }
 
 // MARK: - Archives and backups (Slice 8)
 
-/// Export and import of whole-library archives, and scheduled backups.
-/// Raycast-format snippet and quicklink JSON and Text Replacements import separately (Slice 2).
+/// Export and import, in one place: whole-library archives, and snippets and quicklinks as
+/// plain JSON (Raycast's documented export format) or Text Replacements (Slice 2's importers).
+/// Then scheduled backups.
 struct LibraryArchiveSections: View {
     let model: LauncherModel
     @State private var showsExport = false
@@ -88,20 +88,48 @@ struct LibraryArchiveSections: View {
             } label: {
                 SettingRowLabel(
                     title: "Archive",
-                    detail: "One file with your library, clipboard images and other OpenRay data. Choose what goes in, and optionally encrypt it with a passphrase.")
+                    detail: "One file with your library and clipboard images. Choose what goes in, and optionally encrypt it with a passphrase.")
             }
             .alert(item: $alert) { alert in
                 Alert(title: Text(alert.title), message: Text(alert.message), dismissButton: .default(Text("OK")))
             }
+            ForEach(LibraryTransferKind.allCases, id: \.self) { kind in
+                LabeledContent {
+                    HStack {
+                        Button("Import…") { transfer(kind, importing: true) }
+                            .accessibilityIdentifier("settings.import.\(kind.rawValue)")
+                        Button("Export…") { transfer(kind, importing: false) }
+                            .accessibilityIdentifier("settings.export.\(kind.rawValue)")
+                    }
+                } label: {
+                    SettingRowLabel(
+                        title: kind.title,
+                        detail: kind == .snippets
+                            ? "JSON with name, text and keyword, or a Text Replacements property list."
+                            : "JSON with name, link and openWith.")
+                }
+            }
         } header: {
             Text("Export and Import")
         } footer: {
-            Text("Imports let you pick categories and merge them with what's here, or replace them.")
+            Text("Archive imports let you pick categories and merge them with what's here, or replace them; script folders arrive turned off. Snippet and quicklink imports skip duplicates and drop keywords that are already taken. Encrypted settings files from other apps can't be imported.")
                 .font(.system(size: 12)).foregroundStyle(.secondary)
         }
         if let scheduler {
             BackupSection(model: model, scheduler: scheduler, settings: scheduler.settings) { alert = $0 }
         }
+    }
+
+    /// Slice 2's snippet and quicklink import and export. Its result, which it reports in the
+    /// launcher's action bar, is shown here too.
+    private func transfer(_ kind: LibraryTransferKind, importing: Bool) {
+        model.feedback = nil
+        if importing { model.runImport(kind, files: PanelLibraryFileAccess()) } else { model.runExport(kind, files: PanelLibraryFileAccess()) }
+        guard let feedback = model.feedback else { return }
+        let verb = importing ? "Import" : "Export"
+        alert = ArchiveAlert(
+            title: feedback.style == .error || feedback.style == .warning ? "The \(verb) Didn't Finish" : "\(verb) Finished",
+            message: feedback.text)
     }
 
     private func chooseImport() {
@@ -112,14 +140,19 @@ struct LibraryArchiveSections: View {
         if let type = UTType(filenameExtension: LibraryArchive.fileExtension) { panel.allowedContentTypes = [type] }
         panel.message = "Choose an OpenRay archive to import."
         guard panel.runModal() == .OK, let url = panel.url else { return }
-        do {
-            let data = try Data(contentsOf: url)
-            let encrypted = try LibraryArchive.isEncrypted(data)
-            pendingImport = PendingArchive(
-                name: url.lastPathComponent, data: data,
-                contents: encrypted ? nil : try LibraryArchive.read(data))
-        } catch {
-            alert = ArchiveAlert(title: "Couldn't Open the Archive", message: error.localizedDescription)
+        // Reading and checking every file's digest can take a moment for a large archive.
+        Task {
+            do {
+                let opened = try await Task.detached(priority: .userInitiated) { () -> (Data, LibraryArchive.Contents?) in
+                    let size = (try? url.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0
+                    guard size <= 2 * 1024 * 1024 * 1024 else { throw LibraryArchive.Failure("That archive is too large to import.") }
+                    let data = try Data(contentsOf: url)
+                    return (data, try LibraryArchive.isEncrypted(data) ? nil : try LibraryArchive.read(data))
+                }.value
+                pendingImport = PendingArchive(name: url.lastPathComponent, data: opened.0, contents: opened.1)
+            } catch {
+                alert = ArchiveAlert(title: "Couldn't Open the Archive", message: error.localizedDescription)
+            }
         }
     }
 }
@@ -181,12 +214,13 @@ private struct BackupSection: View {
                 Button(scheduler.isBackingUp ? "Backing Up…" : "Back Up Now") { backUpNow() }
                     .disabled(current.folder == nil || scheduler.isBackingUp)
             } label: {
-                SettingRowLabel(title: "Last backup", detail: lastBackup(current))
+                SettingRowLabel(
+                    title: "Last backup", detail: [lastBackup(current), current.lastNote].compactMap { $0 }.joined(separator: " "))
             }
         } header: {
             Text("Backups")
         } footer: {
-            Text("Backups hold everything, unencrypted, as archives you can import. Older ones beyond the number kept are deleted; other files in the folder are left alone.")
+            Text("Backups hold everything, unencrypted, as archives you can import. Older backups this Mac made beyond the number kept are deleted; other files in the folder, and other Macs' backups, are left alone.")
                 .font(.system(size: 12)).foregroundStyle(.secondary)
         }
     }
@@ -201,7 +235,7 @@ private struct BackupSection: View {
         let panel = NSOpenPanel()
         panel.canChooseDirectories = true
         panel.canChooseFiles = false
-        panel.canCreateDirectories = true
+        panel.canCreateDirectories = !SideEffectGuard.isInert
         panel.prompt = "Choose"
         panel.message = "Choose where OpenRay keeps backups."
         guard panel.runModal() == .OK, let url = panel.url else { return }
@@ -224,7 +258,7 @@ private struct BackupSection: View {
 private struct ExportArchiveSheet: View {
     let model: LauncherModel
     let finish: (ArchiveAlert?) -> Void
-    @State private var categories = Set(LibraryArchiveCategory.allCases)
+    @State private var categories = Set(LibraryArchive.exportableCategories)
     @State private var encrypts = false
     @State private var passphrase = ""
     @State private var confirmation = ""
@@ -234,7 +268,7 @@ private struct ExportArchiveSheet: View {
         VStack(alignment: .leading, spacing: 0) {
             Form {
                 Section("Include") {
-                    ForEach(LibraryArchiveCategory.allCases) { category in
+                    ForEach(LibraryArchive.exportableCategories) { category in
                         Toggle(isOn: binding(category)) {
                             Label {
                                 SettingRowLabel(title: title(category), detail: category.detail)
@@ -299,10 +333,12 @@ private struct ExportArchiveSheet: View {
         Task {
             defer { isWorking = false }
             do {
-                let data = try await model.store.makeArchive(categories: chosen, passphrase: secret)
-                try data.write(to: destination, options: .atomic)
+                try InertWrites.check(destination.deletingLastPathComponent(), what: "exporting archives")
+                let built = try await model.store.makeArchive(categories: chosen, passphrase: secret)
+                try built.data.write(to: destination, options: .atomic)
                 try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: destination.path)
-                finish(ArchiveAlert(title: "Exported", message: "Saved \(destination.lastPathComponent)."))
+                let left = built.omissions.isEmpty ? "" : " " + built.omissions.joined(separator: " ")
+                finish(ArchiveAlert(title: "Exported", message: "Saved \(destination.lastPathComponent).\(left)"))
             } catch {
                 finish(ArchiveAlert(title: "The Export Failed", message: error.localizedDescription))
             }
@@ -381,6 +417,10 @@ private struct ImportArchiveSheet: View {
     }
 
     private func detail(_ row: LibraryArchive.CategoryPreview) -> String {
+        if row.category == .scripts, let contents = pending.contents {
+            let paths = contents.database.scriptDirectories.map(\.path).filter { !$0.isEmpty }
+            return "\(paths.count) folder\(paths.count == 1 ? "" : "s"), added turned off: " + paths.joined(separator: ", ")
+        }
         var parts: [String] = []
         if let archived = row.archived, let current = row.current {
             parts.append("\(archived.formatted()) in the archive, \(current.formatted()) here")

@@ -16,6 +16,10 @@ import Observation
 // (CryptoKit). The key comes from the passphrase with PBKDF2-HMAC-SHA256 (CommonCrypto) over a
 // random 16-byte salt; the salt and iteration count are in the header, which is authenticated as
 // the cipher's associated data. A wrong passphrase and a damaged archive fail the same way.
+//
+// Only library.json and the files of registered portable stores (`LibraryArchive.portableStores`)
+// travel. This Mac's own files (approvals, backup settings, caches) never do, and an archive that
+// names one of them, under any spelling the file system treats as the same, is refused.
 
 /// A part of the library an archive can carry.
 enum LibraryArchiveCategory: String, CaseIterable, Codable, Identifiable, Hashable, Sendable {
@@ -50,7 +54,7 @@ enum LibraryArchiveCategory: String, CaseIterable, Codable, Identifiable, Hashab
         case .quicklinks, .snippets: "Every \(title.lowercased().dropLast())"
         case .notes: "Notes and the files they use"
         case .clipboard: "Copied text, files and images, with the images themselves"
-        case .scripts: "The folders OpenRay reads script commands from (not the scripts)"
+        case .scripts: "The folders OpenRay reads script commands from (not the scripts). They arrive turned off."
         case .ai: "Your AI commands and agents"
         case .windowLayouts: "Saved multi-app window layouts"
         case .focus: "App groups that focus sessions block"
@@ -89,18 +93,44 @@ enum LibraryImportMode: String, CaseIterable, Identifiable, Sendable {
     var title: String { self == .merge ? "Merge" : "Replace" }
 }
 
+/// A folder beside library.json whose files travel in archives, and the file names it owns.
+struct PortableStore: Sendable {
+    var folder: String
+    var category: LibraryArchiveCategory
+    var owns: @Sendable (_ fileName: String) -> Bool
+}
+
+/// Thrown when OpenRay won't write somewhere while inert, or when an archive breaks a rule.
 enum LibraryArchive {
     static let fileExtension = "openraybackup"
     static let magic = Data("OPENRAYA".utf8)
     static let formatVersion: UInt8 = 1
+    static let cipher = "AES-256-GCM"
+    static let keyDerivation = "PBKDF2-HMAC-SHA256"
     /// OWASP's 2023 guidance for PBKDF2-HMAC-SHA256.
     static let defaultIterations = 600_000
-    static let iterationRange = 1_000...10_000_000
-    /// Files bigger than this aren't archived.
+    /// What the reader accepts, and the writer uses.
+    static let iterationRange = 100_000...10_000_000
+    static let saltBytes = 16
+    /// Files bigger than this aren't archived; the export says which were left out.
     static let maximumFileBytes = 512 * 1024 * 1024
-    /// Store files that describe this Mac, not the library, and stay out of archives.
-    static let machineLocalFiles: Set<String> = [
-        "library.json", "library-pending-cleanup.json", LibraryBackupSettingsStore.fileName,
+    static let maximumEntries = 100_000
+    static let libraryFileName = "library.json"
+    /// This Mac's files beside the library. They never travel, and an archive naming one of
+    /// them, however spelled, is refused.
+    static let machineLocalFiles: [String] = [
+        libraryFileName, "library-pending-cleanup.json", LibraryBackupSettingsStore.fileName,
+        LocalApprovalStore.fileName, "currency-rates.json",
+    ]
+
+    /// The stores whose files archives carry. A slice that keeps portable files beside the
+    /// library adds its folder here, with the file names it owns.
+    static let portableStores: [PortableStore] = [
+        PortableStore(folder: "ClipboardImages", category: .clipboard) { name in
+            let stem = (name as NSString).deletingPathExtension
+            let ext = (name as NSString).pathExtension
+            return ClipboardImageStore.isDigest(stem) && ["png", "rich", "txt"].contains(ext)
+        }
     ]
 
     struct Failure: LocalizedError, Equatable {
@@ -110,8 +140,8 @@ enum LibraryArchive {
     }
 
     struct Encryption: Codable, Equatable, Sendable {
-        var algorithm = "AES-256-GCM"
-        var keyDerivation = "PBKDF2-HMAC-SHA256"
+        var algorithm = LibraryArchive.cipher
+        var keyDerivation = LibraryArchive.keyDerivation
         var iterations: Int
         var salt: Data
     }
@@ -146,17 +176,48 @@ enum LibraryArchive {
         var categories: Set<LibraryArchiveCategory> { Set(manifest.categories) }
     }
 
-    // MARK: Categories
+    /// A built archive, and what it had to leave out.
+    struct Built: Sendable {
+        var data: Data
+        var omissions: [String]
+    }
 
-    /// The file's category, by where it lives beside library.json.
-    static func category(forFile path: String) -> LibraryArchiveCategory {
-        let first = path.split(separator: "/").first.map(String.init) ?? path
-        switch first {
-        case "ClipboardImages": return .clipboard
-        case "NoteAssets", "Notes", "NotesAssets": return .notes
-        default: return .otherData
+    // MARK: Paths
+
+    /// How the file system compares names: Unicode-normalized and case-folded, as on APFS and HFS+.
+    static func canonical(_ path: String) -> String {
+        path.precomposedStringWithCanonicalMapping.folding(options: [.caseInsensitive], locale: nil)
+    }
+
+    /// The portable store that owns a relative path, `folder/name`, if one does.
+    static func portableStore(for path: String) -> PortableStore? {
+        let parts = path.split(separator: "/", omittingEmptySubsequences: false).map(String.init)
+        guard parts.count == 2 else { return nil }
+        return portableStores.first { $0.folder == parts[0] && $0.owns(parts[1]) }
+    }
+
+    /// The file's category, or nil when no portable store owns it.
+    static func category(forFile path: String) -> LibraryArchiveCategory? { portableStore(for: path)?.category }
+
+    /// A relative path an archive may carry and write: owned by a portable store, with no
+    /// absolute, empty, `.`, `..` or hidden components, and not the library or one of this Mac's
+    /// files under any spelling the file system treats as the same.
+    static func validate(_ path: String) throws {
+        let unsafe = Failure("The archive contains an unsafe file path.")
+        let components = path.split(separator: "/", omittingEmptySubsequences: false)
+        guard !path.isEmpty, path.count <= 1_024, !path.hasPrefix("/"), !path.contains("\0"),
+            components.allSatisfy({ !$0.isEmpty && $0 != "." && $0 != ".." && !$0.hasPrefix(".") })
+        else { throw unsafe }
+        let name = canonical(path)
+        let lastName = canonical(String(components.last ?? ""))
+        let reserved = machineLocalFiles.map(canonical)
+        guard !reserved.contains(name), !reserved.contains(lastName) else { throw unsafe }
+        guard portableStore(for: path) != nil else {
+            throw Failure("The archive contains a file OpenRay doesn't import: “\(path.truncatedForFeedback)”.")
         }
     }
+
+    // MARK: Categories
 
     /// A copy of `database` holding only the chosen categories; everything else is emptied.
     static func filtered(_ database: LibraryDatabase, keeping categories: Set<LibraryArchiveCategory>) -> LibraryDatabase {
@@ -190,7 +251,16 @@ enum LibraryArchive {
             case .otherData: break
             }
         }
+        for command in result.commandPreferences.keys {
+            result.commandPreferences[command]?[DeepLinkRouter.legacyTrustKey] = nil
+        }
         return result
+    }
+
+    /// The categories there's something to export for: every library category, and Other Data
+    /// only when a portable store files under it.
+    static var exportableCategories: [LibraryArchiveCategory] {
+        LibraryArchiveCategory.allCases.filter { $0 != .otherData || portableStores.contains { $0.category == .otherData } }
     }
 
     /// How many items a category holds, for the import preview. Nil for settings, which aren't counted.
@@ -213,27 +283,65 @@ enum LibraryArchive {
 
     // MARK: Writing
 
-    /// Builds an archive of the chosen categories: the library's own data, and the files in
-    /// `directory` (the library's folder) that belong to them. A passphrase encrypts it.
+    /// Builds an archive of the chosen categories: the library's own data, and the portable files
+    /// in `directory` (the library's folder) that belong to them. A passphrase encrypts it.
+    /// Clipboard entries are checked against their pictures, so the archive never refers to a
+    /// file it doesn't hold; anything left out is listed in `omissions`.
     static func make(
         database: LibraryDatabase, directory: URL?, categories: Set<LibraryArchiveCategory>, passphrase: String? = nil,
         iterations: Int = defaultIterations, appVersion: String = Self.appVersion, now: Date = .now
-    ) throws -> Data {
+    ) throws -> Built {
         guard !categories.isEmpty else { throw Failure("Choose at least one kind of data to export.") }
+        var library = filtered(database, keeping: categories)
+        var omissions: [String] = []
+        var files: [(FileEntry, Data)] = []
+        if let directory {
+            let available = try storeFiles(in: directory, categories: categories)
+            omissions += available.omissions
+            var byPath = available.files
+            if categories.contains(.clipboard) {
+                // Keep only the side files entries refer to, and only entries whose picture is here.
+                var wanted = Set<String>()
+                var dropped = 0
+                library.clipboard = library.clipboard.compactMap { entry in
+                    var entry = entry
+                    if let image = entry.image {
+                        let path = "ClipboardImages/\(image.id).png"
+                        guard let data = byPath[path], digest(data) == image.id else {
+                            dropped += 1
+                            return nil
+                        }
+                        wanted.insert(path)
+                        if byPath["ClipboardImages/\(image.id).txt"] != nil { wanted.insert("ClipboardImages/\(image.id).txt") }
+                    }
+                    if let rich = entry.richTextDigest {
+                        if byPath["ClipboardImages/\(rich).rich"] != nil {
+                            wanted.insert("ClipboardImages/\(rich).rich")
+                        } else {
+                            entry.richTextDigest = nil
+                        }
+                    }
+                    return entry
+                }
+                byPath = byPath.filter { category(forFile: $0.key) != .clipboard || wanted.contains($0.key) }
+                if dropped > 0 {
+                    omissions.append("\(dropped) clipboard image\(dropped == 1 ? " was" : "s were") missing and left out.")
+                }
+            }
+            for (path, data) in byPath.sorted(by: { $0.key < $1.key }) {
+                files.append((FileEntry(path: path, size: data.count, sha256: digest(data), category: category(forFile: path)), data))
+            }
+        } else if categories.contains(.clipboard) {
+            let pictures = library.clipboard.filter { $0.image != nil }.count
+            library.clipboard.removeAll { $0.image != nil }
+            if pictures > 0 { omissions.append("\(pictures) clipboard image\(pictures == 1 ? " was" : "s were") left out.") }
+        }
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
-        let library = try encoder.encode(filtered(database, keeping: categories))
-        var files: [(FileEntry, Data)] = [
-            (FileEntry(path: "library.json", size: library.count, sha256: digest(library), category: nil), library)
-        ]
-        if let directory {
-            for (path, url) in try storeFiles(in: directory) {
-                let category = category(forFile: path)
-                guard categories.contains(category) else { continue }
-                let data = try Data(contentsOf: url)
-                files.append((FileEntry(path: path, size: data.count, sha256: digest(data), category: category), data))
-            }
-        }
+        let libraryData = try encoder.encode(library)
+        files.insert(
+            (FileEntry(path: libraryFileName, size: libraryData.count, sha256: digest(libraryData), category: nil), libraryData),
+            at: 0)
         let manifest = Manifest(
             createdAt: now, appVersion: appVersion, schemaVersion: database.schemaVersion,
             categories: LibraryArchiveCategory.allCases.filter(categories.contains), files: files.map(\.0))
@@ -247,7 +355,7 @@ enum LibraryArchive {
         var flags: UInt8 = 0
         if let passphrase, !passphrase.isEmpty {
             guard iterationRange.contains(iterations) else { throw Failure("The key derivation setting is out of range.") }
-            header.encryption = Encryption(iterations: iterations, salt: randomBytes(16))
+            header.encryption = Encryption(iterations: iterations, salt: randomBytes(saltBytes))
             flags |= 1
         }
         let headerData = try JSONEncoder().encode(header)
@@ -264,53 +372,48 @@ enum LibraryArchive {
         } else {
             archive.append(payload)
         }
-        return archive
+        return Built(data: archive, omissions: omissions)
     }
 
-    /// Files beside library.json, by relative path: regular, non-hidden files, without symbolic
-    /// links, machine-local files or anything too large.
-    static func storeFiles(in directory: URL) throws -> [(String, URL)] {
-        let root = directory.standardizedFileURL.resolvingSymlinksInPath()
-        guard FileManager.default.fileExists(atPath: root.path) else { return [] }
-        guard
-            let enumerator = FileManager.default.enumerator(
-                at: root, includingPropertiesForKeys: [.isRegularFileKey, .isSymbolicLinkKey, .fileSizeKey],
-                options: [.skipsHiddenFiles, .skipsPackageDescendants])
-        else { return [] }
-        var files: [(String, URL)] = []
-        for case let url as URL in enumerator {
-            let values = try url.resourceValues(forKeys: [.isRegularFileKey, .isSymbolicLinkKey, .fileSizeKey])
-            guard values.isSymbolicLink != true, values.isRegularFile == true,
-                (values.fileSize ?? 0) <= maximumFileBytes
-            else { continue }
-            let full = url.standardizedFileURL.resolvingSymlinksInPath().path
-            guard full.hasPrefix(root.path + "/") else { continue }
-            let path = String(full.dropFirst(root.path.count + 1))
-            // A backup folder inside the library's folder mustn't fold old backups into new ones.
-            guard !machineLocalFiles.contains(path), !path.hasSuffix(".tmp"),
-                url.pathExtension != fileExtension, (try? validate(path)) != nil
-            else { continue }
-            files.append((path, url))
+    /// The portable files of the chosen categories in the library's folder: regular files only,
+    /// never through a symbolic link, each under the size limit.
+    static func storeFiles(in directory: URL, categories: Set<LibraryArchiveCategory> = Set(LibraryArchiveCategory.allCases))
+        throws -> (files: [String: Data], omissions: [String])
+    {
+        var files: [String: Data] = [:]
+        var omissions: [String] = []
+        guard let root = realDirectory(directory) else { return ([:], []) }
+        for store in portableStores where categories.contains(store.category) {
+            let folder = root + "/" + store.folder
+            guard fileKind(folder) == S_IFDIR else { continue }
+            for name in try FileManager.default.contentsOfDirectory(atPath: folder).sorted() where store.owns(name) {
+                let path = folder + "/" + name
+                var info = stat()
+                guard lstat(path, &info) == 0, info.st_mode & S_IFMT == S_IFREG else { continue }
+                guard Int(info.st_size) <= maximumFileBytes else {
+                    omissions.append("\(store.folder)/\(name) is too large to archive.")
+                    continue
+                }
+                files[store.folder + "/" + name] = try Data(contentsOf: URL(fileURLWithPath: path))
+            }
         }
-        return files.sorted { $0.0 < $1.0 }
+        return (files, omissions)
     }
 
     // MARK: Reading
 
-    /// Whether the archive needs a passphrase. Throws for anything that isn't an archive.
+    /// Whether the archive needs a passphrase. Throws for anything that isn't a supported archive.
     static func isEncrypted(_ data: Data) throws -> Bool {
         try parseHeader(data).header.encryption != nil
     }
 
-    /// Opens an archive, checking every file against its digest.
+    /// Opens an archive. Every file is checked against its digest and against the path rules;
+    /// a single bad entry refuses the whole archive.
     static func read(_ data: Data, passphrase: String? = nil) throws -> Contents {
         let (header, headerEnd) = try parseHeader(data)
         var payload = Data(data[(data.startIndex + headerEnd)...])
         if let encryption = header.encryption {
             guard let passphrase, !passphrase.isEmpty else { throw Failure("This archive is encrypted. Enter its passphrase.") }
-            guard iterationRange.contains(encryption.iterations), encryption.salt.count >= 8 else {
-                throw Failure("This archive's encryption settings aren't supported.")
-            }
             let key = try deriveKey(passphrase: passphrase, salt: encryption.salt, iterations: encryption.iterations)
             do {
                 let box = try AES.GCM.SealedBox(combined: payload)
@@ -329,22 +432,28 @@ enum LibraryArchive {
         do { manifest = try JSONDecoder().decode(Manifest.self, from: manifestData) } catch {
             throw Failure("The archive is damaged.")
         }
+        guard manifest.files.count <= maximumEntries else { throw Failure("The archive has too many files.") }
         var files: [String: Data] = [:]
+        var names = Set<String>()
         var library: Data?
         for entry in manifest.files {
             guard entry.size >= 0, entry.size <= payload.endIndex - cursor else { throw Failure("The archive is damaged.") }
             let bytes = Data(payload[cursor..<(cursor + entry.size)])
             cursor += entry.size
             guard digest(bytes) == entry.sha256 else {
-                throw Failure("“\(entry.path)” in the archive is damaged.")
+                throw Failure("“\(entry.path.truncatedForFeedback)” in the archive is damaged.")
             }
-            if entry.path == "library.json" {
+            guard names.insert(canonical(entry.path)).inserted else {
+                throw Failure("The archive names the same file twice.")
+            }
+            if entry.path == libraryFileName {
                 library = bytes
             } else {
                 try validate(entry.path)
                 files[entry.path] = bytes
             }
         }
+        guard cursor == payload.endIndex else { throw Failure("The archive is damaged.") }
         guard let library else { throw Failure("The archive has no library.") }
         let database: LibraryDatabase
         do {
@@ -358,31 +467,32 @@ enum LibraryArchive {
         return Contents(manifest: manifest, database: database, files: files)
     }
 
+    /// Reads and checks the plaintext header: the magic, version 1, only the encryption flag, and
+    /// for encrypted archives exactly the supported cipher, key derivation, salt size and iterations.
     private static func parseHeader(_ data: Data) throws -> (header: Header, end: Int) {
         var cursor = data.startIndex
         guard data.count >= magic.count + 6, data.prefix(magic.count) == magic else {
             throw Failure("That file isn't an OpenRay archive.")
         }
         cursor += magic.count
-        guard data[cursor] <= formatVersion else {
+        let version = data[cursor]
+        let flags = data[cursor + 1]
+        guard version == formatVersion else {
             throw Failure("This archive comes from a newer version of OpenRay. Update OpenRay to import it.")
         }
+        guard flags & ~UInt8(1) == 0 else { throw Failure("This archive uses features OpenRay doesn't support.") }
         cursor += 2
-        guard let length = data.readBigEndianUInt32(at: &cursor), Int(length) <= data.endIndex - cursor,
-            let header = try? JSONDecoder().decode(Header.self, from: data[cursor..<(cursor + Int(length))])
+        guard let length = data.readBigEndianUInt32(at: &cursor), length <= 64 * 1024, Int(length) <= data.endIndex - cursor,
+            let header = try? JSONDecoder().decode(Header.self, from: data[cursor..<(cursor + Int(length))]),
+            header.format == 1
         else { throw Failure("The archive is damaged.") }
-        let encrypted = data[data.startIndex + magic.count + 1] & 1 == 1
-        guard encrypted == (header.encryption != nil) else { throw Failure("The archive is damaged.") }
+        guard (flags & 1 == 1) == (header.encryption != nil) else { throw Failure("The archive is damaged.") }
+        if let encryption = header.encryption {
+            guard encryption.algorithm == cipher, encryption.keyDerivation == keyDerivation,
+                encryption.salt.count == saltBytes, iterationRange.contains(encryption.iterations)
+            else { throw Failure("This archive's encryption settings aren't supported.") }
+        }
         return (header, cursor + Int(length) - data.startIndex)
-    }
-
-    /// A relative path an archive may write into the library's folder: no absolute paths, no
-    /// `..`, no hidden components.
-    static func validate(_ path: String) throws {
-        let components = path.split(separator: "/", omittingEmptySubsequences: false)
-        guard !path.isEmpty, path.count <= 1_024, !path.hasPrefix("/"), !path.contains("\0"),
-            components.allSatisfy({ !$0.isEmpty && $0 != "." && $0 != ".." && !$0.hasPrefix(".") })
-        else { throw Failure("The archive contains an unsafe file path.") }
     }
 
     // MARK: Importing
@@ -405,33 +515,35 @@ enum LibraryArchive {
         }
     }
 
-    /// The library after importing `categories` from `incoming`. Merging replaces items with the
-    /// same identity and adds the rest; snippet keywords and aliases that would clash with ones
-    /// already here are dropped from the imported items, and each such change is described.
+    /// The library after importing `categories` from `incoming`. Only the chosen categories
+    /// change. Merging replaces items with the same identity and adds the rest; Replace makes
+    /// each chosen category the archive's. Either way:
+    /// - script folders arrive turned off, and folders already listed here keep their own state;
+    /// - link permissions from an older build are dropped;
+    /// - an imported keyword or alias that clashes with one already here is cleared on the
+    ///   imported item, and each such change is described in `notes`.
     static func merged(
         current: LibraryDatabase, incoming: LibraryDatabase, categories: Set<LibraryArchiveCategory>,
         mode: LibraryImportMode
     ) -> (database: LibraryDatabase, notes: [String]) {
         var result = current
         var notes: [String] = []
-        if mode == .replace, categories.isSuperset(of: LibraryArchiveCategory.allCases) {
-            result = incoming
-            result.schemaVersion = LibraryDatabase.currentSchemaVersion
-            return (result, notes)
-        }
         let replacing = mode == .replace
         for category in LibraryArchiveCategory.allCases where categories.contains(category) {
             switch category {
             case .settings:
                 result.preferences = incoming.preferences
+                var preferences = incoming.commandPreferences
+                for command in preferences.keys { preferences[command]?[DeepLinkRouter.legacyTrustKey] = nil }
+                preferences = preferences.filter { !$0.value.isEmpty }
                 if replacing {
                     result.disabledCommandIDs = incoming.disabledCommandIDs
                     result.fallbackOrder = incoming.fallbackOrder
-                    result.commandPreferences = incoming.commandPreferences
+                    result.commandPreferences = preferences
                 } else {
                     result.disabledCommandIDs.formUnion(incoming.disabledCommandIDs)
                     result.fallbackOrder += incoming.fallbackOrder.filter { !result.fallbackOrder.contains($0) }
-                    for (command, values) in incoming.commandPreferences {
+                    for (command, values) in preferences {
                         result.commandPreferences[command, default: [:]].merge(values) { _, new in new }
                     }
                 }
@@ -470,12 +582,33 @@ enum LibraryArchive {
                     (replacing ? incoming.clipboard : mergeByKey(result.clipboard, incoming.clipboard, key: \.id))
                     .sorted { $0.copiedAt > $1.copiedAt }
             case .scripts:
+                let local = Dictionary(
+                    current.scriptDirectories.map { (canonical($0.path), $0) }, uniquingKeysWith: { first, _ in first })
+                var added = 0
+                var restored: [ScriptDirectoryRecord] = []
+                var seen = Set<String>()
+                for record in incoming.scriptDirectories where !record.path.isEmpty {
+                    let key = canonical(record.path)
+                    guard seen.insert(key).inserted else { continue }
+                    if let existing = local[key] {
+                        restored.append(existing)
+                    } else {
+                        var record = record
+                        record.isEnabled = false
+                        if current.scriptDirectories.contains(where: { $0.id == record.id }) { record.id = UUID() }
+                        restored.append(record)
+                        added += 1
+                    }
+                }
                 if replacing {
-                    result.scriptDirectories = incoming.scriptDirectories
+                    result.scriptDirectories = restored
                 } else {
-                    let paths = Set(result.scriptDirectories.map(\.path))
-                    result.scriptDirectories = mergeByKey(
-                        result.scriptDirectories, incoming.scriptDirectories.filter { !paths.contains($0.path) }, key: \.id)
+                    let here = Set(current.scriptDirectories.map(\.id))
+                    result.scriptDirectories = current.scriptDirectories + restored.filter { !here.contains($0.id) }
+                }
+                if added > 0 {
+                    notes.append(
+                        "\(added) script folder\(added == 1 ? " was" : "s were") added turned off. Turn them on in Settings › Scripts to allow their scripts on this Mac.")
                 }
             case .ai:
                 result.aiCommands = replacing ? incoming.aiCommands : mergeByKey(result.aiCommands, incoming.aiCommands, key: \.id)
@@ -495,16 +628,27 @@ enum LibraryArchive {
                 break
             }
         }
-        notes += resolveConflicts(in: &result, imported: incoming)
+        notes += resolveConflicts(in: &result, imported: incoming, categories: categories)
         result.schemaVersion = LibraryDatabase.currentSchemaVersion
         return (result, notes)
     }
 
-    /// Clears imported snippet keywords that another snippet already uses, and imported aliases
-    /// that another command or a keyword already uses. Items already in the library keep theirs.
-    private static func resolveConflicts(in database: inout LibraryDatabase, imported: LibraryDatabase) -> [String] {
+    /// Clears what the import brought that clashes with what's already here, on the imported
+    /// item only, and only for categories being imported:
+    /// - an imported snippet keyword another snippet here already uses;
+    /// - an imported snippet or quicklink keyword that an alias here already uses;
+    /// - an imported alias that another alias or any keyword already uses.
+    private static func resolveConflicts(
+        in database: inout LibraryDatabase, imported: LibraryDatabase, categories: Set<LibraryArchiveCategory>
+    ) -> [String] {
         var notes: [String] = []
-        let importedSnippets = Set(imported.snippets.map(\.id))
+        let importedSnippets = categories.contains(.snippets) ? Set(imported.snippets.map(\.id)) : []
+        let importedQuicklinks = categories.contains(.quicklinks) ? Set(imported.quicklinks.map(\.id)) : []
+        let importedTargets = categories.contains(.shortcuts) ? Set(imported.commandBindings.map(\.targetID)) : []
+        let localAliases = Set(
+            database.commandBindings.filter { !importedTargets.contains($0.targetID) }
+                .compactMap { CommandBinding.normalizedAlias($0.alias) })
+
         var keywords: [String: UUID] = [:]
         for snippet in database.snippets where !importedSnippets.contains(snippet.id) && !snippet.keyword.isEmpty {
             keywords[snippet.keyword.lowercased()] = snippet.id
@@ -513,36 +657,45 @@ enum LibraryArchive {
         for index in database.snippets.indices where importedSnippets.contains(database.snippets[index].id) {
             let keyword = database.snippets[index].keyword.lowercased()
             guard !keyword.isEmpty else { continue }
-            if let owner = keywords[keyword], owner != database.snippets[index].id {
+            let clashesWithAlias = CommandBinding.normalizedAlias(keyword).map(localAliases.contains) ?? false
+            let takenBySnippet = keywords[keyword].map { $0 != database.snippets[index].id } ?? false
+            if takenBySnippet || clashesWithAlias {
                 database.snippets[index].keyword = ""
                 cleared += 1
             } else {
                 keywords[keyword] = database.snippets[index].id
             }
         }
+        for index in database.quicklinks.indices where importedQuicklinks.contains(database.quicklinks[index].id) {
+            guard let keyword = CommandBinding.normalizedAlias(database.quicklinks[index].keyword),
+                localAliases.contains(keyword)
+            else { continue }
+            database.quicklinks[index].keyword = ""
+            cleared += 1
+        }
         if cleared > 0 {
-            notes.append("\(cleared) imported snippet keyword\(cleared == 1 ? " was" : "s were") already in use and left empty.")
+            notes.append("\(cleared) imported keyword\(cleared == 1 ? " was" : "s were") already in use and left empty.")
         }
 
-        let importedTargets = Set(imported.commandBindings.map(\.targetID))
-        let contentKeywords = Set(
-            (database.quicklinks.map(\.keyword) + database.snippets.map(\.keyword)).compactMap(CommandBinding.normalizedAlias))
-        var aliases = Set(
-            database.commandBindings.filter { !importedTargets.contains($0.targetID) }
-                .compactMap { CommandBinding.normalizedAlias($0.alias) })
-        var dropped = 0
-        for index in database.commandBindings.indices where importedTargets.contains(database.commandBindings[index].targetID) {
-            guard let alias = CommandBinding.normalizedAlias(database.commandBindings[index].alias) else { continue }
-            if aliases.contains(alias) || contentKeywords.contains(alias) {
-                database.commandBindings[index].alias = nil
-                dropped += 1
-            } else {
-                aliases.insert(alias)
+        if !importedTargets.isEmpty {
+            let contentKeywords = Set(
+                (database.quicklinks.map(\.keyword) + database.snippets.map(\.keyword)).compactMap(CommandBinding.normalizedAlias))
+            var aliases = localAliases
+            var dropped = 0
+            for index in database.commandBindings.indices
+            where importedTargets.contains(database.commandBindings[index].targetID) {
+                guard let alias = CommandBinding.normalizedAlias(database.commandBindings[index].alias) else { continue }
+                if aliases.contains(alias) || contentKeywords.contains(alias) {
+                    database.commandBindings[index].alias = nil
+                    dropped += 1
+                } else {
+                    aliases.insert(alias)
+                }
             }
-        }
-        database.commandBindings.removeAll(where: \.isEmpty)
-        if dropped > 0 {
-            notes.append("\(dropped) imported alias\(dropped == 1 ? " was" : "es were") already in use and left out.")
+            database.commandBindings.removeAll { importedTargets.contains($0.targetID) && $0.isEmpty }
+            if dropped > 0 {
+                notes.append("\(dropped) imported alias\(dropped == 1 ? " was" : "es were") already in use and left out.")
+            }
         }
         return notes
     }
@@ -563,37 +716,116 @@ enum LibraryArchive {
         return result
     }
 
-    /// Writes an archive's files for the chosen categories into the library's folder. Merging
-    /// keeps files that are already there; replacing overwrites them. Clipboard images are
-    /// written only when their bytes match their content-addressed name.
-    @discardableResult
-    static func install(
-        _ files: [String: Data], categories: Set<LibraryArchiveCategory>, mode: LibraryImportMode, into directory: URL
+    // MARK: Restoring files
+
+    /// Writes an archive's files into the library's folder and saves the library, as one step
+    /// that can be undone:
+    /// 1. Every destination is checked first: owned by a portable store, its folder a real folder
+    ///    and the file, if there, a regular file. Nothing is followed through a symbolic link.
+    /// 2. The files are written to a hidden staging folder inside the library's folder.
+    /// 3. Each is moved into place; a file it replaces is moved aside, not deleted.
+    /// 4. `commit` saves the library. If it fails, or anything above does, the moved files go
+    ///    back and the replaced ones return. On success the replaced files are deleted, and the
+    ///    library's own cleanup removes pictures nothing refers to anymore.
+    /// Merging keeps files already there. Clipboard pictures are written only when their bytes
+    /// match their name. Returns how many files were written.
+    @MainActor
+    static func restore(
+        _ files: [String: Data], mode: LibraryImportMode, into directory: URL, commit: () -> String?
     ) throws -> Int {
-        let root = directory.standardizedFileURL
-        var written = 0
+        let unsafe = Failure("The archive contains an unsafe file path.")
+        if fileKind(directory.path) == nil {
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
+        }
+        guard let root = realDirectory(directory) else { throw unsafe }
+
+        struct Placement {
+            var folder: String
+            var destination: String
+            var data: Data
+        }
+        var plan: [Placement] = []
+        var seen = Set<String>()
         for (path, data) in files.sorted(by: { $0.key < $1.key }) {
             try validate(path)
-            let category = category(forFile: path)
-            guard categories.contains(category) else { continue }
-            if category == .clipboard, path.hasSuffix(".png") {
-                let name = (path as NSString).lastPathComponent
-                guard ClipboardImageCodec.digest(data) + ".png" == name else { continue }
+            guard seen.insert(canonical(path)).inserted else { throw Failure("The archive names the same file twice.") }
+            let parts = path.split(separator: "/").map(String.init)
+            if parts[1].hasSuffix(".png"), category(forFile: path) == .clipboard,
+                digest(data) + ".png" != parts[1]
+            {
+                continue
             }
-            let destination = root.appending(path: path)
-            let folder = destination.deletingLastPathComponent()
-            try FileManager.default.createDirectory(
-                at: folder, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
-            // Never write through a link that leads out of the library's folder.
-            guard folder.resolvingSymlinksInPath().path.hasPrefix(root.resolvingSymlinksInPath().path),
-                (try? destination.resourceValues(forKeys: [.isSymbolicLinkKey]).isSymbolicLink) != true
-            else { throw Failure("The archive contains an unsafe file path.") }
-            if mode == .merge, FileManager.default.fileExists(atPath: destination.path) { continue }
-            try data.write(to: destination, options: .atomic)
-            try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: destination.path)
-            written += 1
+            let folder = root + "/" + parts[0]
+            if let kind = fileKind(folder), kind != S_IFDIR { throw unsafe }
+            let destination = folder + "/" + parts[1]
+            if let kind = fileKind(destination) {
+                guard kind == S_IFREG else { throw unsafe }
+                if mode == .merge { continue }
+            }
+            plan.append(Placement(folder: folder, destination: destination, data: data))
         }
-        return written
+
+        let staging = root + "/.openray-import-" + UUID().uuidString
+        guard mkdir(staging, 0o700) == 0 else { throw Failure("The import couldn't prepare its files.") }
+        defer { try? FileManager.default.removeItem(atPath: staging) }
+        for (index, placement) in plan.enumerated() {
+            guard FileManager.default.createFile(
+                atPath: staging + "/new-\(index)", contents: placement.data, attributes: [.posixPermissions: 0o600])
+            else { throw Failure("The import couldn't write its files. Is the disk full?") }
+        }
+
+        var placed: [(destination: String, replaced: String?)] = []
+        func rollBack() {
+            for item in placed.reversed() {
+                unlink(item.destination)
+                if let replaced = item.replaced { rename(replaced, item.destination) }
+            }
+        }
+        do {
+            for (index, placement) in plan.enumerated() {
+                if fileKind(placement.folder) == nil, mkdir(placement.folder, 0o700) != 0 {
+                    throw Failure("The import couldn't create \((placement.folder as NSString).lastPathComponent).")
+                }
+                guard fileKind(placement.folder) == S_IFDIR else { throw unsafe }
+                var replaced: String?
+                if let kind = fileKind(placement.destination) {
+                    guard kind == S_IFREG else { throw unsafe }
+                    let aside = staging + "/old-\(index)"
+                    guard rename(placement.destination, aside) == 0 else {
+                        throw Failure("The import couldn't replace \((placement.destination as NSString).lastPathComponent).")
+                    }
+                    replaced = aside
+                }
+                guard rename(staging + "/new-\(index)", placement.destination) == 0 else {
+                    if let replaced { rename(replaced, placement.destination) }
+                    throw Failure("The import couldn't place \((placement.destination as NSString).lastPathComponent).")
+                }
+                placed.append((placement.destination, replaced))
+            }
+        } catch {
+            rollBack()
+            throw error
+        }
+        if let message = commit() {
+            rollBack()
+            throw Failure(message)
+        }
+        return plan.count
+    }
+
+    /// The folder's real path, when it's a folder.
+    static func realDirectory(_ url: URL) -> String? {
+        guard let resolved = realpath(url.path, nil) else { return nil }
+        defer { free(resolved) }
+        let path = String(cString: resolved)
+        return fileKind(path) == S_IFDIR ? path : nil
+    }
+
+    /// What's at a path, without following a symbolic link there. Nil when nothing is.
+    static func fileKind(_ path: String) -> mode_t? {
+        var info = stat()
+        guard lstat(path, &info) == 0 else { return nil }
+        return info.st_mode & S_IFMT
     }
 
     // MARK: Helpers
@@ -649,6 +881,10 @@ struct LibraryBackupSettings: Codable, Equatable, Sendable {
     var keep = 7
     var lastBackupAt: Date?
     var lastError: String?
+    /// What the last backup left out, if anything.
+    var lastNote: String?
+    /// This Mac's backup set. Rotation deletes only the files this set's index lists.
+    var setID: UUID?
 
     static let keepRange = 1...100
 
@@ -705,10 +941,23 @@ final class LibraryBackupSettingsStore {
     }
 }
 
+/// Backups in a chosen folder. Each Mac's backups form a set with its own index file in the
+/// folder; rotation deletes only regular files that index lists and OpenRay named, so other
+/// files, folders and other sets' backups are never touched.
 enum LibraryBackup {
     static let namePrefix = "OpenRay Backup "
 
-    /// `OpenRay Backup 2026-11-26 0930 15.openraybackup`: sortable by name, in local time.
+    struct Index: Codable, Equatable, Sendable {
+        struct Entry: Codable, Equatable, Sendable {
+            var name: String
+            var sequence: Int
+            var createdAt: Date
+        }
+        var setID: UUID
+        var entries: [Entry] = []
+    }
+
+    /// `OpenRay Backup 2026-11-26 0930 15.openraybackup`, in local time.
     static func fileName(for date: Date, calendar: Calendar = .current) -> String {
         let parts = calendar.dateComponents([.year, .month, .day, .hour, .minute, .second], from: date)
         let stamp = String(
@@ -717,34 +966,72 @@ enum LibraryBackup {
         return namePrefix + stamp + "." + LibraryArchive.fileExtension
     }
 
-    /// The backups in a folder, newest first. Only files OpenRay named are listed.
-    static func backups(in folder: URL) throws -> [URL] {
-        try FileManager.default.contentsOfDirectory(at: folder, includingPropertiesForKeys: nil, options: [.skipsHiddenFiles])
-            .filter { $0.lastPathComponent.hasPrefix(namePrefix) && $0.pathExtension == LibraryArchive.fileExtension }
-            .sorted { $0.lastPathComponent > $1.lastPathComponent }
+    static func isBackupName(_ name: String) -> Bool {
+        name.hasPrefix(namePrefix) && name.hasSuffix("." + LibraryArchive.fileExtension) && !name.contains("/")
     }
 
-    /// Writes one backup, then deletes all but the newest `keep`. Returns the new file.
+    static func indexURL(in folder: URL, setID: UUID) -> URL {
+        folder.appending(path: ".openray-backups-\(setID.uuidString.lowercased()).json")
+    }
+
+    static func index(in folder: URL, setID: UUID) -> Index {
+        guard let data = try? Data(contentsOf: indexURL(in: folder, setID: setID)),
+            let index = try? JSONDecoder().decode(Index.self, from: data), index.setID == setID
+        else { return Index(setID: setID) }
+        return index
+    }
+
+    /// This set's backups that are still there, newest first.
+    static func backups(in folder: URL, setID: UUID) -> [URL] {
+        index(in: folder, setID: setID).entries.sorted { $0.sequence > $1.sequence }
+            .map { folder.appending(path: $0.name) }
+            .filter { LibraryArchive.fileKind($0.path) == S_IFREG }
+    }
+
+    /// Writes one backup into the set, then deletes all but the set's newest `keep`. Returns the new file.
     @discardableResult
-    static func write(_ archive: Data, to folder: URL, keep: Int, now: Date = .now) throws -> URL {
+    static func write(_ archive: Data, to folder: URL, setID: UUID, keep: Int, now: Date = .now) throws -> URL {
+        try InertWrites.check(folder, what: "writing backups")
         try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
-        var url = folder.appending(path: fileName(for: now))
+        var index = index(in: folder, setID: setID)
+        let stem = (fileName(for: now) as NSString).deletingPathExtension
+        var name = fileName(for: now)
         var suffix = 2
-        while FileManager.default.fileExists(atPath: url.path) {
-            url = folder.appending(path: (fileName(for: now) as NSString).deletingPathExtension + " \(suffix)." + LibraryArchive.fileExtension)
+        while LibraryArchive.fileKind(folder.appending(path: name).path) != nil {
+            name = "\(stem) \(suffix).\(LibraryArchive.fileExtension)"
             suffix += 1
         }
-        try archive.write(to: url, options: .atomic)
-        try rotate(in: folder, keep: keep)
+        let url = folder.appending(path: name)
+        try archive.write(to: url, options: [.withoutOverwriting])
+        index.entries.append(
+            Index.Entry(name: name, sequence: (index.entries.map(\.sequence).max() ?? 0) + 1, createdAt: now))
+        try save(index, in: folder)
+        try rotate(in: folder, setID: setID, keep: keep)
         return url
     }
 
-    /// Deletes every OpenRay backup in the folder but the newest `keep`. Other files stay.
+    /// Deletes this set's backups beyond the newest `keep`: only regular files the index lists,
+    /// with OpenRay's backup names, directly in the folder. Never a folder or a link.
     @discardableResult
-    static func rotate(in folder: URL, keep: Int) throws -> [URL] {
-        let old = Array(try backups(in: folder).dropFirst(max(1, keep)))
-        for url in old { try FileManager.default.removeItem(at: url) }
-        return old
+    static func rotate(in folder: URL, setID: UUID, keep: Int) throws -> [URL] {
+        var index = index(in: folder, setID: setID)
+        let ordered = index.entries.sorted { $0.sequence > $1.sequence }
+        let old = ordered.dropFirst(max(1, keep))
+        var removed: [URL] = []
+        for entry in old {
+            let url = folder.appending(path: entry.name)
+            if isBackupName(entry.name), LibraryArchive.fileKind(url.path) == S_IFREG, unlink(url.path) == 0 {
+                removed.append(url)
+            }
+        }
+        let dropped = Set(old.map(\.name))
+        index.entries.removeAll { dropped.contains($0.name) }
+        try save(index, in: folder)
+        return removed
+    }
+
+    private static func save(_ index: Index, in folder: URL) throws {
+        try JSONEncoder().encode(index).write(to: indexURL(in: folder, setID: index.setID), options: .atomic)
     }
 }
 
@@ -771,30 +1058,55 @@ extension LibraryStore {
         var filesWritten: Int
     }
 
-    /// Imports the chosen categories from an opened archive: one validated save of the library,
-    /// then the files those categories carry. Nothing changes when the save fails.
+    /// Imports the chosen categories from an opened archive. The merged library is checked
+    /// before anything changes; clipboard entries from the archive whose pictures aren't in it
+    /// (or already here) are left out; then files and library are written as one step that
+    /// rolls back if any part fails.
     func importArchive(
         _ contents: LibraryArchive.Contents, categories: Set<LibraryArchiveCategory>, mode: LibraryImportMode
     ) throws -> ArchiveImportReport {
         let chosen = categories.intersection(contents.categories)
         guard !chosen.isEmpty else { throw LibraryArchive.Failure("Choose at least one kind of data to import.") }
-        let (merged, notes) = LibraryArchive.merged(
+        guard !isReadOnly else { throw LibraryArchive.Failure(errorMessage ?? "The library can't be changed.") }
+        var (merged, notes) = LibraryArchive.merged(
             current: database, incoming: contents.database, categories: chosen, mode: mode)
-        guard replaceLibrary(with: merged) else {
-            throw LibraryArchive.Failure(errorMessage ?? "The library couldn't be saved.")
+        let files = contents.files.filter { path, _ in
+            LibraryArchive.category(forFile: path).map(chosen.contains) ?? false
         }
-        var written = 0
+        if chosen.contains(.clipboard) {
+            let imported = Set(contents.database.clipboard.map(\.id))
+            var missing = 0
+            merged.clipboard.removeAll { entry in
+                guard imported.contains(entry.id), let image = entry.image else { return false }
+                if let data = files["ClipboardImages/\(image.id).png"], LibraryArchive.digest(data) == image.id { return false }
+                if imageData(for: image) != nil { return false }
+                missing += 1
+                return true
+            }
+            if missing > 0 {
+                notes.append("\(missing) clipboard entr\(missing == 1 ? "y was" : "ies were") left out because their pictures weren't in the archive.")
+            }
+        }
+        do { try merged.validate() } catch { throw LibraryArchive.Failure(error.localizedDescription) }
+        let written: Int
         if let directory = fileURL?.deletingLastPathComponent() {
-            written = try LibraryArchive.install(contents.files, categories: chosen, mode: mode, into: directory)
+            written = try LibraryArchive.restore(files, mode: mode, into: directory) {
+                self.replaceLibrary(with: merged) ? nil : (self.errorMessage ?? "The library couldn't be saved.")
+            }
+        } else {
+            guard replaceLibrary(with: merged) else {
+                throw LibraryArchive.Failure(errorMessage ?? "The library couldn't be saved.")
+            }
+            written = 0
         }
         return ArchiveImportReport(categories: chosen, notes: notes, filesWritten: written)
     }
 
-    /// An archive of the whole library, or of the chosen categories, built off the main actor.
+    /// An archive of the chosen categories, built off the main actor.
     func makeArchive(
         categories: Set<LibraryArchiveCategory>, passphrase: String? = nil,
         iterations: Int = LibraryArchive.defaultIterations, now: Date = .now
-    ) async throws -> Data {
+    ) async throws -> LibraryArchive.Built {
         let database = database
         let directory = fileURL?.deletingLastPathComponent()
         return try await Task.detached(priority: .userInitiated) {
@@ -828,7 +1140,7 @@ final class LibraryBackupScheduler {
 
     /// Checks now and then every half hour. Does nothing while inert.
     func start() {
-        guard !sideEffects.isInert, task == nil else { return }
+        guard !sideEffects.isEffectivelyInert, task == nil else { return }
         task = Task { [weak self] in
             while !Task.isCancelled {
                 await self?.backUpIfDue()
@@ -855,34 +1167,27 @@ final class LibraryBackupScheduler {
         guard let folder = settings.settings.folder else {
             throw LibraryArchive.Failure("Choose a folder for backups first.")
         }
-        try checkAllowed(folder)
+        try InertWrites.check(folder, sideEffects: sideEffects, what: "writing backups")
         guard !isBackingUp else { throw LibraryArchive.Failure("A backup is already being made.") }
         isBackingUp = true
         defer { isBackingUp = false }
+        let setID = settings.settings.setID ?? UUID()
+        if settings.settings.setID == nil { settings.update { $0.setID = setID } }
         do {
-            let archive = try await store.makeArchive(categories: Set(LibraryArchiveCategory.allCases), now: now)
+            let built = try await store.makeArchive(categories: Set(LibraryArchiveCategory.allCases), now: now)
             let keep = settings.settings.keep
             let url = try await Task.detached(priority: .utility) {
-                try LibraryBackup.write(archive, to: folder, keep: keep, now: now)
+                try LibraryBackup.write(built.data, to: folder, setID: setID, keep: keep, now: now)
             }.value
             settings.update {
                 $0.lastBackupAt = now
                 $0.lastError = nil
+                $0.lastNote = built.omissions.isEmpty ? nil : built.omissions.joined(separator: " ")
             }
             return url
         } catch {
             settings.update { $0.lastError = error.localizedDescription }
             throw error
-        }
-    }
-
-    /// While inert, backups may go only into the temporary folder.
-    private func checkAllowed(_ folder: URL) throws {
-        guard sideEffects.isInert else { return }
-        let temporary = FileManager.default.temporaryDirectory.resolvingSymlinksInPath().path
-        let target = folder.standardizedFileURL.resolvingSymlinksInPath().path
-        if !target.hasPrefix(temporary.hasSuffix("/") ? temporary : temporary + "/") {
-            try sideEffects.check("writing backups")
         }
     }
 }

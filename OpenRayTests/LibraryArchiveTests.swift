@@ -27,16 +27,53 @@ final class TemporaryLibrary {
         (try? Data(contentsOf: folder.appending(path: path))).map { String(decoding: $0, as: UTF8.self) }
     }
 
+    func exists(_ path: String) -> Bool { FileManager.default.fileExists(atPath: folder.appending(path: path).path) }
+
     deinit { try? FileManager.default.removeItem(at: folder) }
+}
+
+/// Builds archive containers by hand, to feed the reader what OpenRay itself never writes.
+enum ArchiveCrafting {
+    static func uint32(_ value: Int) -> Data {
+        let big = UInt32(value).bigEndian
+        return withUnsafeBytes(of: big) { Data($0) }
+    }
+
+    static func entry(_ path: String, _ data: Data) -> LibraryArchive.FileEntry {
+        LibraryArchive.FileEntry(path: path, size: data.count, sha256: LibraryArchive.digest(data), category: nil)
+    }
+
+    /// A plain archive with exactly these files, in order, and these header bytes.
+    static func archive(
+        _ files: [(String, Data)], categories: [LibraryArchiveCategory] = LibraryArchiveCategory.allCases,
+        flags: UInt8 = 0, header: Data = Data(#"{"format":1}"#.utf8)
+    ) throws -> Data {
+        let manifest = LibraryArchive.Manifest(
+            createdAt: Date(timeIntervalSince1970: 0), appVersion: "test", schemaVersion: 5, categories: categories,
+            files: files.map { entry($0.0, $0.1) })
+        let manifestData = try JSONEncoder().encode(manifest)
+        var data = LibraryArchive.magic
+        data.append(1)
+        data.append(flags)
+        data.append(uint32(header.count))
+        data.append(header)
+        data.append(uint32(manifestData.count))
+        data.append(manifestData)
+        for (_, bytes) in files { data.append(bytes) }
+        return data
+    }
+
+    static func library(_ database: LibraryDatabase = LibraryDatabase()) throws -> Data { try JSONEncoder().encode(database) }
 }
 
 @Suite("Library archives")
 @MainActor
 struct LibraryArchiveTests {
-    static let fastIterations = 1_000
+    /// The reader's minimum, to keep the tests quick.
+    static let fastIterations = LibraryArchive.iterationRange.lowerBound
 
-    /// A library with something in every category the parity build stores today, plus a
-    /// clipboard image and another store file beside library.json.
+    /// A library with something in every category the parity build stores today, a clipboard
+    /// image, and this Mac's own files beside library.json.
     func populated() throws -> TemporaryLibrary {
         let library = try TemporaryLibrary()
         let store = library.store
@@ -59,28 +96,38 @@ struct LibraryArchiveTests {
         #expect(store.capture(ClipboardEntry(text: "copied text", sourceName: "Notes")))
         try library.write("chats.json", #"{"chats":[]}"#)
         try library.write(LibraryBackupSettingsStore.fileName, #"{"isEnabled":true}"#)
+        try library.write(LocalApprovalStore.fileName, "{}")
         try library.write("library-pending-cleanup.json", "[]")
         try library.write(".DS_Store", "x")
         return library
     }
 
+    func make(
+        _ library: TemporaryLibrary, _ categories: Set<LibraryArchiveCategory> = Set(LibraryArchiveCategory.allCases),
+        passphrase: String? = nil
+    ) throws -> Data {
+        try LibraryArchive.make(
+            database: library.store.database, directory: library.folder, categories: categories, passphrase: passphrase,
+            iterations: Self.fastIterations
+        ).data
+    }
+
     // MARK: Round trips
 
-    @Test("An archive of everything round-trips: library, clipboard images and other store files")
+    @Test("An archive of everything round-trips: the library and its clipboard pictures, nothing of this Mac's")
     func roundTrip() throws {
         let source = try populated()
-        let archive = try LibraryArchive.make(
-            database: source.store.database, directory: source.folder,
-            categories: Set(LibraryArchiveCategory.allCases), iterations: Self.fastIterations)
+        let archive = try make(source)
         #expect(try !LibraryArchive.isEncrypted(archive))
         let contents = try LibraryArchive.read(archive)
         #expect(contents.categories == Set(LibraryArchiveCategory.allCases))
         let imageID = try #require(source.store.database.clipboard.compactMap(\.image).first?.id)
-        #expect(Set(contents.files.keys) == ["ClipboardImages/\(imageID).png", "chats.json"])
+        // Only portable store files travel: not chats.json (no store owns it), never this Mac's own files.
+        #expect(Set(contents.files.keys) == ["ClipboardImages/\(imageID).png"])
 
         let target = try TemporaryLibrary()
         let report = try target.store.importArchive(contents, categories: contents.categories, mode: .replace)
-        #expect(report.filesWritten == 2)
+        #expect(report.filesWritten == 1)
         let before = source.store.database
         let after = target.store.database
         #expect(after.snippets == before.snippets)
@@ -88,20 +135,19 @@ struct LibraryArchiveTests {
         #expect(after.quicklinks == before.quicklinks)
         #expect(after.clipboard == before.clipboard)
         #expect(after.commandBindings == before.commandBindings)
-        #expect(after.scriptDirectories == before.scriptDirectories)
         #expect(after.windowLayouts == before.windowLayouts)
         #expect(after.calculatorHistory == before.calculatorHistory)
         #expect(after.commandPreferences == before.commandPreferences)
         #expect(after.favoriteIDs == before.favoriteIDs)
         #expect(after.preferences == before.preferences)
-        #expect(target.contents(of: "chats.json") == #"{"chats":[]}"#)
-        // The imported picture is there for the entry that shows it.
+        // Script folders arrive turned off.
+        #expect(after.scriptDirectories.map(\.path) == ["/Users/x/Scripts"])
+        #expect(after.scriptDirectories.allSatisfy { !$0.isEnabled })
         let entry = try #require(after.clipboard.first { $0.image != nil })
         #expect(target.store.imageData(for: try #require(entry.image)) != nil)
-        // Machine-local and hidden files never travel.
-        #expect(target.contents(of: LibraryBackupSettingsStore.fileName) == nil)
-        #expect(target.contents(of: ".DS_Store") == nil)
-        // The library on disk is the imported one.
+        for local in [LibraryBackupSettingsStore.fileName, LocalApprovalStore.fileName, "chats.json", ".DS_Store"] {
+            #expect(!target.exists(local), "\(local)")
+        }
         let reloaded = LibraryStore(fileURL: target.folder.appending(path: "library.json"))
         #expect(reloaded.database.snippets == before.snippets)
     }
@@ -109,10 +155,7 @@ struct LibraryArchiveTests {
     @Test("Encrypted archives need the passphrase and hide their contents")
     func encryption() throws {
         let source = try populated()
-        let archive = try LibraryArchive.make(
-            database: source.store.database, directory: source.folder,
-            categories: Set(LibraryArchiveCategory.allCases), passphrase: "correct horse battery",
-            iterations: Self.fastIterations)
+        let archive = try make(source, passphrase: "correct horse battery")
         #expect(try LibraryArchive.isEncrypted(archive))
         #expect(archive.range(of: Data("Best, Ada".utf8)) == nil)
         #expect(archive.range(of: Data("library.json".utf8)) == nil)
@@ -122,30 +165,49 @@ struct LibraryArchiveTests {
         }
         let contents = try LibraryArchive.read(archive, passphrase: "correct horse battery")
         #expect(contents.database.snippets == source.store.database.snippets)
-        #expect(contents.files.count == 2)
+        #expect(contents.files.count == 1)
         // The passphrase is normalized, so a decomposed é opens what a composed one sealed.
         let accented = try LibraryArchive.make(
             database: source.store.database, directory: nil, categories: [.snippets], passphrase: "caf\u{E9} au lait",
-            iterations: Self.fastIterations)
+            iterations: Self.fastIterations
+        ).data
         #expect(try LibraryArchive.read(accented, passphrase: "cafe\u{301} au lait").database.snippets.count == 1)
     }
 
     @Test("Tampering with an encrypted archive's body or header is detected")
     func tampering() throws {
         let source = try populated()
-        let archive = try LibraryArchive.make(
-            database: source.store.database, directory: nil, categories: [.snippets], passphrase: "passphrase!",
-            iterations: Self.fastIterations)
+        let archive = try make(source, [.snippets], passphrase: "passphrase!")
         var body = archive
         body[body.count - 20] ^= 0xFF
         #expect(throws: LibraryArchive.Failure.self) { try LibraryArchive.read(body, passphrase: "passphrase!") }
         // The header is authenticated: changing the iteration count breaks decryption.
-        let range = try #require(archive.range(of: Data("\"iterations\":1000".utf8)))
+        let original = Data("\"iterations\":\(Self.fastIterations)".utf8)
+        let range = try #require(archive.range(of: original))
         var changed = archive
-        changed.replaceSubrange(range, with: Data("\"iterations\":1001".utf8))
+        changed.replaceSubrange(range, with: Data("\"iterations\":\(Self.fastIterations + 1)".utf8))
         #expect(changed.count == archive.count)
         #expect(throws: LibraryArchive.Failure.self) { try LibraryArchive.read(changed, passphrase: "passphrase!") }
         #expect(try LibraryArchive.read(archive, passphrase: "passphrase!").database.snippets.count == 1)
+    }
+
+    @Test("Only the v1 suite is read: unknown flags, labels, salt sizes and iteration counts are refused")
+    func strictHeader() throws {
+        let library = try ArchiveCrafting.library()
+        #expect(throws: LibraryArchive.Failure.self) { try LibraryArchive.read(try ArchiveCrafting.archive([("library.json", library)], flags: 2)) }
+        let salt = Data(repeating: 7, count: 16).base64EncodedString()
+        for header in [
+            #"{"format":1,"encryption":{"algorithm":"AES-128-CBC","keyDerivation":"PBKDF2-HMAC-SHA256","iterations":600000,"salt":"\#(salt)"}}"#,
+            #"{"format":1,"encryption":{"algorithm":"AES-256-GCM","keyDerivation":"scrypt","iterations":600000,"salt":"\#(salt)"}}"#,
+            #"{"format":1,"encryption":{"algorithm":"AES-256-GCM","keyDerivation":"PBKDF2-HMAC-SHA256","iterations":10,"salt":"\#(salt)"}}"#,
+            #"{"format":1,"encryption":{"algorithm":"AES-256-GCM","keyDerivation":"PBKDF2-HMAC-SHA256","iterations":600000,"salt":"AAAA"}}"#,
+        ] {
+            let crafted = try ArchiveCrafting.archive([("library.json", library)], flags: 1, header: Data(header.utf8))
+            #expect(throws: LibraryArchive.Failure.self) { try LibraryArchive.isEncrypted(crafted) }
+        }
+        #expect(throws: LibraryArchive.Failure.self) {
+            try LibraryArchive.make(database: LibraryDatabase(), directory: nil, categories: [.notes], passphrase: "x", iterations: 1_000)
+        }
     }
 
     @Test("Damaged, foreign and newer archives are refused")
@@ -154,16 +216,64 @@ struct LibraryArchiveTests {
         #expect(throws: LibraryArchive.Failure("That file isn't an OpenRay archive.")) {
             try LibraryArchive.read(Data("{\"not\":\"an archive\"}".utf8))
         }
-        var archive = try LibraryArchive.make(database: source.store.database, directory: nil, categories: [.notes])
+        var archive = try make(source, [.notes])
         archive[archive.count - 3] ^= 0x01
         #expect(throws: LibraryArchive.Failure.self) { try LibraryArchive.read(archive) }
         var future = source.store.database
         future.schemaVersion = LibraryDatabase.currentSchemaVersion + 1
-        let newer = try LibraryArchive.make(database: future, directory: nil, categories: [.notes])
+        let newer = try LibraryArchive.make(database: future, directory: nil, categories: [.notes]).data
         #expect(throws: LibraryArchive.Failure.self) { try LibraryArchive.read(newer) }
         #expect(throws: LibraryArchive.Failure.self) {
             try LibraryArchive.make(database: source.store.database, directory: nil, categories: [])
         }
+    }
+
+    // MARK: Names the reader refuses (blocker 1)
+
+    @Test("An archive naming the library or this Mac's files, under any spelling, is refused")
+    func reservedNames() throws {
+        let library = try ArchiveCrafting.library()
+        for name in [
+            "LIBRARY.json", "Library.JSON", "library-pending-cleanup.json", "local-approvals.json", "LOCAL-APPROVALS.JSON",
+            "backup-settings.json", "currency-rates.json", "ClipboardImages/library.json",
+        ] {
+            let crafted = try ArchiveCrafting.archive([("library.json", library), (name, Data("{}".utf8))])
+            #expect(throws: LibraryArchive.Failure.self, "\(name)") { try LibraryArchive.read(crafted) }
+        }
+    }
+
+    @Test("Files no portable store owns, duplicates and aliases are refused")
+    func unportableAndDuplicateNames() throws {
+        let library = try ArchiveCrafting.library()
+        let png = Data("png".utf8)
+        let digest = LibraryArchive.digest(png)
+        let name = "ClipboardImages/\(digest).png"
+        for files in [
+            [("library.json", library), ("chats.json", Data("{}".utf8))],
+            [("library.json", library), ("ClipboardImages/notes.txt", Data("x".utf8))],
+            [("library.json", library), ("ClipboardImages/sub/\(digest).png", png)],
+            [("library.json", library), (name, png), (name, png)],
+            [("library.json", library), (name, png), ("ClipboardImages/\(digest.uppercased()).png", png)],
+            [("library.json", library), ("library.json", library)],
+        ] {
+            let crafted = try ArchiveCrafting.archive(files)
+            #expect(throws: LibraryArchive.Failure.self, "\(files.map(\.0))") { try LibraryArchive.read(crafted) }
+        }
+        #expect(try LibraryArchive.read(try ArchiveCrafting.archive([("library.json", library), (name, png)])).files.count == 1)
+    }
+
+    @Test("Archive paths can't be unsafe")
+    func paths() throws {
+        let digest = String(repeating: "a", count: 64)
+        for bad in [
+            "../escape", "/etc/hosts", ".hidden/file", "a//b", "a/./b", "", "x/../../y", "chats.json",
+            "ClipboardImages/../library.json", "ClipboardImages/abc.png",
+        ] {
+            #expect(throws: LibraryArchive.Failure.self, "\(bad)") { try LibraryArchive.validate(bad) }
+        }
+        try LibraryArchive.validate("ClipboardImages/\(digest).png")
+        try LibraryArchive.validate("ClipboardImages/\(digest).rich")
+        try LibraryArchive.validate("ClipboardImages/\(digest).txt")
     }
 
     // MARK: Selection
@@ -171,20 +281,31 @@ struct LibraryArchiveTests {
     @Test("An export carries only the chosen categories and their files")
     func selectiveExport() throws {
         let source = try populated()
-        let archive = try LibraryArchive.make(
-            database: source.store.database, directory: source.folder, categories: [.snippets, .otherData])
-        let contents = try LibraryArchive.read(archive)
-        #expect(contents.categories == [.snippets, .otherData])
+        let contents = try LibraryArchive.read(try make(source, [.snippets]))
+        #expect(contents.categories == [.snippets])
         #expect(contents.database.snippets.count == 1)
         #expect(contents.database.notes.isEmpty)
         #expect(contents.database.clipboard.isEmpty)
         #expect(contents.database.commandBindings.isEmpty)
-        #expect(Set(contents.files.keys) == ["chats.json"])
+        #expect(contents.files.isEmpty)
         let preview = LibraryArchive.preview(contents, current: source.store.database)
-        #expect(preview.map(\.category) == [.snippets, .otherData])
+        #expect(preview.map(\.category) == [.snippets])
         #expect(preview[0].archived == 1)
         #expect(preview[0].current == 1)
-        #expect(preview[1].files == 1)
+        #expect(!LibraryArchive.exportableCategories.contains(.otherData))
+    }
+
+    @Test("An export leaves out entries whose pictures are missing, and says so")
+    func exportChecksPictures() throws {
+        let source = try populated()
+        let image = try #require(source.store.database.clipboard.compactMap(\.image).first)
+        try FileManager.default.removeItem(at: source.folder.appending(path: "ClipboardImages/\(image.id).png"))
+        let built = try LibraryArchive.make(
+            database: source.store.database, directory: source.folder, categories: [.clipboard])
+        #expect(built.omissions.count == 1)
+        let contents = try LibraryArchive.read(built.data)
+        #expect(contents.database.clipboard.allSatisfy { $0.image == nil })
+        #expect(contents.database.clipboard.count == 1)
     }
 
     @Test("Merging updates matching items, adds new ones, and frees clashing keywords and aliases")
@@ -206,9 +327,8 @@ struct LibraryArchiveTests {
         ]
         incoming.notes = [QuickNote(title: "Theirs", content: "Theirs")]
         incoming.commandBindings = [CommandBinding(targetID: "section.notes", alias: "ff")]
-        let archive = try LibraryArchive.make(
-            database: incoming, directory: nil, categories: [.snippets, .notes, .shortcuts])
-        let contents = try LibraryArchive.read(archive)
+        let contents = try LibraryArchive.read(
+            try LibraryArchive.make(database: incoming, directory: nil, categories: [.snippets, .notes, .shortcuts]).data)
 
         let report = try target.store.importArchive(contents, categories: [.snippets, .shortcuts], mode: .merge)
         let snippets = target.store.database.snippets
@@ -218,12 +338,28 @@ struct LibraryArchiveTests {
         #expect(snippets[2].keyword == "")
         #expect(target.store.database.commandBindings.map(\.targetID) == ["section.files"])
         #expect(report.notes.count == 2)
-        // Notes weren't chosen, so they're untouched.
         #expect(target.store.database.notes.map(\.title) == ["Mine"])
 
         _ = try target.store.importArchive(contents, categories: [.notes], mode: .replace)
         #expect(target.store.database.notes.map(\.title) == ["Theirs"])
         #expect(target.store.database.snippets.count == 3)
+    }
+
+    @Test("Importing without Shortcuts never touches an alias here; the imported keyword gives way")
+    func unselectedShortcutsUntouched() throws {
+        let target = try TemporaryLibrary()
+        target.store.update { $0.commandBindings = [CommandBinding(targetID: "section.notes", alias: "docs")] }
+        var incoming = LibraryDatabase()
+        incoming.quicklinks = [Quicklink(name: "Docs", template: "https://example.com", keyword: "docs")]
+        incoming.snippets = [Snippet(name: "Docs snippet", keyword: "docs", content: "x")]
+        incoming.commandBindings = [CommandBinding(targetID: "section.notes", alias: "notes")]
+        let contents = try LibraryArchive.read(
+            try LibraryArchive.make(database: incoming, directory: nil, categories: [.quicklinks, .snippets, .shortcuts]).data)
+        let report = try target.store.importArchive(contents, categories: [.quicklinks, .snippets], mode: .merge)
+        #expect(target.store.database.commandBindings == [CommandBinding(targetID: "section.notes", alias: "docs")])
+        #expect(target.store.database.quicklinks.first { $0.name == "Docs" }?.keyword == "")
+        #expect(target.store.database.snippets.first?.keyword == "")
+        #expect(report.notes.contains { $0.contains("keyword") })
     }
 
     @Test("Merging favorites and usage keeps both, with the larger count and the later date")
@@ -245,24 +381,86 @@ struct LibraryArchiveTests {
         #expect(merged.usage.contains { $0.id == "y" })
     }
 
-    @Test("Script folders already listed aren't added twice")
-    func mergeScripts() {
+    // MARK: Scripts and permissions (blocker 2, deeplink trust)
+
+    @Test("Imported script folders arrive off; folders already here keep their own state")
+    func scriptsArriveOff() {
+        let local = ScriptDirectoryRecord(path: "/Users/me/Scripts", isEnabled: true)
         var current = LibraryDatabase()
-        current.scriptDirectories = [ScriptDirectoryRecord(path: "/a")]
+        current.scriptDirectories = [local]
         var incoming = LibraryDatabase()
-        incoming.scriptDirectories = [ScriptDirectoryRecord(path: "/a"), ScriptDirectoryRecord(path: "/b")]
-        let merged = LibraryArchive.merged(current: current, incoming: incoming, categories: [.scripts], mode: .merge).database
-        #expect(merged.scriptDirectories.map(\.path) == ["/a", "/b"])
+        incoming.scriptDirectories = [
+            ScriptDirectoryRecord(id: local.id, path: "/Users/evil/Payload", isEnabled: true),
+            ScriptDirectoryRecord(path: "/users/me/scripts", isEnabled: false),
+            ScriptDirectoryRecord(path: "/Volumes/Shared/Tools", isEnabled: true),
+        ]
+        for mode in LibraryImportMode.allCases {
+            let (merged, notes) = LibraryArchive.merged(current: current, incoming: incoming, categories: [.scripts], mode: mode)
+            #expect(merged.scriptDirectories.first { $0.id == local.id } == local, "\(mode)")
+            let added = merged.scriptDirectories.filter { $0.id != local.id }
+            #expect(Set(added.map(\.path)) == ["/Users/evil/Payload", "/Volumes/Shared/Tools"], "\(mode)")
+            #expect(added.allSatisfy { !$0.isEnabled }, "\(mode)")
+            #expect(Set(merged.scriptDirectories.map(\.id)).count == merged.scriptDirectories.count)
+            #expect(notes.contains { $0.contains("turned off") })
+        }
     }
 
-    @Test("A failed import changes nothing")
+    @Test("An imported folder runs nothing until it's allowed on this Mac")
+    func importedFolderInert() throws {
+        let target = try TemporaryLibrary()
+        let scripts = try ScriptFolder()
+        try scripts.script("boom.sh", title: "Boom", mode: "inline", extra: ["refreshTime 10s"], body: "echo boom")
+        var incoming = LibraryDatabase()
+        incoming.scriptDirectories = [ScriptDirectoryRecord(path: scripts.url.path, isEnabled: true)]
+        let contents = try LibraryArchive.read(
+            try LibraryArchive.make(database: incoming, directory: nil, categories: [.scripts]).data)
+        _ = try target.store.importArchive(contents, categories: [.scripts], mode: .merge)
+        let provider = ScriptCommandProvider(
+            catalog: ScriptCatalog(), runner: ScriptRunner(launcher: CannedScriptLauncher(
+                execution: ScriptExecution(termination: .exited(0), output: "boom", duration: .zero))),
+            presenter: RecordingScriptPresenter(), refreshesAutomatically: false)
+        let model = LauncherModel(
+            store: target.store, ai: AIChatModel(engine: TestAIEngine()), pasteboard: NSPasteboard.withUniqueName(),
+            registry: CommandRegistry(providers: [provider]))
+        provider.synchronize(with: model, synchronously: true)
+        #expect(provider.catalog.commands.isEmpty)
+        provider.refreshDueInlineScripts(in: model)
+        #expect(provider.runner.jobs.isEmpty)
+    }
+
+    @Test("Restoring settings never brings link permissions")
+    func noLinkTrustTravels() throws {
+        let source = try populated()
+        source.store.update { $0.commandPreferences["linktest.plain"] = [DeepLinkRouter.legacyTrustKey: "com.example.browser", "x": "1"] }
+        LocalApprovalStore.for(source.store).setLinksRunWithoutAsking(true, for: "linktest.plain")
+        let contents = try LibraryArchive.read(try make(source, [.settings]))
+        #expect(contents.database.commandPreferences["linktest.plain"] == ["x": "1"])
+        let target = try TemporaryLibrary()
+        LocalApprovalStore.for(target.store).setLinksRunWithoutAsking(true, for: "kept.here")
+        for mode in LibraryImportMode.allCases {
+            _ = try target.store.importArchive(contents, categories: [.settings], mode: mode)
+            #expect(target.store.database.commandPreferences["linktest.plain"]?[DeepLinkRouter.legacyTrustKey] == nil)
+            #expect(!LocalApprovalStore.for(target.store).linksRunWithoutAsking("linktest.plain"))
+            #expect(LocalApprovalStore.for(target.store).linksRunWithoutAsking("kept.here"))
+        }
+        // A hand-made archive carrying the legacy grant is stripped on import too.
+        var crafted = LibraryDatabase()
+        crafted.commandPreferences = ["a.b": [DeepLinkRouter.legacyTrustKey: "com.example.browser"]]
+        let raw = try LibraryArchive.read(try ArchiveCrafting.archive([("library.json", try ArchiveCrafting.library(crafted))]))
+        _ = try target.store.importArchive(raw, categories: [.settings], mode: .merge)
+        #expect(target.store.database.commandPreferences["a.b"] == nil)
+    }
+
+    // MARK: Restoring files (majors: containment, transactions)
+
+    @Test("A failed import changes nothing, files included")
     func atomicImport() throws {
         let target = try TemporaryLibrary()
         target.store.update { $0.snippets = [Snippet(name: "Keep", keyword: "", content: "x")] }
         var incoming = LibraryDatabase()
         incoming.preferences.clipboardLimit = 9_999
         let contents = try LibraryArchive.read(
-            try LibraryArchive.make(database: incoming, directory: nil, categories: [.settings]))
+            try LibraryArchive.make(database: incoming, directory: nil, categories: [.settings]).data)
         #expect(throws: LibraryArchive.Failure.self) {
             try target.store.importArchive(contents, categories: [.settings], mode: .replace)
         }
@@ -271,47 +469,102 @@ struct LibraryArchiveTests {
         #expect(!target.store.replaceLibrary(with: incoming))
     }
 
-    @Test("Backups kept inside the library's folder never end up in new archives")
-    func nestedBackups() throws {
-        let library = try TemporaryLibrary()
-        try library.write("Backups/OpenRay Backup 2026-01-01 0000 00.\(LibraryArchive.fileExtension)", "old archive")
-        try library.write("Backups/readme.txt", "kept")
-        let paths = try LibraryArchive.storeFiles(in: library.folder).map(\.0)
-        #expect(paths == ["Backups/readme.txt"])
-    }
-
-    // MARK: Paths
-
-    @Test("Archive paths can't leave the library's folder")
-    func paths() throws {
-        for bad in ["../escape", "/etc/hosts", ".hidden/file", "a//b", "a/./b", "", "x/../../y"] {
-            #expect(throws: LibraryArchive.Failure.self, "\(bad)") { try LibraryArchive.validate(bad) }
-        }
-        try LibraryArchive.validate("ClipboardImages/abc.png")
-        try LibraryArchive.validate("chats.json")
+    @Test("When the save fails after files are placed, they're taken back and replaced ones return")
+    func rollback() throws {
         let target = try TemporaryLibrary()
-        #expect(throws: LibraryArchive.Failure.self) {
-            try LibraryArchive.install(["../outside.txt": Data("x".utf8)], categories: [.otherData], mode: .replace, into: target.folder)
+        let new = Data("new".utf8)
+        let rich = "ClipboardImages/\(String(repeating: "b", count: 64)).rich"
+        let png = "ClipboardImages/\(LibraryArchive.digest(new)).png"
+        try target.write(rich, "old")
+        #expect(throws: LibraryArchive.Failure("disk full")) {
+            try LibraryArchive.restore([rich: new, png: new], mode: .replace, into: target.folder) { "disk full" }
         }
-        #expect(!FileManager.default.fileExists(atPath: target.folder.deletingLastPathComponent().appending(path: "outside.txt").path))
+        #expect(target.contents(of: rich) == "old")
+        #expect(!target.exists(png))
+        let leftovers = try FileManager.default.contentsOfDirectory(atPath: target.folder.path).filter { $0.hasPrefix(".openray-import") }
+        #expect(leftovers.isEmpty)
+        // The same restore that commits keeps the new files.
+        let written = try LibraryArchive.restore([rich: new, png: new], mode: .replace, into: target.folder) { nil }
+        #expect(written == 2)
+        #expect(target.contents(of: rich) == "new")
+        #expect(target.exists(png))
     }
 
-    @Test("Images whose bytes don't match their name aren't installed; merging keeps existing files")
-    func install() throws {
+    @Test("Imports never write through links, into a folder that's a link, or over one")
+    func containment() throws {
+        let target = try TemporaryLibrary()
+        let outside = FileManager.default.temporaryDirectory.appending(path: "OpenRayOutside-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: outside, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: outside) }
+        let png = Data("png".utf8)
+        let path = "ClipboardImages/\(LibraryArchive.digest(png)).png"
+        // The store's folder is a link out of the library.
+        try FileManager.default.createSymbolicLink(
+            at: target.folder.appending(path: "ClipboardImages"), withDestinationURL: outside)
+        #expect(throws: LibraryArchive.Failure.self) {
+            try LibraryArchive.restore([path: png], mode: .replace, into: target.folder) { nil }
+        }
+        #expect(try FileManager.default.contentsOfDirectory(atPath: outside.path).isEmpty)
+        // The destination itself is a link.
+        try FileManager.default.removeItem(at: target.folder.appending(path: "ClipboardImages"))
+        try FileManager.default.createDirectory(at: target.folder.appending(path: "ClipboardImages"), withIntermediateDirectories: true)
+        try FileManager.default.createSymbolicLink(
+            at: target.folder.appending(path: path), withDestinationURL: outside.appending(path: "victim"))
+        #expect(throws: LibraryArchive.Failure.self) {
+            try LibraryArchive.restore([path: png], mode: .replace, into: target.folder) { nil }
+        }
+        #expect(!FileManager.default.fileExists(atPath: outside.appending(path: "victim").path))
+        // Unsafe and unowned paths are refused before anything is written.
+        #expect(throws: LibraryArchive.Failure.self) {
+            try LibraryArchive.restore(["../outside.txt": png], mode: .replace, into: target.folder) { nil }
+        }
+        #expect(throws: LibraryArchive.Failure.self) {
+            try LibraryArchive.restore(["Library.JSON": png], mode: .replace, into: target.folder) { nil }
+        }
+    }
+
+    @Test("Pictures whose bytes don't match their name are skipped; merging keeps existing files")
+    func installRules() throws {
         let target = try TemporaryLibrary()
         let png = Data("png bytes".utf8)
-        let good = "ClipboardImages/\(ClipboardImageCodec.digest(png)).png"
+        let good = "ClipboardImages/\(LibraryArchive.digest(png)).png"
         let bad = "ClipboardImages/\(String(repeating: "a", count: 64)).png"
-        try target.write("chats.json", "mine")
-        let written = try LibraryArchive.install(
-            [good: png, bad: png, "chats.json": Data("theirs".utf8)], categories: [.clipboard, .otherData], mode: .merge,
-            into: target.folder)
+        let text = "ClipboardImages/\(String(repeating: "c", count: 64)).txt"
+        try target.write(text, "mine")
+        let written = try LibraryArchive.restore([good: png, bad: png, text: Data("theirs".utf8)], mode: .merge, into: target.folder) { nil }
         #expect(written == 1)
-        #expect(FileManager.default.fileExists(atPath: target.folder.appending(path: good).path))
-        #expect(!FileManager.default.fileExists(atPath: target.folder.appending(path: bad).path))
-        #expect(target.contents(of: "chats.json") == "mine")
-        try LibraryArchive.install(["chats.json": Data("theirs".utf8)], categories: [.otherData], mode: .replace, into: target.folder)
-        #expect(target.contents(of: "chats.json") == "theirs")
+        #expect(target.exists(good))
+        #expect(!target.exists(bad))
+        #expect(target.contents(of: text) == "mine")
+    }
+
+    @Test("Imported clipboard entries without their pictures are left out, and the import says so")
+    func importChecksPictures() throws {
+        let source = try populated()
+        var contents = try LibraryArchive.read(try make(source, [.clipboard]))
+        contents.files = [:]
+        let target = try TemporaryLibrary()
+        let report = try target.store.importArchive(contents, categories: [.clipboard], mode: .merge)
+        #expect(target.store.database.clipboard.allSatisfy { $0.image == nil })
+        #expect(target.store.database.clipboard.count == 1)
+        #expect(report.notes.contains { $0.contains("pictures") })
+    }
+
+    @Test("Store files are read only from portable stores, never through links")
+    func storeFilesRules() throws {
+        let library = try TemporaryLibrary()
+        let png = Data("png".utf8)
+        try library.write("ClipboardImages/\(LibraryArchive.digest(png)).png", "png")
+        try library.write("ClipboardImages/readme.txt", "no")
+        try library.write("Backups/OpenRay Backup 2026-01-01 0000 00.\(LibraryArchive.fileExtension)", "old archive")
+        let outside = FileManager.default.temporaryDirectory.appending(path: "OpenRaySecret-\(UUID().uuidString)")
+        try Data("secret".utf8).write(to: outside)
+        defer { try? FileManager.default.removeItem(at: outside) }
+        try FileManager.default.createSymbolicLink(
+            at: library.folder.appending(path: "ClipboardImages/\(String(repeating: "d", count: 64)).png"),
+            withDestinationURL: outside)
+        let found = try LibraryArchive.storeFiles(in: library.folder)
+        #expect(Set(found.files.keys) == ["ClipboardImages/\(LibraryArchive.digest(png)).png"])
     }
 }
 
@@ -325,25 +578,44 @@ struct LibraryBackupTests {
         return url
     }
 
-    @Test("Backup names sort by time and rotation keeps the newest, leaving other files alone")
+    @Test("Rotation keeps this set's newest backups and touches nothing else in the folder")
     func rotation() throws {
         let folder = try temporaryFolder()
         defer { try? FileManager.default.removeItem(at: folder) }
-        try Data("mine".utf8).write(to: folder.appending(path: "notes.txt"))
+        let set = UUID()
         let start = Date(timeIntervalSince1970: 1_700_000_000)
+        // Someone else's files with OpenRay's naming: another set's backup and a folder.
+        let foreign = folder.appending(path: LibraryBackup.fileName(for: start.addingTimeInterval(-86_400)))
+        try Data("not mine".utf8).write(to: foreign)
+        let decoy = folder.appending(path: LibraryBackup.fileName(for: start.addingTimeInterval(-2 * 86_400)))
+        try FileManager.default.createDirectory(at: decoy, withIntermediateDirectories: true)
+        try Data("inside".utf8).write(to: decoy.appending(path: "keep.txt"))
+        try Data("mine".utf8).write(to: folder.appending(path: "notes.txt"))
         var written: [URL] = []
         for day in 0..<5 {
-            written.append(try LibraryBackup.write(Data("archive \(day)".utf8), to: folder, keep: 3, now: start.addingTimeInterval(Double(day) * 86_400)))
+            written.append(
+                try LibraryBackup.write(Data("archive \(day)".utf8), to: folder, setID: set, keep: 3, now: start.addingTimeInterval(Double(day) * 86_400)))
         }
-        let kept = try LibraryBackup.backups(in: folder)
+        let kept = LibraryBackup.backups(in: folder, setID: set)
         #expect(kept.map(\.lastPathComponent) == written.suffix(3).reversed().map(\.lastPathComponent))
+        #expect(FileManager.default.fileExists(atPath: foreign.path))
+        #expect(FileManager.default.fileExists(atPath: decoy.appending(path: "keep.txt").path))
         #expect(FileManager.default.fileExists(atPath: folder.appending(path: "notes.txt").path))
-        #expect(LibraryBackup.fileName(for: start).hasPrefix(LibraryBackup.namePrefix))
-        #expect(LibraryBackup.fileName(for: start).hasSuffix(".\(LibraryArchive.fileExtension)"))
-        // Two backups in the same second don't overwrite each other.
-        let again = try LibraryBackup.write(Data("again".utf8), to: folder, keep: 10, now: start.addingTimeInterval(4 * 86_400))
-        #expect(again.lastPathComponent != written.last?.lastPathComponent)
-        #expect(try LibraryBackup.rotate(in: folder, keep: 1).count == 3)
+        // Another Mac's set in the same folder is a separate index.
+        #expect(LibraryBackup.backups(in: folder, setID: UUID()).isEmpty)
+    }
+
+    @Test("Two backups in the same second keep their order, so retention keeps the newer")
+    func sameSecond() throws {
+        let folder = try temporaryFolder()
+        defer { try? FileManager.default.removeItem(at: folder) }
+        let set = UUID()
+        let now = Date(timeIntervalSince1970: 1_700_000_000)
+        let first = try LibraryBackup.write(Data("first".utf8), to: folder, setID: set, keep: 5, now: now)
+        let second = try LibraryBackup.write(Data("second".utf8), to: folder, setID: set, keep: 1, now: now)
+        #expect(first.lastPathComponent != second.lastPathComponent)
+        #expect(LibraryBackup.backups(in: folder, setID: set).map(\.lastPathComponent) == [second.lastPathComponent])
+        #expect(try Data(contentsOf: second) == Data("second".utf8))
     }
 
     @Test("A backup is due once its interval passes, only when on and with a folder")
@@ -398,12 +670,13 @@ struct LibraryBackupTests {
         let now = Date(timeIntervalSince1970: 1_700_000_000)
         let url = try await scheduler.backUpNow(now: now)
         #expect(settings.settings.lastBackupAt == now)
+        let set = try #require(settings.settings.setID)
         let contents = try LibraryArchive.read(try Data(contentsOf: url))
         #expect(contents.database.snippets.map(\.name) == ["Saved"])
         #expect(await scheduler.backUpIfDue(now: now.addingTimeInterval(60)) == nil)
         #expect(await scheduler.backUpIfDue(now: now.addingTimeInterval(86_400)) != nil)
         _ = try await scheduler.backUpNow(now: now.addingTimeInterval(2 * 86_400))
-        #expect(try LibraryBackup.backups(in: folder).count == 2)
+        #expect(LibraryBackup.backups(in: folder, setID: set).count == 2)
     }
 
     @Test("While inert, backups never schedule and never write outside the temporary folder")
@@ -421,6 +694,15 @@ struct LibraryBackupTests {
         await #expect(throws: SideEffectGuard.Blocked.self) { try await scheduler.backUpNow() }
         #expect(!FileManager.default.fileExists(atPath: outside.path))
         #expect(await scheduler.backUpIfDue() == nil)
+        // An injected live rule doesn't change that in the test host.
+        let live = LibraryBackupScheduler(store: library.store, settings: settings, sideEffects: SideEffectGuard(mode: .live))
+        live.start()
+        #expect(!live.isRunning)
+        await #expect(throws: SideEffectGuard.Blocked.self) { try await live.backUpNow() }
+        #expect(throws: SideEffectGuard.Blocked.self) {
+            try LibraryBackup.write(Data(), to: outside, setID: UUID(), keep: 1)
+        }
+        #expect(!FileManager.default.fileExists(atPath: outside.path))
     }
 
     @Test("The archive commands are bindable, and Back Up Now asks for a folder first")
