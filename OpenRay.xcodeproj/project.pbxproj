@@ -192,6 +192,8 @@
 				INFOPLIST_FILE = "OpenRay-Info.plist";
 				INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.productivity";
 				INFOPLIST_KEY_LSUIElement = YES;
+				INFOPLIST_KEY_NSAppleEventsUsageDescription = "OpenRay asks to control System Events, Finder and the login window only when you run a system command that needs them, such as Toggle System Appearance, Empty Trash or Restart.";
+				CODE_SIGN_ENTITLEMENTS = OpenRay.entitlements;
 				INFOPLIST_KEY_NSCalendarsFullAccessUsageDescription = "OpenRay reads your calendars to show My Schedule and your next meeting, and adds events when you block time. Your events stay on this Mac.";
 				MARKETING_VERSION = 0.1.0;
 				CURRENT_PROJECT_VERSION = 1;
@@ -361,6 +363,8 @@
 				INFOPLIST_FILE = "OpenRay-Info.plist";
 				INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.productivity";
 				INFOPLIST_KEY_LSUIElement = YES;
+				INFOPLIST_KEY_NSAppleEventsUsageDescription = "OpenRay asks to control System Events, Finder and the login window only when you run a system command that needs them, such as Toggle System Appearance, Empty Trash or Restart.";
+				CODE_SIGN_ENTITLEMENTS = OpenRay.entitlements;
 				INFOPLIST_KEY_NSCalendarsFullAccessUsageDescription = "OpenRay reads your calendars to show My Schedule and your next meeting, and adds events when you block time. Your events stay on this Mac.";
 				MARKETING_VERSION = 0.1.0;
 				CURRENT_PROJECT_VERSION = 1;

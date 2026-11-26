@@ -45,9 +45,9 @@ struct ApplicationsPane: View {
             AutoQuitSection(model: model)
             AppListSection(
                 model: model, title: "Keep running", emptyText: "No apps kept running",
-                footer: "Hide All Apps and Quit All Apps, in the Applications scope's ⌘K, leave these apps alone. OpenRay and the Finder are never quit.",
-                ids: settings.keepRunningBundleIDs, addTitle: "Add App"
-            ) { ids in model.updateApplicationSettings { $0.keepRunningBundleIDs = ids } }
+                footer: "Hide All, Quit All, Quit Others and Hide Others leave these apps alone. OpenRay and the Finder are never quit.",
+                ids: model.store.database.keepRunningBundleIDs, addTitle: "Add App"
+            ) { ids in _ = model.store.update { $0.keepRunningBundleIDs = ids } }
         }
     }
 
