@@ -204,6 +204,32 @@ struct EmojiPreferences: Codable, Equatable, Sendable {
         columns = GridColumns.clamped(try container.decodeIfPresent(Int.self, forKey: .columns) ?? GridColumns.defaultCount)
     }
 
+    /// Preferences from `LibraryDatabase.emojiUsage` and two settings kept elsewhere.
+    init(records: [EmojiUsageRecord], defaultSkinTone: SkinTone = .none, columns: Int = GridColumns.defaultCount) {
+        var usage: [String: EmojiUsage.Record] = [:]
+        for record in records {
+            if let score = record.score, let lastUsed = record.lastUsed, score.isFinite, score > 0 {
+                usage[record.id] = EmojiUsage.Record(score: score, count: record.count ?? 1, lastUsed: lastUsed)
+            }
+            if let keywords = record.keywords, !keywords.isEmpty { customKeywords[record.id] = keywords }
+        }
+        self.usage = EmojiUsage(records: usage)
+        pinned = records.filter { $0.pinOrder != nil }.sorted { ($0.pinOrder ?? 0) < ($1.pinOrder ?? 0) }.map(\.id)
+        self.defaultSkinTone = defaultSkinTone
+        self.columns = GridColumns.clamped(columns)
+    }
+
+    /// One record per emoji with usage, a pin or custom keywords, sorted by emoji.
+    var records: [EmojiUsageRecord] {
+        let ids = Set(usage.records.keys).union(pinned).union(customKeywords.keys)
+        return ids.sorted().map { id in
+            let use = usage.records[id]
+            return EmojiUsageRecord(
+                id: id, score: use?.score, count: use?.count, lastUsed: use?.lastUsed,
+                pinOrder: pinned.firstIndex(of: id), keywords: customKeywords[id])
+        }
+    }
+
     func isPinned(_ id: String) -> Bool { pinned.contains(id) }
 
     mutating func togglePin(_ id: String) {
