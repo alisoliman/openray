@@ -113,8 +113,10 @@ final class FileSearchService: NSObject {
         // recent listing, would mislead, so those clear.
         // Rows found by other contents would sit under the new search's heading, so they clear too.
         let parsed = FileQuery.parse(text)
+        // What the query will really do: Files asks for contents, and Settings › Files allows it.
+        let matchingContent = showRecent && options().matchesContent
         let listing = Listing(
-            scope: scope, recent: text.isEmpty, contentTerms: parsed.contentTerms, matchingContent: showRecent)
+            scope: scope, recent: text.isEmpty, contentTerms: parsed.contentTerms, matchingContent: matchingContent)
         if listing != self.listing {
             if !results.isEmpty { results = [] }
         } else if text != listingText, !results.isEmpty {
