@@ -59,6 +59,8 @@ extension SettingsPane {
         // Slice 3: calculator, emoji, translator
         .files,
         // Slice 4: applications
+        .applications,
+        .screenshots,
         .ai,
         // Slice 5: windows, system
         // Slice 6: notes, calendar, focus

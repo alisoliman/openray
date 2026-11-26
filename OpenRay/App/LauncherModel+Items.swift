@@ -13,7 +13,8 @@ extension LauncherModel {
     }
 
     var applicationItems: [LauncherItem] {
-        applications.applications.map { app in
+        let hidden = Set(applicationSettings.hiddenAppIDs)
+        return applications.applications.filter { !hidden.contains($0.id) }.map { app in
             LauncherItem(
                 id: app.id, title: app.name, subtitle: Self.shortenedPath(app.url.deletingLastPathComponent()),
                 symbol: "app", kind: .system, badge: "Application", keywords: app.bundleIdentifier ?? "",
@@ -22,12 +23,7 @@ extension LauncherModel {
     }
 
     var fileItems: [LauncherItem] {
-        files.results.map { file in
-            LauncherItem(
-                id: file.id, title: file.name, subtitle: Self.shortenedPath(file.url.deletingLastPathComponent()),
-                symbol: file.url.hasDirectoryPath ? "folder" : "doc", kind: .file, badge: Self.fileKind(file.url),
-                iconURL: file.url, action: .file(file.url), isLiveResult: true)
-        }
+        files.results.map(fileRow)
     }
 
     var savedFileItems: [LauncherItem] {

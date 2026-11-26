@@ -704,6 +704,7 @@ extension LauncherModel {
                         key: "c", modifiers: [.command, .shift], group: .item
                     ) { [weak self] in self?.copy(url.path, label: Self.shortenedPath(url)) })
             }
+            addFileAndApplicationActions(to: &entries, for: item)
             if item.canEdit {
                 entries.append(
                     ActionEntry(
@@ -777,6 +778,7 @@ extension LauncherModel {
                     })
             }
         }
+        entries += filesAndApplicationsPanelActions()
         entries.append(
             ActionEntry(id: "shortcuts", title: "Show Shortcuts", symbol: "keyboard", shortcut: .command("/"), group: .panel)
             { [weak self] in self?.showShortcuts = true })

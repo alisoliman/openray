@@ -138,6 +138,7 @@ final class LauncherModel {
         clipboard = ClipboardService(store: store, pasteboard: pasteboard)
         snippets = SnippetExpander(store: store)
         fileScope = store.database.preferences.fileSearchScope ?? .home
+        connectFilesAndApplications()
         store.commandBindingsDidChange = { [weak self] in self?.synchronizeCommandHotKeys() }
     }
 
@@ -159,6 +160,8 @@ final class LauncherModel {
         {
             return [command]
         }
+        // A typed path, a content search and the Files scope rank their own rows.
+        if let rows = fileSearchRows { return rows }
         var items: [LauncherItem] = []
         switch section {
         case .home:
@@ -257,6 +260,7 @@ final class LauncherModel {
                 LauncherResultGroup(id: "elsewhere", title: "Same search elsewhere", items: Array(items.dropFirst())),
             ].filter { !$0.items.isEmpty }
         }
+        if let fileGroups = fileSearchGroups { return fileGroups }
         // An empty Home shows favorites and recents, so it never computes results.
         switch section {
         case .home where isQueryBlank: return homeGroups
@@ -747,6 +751,8 @@ final class LauncherModel {
             if let text = entry.plainText {
                 openAI(.chat, attachment: AIAttachment(source: .clipboard, text: text, appName: entry.sourceName))
             }
+        case .file(let url)? where canEnterFilePath(url):
+            enterFilePath(url)
         default:
             guard argumentLink == nil else { return }
             let prompt = query.trimmingCharacters(in: .whitespacesAndNewlines)
