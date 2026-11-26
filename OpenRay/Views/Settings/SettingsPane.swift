@@ -63,6 +63,7 @@ extension SettingsPane {
         // Slice 5: windows, system
         // Slice 6: notes, calendar, focus
         // Slice 8: scripts
+        .scripts,
     ]
 
     static let secondary: [SettingsPane] = [.permissions, .library, .about]

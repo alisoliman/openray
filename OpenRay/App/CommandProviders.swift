@@ -16,5 +16,6 @@ enum CommandProviders {
         // Slice 6: notes, calendar, focus
         // Slice 7: AI commands, agents
         // Slice 8: script commands
+        ScriptCommandProvider.registration,
     ]
 }
