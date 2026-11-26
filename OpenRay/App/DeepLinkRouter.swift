@@ -169,8 +169,6 @@ struct DeepLinkRequest: Identifiable, Equatable {
     var fallbackFillsArgument = false
     var source: DeepLinkSource
     var background: Bool
-    /// When the question appeared, in seconds since the Mac started, the clock key events use.
-    var presentedAt: TimeInterval = 0
 
     /// The link without its query, which can hold argument values.
     var displayLink: String {
@@ -207,40 +205,6 @@ enum DeepLinkOutcome: Equatable {
     case waiting
 }
 
-/// Decides whether the event being handled may approve a link's question.
-@MainActor
-protocol DeepLinkApprovalGate {
-    /// Now, on the clock `presentedAt` uses.
-    var now: TimeInterval { get }
-    func mayApprove(presentedAt: TimeInterval, in model: LauncherModel) -> Bool
-}
-
-/// The live gate: a fresh Return (never a held one) or a click, at least half a second after
-/// the question appeared, while the launcher is the key window, on screen and not covered by
-/// ⌘K or the shortcuts overlay. A keystroke meant for another app can't answer it.
-struct LiveDeepLinkApprovalGate: DeepLinkApprovalGate {
-    static let minimumDelay: TimeInterval = 0.5
-
-    var now: TimeInterval { ProcessInfo.processInfo.systemUptime }
-
-    func mayApprove(presentedAt: TimeInterval, in model: LauncherModel) -> Bool {
-        guard let event = NSApp.currentEvent, event.timestamp - presentedAt >= Self.minimumDelay else { return false }
-        switch event.type {
-        case .keyDown:
-            guard !event.isARepeat, [36, 76].contains(event.keyCode) else { return false }
-        case .leftMouseDown, .leftMouseUp:
-            break
-        default:
-            return false
-        }
-        guard model.panel?.isVisible == true, NSApp.isActive,
-            NSApp.keyWindow?.identifier?.rawValue == "OpenRayLauncher",
-            !model.showShortcuts, !model.showActions
-        else { return false }
-        return true
-    }
-}
-
 /// Receives links, asks about them, and runs what the person approves.
 @MainActor
 final class DeepLinkRouter: CommandProvider {
@@ -253,13 +217,30 @@ final class DeepLinkRouter: CommandProvider {
         placeholder: "Run this command?", itemNoun: "choice", showsPreview: true, ranksItems: false)
 
     private(set) var pending: DeepLinkRequest?
-    var gate: any DeepLinkApprovalGate = LiveDeepLinkApprovalGate()
 
     var id: String { Self.registration.id }
 
     init() {}
 
     func commands(in model: LauncherModel) -> [CommandDescriptor] { [] }
+
+    // MARK: Focus (Slice 6 hook)
+
+    /// Starts a focus session for `openray://focus/start?goal=…&duration=…`, once asked and
+    /// approved. Slice 6 sets it at launch; while it's nil, Focus links say Focus isn't available.
+    static var focusStarter: (@MainActor (_ goal: String?, _ duration: Duration?, _ model: LauncherModel) -> Void)?
+
+    /// The id a Focus link's request carries in place of a command.
+    static let focusCommandID = "focus.start"
+
+    static func focusRequest(url: URL, goal: String?, duration: Duration?, source: DeepLinkSource) -> DeepLinkRequest {
+        var arguments: [String: String] = [:]
+        if let goal { arguments["Goal"] = goal }
+        if let duration { arguments["Minutes"] = String(Int(duration.timeInterval / 60)) }
+        return DeepLinkRequest(
+            url: url, commandID: focusCommandID, title: "Start Focus", arguments: arguments, specs: [],
+            fallbackText: nil, source: source, background: false)
+    }
 
     // MARK: Receiving
 
@@ -287,9 +268,13 @@ final class DeepLinkRouter: CommandProvider {
         let route: DeepLinkRoute
         do { route = try DeepLink.parse(url) } catch { return fail(error.localizedDescription, in: model) }
         switch route {
-        case .focus:
-            // Slice 6 serves focus sessions; until then the link explains itself.
-            return fail("Focus sessions aren't available in this version of OpenRay yet.", in: model)
+        case .focus(let goal, let duration):
+            // Slice 6 hook: Focus sets `DeepLinkRouter.focusStarter`. Until it does, the link
+            // explains itself. A Focus link asks first like any other; see `startFocus`.
+            guard Self.focusStarter != nil else {
+                return fail("Focus sessions aren't available in this version of OpenRay yet.", in: model)
+            }
+            return .asked(ask(Self.focusRequest(url: url, goal: goal, duration: duration, source: source), in: model))
         case .command(let commandID, let arguments, let fallbackText, let background):
             guard let item = Self.commandItem(withID: commandID, in: model) else {
                 if let scripts = Self.scriptCatalogStillLoading(for: commandID, in: model) {
@@ -324,15 +309,18 @@ final class DeepLinkRouter: CommandProvider {
         }
     }
 
-    /// Shows the question. A newer link replaces an older one still waiting; the older one's
-    /// answer can't run the newer command, because each question is bound to its own request.
+    /// Shows the question through the launcher's confirmation (Slice 1's `presentConfirmation`).
+    /// Link questions are always `isDestructive`: a command asked for from outside is risky, so
+    /// the launcher's visible-approval rule applies. Return answers only a prompt instance an
+    /// action bar has drawn uncovered on the visible, key panel (never one hidden by onboarding,
+    /// ⌘K or ⌘/), with a fresh press made after it had been shown long enough; the button answers
+    /// only the instance it drew. A newer link replaces an older one still waiting, and the older
+    /// one's answer can't run the newer command: each question is bound to its own request.
     private func ask(_ request: DeepLinkRequest, in model: LauncherModel) -> DeepLinkRequest {
-        var request = request
         show(.provided(Self.confirmScope), in: model)
-        request.presentedAt = gate.now
         pending = request
         model.selectedID = "deeplink.question"
-        model.confirmation = .provided(confirmation(for: request, in: model))
+        model.presentConfirmation(.provided(confirmation(for: request, in: model)))
         return request
     }
 
@@ -344,7 +332,7 @@ final class DeepLinkRouter: CommandProvider {
             id: "deeplink.\(request.id.uuidString)",
             CommandConfirmation(
                 question: "Run “\(request.title.truncatedForFeedback)” from a link?", detail: detail, confirmTitle: "Run",
-                symbol: "link")
+                symbol: "link", isDestructive: true)
         ) { [weak self, weak model] in
             guard let self, let model else { return }
             self.approve(request.id, in: model)
@@ -449,15 +437,17 @@ final class DeepLinkRouter: CommandProvider {
         model.leaveScope()
     }
 
-    /// The question's ↩. It runs only the request it was asked for, and only when the gate allows.
+    /// The question's answer, once the launcher's visible-approval rule has allowed it. It runs
+    /// only the request it was asked for.
     func approve(_ requestID: UUID, in model: LauncherModel) {
         guard let request = pending, request.id == requestID else { return }
-        guard gate.mayApprove(presentedAt: request.presentedAt, in: model) else {
-            // `confirm` already cleared the question; put it back as it was.
-            model.confirmation = .provided(confirmation(for: request, in: model))
+        pending = nil
+        if request.commandID == Self.focusCommandID, let start = Self.focusStarter {
+            model.navigate(to: .home)
+            let minutes = request.arguments["Minutes"].flatMap(Int.init)
+            start(request.arguments["Goal"], minutes.map { .seconds($0 * 60) }, model)
             return
         }
-        pending = nil
         guard let item = Self.commandItem(withID: request.commandID, in: model),
             !model.store.database.disabledCommandIDs.contains(request.commandID)
         else {
@@ -486,7 +476,7 @@ final class DeepLinkRouter: CommandProvider {
             let confirmation = model.confirmation
             panel.show()
             model.feedback = feedback
-            model.confirmation = confirmation
+            if let confirmation { model.presentConfirmation(confirmation) }
         }
         // Fallback text that became an argument (perhaps a password) is never typed into search.
         if let text = request.fallbackText, !request.fallbackFillsArgument, model.section != .home,

@@ -36,33 +36,26 @@ final class LinkTargetProvider: CommandProvider {
     }
 }
 
-/// Approves or refuses as the test says, in place of the live key-event check.
-@MainActor
-final class FakeApprovalGate: DeepLinkApprovalGate {
-    var allows = true
-    var now: TimeInterval = 100
-    var asked: [TimeInterval] = []
-    func mayApprove(presentedAt: TimeInterval, in model: LauncherModel) -> Bool {
-        asked.append(presentedAt)
-        return allows
-    }
-}
 
 @Suite("Deeplinks")
 @MainActor
 struct DeepLinkTests {
     let browser = DeepLinkSource(bundleID: "com.example.browser", name: "Browser")
 
-    func harness(extra: [any CommandProvider] = []) -> (LauncherModel, DeepLinkRouter, LinkTargetProvider, NSPasteboard, FakeApprovalGate) {
+    static let start = Date(timeIntervalSinceReferenceDate: 1_000)
+
+    /// A launcher whose prompt clock and panel surface the test drives (Slice 1's hooks).
+    func harness(extra: [any CommandProvider] = []) -> (LauncherModel, DeepLinkRouter, LinkTargetProvider, NSPasteboard, Date) {
         let target = LinkTargetProvider()
         let router = DeepLinkRouter()
-        let gate = FakeApprovalGate()
-        router.gate = gate
         let pasteboard = NSPasteboard.withUniqueName()
         let model = LauncherModel(
             store: LibraryStore(fileURL: nil), ai: AIChatModel(engine: TestAIEngine()),
             pasteboard: pasteboard, registry: CommandRegistry(providers: [target, router] + extra))
-        return (model, router, target, pasteboard, gate)
+        let start = Self.start
+        model.promptClock = { start }
+        model.confirmationSurfaceVisibleSince = { start }
+        return (model, router, target, pasteboard, start)
     }
 
     func isAsked(_ outcome: DeepLinkOutcome) -> Bool {
@@ -75,10 +68,15 @@ struct DeepLinkTests {
         return nil
     }
 
-    /// Answers the question on screen with ↩, as `LauncherPanel` does.
+    /// Answers the question as a person would: an action bar draws it, it stays up for the
+    /// minimum exposure, and a fresh Return arrives (`LauncherPanel`'s path).
     func pressReturn(_ model: LauncherModel) {
-        guard let confirmation = model.confirmation else { return }
-        model.confirm(confirmation)
+        guard let instance = model.confirmationInstanceID else { return }
+        let shown = model.promptClock()
+        model.confirmationDidAppear(instance)
+        let later = shown.addingTimeInterval(LauncherModel.minimumPromptExposure)
+        model.promptClock = { later }
+        _ = model.confirmFromReturn(isRepeat: false, pressedAt: later)
     }
 
     // MARK: Parsing
@@ -177,6 +175,7 @@ struct DeepLinkTests {
             return
         }
         #expect(question.id == "deeplink.\(request.id.uuidString)")
+        #expect(question.isDestructive, "Link questions need visible approval")
         #expect(question.question.contains("Greet Someone"))
         #expect(!question.detail.contains("s3cret"))
         #expect(question.detail.contains("Browser"))
@@ -210,24 +209,50 @@ struct DeepLinkTests {
         #expect(target.runs == [["token": "hunter2"]])
     }
 
-    @Test("The answer needs the gate: a held or early Return, or a covered panel, doesn't run")
-    func gate() {
-        let (model, router, target, _, gate) = harness()
+    @Test("Only a fresh Return, after the question was drawn and shown long enough, uncovered, answers it")
+    func visibleApproval() throws {
+        let (model, router, target, _, start) = harness()
         router.handle(DeepLink.url(forCommandID: "linktest.plain")!, source: browser, in: model)
-        gate.allows = false
-        pressReturn(model)
+        let instance = try #require(model.confirmationInstanceID)
+        // No action bar has drawn it (as when onboarding covers the panel): Return can't answer it.
+        #expect(model.confirmFromReturn(isRepeat: false, pressedAt: start.addingTimeInterval(5)))
+        #expect(target.runs.isEmpty)
+        model.confirmationDidAppear(instance)
+        // Too soon after it was drawn.
+        #expect(model.confirmFromReturn(isRepeat: false, pressedAt: start.addingTimeInterval(0.1)))
+        let later = start.addingTimeInterval(1)
+        model.promptClock = { later }
+        // A held Return never answers.
+        #expect(model.confirmFromReturn(isRepeat: true, pressedAt: later))
+        // Nor while the panel isn't on screen.
+        model.confirmationSurfaceVisibleSince = { nil }
+        #expect(model.confirmFromReturn(isRepeat: false, pressedAt: later))
         #expect(target.runs.isEmpty)
         #expect(router.pending != nil)
-        #expect(model.confirmation != nil, "The question stays up")
-        gate.allows = true
-        pressReturn(model)
+        model.confirmationSurfaceVisibleSince = { start }
+        #expect(model.confirmFromReturn(isRepeat: false, pressedAt: later))
         #expect(target.runs.count == 1)
         #expect(router.pending == nil)
         #expect(model.section == .home)
-        #expect(gate.asked.count == 2)
     }
 
-    @Test("A newer link replaces the question; the old answer can't run either command")
+    @Test("The Run button answers only the question it drew; a newer link's question isn't it")
+    func buttonBoundToInstance() throws {
+        let (model, router, target, _, start) = harness()
+        router.handle(DeepLink.url(forCommandID: "linktest.plain")!, source: browser, in: model)
+        let first = try #require(model.confirmationInstanceID)
+        model.confirmationDidAppear(first)
+        let later = start.addingTimeInterval(1)
+        model.promptClock = { later }
+        router.handle(DeepLink.url(forCommandID: "linktest.greet", arguments: ["name": "Eve"])!, source: browser, in: model)
+        model.approveConfirmation(id: first)
+        #expect(target.runs.isEmpty)
+        #expect(router.pending?.commandID == "linktest.greet")
+        let second = try #require(model.confirmationInstanceID)
+        #expect(second != first)
+    }
+
+    @Test("A newer link replaces the question; an answer bound to the old one can't run either command")
     func superseded() throws {
         let (model, router, target, _, _) = harness()
         router.handle(DeepLink.url(forCommandID: "linktest.plain")!, source: browser, in: model)
@@ -427,5 +452,24 @@ extension DeepLinkTests {
         let job = try #require(scripts.runner.jobs.first)
         #expect(job.values == ["argument1": "hunter2"])
         await job.task?.value
+    }
+}
+
+extension DeepLinkTests {
+    @Test("With Slice 6's hook set, a Focus link asks first, then starts the session it describes")
+    func focusHook() throws {
+        let (model, router, _, _, _) = harness()
+        var started: [(goal: String?, duration: Duration?)] = []
+        DeepLinkRouter.focusStarter = { goal, duration, _ in started.append((goal, duration)) }
+        defer { DeepLinkRouter.focusStarter = nil }
+        let url = try #require(URL(string: "openray://focus/start?goal=Write&duration=25"))
+        #expect(isAsked(router.handle(url, source: browser, in: model)))
+        #expect(started.isEmpty)
+        let request = try #require(router.pending)
+        #expect(request.displayedArguments.map(\.label) == ["Goal", "Minutes"])
+        pressReturn(model)
+        #expect(started.count == 1)
+        #expect(started.first?.goal == "Write")
+        #expect(started.first?.duration == .seconds(1_500))
     }
 }

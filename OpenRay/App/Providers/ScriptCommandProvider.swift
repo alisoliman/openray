@@ -7,8 +7,11 @@ protocol ScriptResultPresenting: AnyObject {
     func showHUD(_ text: String, isError: Bool, in model: LauncherModel)
 }
 
-/// Until the shared HUD window lands (Slice 5's `HUDController`), a silent script's message
-/// waits in the action bar, where the next look at the panel finds it.
+/// Slice 5 hook: until Slice 5's `HUDController` lands on the integration branch, a silent
+/// script's message waits in the action bar, where the next look at the panel finds it. When it
+/// lands, add a presenter that calls `HUDController.shared.show(HUDMessage(text, style: isError ?
+/// .error : .success))` and pass it in `ScriptCommandProvider.init()` (the one place that picks
+/// the presenter); nothing else changes.
 @MainActor
 final class FeedbackScriptResultPresenter: ScriptResultPresenting {
     init() {}
@@ -82,6 +85,7 @@ final class ScriptCommandProvider: CommandProvider {
         let inert = SideEffectGuard.current.isInert
         self.init(
             catalog: ScriptCatalog(watcher: inert ? nil : FSEventsDirectoryWatcher()), runner: ScriptRunner(),
+            // Slice 5 hook: swap in a HUD presenter here (see FeedbackScriptResultPresenter).
             presenter: FeedbackScriptResultPresenter(), refreshesAutomatically: !inert)
     }
 
@@ -164,10 +168,12 @@ final class ScriptCommandProvider: CommandProvider {
             badge: running ? "Running" : script.mode == .inline ? "Inline Script" : "Script",
             detail: script.metadata.description,
             confirmation: script.metadata.needsConfirmation
+                // The format's needsConfirmation is for scripts like Quit All Apps or Empty Trash, so
+                // the question is destructive: Return answers it only while it's on screen.
                 ? CommandConfirmation(
                     question: "Run “\(script.title.truncatedForFeedback)”?",
                     detail: "This script asks for confirmation before it runs.", confirmTitle: "Run Script",
-                    symbol: "terminal")
+                    symbol: "terminal", isDestructive: true)
                 : nil)
     }
 
