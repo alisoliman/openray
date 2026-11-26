@@ -722,3 +722,116 @@ struct LibraryBackupTests {
         #expect(!provider.scheduler(for: model).isBackingUp)
     }
 }
+
+// MARK: - Re-review fixes
+
+extension LibraryArchiveTests {
+    @Test("Imported files must pass the store's own read rules; merging replaces a damaged file with a good one")
+    func readRules() throws {
+        let source = try populated()
+        let image = try #require(source.store.database.clipboard.compactMap(\.image).first)
+        var contents = try LibraryArchive.read(try make(source, [.clipboard]))
+        let path = "ClipboardImages/\(image.id).png"
+        let good = try #require(contents.files[path])
+
+        // A damaged file already sits under the picture's name; Merge replaces it.
+        let target = try TemporaryLibrary()
+        try target.write(path, "damaged")
+        _ = try target.store.importArchive(contents, categories: [.clipboard], mode: .merge)
+        #expect(try Data(contentsOf: target.folder.appending(path: path)) == good)
+        #expect(target.store.imageData(for: image) == good)
+
+        // A picture whose digest matches its name but not its entry's size isn't accepted.
+        var entry = try #require(contents.database.clipboard.first { $0.image != nil })
+        let other = try TemporaryLibrary()
+        let truncated = Data(good.prefix(good.count - 1))
+        contents.files = ["ClipboardImages/\(LibraryArchive.digest(truncated)).png": truncated]
+        entry.content = .image(ClipboardImage(id: LibraryArchive.digest(truncated), pixelWidth: image.pixelWidth, pixelHeight: image.pixelHeight, byteCount: good.count))
+        contents.database.clipboard = [entry]
+        let report = try other.store.importArchive(contents, categories: [.clipboard], mode: .merge)
+        #expect(other.store.database.clipboard.isEmpty)
+        #expect(report.notes.contains { $0.contains("damaged") })
+
+        // Formatting whose bytes don't decode is dropped; the text entry stays, without it.
+        let bogus = Data("not a property list".utf8)
+        let digest = LibraryArchive.digest(bogus)
+        #expect(!LibraryArchive.sideFileIsReadable("\(digest).rich", bogus))
+        var text = ClipboardEntry(text: "formatted", sourceName: "Notes")
+        text.richTextDigest = digest
+        var richContents = contents
+        richContents.database.clipboard = [text]
+        richContents.files = ["ClipboardImages/\(digest).rich": bogus]
+        let third = try TemporaryLibrary()
+        _ = try third.store.importArchive(richContents, categories: [.clipboard], mode: .replace)
+        #expect(third.store.database.clipboard.first?.richTextDigest == nil)
+        #expect(!third.exists("ClipboardImages/\(digest).rich"))
+    }
+
+    @Test("A save that fails before reaching the disk rolls the files back")
+    func failedSaveRollsBack() throws {
+        let target = try TemporaryLibrary()
+        var incoming = LibraryDatabase()
+        incoming.preferences.clipboardLimit = 9_999
+        #expect(target.store.replaceLibraryForImport(with: incoming) != .saved)
+        if case .savedWithWarning = target.store.replaceLibraryForImport(with: incoming) {
+            Issue.record("An invalid library never reaches the disk")
+        }
+    }
+
+    @Test("A replaced original that can't be put back keeps the staging folder and says where")
+    func rollbackFailureKeepsOriginals() throws {
+        let target = try TemporaryLibrary()
+        let rich = "ClipboardImages/\(String(repeating: "e", count: 64)).rich"
+        try target.write(rich, "original")
+        do {
+            _ = try LibraryArchive.restore([rich: Data("new".utf8)], mode: .replace, into: target.folder) {
+                // The save fails, and the folder the original goes back into has become read-only.
+                chmod(target.folder.appending(path: "ClipboardImages").path, 0o500)
+                return "disk full"
+            }
+            Issue.record("Expected the restore to fail")
+        } catch let error as LibraryArchive.Failure {
+            #expect(error.message.contains("originals are in"))
+        }
+        chmod(target.folder.appending(path: "ClipboardImages").path, 0o700)
+        let staging = try FileManager.default.contentsOfDirectory(atPath: target.folder.path).filter { $0.hasPrefix(".openray-import") }
+        #expect(staging.count == 1)
+    }
+}
+
+extension LibraryBackupTests {
+    @Test("Rotation never deletes a different file that took an indexed backup's name")
+    func rotationChecksIdentity() throws {
+        let folder = try temporaryFolder()
+        defer { try? FileManager.default.removeItem(at: folder) }
+        let set = UUID()
+        let start = Date(timeIntervalSince1970: 1_700_000_000)
+        let first = try LibraryBackup.write(Data("one".utf8), to: folder, setID: set, keep: 5, now: start)
+        // Someone deletes the backup and puts another file under its name.
+        try FileManager.default.removeItem(at: first)
+        try Data("someone else's".utf8).write(to: first)
+        for day in 1...3 {
+            try LibraryBackup.write(Data("day \(day)".utf8), to: folder, setID: set, keep: 2, now: start.addingTimeInterval(Double(day) * 86_400))
+        }
+        #expect(try Data(contentsOf: first) == Data("someone else's".utf8))
+        #expect(LibraryBackup.backups(in: folder, setID: set).count == 2)
+        #expect(!LibraryBackup.index(in: folder, setID: set).entries.contains { $0.name == first.lastPathComponent })
+    }
+
+    @Test("A damaged index is cleaned: repeated names and foreign names are dropped")
+    func indexValidation() throws {
+        let folder = try temporaryFolder()
+        defer { try? FileManager.default.removeItem(at: folder) }
+        let set = UUID()
+        let name = LibraryBackup.fileName(for: Date(timeIntervalSince1970: 1_700_000_000))
+        let index = LibraryBackup.Index(
+            setID: set,
+            entries: [
+                .init(name: name, sequence: 1, createdAt: .now), .init(name: name, sequence: 2, createdAt: .now),
+                .init(name: "../escape.openraybackup", sequence: 3, createdAt: .now),
+                .init(name: "notes.txt", sequence: 4, createdAt: .now),
+            ])
+        try JSONEncoder().encode(index).write(to: LibraryBackup.indexURL(in: folder, setID: set))
+        #expect(LibraryBackup.index(in: folder, setID: set).entries.map(\.name) == [name])
+    }
+}

@@ -148,6 +148,41 @@ final class LibraryStore {
         update { $0 = replacement }
     }
 
+    /// What saving an imported library did.
+    enum ImportSaveOutcome: Equatable {
+        case saved
+        /// The new library reached the disk, but a later step (setting its permissions) failed.
+        /// It's the library now: the store has adopted it.
+        case savedWithWarning(String)
+        case failed(String)
+    }
+
+    /// Replaces the library for an import and says whether the new one reached the disk, the
+    /// import's commit point. A save that wrote the file and then failed to set its permissions
+    /// has still happened: the store adopts the file it wrote, so files imported with it stay.
+    func replaceLibraryForImport(with replacement: LibraryDatabase) -> ImportSaveOutcome {
+        let before = fileURL.flatMap(Self.fileIdentity)
+        if replaceLibrary(with: replacement) { return .saved }
+        let message = errorMessage ?? "The library couldn't be saved."
+        guard let fileURL, let after = Self.fileIdentity(fileURL), after != before,
+            let data = try? Data(contentsOf: fileURL),
+            let written = try? JSONDecoder().decode(LibraryDatabase.self, from: data), (try? written.validate()) != nil
+        else { return .failed(message) }
+        let bindingsChanged = database.commandBindings != written.commandBindings
+        database = written
+        if bindingsChanged { commandBindingsDidChange?() }
+        let warning = "The library was saved, but its file permissions couldn't be set. \(message)"
+        errorMessage = warning
+        return .savedWithWarning(warning)
+    }
+
+    private static func fileIdentity(_ url: URL) -> [Int]? {
+        guard let values = try? FileManager.default.attributesOfItem(atPath: url.path),
+            let device = values[.systemNumber] as? Int, let inode = values[.systemFileNumber] as? Int
+        else { return nil }
+        return [device, inode]
+    }
+
     @discardableResult
     func saveCommandBinding(_ binding: CommandBinding) -> Bool {
         update { database in

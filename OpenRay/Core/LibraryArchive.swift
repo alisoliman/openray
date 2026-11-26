@@ -716,6 +716,41 @@ enum LibraryArchive {
         return result
     }
 
+    // MARK: Read rules
+
+    /// Whether a clipboard side file would be read back by the store: the same checks
+    /// `ClipboardImageStore` applies when it reads. Pictures also need their entry's
+    /// `ClipboardImage` (size and validity), which `pictureIsReadable` checks.
+    static func sideFileIsReadable(_ name: String, _ data: Data) -> Bool {
+        let stem = (name as NSString).deletingPathExtension
+        switch (name as NSString).pathExtension {
+        case "rich":
+            guard ClipboardImageStore.isDigest(stem), data.count <= ClipboardLimits.richTextBytes + 4_096,
+                digest(data) == stem,
+                let richText = try? PropertyListDecoder().decode(ClipboardRichText.self, from: data)
+            else { return false }
+            return !richText.isEmpty && richText.byteCount <= ClipboardLimits.richTextBytes
+        case "txt":
+            return ClipboardImageStore.isDigest(stem) && data.count <= ClipboardLimits.recognizedTextBytes
+                && String(data: data, encoding: .utf8) != nil
+        default:
+            return false
+        }
+    }
+
+    /// Whether these bytes are the picture `image` refers to, as the store checks on read.
+    static func pictureIsReadable(_ data: Data, for image: ClipboardImage) -> Bool {
+        image.isValid && data.count == image.byteCount && digest(data) == image.id
+    }
+
+    /// The bytes of a regular file in the library's folder, never through a link. Nil otherwise.
+    static func existingFile(_ path: String, in directory: URL) -> Data? {
+        guard let root = realDirectory(directory) else { return nil }
+        let full = root + "/" + path
+        guard fileKind(full) == S_IFREG else { return nil }
+        return try? Data(contentsOf: URL(fileURLWithPath: full))
+    }
+
     // MARK: Restoring files
 
     /// Writes an archive's files into the library's folder and saves the library, as one step
@@ -731,7 +766,8 @@ enum LibraryArchive {
     /// match their name. Returns how many files were written.
     @MainActor
     static func restore(
-        _ files: [String: Data], mode: LibraryImportMode, into directory: URL, commit: () -> String?
+        _ files: [String: Data], mode: LibraryImportMode, into directory: URL, overwriting: Set<String> = [],
+        commit: () -> String?
     ) throws -> Int {
         let unsafe = Failure("The archive contains an unsafe file path.")
         if fileKind(directory.path) == nil {
@@ -760,14 +796,16 @@ enum LibraryArchive {
             let destination = folder + "/" + parts[1]
             if let kind = fileKind(destination) {
                 guard kind == S_IFREG else { throw unsafe }
-                if mode == .merge { continue }
+                if mode == .merge, !overwriting.contains(path) { continue }
             }
             plan.append(Placement(folder: folder, destination: destination, data: data))
         }
 
         let staging = root + "/.openray-import-" + UUID().uuidString
         guard mkdir(staging, 0o700) == 0 else { throw Failure("The import couldn't prepare its files.") }
-        defer { try? FileManager.default.removeItem(atPath: staging) }
+        // Removed afterwards unless a replaced file couldn't be put back: then it holds the originals.
+        var keepStaging = false
+        defer { if !keepStaging { try? FileManager.default.removeItem(atPath: staging) } }
         for (index, placement) in plan.enumerated() {
             guard FileManager.default.createFile(
                 atPath: staging + "/new-\(index)", contents: placement.data, attributes: [.posixPermissions: 0o600])
@@ -775,11 +813,20 @@ enum LibraryArchive {
         }
 
         var placed: [(destination: String, replaced: String?)] = []
-        func rollBack() {
+        /// Takes placed files back and returns replaced ones. A failure keeps the staging folder,
+        /// which then holds the originals, and says where.
+        func rollBack(after error: Failure) -> Failure {
+            var lost: [String] = []
             for item in placed.reversed() {
                 unlink(item.destination)
-                if let replaced = item.replaced { rename(replaced, item.destination) }
+                if let replaced = item.replaced, rename(replaced, item.destination) != 0 {
+                    lost.append((item.destination as NSString).lastPathComponent)
+                }
             }
+            guard !lost.isEmpty else { return error }
+            keepStaging = true
+            return Failure(
+                "\(error.message) Some replaced files couldn't be put back; their originals are in \(staging).")
         }
         do {
             for (index, placement) in plan.enumerated() {
@@ -802,14 +849,13 @@ enum LibraryArchive {
                 }
                 placed.append((placement.destination, replaced))
             }
+        } catch let error as Failure {
+            throw rollBack(after: error)
         } catch {
-            rollBack()
-            throw error
+            throw rollBack(after: Failure(error.localizedDescription))
         }
-        if let message = commit() {
-            rollBack()
-            throw Failure(message)
-        }
+        // The commit point: the library's save. Before it, everything above can be undone.
+        if let message = commit() { throw rollBack(after: Failure(message)) }
         return plan.count
     }
 
@@ -952,6 +998,10 @@ enum LibraryBackup {
             var name: String
             var sequence: Int
             var createdAt: Date
+            /// The file's device and inode when it was written. Rotation deletes only a file that
+            /// still has them, so a different file that later took the name is never touched.
+            var device: Int64?
+            var inode: UInt64?
         }
         var setID: UUID
         var entries: [Entry] = []
@@ -974,11 +1024,23 @@ enum LibraryBackup {
         folder.appending(path: ".openray-backups-\(setID.uuidString.lowercased()).json")
     }
 
+    /// This set's index. Entries without OpenRay's backup names, and repeated names, are dropped.
     static func index(in folder: URL, setID: UUID) -> Index {
         guard let data = try? Data(contentsOf: indexURL(in: folder, setID: setID)),
-            let index = try? JSONDecoder().decode(Index.self, from: data), index.setID == setID
+            var index = try? JSONDecoder().decode(Index.self, from: data), index.setID == setID
         else { return Index(setID: setID) }
+        var seen = Set<String>()
+        index.entries = index.entries.sorted { $0.sequence > $1.sequence }
+            .filter { isBackupName($0.name) && seen.insert($0.name).inserted }
+            .reversed()
         return index
+    }
+
+    /// The device and inode of a regular file, not through a link.
+    static func fileIdentity(_ url: URL) -> (device: Int64, inode: UInt64)? {
+        var info = stat()
+        guard lstat(url.path, &info) == 0, info.st_mode & S_IFMT == S_IFREG else { return nil }
+        return (Int64(info.st_dev), UInt64(info.st_ino))
     }
 
     /// This set's backups that are still there, newest first.
@@ -1003,29 +1065,42 @@ enum LibraryBackup {
         }
         let url = folder.appending(path: name)
         try archive.write(to: url, options: [.withoutOverwriting])
+        let identity = fileIdentity(url)
         index.entries.append(
-            Index.Entry(name: name, sequence: (index.entries.map(\.sequence).max() ?? 0) + 1, createdAt: now))
+            Index.Entry(
+                name: name, sequence: (index.entries.map(\.sequence).max() ?? 0) + 1, createdAt: now,
+                device: identity?.device, inode: identity?.inode))
         try save(index, in: folder)
         try rotate(in: folder, setID: setID, keep: keep)
         return url
     }
 
     /// Deletes this set's backups beyond the newest `keep`: only regular files the index lists,
-    /// with OpenRay's backup names, directly in the folder. Never a folder or a link.
+    /// with OpenRay's backup names, directly in the folder, that are still the very file written
+    /// (same device and inode). Never a folder, a link or a file that took the name later. A
+    /// deletion that fails stays in the index and is tried again next time.
     @discardableResult
     static func rotate(in folder: URL, setID: UUID, keep: Int) throws -> [URL] {
         var index = index(in: folder, setID: setID)
         let ordered = index.entries.sorted { $0.sequence > $1.sequence }
         let old = ordered.dropFirst(max(1, keep))
         var removed: [URL] = []
+        var forgotten = Set<String>()
         for entry in old {
             let url = folder.appending(path: entry.name)
-            if isBackupName(entry.name), LibraryArchive.fileKind(url.path) == S_IFREG, unlink(url.path) == 0 {
+            guard let identity = fileIdentity(url), let device = entry.device, let inode = entry.inode,
+                identity.device == device, identity.inode == inode
+            else {
+                // Gone, or no longer the file this set wrote: forget it, delete nothing.
+                forgotten.insert(entry.name)
+                continue
+            }
+            if unlink(url.path) == 0 {
                 removed.append(url)
+                forgotten.insert(entry.name)
             }
         }
-        let dropped = Set(old.map(\.name))
-        index.entries.removeAll { dropped.contains($0.name) }
+        index.entries.removeAll { forgotten.contains($0.name) }
         try save(index, in: folder)
         return removed
     }
@@ -1070,29 +1145,74 @@ extension LibraryStore {
         guard !isReadOnly else { throw LibraryArchive.Failure(errorMessage ?? "The library can't be changed.") }
         var (merged, notes) = LibraryArchive.merged(
             current: database, incoming: contents.database, categories: chosen, mode: mode)
-        let files = contents.files.filter { path, _ in
-            LibraryArchive.category(forFile: path).map(chosen.contains) ?? false
+        let directory = fileURL?.deletingLastPathComponent()
+        // Only files the committed rows will read, checked by the store's own read rules. Merging
+        // keeps a file already here unless it fails those rules and the archive's passes.
+        var files: [String: Data] = [:]
+        var overwriting: Set<String> = []
+        func existingPasses(_ path: String, _ check: (Data) -> Bool) -> Bool {
+            guard let directory, let data = LibraryArchive.existingFile(path, in: directory) else { return false }
+            return check(data)
+        }
+        func take(_ path: String, _ check: (Data) -> Bool) -> Bool {
+            let here = existingPasses(path, check)
+            guard let data = contents.files[path], check(data) else { return here }
+            files[path] = data
+            if !here { overwriting.insert(path) }
+            return true
         }
         if chosen.contains(.clipboard) {
             let imported = Set(contents.database.clipboard.map(\.id))
             var missing = 0
-            merged.clipboard.removeAll { entry in
-                guard imported.contains(entry.id), let image = entry.image else { return false }
-                if let data = files["ClipboardImages/\(image.id).png"], LibraryArchive.digest(data) == image.id { return false }
-                if imageData(for: image) != nil { return false }
-                missing += 1
-                return true
+            var lostFormatting = 0
+            merged.clipboard = merged.clipboard.compactMap { entry in
+                guard imported.contains(entry.id) else { return entry }
+                var entry = entry
+                if let image = entry.image {
+                    // Without a folder (an in-memory library) nothing can be placed, so only a
+                    // picture the store already has will do.
+                    let readable =
+                        directory == nil
+                        ? imageData(for: image) != nil
+                        : take("ClipboardImages/\(image.id).png") { LibraryArchive.pictureIsReadable($0, for: image) }
+                    guard readable else {
+                        missing += 1
+                        return nil
+                    }
+                    let text = "ClipboardImages/\(image.id).txt"
+                    _ = take(text) { LibraryArchive.sideFileIsReadable((text as NSString).lastPathComponent, $0) }
+                }
+                if let rich = entry.richTextDigest {
+                    let path = "ClipboardImages/\(rich).rich"
+                    if !take(path, { LibraryArchive.sideFileIsReadable((path as NSString).lastPathComponent, $0) }) {
+                        entry.richTextDigest = nil
+                        lostFormatting += 1
+                    }
+                }
+                return entry
             }
             if missing > 0 {
-                notes.append("\(missing) clipboard entr\(missing == 1 ? "y was" : "ies were") left out because their pictures weren't in the archive.")
+                notes.append("\(missing) clipboard entr\(missing == 1 ? "y was" : "ies were") left out because their pictures weren't in the archive or were damaged.")
+            }
+            if lostFormatting > 0 {
+                notes.append("\(lostFormatting) clipboard entr\(lostFormatting == 1 ? "y keeps" : "ies keep") its text but not its formatting.")
             }
         }
         do { try merged.validate() } catch { throw LibraryArchive.Failure(error.localizedDescription) }
         let written: Int
-        if let directory = fileURL?.deletingLastPathComponent() {
-            written = try LibraryArchive.restore(files, mode: mode, into: directory) {
-                self.replaceLibrary(with: merged) ? nil : (self.errorMessage ?? "The library couldn't be saved.")
+        if let directory {
+            var warning: String?
+            written = try LibraryArchive.restore(files, mode: mode, into: directory, overwriting: overwriting) {
+                switch self.replaceLibraryForImport(with: merged) {
+                case .saved: return nil
+                case .savedWithWarning(let message):
+                    // The library reached the disk, so the files stay with it.
+                    warning = message
+                    return nil
+                case .failed(let message): return message
+                }
             }
+            if let warning { notes.append(warning) }
         } else {
             guard replaceLibrary(with: merged) else {
                 throw LibraryArchive.Failure(errorMessage ?? "The library couldn't be saved.")
