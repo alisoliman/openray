@@ -13,6 +13,9 @@ final class AutoQuit {
     var now: @MainActor () -> Date
     /// When each running process was last frontmost, by PID.
     private(set) var lastActive: [pid_t: Date] = [:]
+    /// Processes whose clock started while their app had Auto Quit on. An app opted in later
+    /// starts a fresh clock, never one left from before.
+    private var armed: Set<pid_t> = []
     /// The apps the last check quit, for the Settings pane and tests.
     private(set) var recentlyQuit: [String] = []
     private var timer: Timer?
@@ -49,17 +52,20 @@ final class AutoQuit {
         let settings = settings()
         guard !settings.autoQuit.isEmpty else {
             lastActive = [:]
+            armed = []
             return []
         }
         let apps = running.controller.runningApplications()
         let alive = Set(apps.map(\.pid))
         lastActive = lastActive.filter { alive.contains($0.key) }
+        var stillArmed: Set<pid_t> = []
         var quit: [RunningApp] = []
         for app in apps where app.isRegular {
             guard canAutoQuit(app.bundleID), let bundleID = app.bundleID,
                 let minutes = settings.autoQuitMinutes(for: bundleID)
             else { continue }
-            if app.isActive {
+            stillArmed.insert(app.pid)
+            if app.isActive || !armed.contains(app.pid) {
                 lastActive[app.pid] = now
                 continue
             }
@@ -77,13 +83,14 @@ final class AutoQuit {
                 continue
             }
         }
+        armed = stillArmed
         if !quit.isEmpty { recentlyQuit = quit.map(\.name) }
         return quit
     }
 
     /// Starts the live timer and activation tracking, in a normal launch only.
     func start(sideEffects: SideEffectGuard = .current) {
-        guard !sideEffects.isInert, timer == nil else { return }
+        guard !SideEffectGuard.atLeastCurrent(sideEffects).isInert, timer == nil else { return }
         let center = NSWorkspace.shared.notificationCenter
         observers.append(
             center.addObserver(forName: NSWorkspace.didDeactivateApplicationNotification, object: nil, queue: .main) {

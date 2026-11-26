@@ -136,8 +136,11 @@ final class ApplicationCatalog {
         let manager = FileManager.default
         var apps: [String: InstalledApplication] = [:]
         // Standard folders are searched all the way down; extra folders as deep as configured.
-        let roots = standardRoots.map { ($0, Int.max) } + configuration.extraFolders.map { ($0, configuration.extraFolderDepth) }
-        for (root, depth) in roots {
+        // Extra folders can hold anything, so only real app bundles count there.
+        let roots =
+            standardRoots.map { ($0, Int.max, false) }
+            + configuration.extraFolders.map { ($0, configuration.extraFolderDepth, true) }
+        for (root, depth, requiresBundle) in roots {
             guard
                 let enumerator = manager.enumerator(
                     at: root, includingPropertiesForKeys: [.isDirectoryKey],
@@ -148,6 +151,7 @@ final class ApplicationCatalog {
                     if enumerator.level >= depth { enumerator.skipDescendants() }
                     continue
                 }
+                if requiresBundle, !ApplicationBundle.isValid(url) { continue }
                 let bundle = Bundle(url: url)
                 guard bundle?.bundleIdentifier != Bundle.main.bundleIdentifier else { continue }
                 let name =
@@ -184,11 +188,26 @@ final class FileIconCache {
     }
 }
 
-/// What Uninstall would move to the Trash: the app, and the files it keeps in `~/Library`,
-/// matched by bundle id or exact app name. Shown for review before anything moves.
+/// Whether a folder is a real application bundle: an `APPL` Info.plist with a bundle id and an
+/// executable that exists. A plain folder named `Archive.app` isn't one.
+enum ApplicationBundle {
+    nonisolated static func isValid(_ url: URL) -> Bool {
+        guard let bundle = Bundle(url: url), let info = bundle.infoDictionary, !info.isEmpty,
+            let identifier = bundle.bundleIdentifier, !identifier.isEmpty
+        else { return false }
+        if let type = info["CFBundlePackageType"] as? String, type != "APPL" { return false }
+        guard let executable = bundle.executableURL else { return false }
+        return FileManager.default.isExecutableFile(atPath: executable.path)
+    }
+}
+
+/// What Uninstall would move to the Trash: the app, and the files it keeps in `~/Library` that
+/// provably belong to it alone. Each is reviewed and ticked by hand before anything moves.
 struct UninstallPlan: Equatable, Sendable {
     var app: InstalledApplication
     var supportFiles: [URL]
+    /// Why support files aren't offered, such as another installed copy that shares them.
+    var supportFilesNote: String?
 
     /// Why an app can't be uninstalled from OpenRay, or nil when it can.
     static func refusal(for app: InstalledApplication, ownBundleID: String? = Bundle.main.bundleIdentifier) -> String? {
@@ -197,51 +216,60 @@ struct UninstallPlan: Equatable, Sendable {
             return "\(app.name) is part of macOS and can't be uninstalled."
         }
         if let ownBundleID, app.bundleIdentifier == ownBundleID { return "OpenRay can't uninstall itself." }
+        guard ApplicationBundle.isValid(app.url) else {
+            return "“\(app.url.lastPathComponent)” isn't an app bundle OpenRay can uninstall."
+        }
         return nil
     }
 
-    /// The support files that exist for an app under `library` (normally `~/Library`).
-    static func supportFiles(
-        bundleID: String?, appName: String, library: URL, fileManager: FileManager = .default
-    ) -> [URL] {
-        var candidates: [URL] = []
-        func add(_ folder: String, _ name: String) {
-            candidates.append(library.appending(path: folder).appending(path: name))
+    /// A bundle id safe to use as a file name: reverse-DNS letters, digits, dots and hyphens.
+    static func isPlainBundleID(_ id: String) -> Bool {
+        let allowed = CharacterSet.alphanumerics.union(CharacterSet(charactersIn: ".-"))
+        return id.count <= 255 && id.contains(".") && !id.hasPrefix(".") && !id.hasSuffix(".") && !id.contains("..")
+            && id.unicodeScalars.allSatisfy { allowed.contains($0) && $0.isASCII }
+    }
+
+    /// The support files that exist for an app under `library` (normally `~/Library`), named by
+    /// its bundle id. Folders named only by the app's name, and group containers that other apps
+    /// can share, are never offered: their owner can't be proven. Every candidate must sit
+    /// directly in its Library folder once symlinks are resolved.
+    static func supportFiles(bundleID: String?, library: URL, fileManager: FileManager = .default) -> [URL] {
+        guard let bundleID, isPlainBundleID(bundleID) else { return [] }
+        let names: [(folder: String, name: String)] = [
+            ("Application Support", bundleID), ("Caches", bundleID), ("Containers", bundleID),
+            ("Logs", bundleID), ("HTTPStorages", bundleID), ("HTTPStorages", "\(bundleID).binarycookies"),
+            ("WebKit", bundleID), ("Application Scripts", bundleID), ("Preferences", "\(bundleID).plist"),
+            ("Saved Application State", "\(bundleID).savedState"), ("Cookies", "\(bundleID).binarycookies"),
+            ("LaunchAgents", "\(bundleID).plist"),
+        ]
+        var candidates = names.map { library.appending(path: $0.folder).appending(path: $0.name) }
+        let byHost = library.appending(path: "Preferences/ByHost")
+        for entry in (try? fileManager.contentsOfDirectory(atPath: byHost.path)) ?? []
+        where entry.hasPrefix("\(bundleID).") && entry.hasSuffix(".plist")
+            && !entry.dropFirst(bundleID.count + 1).dropLast(6).contains(".")
+        {
+            candidates.append(byHost.appending(path: entry))
         }
-        let name = appName.trimmingCharacters(in: .whitespaces)
-        // A short or generic name could match another app's folder, so only real names count.
-        let usesName = name.count >= 3 && !["Apple", "Google", "Microsoft", "Adobe"].contains(name)
-        if let bundleID, !bundleID.isEmpty {
-            for folder in ["Application Support", "Caches", "Containers", "Logs", "HTTPStorages", "WebKit",
-                "Application Scripts"]
-            {
-                add(folder, bundleID)
-            }
-            add("Preferences", "\(bundleID).plist")
-            add("Saved Application State", "\(bundleID).savedState")
-            add("HTTPStorages", "\(bundleID).binarycookies")
-            add("Cookies", "\(bundleID).binarycookies")
-            add("LaunchAgents", "\(bundleID).plist")
-            // Group containers are named with a team or "group." prefix before the bundle id.
-            let groups = library.appending(path: "Group Containers")
-            for entry in (try? fileManager.contentsOfDirectory(atPath: groups.path)) ?? []
-            where entry == "group.\(bundleID)" || entry.hasSuffix(".\(bundleID)") {
-                candidates.append(groups.appending(path: entry))
-            }
-            let byHost = library.appending(path: "Preferences/ByHost")
-            for entry in (try? fileManager.contentsOfDirectory(atPath: byHost.path)) ?? []
-            where entry.hasPrefix("\(bundleID).") && entry.hasSuffix(".plist") {
-                candidates.append(byHost.appending(path: entry))
-            }
-        }
-        if usesName {
-            add("Application Support", name)
-            add("Caches", name)
-            add("Logs", name)
-        }
+        let root = library.standardizedFileURL.resolvingSymlinksInPath().path
         var seen = Set<String>()
         return candidates.filter { url in
-            seen.insert(url.standardizedFileURL.path).inserted && fileManager.fileExists(atPath: url.path)
+            guard seen.insert(url.standardizedFileURL.path).inserted, FileIdentity.of(url) != nil else { return false }
+            // The folder it sits in must really be inside Library, whatever symlinks say.
+            let parent = url.deletingLastPathComponent().resolvingSymlinksInPath().path
+            return parent.hasPrefix(root + "/")
         }
+    }
+
+    /// The plan for an app. When another copy with the same bundle id is installed, the
+    /// support files are shared with it, so none are offered.
+    static func make(for app: InstalledApplication, library: URL, otherCopies: [URL]) -> UninstallPlan {
+        let path = app.url.standardizedFileURL.resolvingSymlinksInPath().path
+        let others = otherCopies.filter { $0.standardizedFileURL.resolvingSymlinksInPath().path != path }
+        if !others.isEmpty {
+            return UninstallPlan(
+                app: app, supportFiles: [],
+                supportFilesNote: "Another copy of \(app.name) is installed, so its support files stay.")
+        }
+        return UninstallPlan(app: app, supportFiles: supportFiles(bundleID: app.bundleIdentifier, library: library))
     }
 }

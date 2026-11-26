@@ -450,6 +450,10 @@ struct FilesSearchTests {
         try await waitFor { !workspace.opened.isEmpty }
         #expect(workspace.opened.first?.app.lastPathComponent == "Xcode.app")
         let share = try #require(entries.first { $0.id == "share" })
+        // Without a submenu, Share only says where to choose; it never picks a destination itself.
+        share.perform()
+        #expect(workspace.shared.isEmpty)
+        #expect(model.feedback?.style == .info)
         share.children[1].perform()
         #expect(workspace.shared.map(\.target) == ["com.apple.share.Mail.compose"])
         let trash = try #require(entries.first { $0.id == "trash" })
@@ -478,13 +482,65 @@ struct FilesSearchTests {
     }
 
     @Test func aFailedTrashSaysWhy() throws {
+        let root = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let locked = root.appending(path: "locked.txt")
+        try Data("x".utf8).write(to: locked)
         let workspace = FakeFileWorkspace()
         workspace.trashFailures = ["locked.txt"]
         let model = model([FilesCommandProvider(workspace: workspace)])
-        model.askToTrash(URL(fileURLWithPath: "/tmp/locked.txt"), workspace: workspace)
+        model.askToTrash(locked, workspace: workspace)
         model.performSelected()
         #expect(model.feedback?.style == .error)
         #expect(workspace.trashed.isEmpty)
+        // Nothing at the path: nothing to ask about.
+        model.askToTrash(root.appending(path: "missing.txt"), workspace: workspace)
+        #expect(model.confirmation == nil)
+    }
+
+    @Test func trashMovesNothingWhenTheFileWasReplacedAfterAsking() throws {
+        let root = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let file = root.appending(path: "draft.txt")
+        try Data("first".utf8).write(to: file)
+        let workspace = FakeFileWorkspace()
+        let model = model([FilesCommandProvider(workspace: workspace)])
+        model.askToTrash(file, workspace: workspace)
+        try FileManager.default.removeItem(at: file)
+        try Data("something else entirely".utf8).write(to: file)
+        model.performSelected()
+        #expect(workspace.trashed.isEmpty)
+        #expect(model.feedback?.text.contains("changed since you asked") == true)
+    }
+
+    @Test func aGlobalAliasStillWinsInsideFiles() throws {
+        let model = model()
+        #expect(model.store.saveCommandBinding(CommandBinding(targetID: "settings", alias: "prefs")))
+        model.navigate(to: .files)
+        model.query = "prefs"
+        #expect(model.fileSearchRows == nil)
+        #expect(model.orderedResults.first?.id == "settings")
+        model.files.stop()
+    }
+
+    @Test func browsingLeavesOutExcludedItemsAndNeverReadsRealFoldersInTests() async throws {
+        let root = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        try FileManager.default.createDirectory(at: root.appending(path: "Private"), withIntermediateDirectories: true)
+        try Data("x".utf8).write(to: root.appending(path: "plan.txt"))
+        let model = model()
+        model.updateFilesSettings { $0.excludedPaths = [root.appending(path: "Private").path] }
+        model.query = root.path + "/"
+        try await waitFor { model.files.browsedFolder?.path == root.path && !model.files.isSearching }
+        #expect(model.orderedResults.map(\.title) == [root.lastPathComponent, "plan.txt"])
+
+        // The test host is inert: a folder outside the fixtures is refused before it's opened.
+        let outside = "/OpenRayTestsNoSuchFolder-\(UUID().uuidString)"
+        model.query = outside + "/"
+        try await waitFor { model.files.browsedFolder?.path == outside && !model.files.isSearching }
+        #expect(model.files.results.isEmpty)
+        #expect(model.files.errorMessage?.contains("doesn't allow") == true)
+        model.files.stop()
     }
 
     @Test func excludeSortHiddenQuicklinkAndAIActionsWork() throws {

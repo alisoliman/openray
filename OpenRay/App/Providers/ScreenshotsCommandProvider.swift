@@ -19,9 +19,38 @@ final class ScreenshotsCommandProvider: CommandProvider {
         summary: "Find screenshots by name, date or the text inside", shortTitle: "Screenshots",
         itemNoun: "screenshot", style: .grid, ranksItems: false, columns: ScreenshotSettings.defaultColumns)
 
+    /// The app a paste goes to, captured when the command runs.
+    struct PasteDestination: Equatable {
+        var pid: pid_t
+        var name: String
+        var launchDate: Date?
+    }
+
     var id: String { Self.registration.id }
     let index: ScreenshotIndex
     let workspace: any FileWorkspace
+    /// Where a paste would go right now: the app behind the panel while it shows, else the
+    /// frontmost app. Read once per command, before anything awaits.
+    var destination: @MainActor (LauncherModel) -> PasteDestination? = { model in
+        let app = model.panel?.isVisible == true ? model.previousApplication : NSWorkspace.shared.frontmostApplication
+        guard let app, !app.isTerminated, app.processIdentifier != ProcessInfo.processInfo.processIdentifier else {
+            return nil
+        }
+        return PasteDestination(pid: app.processIdentifier, name: app.localizedName ?? "your app", launchDate: app.launchDate)
+    }
+    var frontmostPID: @MainActor () -> pid_t? = { NSWorkspace.shared.frontmostApplication?.processIdentifier }
+    /// Whether a paste may reach another app: never with the isolated pasteboard.
+    var canPasteAcrossApps: @MainActor (LauncherModel) -> Bool = { $0.clipboard.usesGeneralPasteboard }
+    /// Sends ⌘V to the destination, once it's frontmost and the clipboard is unchanged.
+    var pasteInto: @MainActor (PasteDestination, Int) async throws -> Void = { destination, changeCount in
+        try SideEffectGuard.check("pasting into \(destination.name)")
+        guard let app = NSRunningApplication(processIdentifier: destination.pid), !app.isTerminated,
+            app.launchDate == destination.launchDate
+        else { throw LibraryValidationError("\(destination.name) quit before the paste.") }
+        try await SyntheticInput.paste(into: app, expectedChangeCount: changeCount)
+    }
+    /// The latest copy or paste request. An older one still scanning gives way to it.
+    private var invocation = UUID()
 
     convenience init() {
         self.init(index: ScreenshotIndex(), workspace: LiveFileWorkspace())
@@ -66,15 +95,26 @@ final class ScreenshotsCommandProvider: CommandProvider {
         switch ref.id {
         case Self.pasteLatestID, Self.copyLatestID:
             let pastes = ref.id == Self.pasteLatestID
-            Task {
-                index.startWatchingIfNeeded()
-                await index.refresh()
-                guard let latest = index.latest else {
+            // The destination is fixed now, before the scan, so a paste can't land in an app the
+            // person switched to meanwhile.
+            let destination = pastes ? destination(model) : nil
+            let request = UUID()
+            invocation = request
+            Task { [weak self, weak model] in
+                guard let self, let model else { return }
+                self.index.startWatchingIfNeeded()
+                await self.index.refresh()
+                guard self.invocation == request else { return }
+                guard let latest = self.index.latest else {
                     model.feedback = .info("No screenshots yet. Take one with ⇧⌘3 or ⇧⌘4.")
                     return
                 }
                 model.store.recordUse(of: item.id)
-                if pastes { model.paste(Self.fileItem(latest.url)) } else { copy(latest.url, in: model) }
+                if pastes {
+                    await self.paste(latest.url, to: destination, request: request, in: model)
+                } else {
+                    self.copy(latest.url, in: model)
+                }
             }
         default:
             guard let path = ref.payload else { return }
@@ -96,27 +136,62 @@ final class ScreenshotsCommandProvider: CommandProvider {
 
     func performSecondary(_ item: LauncherItem, ref: ProvidedRef, in model: LauncherModel) {
         guard let path = ref.payload else { return }
-        model.paste(Self.fileItem(URL(fileURLWithPath: path)))
+        let destination = destination(model)
+        let request = UUID()
+        invocation = request
+        Task { [weak self, weak model] in
+            guard let self, let model else { return }
+            await self.paste(URL(fileURLWithPath: path), to: destination, request: request, in: model)
+        }
     }
 
-    /// Copies the screenshot as a file, which apps paste as the image.
-    func copy(_ url: URL, in model: LauncherModel) {
+    /// Copies the screenshot as image data (PNG) with its file URL.
+    @discardableResult
+    func copy(_ url: URL, in model: LauncherModel, announce: Bool = true) -> Bool {
+        let name = url.lastPathComponent.truncatedForFeedback
         guard FileManager.default.fileExists(atPath: url.path) else {
-            model.feedback = .error("“\(url.lastPathComponent)” has moved or was deleted.")
+            model.feedback = .error("“\(name)” has moved or was deleted.")
+            return false
+        }
+        guard let png = ScreenshotImageData.png(at: url) else {
+            model.feedback = .error("“\(name)” couldn't be read as an image.")
+            return false
+        }
+        guard model.clipboard.copyImage(pngData: png, fileURL: url) else {
+            model.feedback = .error(model.clipboard.lastCopyError ?? "Couldn't write to the clipboard. Try again.")
+            return false
+        }
+        if announce { model.toast("Copied “\(name)”") }
+        return true
+    }
+
+    /// Copies the image, then pastes it into the destination captured when the command ran,
+    /// only if that app is still where the person is. Otherwise the image stays copied, and
+    /// the launcher says so.
+    func paste(_ url: URL, to destination: PasteDestination?, request: UUID, in model: LauncherModel) async {
+        guard invocation == request, copy(url, in: model, announce: false) else { return }
+        let name = url.lastPathComponent.truncatedForFeedback
+        guard canPasteAcrossApps(model) else {
+            model.feedback = .info("Copied “\(name)” to the isolated verification pasteboard. Cross-app paste is disabled in this mode.")
             return
         }
-        if model.clipboard.copy(ClipboardEntry(content: .files([url]), sourceName: "OpenRay")) {
-            model.toast("Copied “\(url.lastPathComponent.truncatedForFeedback)”")
-        } else {
-            model.feedback = .error(model.clipboard.lastCopyError ?? "Couldn't write to the clipboard. Try again.")
+        guard let destination else {
+            model.toast("Copied “\(name)” to the clipboard. Press ⌘V to paste it.")
+            return
         }
-    }
-
-    /// The launcher's own file row, so ⌘↩ pastes through the shared file-paste path.
-    static func fileItem(_ url: URL) -> LauncherItem {
-        LauncherItem(
-            id: "file.\(url.path)", title: url.lastPathComponent, subtitle: "", symbol: "photo", kind: .file,
-            badge: "Image", iconURL: url, action: .file(url))
+        let front = frontmostPID()
+        guard front == destination.pid || front == ProcessInfo.processInfo.processIdentifier else {
+            model.toast("Copied “\(name)” to the clipboard instead: \(destination.name) isn't in front anymore.")
+            return
+        }
+        let changeCount = model.clipboard.changeCount
+        model.panel?.dismiss(restoreFocus: false)
+        do {
+            try await pasteInto(destination, changeCount)
+        } catch {
+            model.panel?.show()
+            model.feedback = .error("Copied “\(name)” to the clipboard, but couldn't paste into \(destination.name). \(error.localizedDescription)")
+        }
     }
 
     // MARK: Scope
@@ -131,11 +206,11 @@ final class ScreenshotsCommandProvider: CommandProvider {
         LauncherItem(
             id: "screenshot.\(record.path)", title: record.name,
             subtitle: record.createdAt.formatted(date: .abbreviated, time: .shortened), symbol: "photo", kind: .file,
-            badge: "Screenshot", keywords: record.text ?? "", iconURL: record.url,
+            badge: "Screenshot", iconURL: record.url,
             action: .provided(
                 ProvidedRef(
-                    provider: id, id: record.path, payload: record.path, copyText: nil, primaryTitle: "Copy Image",
-                    traits: [])))
+                    provider: id, id: record.path, payload: record.path, arguments: ["version": record.version],
+                    copyText: nil, primaryTitle: "Copy Image", traits: [])))
     }
 
     func scopeGroups(_ scope: ProvidedScope, items: [LauncherItem], in model: LauncherModel) -> [LauncherResultGroup]? {
@@ -171,7 +246,7 @@ final class ScreenshotsCommandProvider: CommandProvider {
         if filter.hasInvalidDate {
             return ProvidedEmptyState(
                 title: "OpenRay can't read that date",
-                detail: "Try date:today, date:yesterday, date:last week or date:2026-11-26.", symbol: "calendar")
+                detail: "Try date:today, date:yesterday, date:last week, date:Nov 3 or date:2026-11-26.", symbol: "calendar")
         }
         if !query.trimmingCharacters(in: .whitespaces).isEmpty {
             let waiting = index.pendingRecognition > 0 ? " Text is still being read from \(index.pendingRecognition) images." : ""
@@ -193,7 +268,14 @@ final class ScreenshotsCommandProvider: CommandProvider {
             ActionEntry(
                 id: "quickLook", title: "Quick Look", symbol: "eye", shortcut: .command("Y"), key: "y", modifiers: .command,
                 group: .item
-            ) { [weak model] in model?.panel?.toggleQuickLook(url) },
+            ) { [weak model] in
+                // A verification run never opens a real screenshot.
+                guard InertReadBoundary.allows(url) else {
+                    model?.feedback = .info("Quick Look is off for files outside fixtures in this mode.")
+                    return
+                }
+                model?.panel?.toggleQuickLook(url)
+            },
             ActionEntry(
                 id: "open", title: "Open", symbol: "arrow.up.forward.app", shortcut: .command("O"), key: "o",
                 modifiers: .command, group: .item
@@ -206,7 +288,10 @@ final class ScreenshotsCommandProvider: CommandProvider {
                 modifiers: [.command, .shift], group: .item
             ) { [weak model] in model?.revealInFinder(url) },
         ]
-        if let text = index.records.first(where: { $0.path == path })?.text, !text.isEmpty {
+        // With text recognition off, recognized text is neither searched nor copied.
+        if model.screenshotSettings.recognizesText, let text = index.records.first(where: { $0.path == path })?.text,
+            !text.isEmpty
+        {
             entries.append(
                 ActionEntry(
                     id: "copyText", title: "Copy Text from Image", symbol: "text.viewfinder",
@@ -271,6 +356,12 @@ struct ScreenshotTile: View {
 
     private var height: CGFloat { columns <= 3 ? 150 : columns == 4 ? 110 : columns == 5 ? 88 : 72 }
 
+    /// The indexed file's version, so a replaced screenshot loads its new picture.
+    private var version: String {
+        if case .provided(let ref) = item.action { return ref.arguments["version"] ?? "" }
+        return ""
+    }
+
     var body: some View {
         VStack(spacing: 6) {
             ZStack {
@@ -286,10 +377,10 @@ struct ScreenshotTile: View {
             Text(item.title).font(OR.Font.callout).foregroundStyle(selected ? OR.Color.text : OR.Color.text2)
                 .lineLimit(1).truncationMode(.middle)
         }
-        .task(id: item.iconURL) {
+        .task(id: "\(item.iconURL?.path ?? "")#\(version)") {
             guard let url = item.iconURL else { return }
-            image = ScreenshotThumbnails.shared.cached(url)
-            if image == nil { image = await ScreenshotThumbnails.shared.thumbnail(for: url) }
+            image = ScreenshotThumbnails.shared.cached(url, version: version)
+            if image == nil { image = await ScreenshotThumbnails.shared.thumbnail(for: url, version: version) }
         }
     }
 }

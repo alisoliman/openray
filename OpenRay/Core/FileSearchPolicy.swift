@@ -537,3 +537,60 @@ struct FilesSettings: Equatable, Sendable {
             matchesContent: matchesContent, sort: sort)
     }
 }
+
+// MARK: - Safety helpers
+
+/// Who a file is, beyond its path: the same device and inode, and for files the same size and
+/// modification time. A prompt freezes it, and approval checks it again, so a file replaced at
+/// the same path after the person reviewed it is never the one acted on.
+struct FileIdentity: Equatable, Sendable {
+    var device: UInt64
+    var inode: UInt64
+    var isDirectory: Bool
+    var size: Int64
+    var modified: TimeInterval
+
+    /// The identity of what's at `url` now, without following a final symlink. Nil when nothing is.
+    static func of(_ url: URL) -> FileIdentity? {
+        var info = stat()
+        guard lstat(url.path, &info) == 0 else { return nil }
+        let isDirectory = (info.st_mode & S_IFMT) == S_IFDIR
+        let modified = TimeInterval(info.st_mtimespec.tv_sec) + TimeInterval(info.st_mtimespec.tv_nsec) / 1e9
+        return FileIdentity(
+            device: UInt64(bitPattern: Int64(info.st_dev)), inode: UInt64(info.st_ino), isDirectory: isDirectory,
+            size: Int64(info.st_size), modified: modified)
+    }
+
+    /// Whether `current` is the same item. A folder's own size and time change as its contents
+    /// do, so folders compare by device and inode only.
+    func isSameItem(as current: FileIdentity?) -> Bool {
+        guard let current, current.device == device, current.inode == inode, current.isDirectory == isDirectory
+        else { return false }
+        return isDirectory || (current.size == size && current.modified == modified)
+    }
+}
+
+/// While inert (tests and isolated verification), live readers may open only fixtures under
+/// the temporary folder, so a verification run never lists or reads the person's real files.
+enum InertReadBoundary {
+    static func allows(_ url: URL, sideEffects: SideEffectGuard = .current) -> Bool {
+        guard sideEffects.isInert else { return true }
+        let temporary = FileManager.default.temporaryDirectory.standardizedFileURL.resolvingSymlinksInPath().path
+        let path = url.standardizedFileURL.resolvingSymlinksInPath().path
+        return path == temporary || path.hasPrefix(temporary + "/")
+    }
+
+    static func check(_ url: URL, sideEffects: SideEffectGuard = .current) throws {
+        guard allows(url, sideEffects: sideEffects) else {
+            throw SideEffectGuard.Blocked(what: "reading \(url.lastPathComponent)", mode: sideEffects.mode)
+        }
+    }
+}
+
+extension SideEffectGuard {
+    /// A rule passed into a live adapter, never weaker than this process's own: an inert
+    /// process stays inert even when a caller injects a live rule.
+    static func atLeastCurrent(_ injected: SideEffectGuard) -> SideEffectGuard {
+        injected.isInert || !current.isInert ? injected : current
+    }
+}

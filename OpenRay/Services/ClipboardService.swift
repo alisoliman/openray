@@ -342,3 +342,22 @@ enum SyntheticInput {
         }
     }
 }
+
+// Slice 4 (screenshots): an additive image copy. It writes through the same writer as every
+// other copy, after the same general-pasteboard check, so it is refused while inert.
+extension ClipboardService {
+    /// Copies an image as PNG data, with its file URL when there is one, so apps that take
+    /// pictures paste the image and Finder-like targets paste the file.
+    @discardableResult
+    func copyImage(pngData: Data, fileURL: URL?) -> Bool {
+        lastCopyError = nil
+        do { try SideEffectGuard.checkWrite(to: pasteboard) } catch {
+            lastCopyError = error.localizedDescription
+            return false
+        }
+        let item = NSPasteboardItem()
+        item.setData(pngData, forType: .png)
+        if let fileURL { item.setString(fileURL.absoluteString, forType: .fileURL) }
+        return write([item])
+    }
+}

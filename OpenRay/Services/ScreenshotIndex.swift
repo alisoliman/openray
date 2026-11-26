@@ -17,6 +17,7 @@ struct VisionScreenshotRecognizer: ImageTextRecognizing {
     static let maximumBytes = 64_000_000
 
     func recognizeText(inImageAt url: URL, accurate: Bool) async throws -> String {
+        try InertReadBoundary.check(url)
         let size = (try? url.resourceValues(forKeys: [.fileSizeKey]))?.fileSize ?? 0
         guard size > 0, size <= Self.maximumBytes else { return "" }
         var request = RecognizeTextRequest()
@@ -28,6 +29,30 @@ struct VisionScreenshotRecognizer: ImageTextRecognizing {
         return observations.compactMap { $0.topCandidates(1).first?.string }
             .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }.filter { !$0.isEmpty }
             .joined(separator: "\n")
+    }
+}
+
+/// An image file as PNG data, for the clipboard: PNG files as they are, other formats
+/// converted. Nil for unreadable or oversized images, and outside fixtures while inert.
+enum ScreenshotImageData {
+    static let maximumBytes = 64_000_000
+    static let maximumPixels = 40_000_000
+
+    static func png(at url: URL, sideEffects: SideEffectGuard = .current) -> Data? {
+        guard InertReadBoundary.allows(url, sideEffects: sideEffects),
+            let size = (try? url.resourceValues(forKeys: [.fileSizeKey]))?.fileSize, size > 0, size <= maximumBytes,
+            let source = CGImageSourceCreateWithURL(url as CFURL, [kCGImageSourceShouldCache: false] as CFDictionary),
+            let properties = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [CFString: Any],
+            let width = (properties[kCGImagePropertyPixelWidth] as? NSNumber)?.intValue,
+            let height = (properties[kCGImagePropertyPixelHeight] as? NSNumber)?.intValue,
+            width > 0, height > 0, width <= maximumPixels / height
+        else { return nil }
+        if CGImageSourceGetType(source) as String? == "public.png" { return try? Data(contentsOf: url) }
+        guard let image = CGImageSourceCreateImageAtIndex(source, 0, nil) else { return nil }
+        let data = NSMutableData()
+        guard let destination = CGImageDestinationCreateWithData(data, "public.png" as CFString, 1, nil) else { return nil }
+        CGImageDestinationAddImage(destination, image, nil)
+        return CGImageDestinationFinalize(destination) ? data as Data : nil
     }
 }
 
@@ -107,6 +132,8 @@ struct ScreenshotRecord: Codable, Equatable, Identifiable, Sendable {
 
     var id: String { path }
     var url: URL { URL(fileURLWithPath: path) }
+    /// Changes when the file does, so thumbnails and actions never show an older image.
+    var version: String { "\(modifiedAt.timeIntervalSinceReferenceDate)-\(byteCount)" }
 }
 
 /// A file a folder scan found.
@@ -140,7 +167,19 @@ struct ScreenshotFilter: Equatable, Sendable {
 
     static func parse(_ query: String, now: Date = .now, calendar: Calendar = .current) -> ScreenshotFilter {
         var filter = ScreenshotFilter()
-        for token in QueryTokenizer.tokens(query, keys: ["text", "name", "date"]) {
+        var tokens = QueryTokenizer.tokens(query, keys: ["text", "name", "date"])
+        // `date:last week` without quotes: the phrase continues into the next word.
+        var index = 0
+        while index + 1 < tokens.count {
+            if tokens[index].key == "date", ["last", "this"].contains(tokens[index].text.lowercased()),
+                tokens[index + 1].key == nil, ["week", "month"].contains(tokens[index + 1].text.lowercased())
+            {
+                tokens[index].text += " " + tokens[index + 1].text
+                tokens.remove(at: index + 1)
+            }
+            index += 1
+        }
+        for token in tokens {
             switch token.key {
             case "text": if !token.text.isEmpty { filter.text.append(token.text) }
             case "name": if !token.text.isEmpty { filter.name.append(token.text) }
@@ -197,10 +236,11 @@ struct ScreenshotFilter: Equatable, Sendable {
         return nil
     }
 
-    func matches(_ record: ScreenshotRecord) -> Bool {
+    /// Whether a screenshot matches. With text recognition off, recognized text isn't searched.
+    func matches(_ record: ScreenshotRecord, usingText: Bool = true) -> Bool {
         if hasInvalidDate { return false }
         if let dates, !dates.contains(record.createdAt) { return false }
-        let recognized = record.text ?? ""
+        let recognized = usingText ? record.text ?? "" : ""
         func contains(_ haystack: String, _ needle: String) -> Bool {
             haystack.range(of: needle, options: [.caseInsensitive, .diacriticInsensitive]) != nil
         }
@@ -301,8 +341,17 @@ enum ScreenshotLocation {
                     url: URL(fileURLWithPath: (path as NSString).expandingTildeInPath, isDirectory: true),
                     includesAllImages: true))
         }
-        var seen = Set<String>()
-        return folders.filter { seen.insert($0.url.standardizedFileURL.path).inserted }
+        // A folder listed twice keeps the broader policy: every image if either says so.
+        var merged: [ScreenshotFolder] = []
+        for folder in folders {
+            let path = folder.url.standardizedFileURL.path
+            if let index = merged.firstIndex(where: { $0.url.standardizedFileURL.path == path }) {
+                merged[index].includesAllImages = merged[index].includesAllImages || folder.includesAllImages
+            } else {
+                merged.append(folder)
+            }
+        }
+        return merged
     }
 }
 
@@ -337,6 +386,8 @@ final class ScreenshotIndex {
     @ObservationIgnored private var debounce: Task<Void, Never>?
     @ObservationIgnored private var loaded = false
     @ObservationIgnored private var hasStartedWatching = false
+    @ObservationIgnored private var recognitionPass: UUID?
+    @ObservationIgnored private var lastRefreshAt: Date?
 
     nonisolated static let fileName = "screenshots.json"
     /// The index keeps at most this many screenshots, newest first.
@@ -346,6 +397,7 @@ final class ScreenshotIndex {
         recognizer: any ImageTextRecognizing = VisionScreenshotRecognizer(), sideEffects: SideEffectGuard = .current,
         folders: (@MainActor (ScreenshotSettings) -> [ScreenshotFolder])? = nil
     ) {
+        let sideEffects = SideEffectGuard.atLeastCurrent(sideEffects)
         self.recognizer = recognizer
         self.sideEffects = sideEffects
         self.folders =
@@ -379,7 +431,8 @@ final class ScreenshotIndex {
     func matching(_ query: String) -> [ScreenshotRecord] {
         let filter = ScreenshotFilter.parse(query, now: now())
         guard !filter.isEmpty else { return records }
-        return records.filter(filter.matches)
+        let usingText = settings().recognizesText
+        return records.filter { filter.matches($0, usingText: usingText) }
     }
 
     /// Scans the watched folders, folds the result into the index, saves, and recognizes text.
@@ -404,6 +457,9 @@ final class ScreenshotIndex {
     private func performRefresh() async {
         let settings = settings()
         let folders = folders(settings)
+        lastRefreshAt = now()
+        // The screenshot location can move; the watchers follow it.
+        if hasStartedWatching { bind(folders.map(\.url.path)) }
         guard !folders.isEmpty else { return }
         isScanning = true
         defer { isScanning = false }
@@ -414,7 +470,9 @@ final class ScreenshotIndex {
             records = limited
             save()
         }
-        if settings.recognizesText { recognizePending(accurate: settings.accurateRecognition) } else { stopRecognition() }
+        // Read again: recognition may have been turned off while the scan ran.
+        let current = self.settings()
+        if current.recognizesText { recognizePending(accurate: current.accurateRecognition) } else { stopRecognition() }
     }
 
     /// Drops every recognized text and recognizes again, for a changed accuracy setting.
@@ -439,8 +497,10 @@ final class ScreenshotIndex {
     func recognizePending(accurate: Bool) {
         guard recognition == nil else { return }
         let recognizer = self.recognizer
+        let pass = UUID()
+        recognitionPass = pass
         recognition = Task { [weak self] in
-            while let self, !Task.isCancelled {
+            while let self, !Task.isCancelled, self.settings().recognizesText {
                 let pending = self.records.filter { $0.text == nil }
                 self.pendingRecognition = pending.count
                 guard let next = pending.first else { break }
@@ -457,8 +517,10 @@ final class ScreenshotIndex {
                     self.records.removeAll { $0.path == next.path && $0.text == nil && $0.modifiedAt == next.modifiedAt }
                 }
             }
-            self?.pendingRecognition = self?.records.filter { $0.text == nil }.count ?? 0
-            self?.recognition = nil
+            // Only this pass clears its handle; a newer pass keeps its own.
+            guard let self, self.recognitionPass == pass else { return }
+            self.pendingRecognition = self.records.filter { $0.text == nil }.count
+            self.recognition = nil
         }
     }
 
@@ -470,6 +532,7 @@ final class ScreenshotIndex {
     func stopRecognition() {
         recognition?.cancel()
         recognition = nil
+        recognitionPass = nil
     }
 
     private func save() {
@@ -498,11 +561,31 @@ final class ScreenshotIndex {
     /// shortly after each change. Calling it again picks up changed folders.
     func startWatching() {
         guard !sideEffects.isInert else { return }
-        let folders = folders(settings()).map(\.url.path)
-        guard folders != watchedPaths else { return }
+        hasStartedWatching = true
+        bind(folders(settings()).map(\.url.path))
+        Task { await refresh() }
+    }
+
+    /// Starts watching the first time Search Screenshots is used, and rescans when the last
+    /// scan is more than a minute old. Cheap to call on every keystroke.
+    func startWatchingIfNeeded() {
+        guard hasStartedWatching else {
+            startWatching()
+            hasStartedWatching = true
+            return
+        }
+        if !sideEffects.isInert, scanTask == nil, lastRefreshAt.map({ now().timeIntervalSince($0) > 60 }) ?? true {
+            lastRefreshAt = now()
+            Task { await refresh() }
+        }
+    }
+
+    /// Points the watchers at these folders, unless they already are.
+    private func bind(_ paths: [String]) {
+        guard !sideEffects.isInert, paths != watchedPaths else { return }
         stopWatching()
-        watchedPaths = folders
-        for path in folders {
+        watchedPaths = paths
+        for path in paths {
             let descriptor = open(path, O_EVTONLY)
             guard descriptor >= 0 else { continue }
             let source = DispatchSource.makeFileSystemObjectSource(
@@ -514,14 +597,6 @@ final class ScreenshotIndex {
             source.resume()
             watchers.append(source)
         }
-        Task { await refresh() }
-    }
-
-    /// Starts watching the first time Search Screenshots is used. Cheap to call on every keystroke.
-    func startWatchingIfNeeded() {
-        guard !hasStartedWatching else { return }
-        hasStartedWatching = true
-        startWatching()
     }
 
     func stopWatching() {
@@ -549,10 +624,14 @@ final class ScreenshotThumbnails {
 
     init() { cache.countLimit = 300 }
 
-    func cached(_ url: URL) -> NSImage? { cache.object(forKey: url.path as NSString) }
+    /// Keyed by path and file version, so a replaced screenshot never shows the old picture.
+    private func key(_ url: URL, _ version: String) -> NSString { "\(url.path)#\(version)" as NSString }
 
-    func thumbnail(for url: URL, maxPixels: Int = 480) async -> NSImage? {
-        if let cached = cached(url) { return cached }
+    func cached(_ url: URL, version: String) -> NSImage? { cache.object(forKey: key(url, version)) }
+
+    func thumbnail(for url: URL, version: String, maxPixels: Int = 480) async -> NSImage? {
+        if let cached = cached(url, version: version) { return cached }
+        guard InertReadBoundary.allows(url) else { return nil }
         let image = await Task.detached(priority: .userInitiated) { () -> CGImage? in
             guard let source = CGImageSourceCreateWithURL(url as CFURL, [kCGImageSourceShouldCache: false] as CFDictionary)
             else { return nil }
@@ -565,7 +644,7 @@ final class ScreenshotThumbnails {
         }.value
         guard let image else { return nil }
         let thumbnail = NSImage(cgImage: image, size: NSSize(width: image.width, height: image.height))
-        cache.setObject(thumbnail, forKey: url.path as NSString)
+        cache.setObject(thumbnail, forKey: key(url, version))
         return thumbnail
     }
 }

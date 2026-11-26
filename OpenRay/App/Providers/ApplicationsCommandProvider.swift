@@ -1,12 +1,12 @@
 import AppKit
 import Observation
 
-/// Which support files the person left out of an uninstall, by app path. Observable, so the
-/// review list redraws as rows are ticked.
+/// Which support files the person ticked for an uninstall, by app path. Support files start
+/// unticked: nothing beyond the app moves unless chosen. Observable, so the list redraws.
 @MainActor
 @Observable
 final class UninstallSelection {
-    var excluded: [String: Set<String>] = [:]
+    var included: [String: Set<String>] = [:]
 }
 
 /// Applications: Uninstall and Manage Auto Quit commands, the uninstall review lists, the
@@ -44,7 +44,13 @@ final class ApplicationsCommandProvider: CommandProvider {
     let selection = UninstallSelection()
     /// `~/Library`, where support files are looked for.
     let library: URL
+    /// Every installed copy of an app, by bundle id, from Launch Services. Tests replace it.
+    var installedCopies: @MainActor (String) -> [URL] = { NSWorkspace.shared.urlsForApplications(withBundleIdentifier: $0) }
     private let sideEffects: SideEffectGuard
+    /// Plans by app path, made when a review opens, so typing doesn't rescan Library.
+    private var plans: [String: UninstallPlan] = [:]
+    /// The catalog's apps that can be uninstalled, kept until the catalog changes.
+    private var uninstallable: (source: [InstalledApplication], apps: [InstalledApplication])?
 
     convenience init() {
         self.init(controller: LiveRunningApplications(), workspace: LiveFileWorkspace())
@@ -59,8 +65,15 @@ final class ApplicationsCommandProvider: CommandProvider {
         running = RunningApplications(controller: controller, ownBundleID: ownBundleID)
         autoQuit = AutoQuit(running: running, settings: { ApplicationSettings() }, now: now)
         self.workspace = workspace
-        self.sideEffects = sideEffects
+        self.sideEffects = SideEffectGuard.atLeastCurrent(sideEffects)
         self.library = library
+    }
+
+    /// Opens the review list for an app, starting from a fresh plan with nothing ticked.
+    func beginReview(of app: InstalledApplication, in model: LauncherModel) {
+        selection.included[app.url.path] = nil
+        plans[app.url.path] = nil
+        model.navigate(to: .provided(Self.reviewScope(for: app)))
     }
 
     /// Reads settings from the model and starts Auto Quit, in a normal launch only.
@@ -91,16 +104,15 @@ final class ApplicationsCommandProvider: CommandProvider {
             model.openSettings(.applications)
         case "pick":
             guard let app = application(atPath: ref.payload, in: model) else { return }
-            selection.excluded[app.url.path] = nil
-            model.navigate(to: .provided(Self.reviewScope(for: app)))
+            beginReview(of: app, in: model)
         case "review.app":
             guard let app = application(atPath: ref.payload, in: model) else { return }
             askToUninstall(app, in: model)
         case "review.file":
             guard let file = ref.payload, let appPath = ref.arguments["app"] else { return }
-            var excluded = selection.excluded[appPath] ?? []
-            if excluded.contains(file) { excluded.remove(file) } else { excluded.insert(file) }
-            selection.excluded[appPath] = excluded
+            var included = selection.included[appPath] ?? []
+            if included.contains(file) { included.remove(file) } else { included.insert(file) }
+            selection.included[appPath] = included
         default: break
         }
     }
@@ -110,7 +122,7 @@ final class ApplicationsCommandProvider: CommandProvider {
         case "pick": "Review Files"
         case "review.app": "Uninstall…"
         case "review.file":
-            selection.excluded[ref.arguments["app"] ?? ""]?.contains(ref.payload ?? "") == true ? "Include" : "Leave Out"
+            selection.included[ref.arguments["app"] ?? ""]?.contains(ref.payload ?? "") == true ? "Leave Out" : "Include"
         default: nil
         }
     }
@@ -145,7 +157,7 @@ final class ApplicationsCommandProvider: CommandProvider {
     func scopeItems(_ scope: ProvidedScope, query: String, in model: LauncherModel) -> [LauncherItem] {
         switch scope.id {
         case Self.pickScope.id:
-            return model.applications.applications.filter { UninstallPlan.refusal(for: $0) == nil }.map { app in
+            return uninstallableApps(in: model).map { app in
                 LauncherItem(
                     id: "applications.uninstall.\(app.bundleIdentifier ?? app.url.path)", title: app.name,
                     subtitle: LauncherModel.shortenedPath(app.url.deletingLastPathComponent()), symbol: "app",
@@ -156,7 +168,7 @@ final class ApplicationsCommandProvider: CommandProvider {
             }
         case Self.reviewScopeID:
             guard let app = application(atPath: scope.arguments["path"], in: model) else { return [] }
-            return reviewItems(for: plan(for: app), query: query)
+            return reviewItems(for: plan(for: app, in: model), query: query)
         default:
             return []
         }
@@ -170,14 +182,25 @@ final class ApplicationsCommandProvider: CommandProvider {
             title: "This app is gone", detail: "It may have been moved or uninstalled already.", symbol: "questionmark.app")
     }
 
-    /// The app, then each support file it keeps, ticked unless left out.
+    /// The catalog's apps that pass `UninstallPlan.refusal`, checked once per catalog.
+    private func uninstallableApps(in model: LauncherModel) -> [InstalledApplication] {
+        let source = model.applications.applications
+        if let uninstallable, uninstallable.source == source { return uninstallable.apps }
+        let apps = source.filter { UninstallPlan.refusal(for: $0, ownBundleID: running.ownBundleID) == nil }
+        uninstallable = (source, apps)
+        return apps
+    }
+
+    /// The app, then each support file it keeps, unticked until chosen.
     func reviewItems(for plan: UninstallPlan, query: String) -> [LauncherItem] {
         let appPath = plan.app.url.path
-        let excluded = selection.excluded[appPath] ?? []
-        let included = plan.supportFiles.filter { !excluded.contains($0.path) }.count
+        let chosen = selection.included[appPath] ?? []
+        let included = plan.supportFiles.filter { chosen.contains($0.path) }.count
         let summary =
-            plan.supportFiles.isEmpty
-            ? "No support files found" : "\(included) of \(plan.supportFiles.count) support files included"
+            plan.supportFilesNote
+            ?? (plan.supportFiles.isEmpty
+                ? "No support files found"
+                : "\(included) of \(plan.supportFiles.count) support files chosen · ↩ on a file to choose it")
         var rows = [
             LauncherItem(
                 id: "applications.review.app", title: "Uninstall \(plan.app.name)", subtitle: summary, symbol: "trash",
@@ -187,7 +210,7 @@ final class ApplicationsCommandProvider: CommandProvider {
         ]
         let library = self.library.path
         for file in plan.supportFiles {
-            let isIncluded = !excluded.contains(file.path)
+            let isIncluded = chosen.contains(file.path)
             let folder = file.deletingLastPathComponent().path
             let location = folder.hasPrefix(library) ? "~/Library" + folder.dropFirst(library.count) : folder
             rows.append(
@@ -207,16 +230,30 @@ final class ApplicationsCommandProvider: CommandProvider {
 
     // MARK: Uninstall
 
-    func plan(for app: InstalledApplication) -> UninstallPlan {
-        UninstallPlan(
-            app: app,
-            supportFiles: UninstallPlan.supportFiles(bundleID: app.bundleIdentifier, appName: app.name, library: library))
+    /// The plan for an app, made once per review. Copies the catalog or Launch Services know
+    /// about share the support files, so their presence withholds them.
+    func plan(for app: InstalledApplication, in model: LauncherModel? = nil) -> UninstallPlan {
+        if let plan = plans[app.url.path] { return plan }
+        var copies: [URL] = []
+        if let bundleID = app.bundleIdentifier {
+            copies = installedCopies(bundleID)
+            copies += (model?.applications.applications ?? []).filter { $0.bundleIdentifier == bundleID }.map(\.url)
+        }
+        let plan = UninstallPlan.make(for: app, library: library, otherCopies: copies)
+        plans[app.url.path] = plan
+        return plan
     }
 
-    /// The files an uninstall would move now: the app, then the support files still included.
+    /// The files an uninstall would move now: the app, then the support files ticked.
     func filesToTrash(for plan: UninstallPlan) -> [URL] {
-        let excluded = selection.excluded[plan.app.url.path] ?? []
-        return [plan.app.url] + plan.supportFiles.filter { !excluded.contains($0.path) }
+        let chosen = selection.included[plan.app.url.path] ?? []
+        return [plan.app.url] + plan.supportFiles.filter { chosen.contains($0.path) }
+    }
+
+    /// One file an uninstall will move, as it was when the person approved the list.
+    struct ReviewedFile: Equatable {
+        var url: URL
+        var identity: FileIdentity
     }
 
     func askToUninstall(_ app: InstalledApplication, in model: LauncherModel) {
@@ -228,9 +265,18 @@ final class ApplicationsCommandProvider: CommandProvider {
             model.feedback = .warning("Quit \(app.name) before uninstalling it.")
             return
         }
-        let plan = plan(for: app)
-        let files = filesToTrash(for: plan)
-        let extra = files.count - 1
+        let plan = plan(for: app, in: model)
+        // What the prompt names is frozen here, file by file; approval checks each again.
+        var reviewed: [ReviewedFile] = []
+        for url in filesToTrash(for: plan) {
+            guard let identity = FileIdentity.of(url) else {
+                plans[app.url.path] = nil
+                model.feedback = .warning("“\(url.lastPathComponent)” is gone. Review \(app.name) again.")
+                return
+            }
+            reviewed.append(ReviewedFile(url: url, identity: identity))
+        }
+        let extra = reviewed.count - 1
         let question = CommandConfirmation(
             question: extra == 0
                 ? "Move \(app.name) to the Trash?" : "Move \(app.name) and \(extra) support file\(extra == 1 ? "" : "s") to the Trash?",
@@ -239,35 +285,51 @@ final class ApplicationsCommandProvider: CommandProvider {
         model.askConfirmation(ProvidedConfirmation(id: "applications.uninstall.\(app.url.path)", question) {
             [weak self, weak model] in
             guard let self, let model else { return }
-            self.uninstall(plan, in: model)
+            self.uninstall(app, reviewed: reviewed, in: model)
         })
     }
 
-    /// Moves the app and the included support files to the Trash, then rescans apps.
-    func uninstall(_ plan: UninstallPlan, in model: LauncherModel) {
+    /// Why the reviewed list can't be moved as approved, or nil when everything still matches:
+    /// the app isn't running, it's still an app bundle, and every file is the one reviewed.
+    func revalidate(_ app: InstalledApplication, reviewed: [ReviewedFile]) -> String? {
+        if running.isRunning(app) { return "\(app.name) is running now. Quit it, then review it again." }
+        if let refusal = UninstallPlan.refusal(for: app, ownBundleID: running.ownBundleID) { return refusal }
+        for file in reviewed where !file.identity.isSameItem(as: FileIdentity.of(file.url)) {
+            return "“\(file.url.lastPathComponent)” changed since you reviewed it. Nothing was moved; review \(app.name) again."
+        }
+        return nil
+    }
+
+    /// Moves the reviewed app and support files to the Trash, after checking nothing changed.
+    func uninstall(_ app: InstalledApplication, reviewed: [ReviewedFile], in model: LauncherModel) {
+        plans[app.url.path] = nil
+        if let problem = revalidate(app, reviewed: reviewed) {
+            model.feedback = .warning(problem)
+            return
+        }
         var failed: [String] = []
         var moved = 0
-        for (index, url) in filesToTrash(for: plan).enumerated() {
+        for (index, file) in reviewed.enumerated() {
             do {
-                try workspace.trash(url)
+                try workspace.trash(file.url)
                 moved += 1
             } catch {
                 // Without the app itself, the support files stay.
                 if index == 0 {
-                    model.feedback = .error("Couldn't move \(plan.app.name) to the Trash. \(error.localizedDescription)")
+                    model.feedback = .error("Couldn't move \(app.name) to the Trash. \(error.localizedDescription)")
                     return
                 }
-                failed.append(url.lastPathComponent)
+                failed.append(file.url.lastPathComponent)
             }
         }
-        selection.excluded[plan.app.url.path] = nil
+        selection.included[app.url.path] = nil
         Task { await model.applications.refresh() }
         if case .provided(let scope) = model.section, scope.id == Self.reviewScopeID { model.leaveScope() }
         if failed.isEmpty {
-            model.toast("Moved \(plan.app.name)\(moved > 1 ? " and \(moved - 1) support files" : "") to the Trash")
+            model.toast("Moved \(app.name)\(moved > 1 ? " and \(moved - 1) support files" : "") to the Trash")
         } else {
             model.feedback = .warning(
-                "Moved \(plan.app.name) to the Trash. \(failed.count) support file\(failed.count == 1 ? "" : "s") stayed: \(failed.prefix(3).joined(separator: ", ")).")
+                "Moved \(app.name) to the Trash. \(failed.count) support file\(failed.count == 1 ? "" : "s") stayed: \(failed.prefix(3).joined(separator: ", ")).")
         }
     }
 

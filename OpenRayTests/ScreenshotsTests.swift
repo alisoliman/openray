@@ -89,6 +89,12 @@ struct ScreenshotsTests {
         // A day still to come this year means last year's.
         #expect(day("Dec 24") == calendar.startOfDay(for: date(2025, 12, 24)))
         #expect(ScreenshotFilter.dateInterval("last week", now: now, calendar: calendar)?.contains(date(2026, 11, 18)) == true)
+        // The phrase works unquoted, as the empty state suggests it.
+        let unquoted = ScreenshotFilter.parse("date:last week invoice", now: now, calendar: calendar)
+        #expect(!unquoted.hasInvalidDate)
+        #expect(unquoted.dates?.contains(date(2026, 11, 18)) == true)
+        #expect(unquoted.free == ["invoice"])
+        #expect(ScreenshotFilter.parse("date:\"this month\"", now: now, calendar: calendar).dates?.contains(date(2026, 11, 1)) == true)
         #expect(ScreenshotFilter.dateInterval("this month", now: now, calendar: calendar)?.contains(date(2026, 11, 1)) == true)
         #expect(day("someday") == nil)
         let invalid = ScreenshotFilter.parse("date:someday", now: now, calendar: calendar)
@@ -110,6 +116,9 @@ struct ScreenshotsTests {
         #expect(!matches("text:receipt"))
         #expect(!matches("date:today"))
         #expect(matches("text:INVOICE"))
+        // With text recognition off, recognized text isn't searched.
+        #expect(!ScreenshotFilter.parse("invoice", now: now, calendar: calendar).matches(record, usingText: false))
+        #expect(ScreenshotFilter.parse("receipt", now: now, calendar: calendar).matches(record, usingText: false))
     }
 
     // MARK: Index
@@ -208,6 +217,13 @@ struct ScreenshotsTests {
         #expect(
             ScreenshotLocation.folders(settings: settings, system: URL(fileURLWithPath: "/Users/t/Desktop"), home: URL(fileURLWithPath: "/Users/t"))
                 .map(\.url.path) == ["/Users/t/Desktop", "/Volumes/Shots"])
+        // The Desktop added again as an extra folder keeps its every-image policy.
+        var desktopTwice = ScreenshotSettings()
+        desktopTwice.extraFolders = ["/Users/t/Desktop"]
+        let merged = ScreenshotLocation.folders(
+            settings: desktopTwice, system: URL(fileURLWithPath: "/Users/t/Pictures"), home: URL(fileURLWithPath: "/Users/t"))
+        #expect(merged.map(\.url.path) == ["/Users/t/Pictures", "/Users/t/Desktop"])
+        #expect(merged.last?.includesAllImages == true)
     }
 
     @Test func screenshotSettingsRoundTrip() {
@@ -276,7 +292,7 @@ struct ScreenshotsTests {
         #expect(model.providedEmptyState(for: ScreenshotsCommandProvider.scope).title == "OpenRay can't read that date")
     }
 
-    @Test func copyLatestPutsTheNewestScreenshotOnThePrivateClipboard() async throws {
+    @Test func copyLatestPutsTheImageItselfOnThePrivateClipboard() async throws {
         let folder = try temporaryDirectory()
         defer { try? FileManager.default.removeItem(at: folder) }
         try image("Screenshot old.png", in: folder, created: date(2026, 11, 20))
@@ -286,9 +302,68 @@ struct ScreenshotsTests {
         let command = try #require(model.commandItems.first { $0.id == ScreenshotsCommandProvider.copyLatestID })
         model.perform(command)
         try await waitFor { pasteboard.pasteboardItems?.isEmpty == false }
-        let copied = pasteboard.pasteboardItems?.first?.string(forType: .fileURL).flatMap(URL.init(string:))
-        #expect(copied?.standardizedFileURL.path == newest.path)
+        let item = try #require(pasteboard.pasteboardItems?.first)
+        // Real image data, so apps that only take pictures can paste it, and the file for the rest.
+        #expect(item.data(forType: .png) == (try Data(contentsOf: newest)))
+        #expect(item.string(forType: .fileURL).flatMap(URL.init(string:))?.standardizedFileURL.path == newest.path)
         #expect(model.feedback?.text == "Copied “Screenshot new.png”")
+    }
+
+    @Test func pasteLatestGoesWhereItWasInvokedOrOnlyCopies() async throws {
+        let folder = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: folder) }
+        try image("Screenshot one.png", in: folder, created: date(2026, 11, 25))
+        let pasteboard = NSPasteboard.withUniqueName()
+        let (model, provider, _) = await setUp(folder, pasteboard: pasteboard)
+        let editor = ScreenshotsCommandProvider.PasteDestination(pid: 501, name: "Editor", launchDate: nil)
+        let chat = ScreenshotsCommandProvider.PasteDestination(pid: 502, name: "Chat", launchDate: nil)
+        final class Box<Value> { var value: Value; init(_ value: Value) { self.value = value } }
+        let pastedBox = Box<[ScreenshotsCommandProvider.PasteDestination]>([])
+        let frontBox = Box<pid_t>(501)
+        var pasted: [ScreenshotsCommandProvider.PasteDestination] { pastedBox.value }
+        provider.destination = { _ in editor }
+        provider.frontmostPID = { frontBox.value }
+        provider.canPasteAcrossApps = { _ in true }
+        provider.pasteInto = { destination, _ in pastedBox.value.append(destination) }
+        let command = try #require(model.commandItems.first { $0.id == ScreenshotsCommandProvider.pasteLatestID })
+
+        // The destination is captured when the command runs, before the scan awaits.
+        model.perform(command)
+        provider.destination = { _ in chat }
+        try await waitFor { !pasted.isEmpty }
+        #expect(pasted == [editor])
+        #expect(pasteboard.pasteboardItems?.first?.data(forType: .png) != nil)
+
+        // The person moved to another app during the scan: copy only, and say so.
+        provider.destination = { _ in editor }
+        frontBox.value = 777
+        model.perform(command)
+        try await waitFor { model.feedback?.text.contains("isn't in front anymore") == true }
+        #expect(pasted == [editor])
+
+        // A newer request supersedes one still scanning; only the newer one acts.
+        frontBox.value = 501
+        model.perform(command)
+        model.perform(command)
+        try await waitFor { pasted.count == 2 }
+        try await Task.sleep(for: .milliseconds(50))
+        #expect(pasted.count == 2)
+    }
+
+    @Test func turningTextRecognitionOffHidesRecognizedText() async throws {
+        let folder = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: folder) }
+        try image("Screenshot receipt.png", in: folder, created: date(2026, 11, 25))
+        let (model, provider, _) = await setUp(folder, pasteboard: .withUniqueName())
+        model.navigate(to: .provided(ScreenshotsCommandProvider.scope))
+        model.query = "text of"
+        #expect(model.orderedResults.count == 1)
+        #expect(model.actions(for: model.orderedResults.first).contains { $0.id == "copyText" })
+        model.updateScreenshotSettings { $0.recognizesText = false }
+        #expect(model.orderedResults.isEmpty)
+        model.query = ""
+        #expect(!model.actions(for: model.selectedItem).contains { $0.id == "copyText" })
+        #expect(provider.index.records.first?.version.isEmpty == false)
     }
 
     @Test func screenshotActionsCopyTextAndMoveToTrash() async throws {

@@ -46,7 +46,7 @@ final class LiveRunningApplications: RunningApplicationControlling {
     private let sideEffects: SideEffectGuard
 
     init(sideEffects: SideEffectGuard = .current) {
-        self.sideEffects = sideEffects
+        self.sideEffects = SideEffectGuard.atLeastCurrent(sideEffects)
     }
 
     func runningApplications() -> [RunningApp] {
@@ -110,12 +110,35 @@ final class RunningApplications {
         self.ownBundleID = ownBundleID
     }
 
-    /// The running processes of an installed app, matched by bundle id, or by path without one.
+    /// The running processes of this installed copy of an app: the same bundle id and the same
+    /// bundle on disk, so another copy with the same id is never touched.
     func instances(of app: InstalledApplication) -> [RunningApp] {
         controller.runningApplications().filter { running in
-            if let bundleID = app.bundleIdentifier { return running.bundleID == bundleID }
-            return running.bundleURL?.standardizedFileURL.path == app.url.standardizedFileURL.path
+            guard running.bundleID == app.bundleIdentifier, let bundleURL = running.bundleURL else { return false }
+            return Self.isSameBundle(bundleURL, app.url)
         }
+    }
+
+    nonisolated static func isSameBundle(_ lhs: URL, _ rhs: URL) -> Bool {
+        let left = lhs.standardizedFileURL.path
+        let right = rhs.standardizedFileURL.path
+        if left == right { return true }
+        guard lhs.lastPathComponent == rhs.lastPathComponent else { return false }
+        return lhs.resolvingSymlinksInPath().path == rhs.resolvingSymlinksInPath().path
+    }
+
+    /// The processes of a snapshot that are still the same processes: same PID, bundle and
+    /// launch time. Ones that quit, or were replaced by a relaunch, drop out.
+    func stillRunning(_ snapshot: [RunningApp]) -> [RunningApp] {
+        let now = controller.runningApplications()
+        return snapshot.filter { taken in
+            now.contains { $0.pid == taken.pid && $0.bundleID == taken.bundleID && $0.launchDate == taken.launchDate }
+        }
+    }
+
+    /// Force quits exactly the processes a prompt named, skipping any that are gone or replaced.
+    func forceQuit(_ snapshot: [RunningApp]) -> BatchResult {
+        batch(stillRunning(snapshot)) { try controller.forceQuit($0) }
     }
 
     func isRunning(_ app: InstalledApplication) -> Bool { !instances(of: app).isEmpty }
@@ -172,6 +195,16 @@ final class RunningApplications {
 
     func quitAll(keeping: Set<String>) -> BatchResult {
         batch(batchTargets(keeping: keeping, quitting: true)) { try controller.quit($0) }
+    }
+
+    /// Hides or quits exactly the processes a prompt listed. Apps opened since are left alone,
+    /// and so are ones that quit, were relaunched, or were added to `keeping` meanwhile.
+    func act(on snapshot: [RunningApp], quitting: Bool, keeping: Set<String>) -> BatchResult {
+        let targets = stillRunning(snapshot).filter { app in
+            guard let bundleID = app.bundleID else { return !quitting }
+            return !keeping.contains(bundleID) && bundleID != ownBundleID
+        }
+        return batch(targets) { quitting ? try controller.quit($0) : try controller.hide($0) }
     }
 
     private func batch(_ apps: [RunningApp], _ act: (RunningApp) throws -> Void) -> BatchResult {

@@ -58,7 +58,8 @@ final class LiveFileWorkspace: FileWorkspace {
     ]
 
     init(sideEffects: SideEffectGuard = .current) {
-        self.sideEffects = sideEffects
+        // Never weaker than this process: an inert run stays inert whatever is passed in.
+        self.sideEffects = SideEffectGuard.atLeastCurrent(sideEffects)
     }
 
     func applications(toOpen url: URL) -> [OpenWithApp] {

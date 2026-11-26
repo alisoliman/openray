@@ -18,7 +18,11 @@ protocol FolderReading: Sendable {
 }
 
 struct LiveFolderReader: FolderReading {
+    /// While inert, only fixtures under the temporary folder are listed.
+    var sideEffects = SideEffectGuard.current
+
     func contents(of directory: URL, includingHidden: Bool, limit: Int) throws -> [FileSearchResult] {
+        try InertReadBoundary.check(directory, sideEffects: SideEffectGuard.atLeastCurrent(sideEffects))
         let keys: [URLResourceKey] = [.isDirectoryKey, .isPackageKey, .contentModificationDateKey]
         let urls = try FileManager.default.contentsOfDirectory(
             at: directory, includingPropertiesForKeys: keys, options: includingHidden ? [] : [.skipsHiddenFiles])
@@ -63,6 +67,7 @@ final class FileSearchService: NSObject {
     private struct Listing: Equatable {
         var scope: FileSearchScope
         var recent: Bool
+        var contentTerms: [String] = []
     }
 
     init(home: URL = FileManager.default.homeDirectoryForCurrentUser, folders: any FolderReading = LiveFolderReader()) {
@@ -87,7 +92,8 @@ final class FileSearchService: NSObject {
         // against the new query, so the list doesn't empty and refill on each
         // keystroke. Rows from another folder, or from a name search shown as the
         // recent listing, would mislead, so those clear.
-        let listing = Listing(scope: scope, recent: text.isEmpty)
+        // Rows found by other contents would sit under the new search's heading, so they clear too.
+        let listing = Listing(scope: scope, recent: text.isEmpty, contentTerms: FileQuery.parse(text).contentTerms)
         if listing != self.listing, !results.isEmpty { results = [] }
         self.listing = listing
         isSearching = true
@@ -159,12 +165,13 @@ final class FileSearchService: NSObject {
             case .success(let entries):
                 self.results = entries
                 self.errorMessage = nil
-            case .failure:
+            case .failure(let error):
                 self.results = []
                 self.errorMessage =
-                    FileManager.default.fileExists(atPath: directory.path)
+                    (error as? SideEffectGuard.Blocked)?.errorDescription
+                    ?? (FileManager.default.fileExists(atPath: directory.path)
                     ? "OpenRay can't read “\(directory.lastPathComponent)”. Check Full Disk Access in Settings."
-                    : "There's no folder at \(directory.path)."
+                    : "There's no folder at \(directory.path).")
             }
             self.browsedAt = .now
             self.isSearching = false

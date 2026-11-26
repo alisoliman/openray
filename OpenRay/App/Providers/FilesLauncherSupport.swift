@@ -113,21 +113,30 @@ extension LauncherModel {
     /// Everything for a typed path or a `content:` search. Nil leaves results to the launcher.
     var fileSearchRows: [LauncherItem]? {
         guard destination == .search, argumentLink == nil, query.count <= 512 else { return nil }
+        // A global alias wins everywhere, Files included, as `results` resolves it first.
+        if let target = store.database.aliasTarget(for: query), bindableCommands.contains(where: { $0.id == target }) {
+            return nil
+        }
         let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
         let settings = filesSettings
+        let excluded = settings.excludedPaths
+        func isExcluded(_ url: URL) -> Bool {
+            guard !excluded.isEmpty else { return false }
+            // Listings can report /private/var for /var; the standardized path is what's saved.
+            let path = url.standardizedFileURL.path
+            return excluded.contains { path == $0 || path.hasPrefix($0 + "/") }
+        }
         if let path = filePathQuery {
             guard files.browsedFolder == path.directory else { return path.filter.isEmpty ? [folderRow(path.directory)] : [] }
-            let rows = files.orderedListing(filter: path.filter, sort: settings.sort).prefix(100).map(fileRow)
+            let rows = files.orderedListing(filter: path.filter, sort: settings.sort).lazy.filter { !isExcluded($0.url) }
+                .prefix(100).map(fileRow)
             return Array(((path.filter.isEmpty ? [folderRow(path.directory)] : []) + rows).prefix(100))
         }
         let parsed = FileQuery.parse(trimmed)
         guard section == .files || section == .home && parsed.hasFilters else { return nil }
         // A folder listing still on screen belongs to the path just erased.
         guard files.browsedFolder == nil else { return [] }
-        let excluded = settings.excludedPaths
-        let results = files.results.filter { result in
-            !excluded.contains { result.url.path == $0 || result.url.path.hasPrefix($0 + "/") }
-        }
+        let results = files.results.filter { !isExcluded($0.url) }
         return Array(Self.rankedFileResults(results, query: parsed, sort: settings.sort).prefix(100).map(fileRow))
     }
 
@@ -299,8 +308,8 @@ extension LauncherModel {
             let keeping = Set(applicationSettings.keepRunningBundleIDs)
             if !provider.running.batchTargets(keeping: keeping, quitting: false).isEmpty {
                 entries.append(
-                    ActionEntry(id: "apps.hideAll", title: "Hide All Apps", symbol: "eye.slash", group: .panel) {
-                        [weak self] in self?.hideAllApplications()
+                    ActionEntry(id: "apps.hideAll", title: "Hide All Apps…", symbol: "eye.slash", group: .panel) {
+                        [weak self] in self?.askToBatch(quitting: false)
                     })
             }
             if !provider.running.batchTargets(keeping: keeping, quitting: true).isEmpty {
@@ -308,7 +317,7 @@ extension LauncherModel {
                     ActionEntry(
                         id: "apps.quitAll", title: "Quit All Apps…", symbol: "xmark.circle", group: .panel,
                         isDestructive: true
-                    ) { [weak self] in self?.askToQuitAllApplications() })
+                    ) { [weak self] in self?.askToBatch(quitting: true) })
             }
         }
         return entries
@@ -340,7 +349,7 @@ extension LauncherModel {
                 })
         }
         let targets = workspace.shareTargets(for: url)
-        if let first = targets.first {
+        if !targets.isEmpty {
             entries.append(
                 ActionEntry(
                     id: "share", title: "Share", symbol: "square.and.arrow.up", group: .item,
@@ -349,7 +358,10 @@ extension LauncherModel {
                             [weak self] in self?.share(url, via: target, workspace: workspace)
                         }
                     }
-                ) { [weak self] in self?.share(url, via: first, workspace: workspace) })
+                ) { [weak self] in
+                    // Where a file goes is the person's choice; a surface without submenus only says how.
+                    self?.feedback = .info("Choose \(targets.map(\.title).joined(separator: ", ")) under Share in ⌘K.")
+                })
         }
         if !isFolder || filePathQuery == nil {
             entries.append(
@@ -370,7 +382,10 @@ extension LauncherModel {
                 id: "trash", title: "Move to Trash", symbol: "trash", shortcut: KeyShortcut(["⌘", "⌫"]), key: .delete,
                 modifiers: .command, group: .organize, isDestructive: true
             ) { [weak self] in
-                self?.askToTrash(url, workspace: workspace) { [weak self] in self?.resumeSearch() }
+                self?.askToTrash(url, workspace: workspace) { [weak self] in
+                    self?.files.invalidateListing()
+                    self?.resumeSearch()
+                }
             })
         return entries
     }
@@ -437,8 +452,7 @@ extension LauncherModel {
                     isDestructive: true
                 ) { [weak self] in
                     guard let self else { return }
-                    provider.selection.excluded[app.url.path] = nil
-                    self.navigate(to: .provided(ApplicationsCommandProvider.reviewScope(for: app)))
+                    provider.beginReview(of: app, in: self)
                 })
         }
         return entries
@@ -452,8 +466,14 @@ extension LauncherModel {
         self.confirmation = .provided(confirmation)
     }
 
+    /// Asks before moving a file to the Trash. The file is frozen as it is now; if something else
+    /// is at that path when ↩ approves, nothing moves.
     func askToTrash(_ url: URL, workspace: any FileWorkspace, then: @escaping @MainActor () -> Void = {}) {
         let name = url.lastPathComponent
+        guard let identity = FileIdentity.of(url) else {
+            feedback = .warning("“\(name.truncatedForFeedback)” is gone.")
+            return
+        }
         askConfirmation(
             ProvidedConfirmation(
                 id: "files.trash.\(url.path)",
@@ -463,6 +483,10 @@ extension LauncherModel {
                     symbol: "trash")
             ) { [weak self] in
                 guard let self else { return }
+                guard identity.isSameItem(as: FileIdentity.of(url)) else {
+                    self.feedback = .warning("“\(name.truncatedForFeedback)” changed since you asked. Nothing was moved.")
+                    return
+                }
                 do {
                     try workspace.trash(url)
                     self.toast("Moved “\(name.truncatedForFeedback)” to the Trash")
@@ -582,8 +606,14 @@ extension LauncherModel {
         }
     }
 
+    /// Force Quit asks first and then acts on exactly the processes running when it asked.
     func askToForceQuit(_ app: InstalledApplication) {
         guard let running = applicationsProvider?.running else { return }
+        let snapshot = running.instances(of: app)
+        guard !snapshot.isEmpty else {
+            feedback = .info("\(app.name) isn't running.")
+            return
+        }
         askConfirmation(
             ProvidedConfirmation(
                 id: "applications.forceQuit.\(app.id)",
@@ -591,7 +621,15 @@ extension LauncherModel {
                     question: "Force quit \(app.name)?", detail: "Unsaved changes in its documents will be lost.",
                     confirmTitle: "Force Quit", symbol: "exclamationmark.octagon")
             ) { [weak self] in
-                self?.runApplicationAction(app, verb: "Force quit") { try running.forceQuit(app) }
+                guard let self else { return }
+                let result = running.forceQuit(snapshot)
+                if !result.failed.isEmpty {
+                    self.feedback = .error("Couldn't force quit \(app.name).")
+                } else if result.acted.isEmpty {
+                    self.feedback = .info("\(app.name) had already quit. Nothing else was touched.")
+                } else {
+                    self.toast("Force quit \(app.name)")
+                }
             })
     }
 
@@ -608,29 +646,31 @@ extension LauncherModel {
         }
     }
 
-    func hideAllApplications() {
-        guard let running = applicationsProvider?.running else { return }
-        let result = running.hideAll(keeping: Set(applicationSettings.keepRunningBundleIDs))
-        reportBatch(result, verb: "Hid", noun: "hide")
-    }
-
-    func askToQuitAllApplications() {
+    /// Hide All and Quit All name the apps they'll act on, then act on exactly those processes:
+    /// apps opened while the prompt shows, and apps added to Keep running meanwhile, are left alone.
+    func askToBatch(quitting: Bool) {
         guard let running = applicationsProvider?.running else { return }
         let keeping = Set(applicationSettings.keepRunningBundleIDs)
-        let targets = running.batchTargets(keeping: keeping, quitting: true)
-        guard !targets.isEmpty else { return }
-        let names = targets.map(\.name)
+        let snapshot = running.batchTargets(keeping: keeping, quitting: quitting).filter { quitting || !$0.isHidden }
+        guard !snapshot.isEmpty else {
+            feedback = .info(quitting ? "No apps to quit." : "No apps to hide.")
+            return
+        }
+        let names = snapshot.map(\.name)
         let listed = names.prefix(3).joined(separator: ", ") + (names.count > 3 ? " and \(names.count - 3) more" : "")
+        let verb = quitting ? "Quit" : "Hide"
         askConfirmation(
             ProvidedConfirmation(
-                id: "applications.quitAll",
+                id: quitting ? "applications.quitAll" : "applications.hideAll",
                 CommandConfirmation(
-                    question: "Quit \(names.count) app\(names.count == 1 ? "" : "s")?",
-                    detail: "\(listed). Apps can ask to save first. Apps you keep running in Settings › Applications stay open.",
-                    confirmTitle: "Quit All", symbol: "xmark.circle")
+                    question: "\(verb) \(names.count) app\(names.count == 1 ? "" : "s")?",
+                    detail: "\(listed).\(quitting ? " Apps can ask to save first." : "") Apps you keep running in Settings › Applications stay as they are.",
+                    confirmTitle: quitting ? "Quit All" : "Hide All", symbol: quitting ? "xmark.circle" : "eye.slash")
             ) { [weak self] in
                 guard let self else { return }
-                self.reportBatch(running.quitAll(keeping: keeping), verb: "Asked", noun: "quit")
+                let keepingNow = Set(self.applicationSettings.keepRunningBundleIDs)
+                let result = running.act(on: snapshot, quitting: quitting, keeping: keepingNow)
+                self.reportBatch(result, verb: quitting ? "Asked" : "Hid", noun: quitting ? "quit" : "hide")
             })
     }
 
