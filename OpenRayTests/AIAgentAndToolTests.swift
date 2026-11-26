@@ -307,8 +307,8 @@ struct AIToolTests {
         #expect(request.prompt == "save my groceries: milk, eggs")
         #expect(model.ai.messages.first?.displayText == "@notes save my groceries: milk, eggs")
         #expect(model.store.database.notes.isEmpty)
-        // ⌘K offers the same choices as the card.
-        #expect(model.actions(for: nil).contains { $0.id == "tool.allow" })
+        // A write is approved on its card, which shows every value; ⌘K doesn't offer it.
+        #expect(!model.actions(for: nil).contains { $0.id == "tool.allow" })
         broker.resolve(broker.pendingApprovals[0].id, .allow)
         await model.ai.waitForResponse()
         #expect(model.store.database.notes.map(\.title) == ["Groceries"])
@@ -345,7 +345,8 @@ struct AIToolTests {
         #expect(try await calculator.run(AIToolArguments(["expression": "2+2"])) == "2+2 = 4")
         #expect(try await calculator.run(AIToolArguments(["expression": "??"])).contains("couldn't"))
         let catalog = AIToolCatalog.extensions(for: AIToolCatalog.standard(store: store, files: StubFiles()).map(\.spec))
-        #expect(catalog.map(\.id) == AIToolCatalog.extensionOrder)
+        // Without the calendar and command services, the library's own tools.
+        #expect(catalog.map(\.id) == Array(AIToolCatalog.extensionOrder.prefix(6)))
         #expect(catalog.first { $0.id == "notes" }?.tools.map(\.id) == ["searchNotes", "createNote"])
         #expect(try await FileSearchTool(searcher: StubFiles()).run(AIToolArguments(["query": "report"])).contains("report.pdf"))
     }
