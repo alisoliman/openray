@@ -181,7 +181,7 @@ extension WindowLayout {
 // MARK: - Geometry
 
 /// A region of a display in unit fractions, origin at the bottom-left like AppKit.
-struct UnitRect: Equatable, Codable, Sendable {
+struct UnitRect: Hashable, Codable, Sendable {
     var x: Double
     var y: Double
     var width: Double
@@ -651,11 +651,11 @@ struct CustomWindowCommand: Codable, Equatable, Identifiable, Sendable {
 // MARK: - Saved layouts
 
 /// A saved arrangement of several apps' windows across displays.
-struct SavedWindowLayout: Codable, Equatable, Identifiable, Sendable {
+struct SavedWindowLayout: Codable, Hashable, Identifiable, Sendable {
     static let maximumWindowsPerDisplay = 8
 
     /// What happens to windows the layout doesn't place, on the displays it uses.
-    enum OtherWindows: String, Codable, CaseIterable, Sendable {
+    enum OtherWindows: String, Codable, CaseIterable, Hashable, Sendable {
         case leave, minimize, close
 
         var title: String {
@@ -667,7 +667,7 @@ struct SavedWindowLayout: Codable, Equatable, Identifiable, Sendable {
         }
     }
 
-    struct Slot: Codable, Equatable, Identifiable, Sendable {
+    struct Slot: Codable, Hashable, Identifiable, Sendable {
         var id = UUID()
         var bundleIdentifier: String
         var appName: String

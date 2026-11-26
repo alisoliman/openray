@@ -31,9 +31,48 @@ struct ScriptDirectoryRecord: Codable, Identifiable, Hashable, Sendable {
 
 // MARK: Slice 5: Window management
 
-/// A saved multi-app window arrangement.
+/// A saved multi-app window arrangement. Every field but `id` decodes if present, so the
+/// ID-only records Step 0 wrote still load (as an empty, unnamed layout).
 struct WindowLayoutRecord: Codable, Identifiable, Hashable, Sendable {
     var id: UUID = UUID()
+    var name = ""
+    /// Front to back: the first slot ends up frontmost.
+    var slots: [SavedWindowLayout.Slot] = []
+    var otherWindows: SavedWindowLayout.OtherWindows = .leave
+
+    init(
+        id: UUID = UUID(), name: String = "", slots: [SavedWindowLayout.Slot] = [],
+        otherWindows: SavedWindowLayout.OtherWindows = .leave
+    ) {
+        self.id = id
+        self.name = name
+        self.slots = slots
+        self.otherWindows = otherWindows
+    }
+
+    init(_ layout: SavedWindowLayout) {
+        self.init(id: layout.id, name: layout.name, slots: layout.slots, otherWindows: layout.otherWindows)
+    }
+
+    init(from decoder: any Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        id = try container.decode(UUID.self, forKey: .id)
+        name = try container.decodeIfPresent(String.self, forKey: .name) ?? ""
+        slots = try container.decodeIfPresent([SavedWindowLayout.Slot].self, forKey: .slots) ?? []
+        // An option a later build adds reads as Leave Open rather than failing the library.
+        otherWindows =
+            (try? container.decodeIfPresent(SavedWindowLayout.OtherWindows.self, forKey: .otherWindows)) ?? .leave
+    }
+
+    /// The name to show: "Untitled Layout" until the person names it.
+    var displayName: String {
+        let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? "Untitled Layout" : trimmed
+    }
+
+    var layout: SavedWindowLayout {
+        SavedWindowLayout(id: id, name: displayName, slots: slots, otherWindows: otherWindows)
+    }
 }
 
 // MARK: Slice 6: Focus

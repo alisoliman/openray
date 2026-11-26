@@ -22,6 +22,11 @@ struct SystemCommand: Identifiable, Sendable {
 
         /// The launcher item ID, e.g. "system.lockScreen".
         var itemID: String { "system.\(rawValue)" }
+
+        init?(itemID: String) {
+            guard itemID.hasPrefix("system.") else { return nil }
+            self.init(rawValue: String(itemID.dropFirst("system.".count)))
+        }
     }
 
     enum Group: String, CaseIterable, Sendable {

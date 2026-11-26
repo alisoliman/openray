@@ -50,6 +50,9 @@ final class HUDController {
 
     static let duration: Duration = .milliseconds(1_500)
 
+    /// The app's one HUD, so a new message always replaces the last.
+    static let shared = HUDController()
+
     private let presenter: any HUDPresenting
     private let screenFrame: @MainActor () -> CGRect?
     private let schedule: Schedule
