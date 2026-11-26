@@ -132,6 +132,9 @@ codesign -d --entitlements - --xml "$OPENRAY_APP" >"$OPENRAY_OUTPUT/entitlements
 # this entitlement and a usage description. Refuse a debugger entitlement if one appears.
 [[ "$(/usr/libexec/PlistBuddy -c 'Print :com.apple.security.automation.apple-events' "$OPENRAY_OUTPUT/entitlements.plist" 2>/dev/null || true)" == true ]] ||
   fail 'The release signature is missing the Automation (Apple Events) entitlement.'
+# Calendar commands (My Schedule) read EventKit, which the hardened runtime allows only with this.
+[[ "$(/usr/libexec/PlistBuddy -c 'Print :com.apple.security.personal-information.calendars' "$OPENRAY_OUTPUT/entitlements.plist" 2>/dev/null || true)" == true ]] ||
+  fail 'The release signature is missing the Calendars entitlement.'
 /usr/libexec/PlistBuddy -c 'Print :NSAppleEventsUsageDescription' "$OPENRAY_APP/Contents/Info.plist" >/dev/null 2>&1 ||
   fail 'The app is missing NSAppleEventsUsageDescription.'
 if [[ "$(/usr/libexec/PlistBuddy -c 'Print :com.apple.security.get-task-allow' "$OPENRAY_OUTPUT/entitlements.plist" 2>/dev/null || true)" == true ]]; then
