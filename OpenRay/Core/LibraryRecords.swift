@@ -38,9 +38,18 @@ struct WindowLayoutRecord: Codable, Identifiable, Hashable, Sendable {
 
 // MARK: Slice 6: Focus
 
-/// A named group of apps that a focus session blocks or allows.
+/// A named group of apps that a focus session blocks or allows. `id` is `builtin.<name>` for an
+/// edit to one of the built-in categories (see `FocusCategory.builtIns`), or a UUID string for one
+/// the person made. Every other field is optional, so a record can override just what changed.
 struct FocusCategoryRecord: Codable, Identifiable, Hashable, Sendable {
     var id: String
+    var name: String? = nil
+    /// An SF Symbol name.
+    var symbol: String? = nil
+    /// The apps in the category, by bundle identifier.
+    var bundleIDs: [String]? = nil
+    /// True when the person removed a built-in category.
+    var isHidden: Bool? = nil
 }
 
 // MARK: Slice 3: Emoji and Calculator
