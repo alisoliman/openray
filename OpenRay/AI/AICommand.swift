@@ -141,7 +141,7 @@ extension AICommand {
     static let changeTone = AICommand(
         id: "aicommand.changeTone", name: "Change Tone", symbol: "theatermasks",
         prompt:
-            "Rewrite the following text in a {argument name=\"tone\" options=\"Friendly, Professional, Confident, Casual, Direct, Empathetic\" default=\"Friendly\"} tone. Keep its meaning, facts and language.\n\n{selection}",
+            "Rewrite the following text in a {argument name=\"tone\" options=\"Friendly, Professional, Confident, Casual, Direct, Empathetic\" default=\"Friendly\" | raw} tone. Keep its meaning, facts and language.\n\n{selection}",
         subtitle: "Rewrite your text in another tone", creativity: .medium, guardrail: .permissive, output: .replace)
 
     static let findBugs = AICommand(
@@ -152,7 +152,7 @@ extension AICommand {
 
     static let translate = AICommand(
         id: "aicommand.translate", name: "Translate Selection", symbol: "character.bubble",
-        prompt: "{argument name=\"language\" options=\"\(TranslationLanguages.all.map(\.name).joined(separator: ", "))\" default=\"English\"}{selection}",
+        prompt: "{argument name=\"language\" options=\"\(TranslationLanguages.all.map(\.name).joined(separator: ", "))\" default=\"English\" | raw}{selection}",
         subtitle: "Translate on this Mac with Apple Translation", creativity: .none, guardrail: .standard, output: .replace,
         performer: .translation(languageArgument: "language"))
 

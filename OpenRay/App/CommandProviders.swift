@@ -19,6 +19,7 @@ enum CommandProviders {
         // Slice 5: system, windows
         // Slice 6: notes, calendar, focus
         // Slice 7: AI commands, agents
+        AICommandProvider.registration,
         // Slice 8: script commands
     ]
 }

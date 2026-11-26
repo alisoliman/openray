@@ -631,8 +631,27 @@ final class LauncherModel {
     /// Writing commands always run fresh on the current selection. A query or
     /// attachment starts a new chat, unless it is the question that started the
     /// chat on screen; opening AI with neither resumes the chat as it was.
-    func openAI(_ action: AIAction = .chat, prompt: String? = nil, attachment: AIAttachment? = nil) {
-        let switchingWhileBusy = ai.isGenerating && ai.action != action
+    func openAI(
+        _ action: AIAction = .chat, prompt: String? = nil, attachment: AIAttachment? = nil, command: AICommandRun? = nil
+    ) {
+        // Slice 7: agents, tools and saved chats connect on first use.
+        _ = aiHub
+        if let command {
+            // An AI Command runs at once on the text it rendered (Slice 7).
+            if destination == .search { aiReturn = (section, query) }
+            destination = .ai
+            argumentLink = nil
+            files.stop()
+            cancelProvidedLiveItems()
+            showActions = false
+            confirmation = nil
+            feedback =
+                ai.isGenerating ? .warning("Stop the current response or wait for it to finish before running another command.") : nil
+            if !ai.isGenerating { ai.start(command) }
+            focusRequest += 1
+            return
+        }
+        let switchingWhileBusy = ai.isGenerating && (ai.action != action || ai.command != nil)
         if destination == .search { aiReturn = (section, query) }
         var sendPrompt = true
         // Reset before open(_:), so the engine is prepared for the new run.

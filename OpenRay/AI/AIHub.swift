@@ -43,10 +43,7 @@ final class AIHub {
         guard launcher == nil else { return self }
         launcher = model
         chatStore = ChatStore(fileURL: model.store.fileURL.map(ChatStore.url(nextTo:)))
-        let broker = AIToolBroker(
-            executors: AIToolCatalog.standard(store: model.store, files: fileSearcher ?? SpotlightFileSearcher()),
-            permissions: LibraryToolPermissions(store: model.store))
-        self.broker = broker
+        broker = makeBroker()
         if translator == nil { translator = TranslationServiceTranslator() }
         if let panelChat { configure(panelChat) }
         applySettings()
@@ -54,12 +51,22 @@ final class AIHub {
         return self
     }
 
+    /// Tools over the launcher's library. Each conversation has its own broker, so its
+    /// approval cards show where it is: the panel or the window.
+    func makeBroker() -> AIToolBroker? {
+        guard let launcher else { return nil }
+        return AIToolBroker(
+            executors: AIToolCatalog.standard(store: launcher.store, files: fileSearcher ?? SpotlightFileSearcher()),
+            permissions: LibraryToolPermissions(store: launcher.store))
+    }
+
     /// Gives a conversation the agents, tools and translator.
     func configure(_ chat: AIChatModel) {
         chat.environment = AIChatEnvironment(
             agents: { [weak self] in self?.agents ?? [] },
             defaultAgent: { [weak self] in self?.defaultAgent },
-            toolExtensions: { [weak self] in self?.toolExtensions ?? [] }, toolBroker: broker, translator: translator)
+            toolExtensions: { [weak self] in self?.toolExtensions ?? [] },
+            toolBroker: chat.environment.toolBroker ?? makeBroker(), translator: translator)
         if chat.messages.isEmpty, !chat.isGenerating, chat.agent == nil, let agent = defaultAgent, !agent.isAssistant {
             chat.selectAgent(agent)
         }

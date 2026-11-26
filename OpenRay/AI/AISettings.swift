@@ -13,6 +13,7 @@ struct AISettings: Equatable, Sendable {
     var chatRetention: ChatRetention = .forever
     var dictationEnabled = false
     var screenContextEnabled = false
+    var chatWindowOnTop = false
 
     init() {}
 
@@ -27,6 +28,7 @@ struct AISettings: Equatable, Sendable {
         chatRetention = values["retention"].flatMap(ChatRetention.init(rawValue:)) ?? .forever
         dictationEnabled = values["dictation"] == "true"
         screenContextEnabled = values["screenContext"] == "true"
+        chatWindowOnTop = values["onTop"] == "true"
     }
 
     /// Writes every value, dropping keys left at their defaults.
@@ -39,6 +41,7 @@ struct AISettings: Equatable, Sendable {
         if chatRetention != .forever { values["retention"] = chatRetention.rawValue }
         if dictationEnabled { values["dictation"] = "true" }
         if screenContextEnabled { values["screenContext"] = "true" }
+        if chatWindowOnTop { values["onTop"] = "true" }
         if values.isEmpty {
             database.commandPreferences.removeValue(forKey: Self.preferencesKey)
         } else {

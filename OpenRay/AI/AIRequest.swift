@@ -33,7 +33,7 @@ enum AICreativity: String, CaseIterable, Identifiable, Sendable {
 
     /// The nearest setting for a temperature, so an agent's number shows as a choice.
     static func nearest(to temperature: Double?) -> AICreativity {
-        guard let temperature else { return .none }
+        guard let temperature, temperature > 0.05 else { return .none }
         return allCases.filter { $0 != .none }
             .min { abs(($0.temperature ?? 0) - temperature) < abs(($1.temperature ?? 0) - temperature) } ?? .medium
     }
