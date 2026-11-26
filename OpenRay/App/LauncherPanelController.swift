@@ -345,6 +345,9 @@ final class OpenRayDelegate: NSObject, NSApplicationDelegate {
     private var panelController: LauncherPanelController?
     private(set) lazy var settingsController = SettingsWindowController(model: model)
     private(set) lazy var helpController = HelpWindowController(model: model)
+    // Slice 7: the AI Chat window and the AI Command and agent editor.
+    private(set) lazy var aiChatController = AIChatWindowController(model: model)
+    private(set) lazy var aiEditorController = AIEditorWindowController(model: model)
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         guard !RuntimeMode.isTestHost else { return }
@@ -362,6 +365,8 @@ final class OpenRayDelegate: NSObject, NSApplicationDelegate {
             self?.settingsController.show(pane: pane, focusCommandID: commandID)
         }
         model.presentHelp = { [weak self] in self?.helpController.show() }
+        model.aiHub.presentWindow = { [weak self] in self?.aiChatController.show() }
+        model.aiHub.presentEditor = { [weak self] request in self?.aiEditorController.show(request) }
         NSWorkspace.shared.notificationCenter.addObserver(
             self, selector: #selector(activeApplicationChanged(_:)),
             name: NSWorkspace.didActivateApplicationNotification, object: nil)
