@@ -72,6 +72,21 @@ struct EmojiProviderTests {
         #expect(model.groups.map(\.id) == ["emoji.categories"])
     }
 
+    @Test func pinsPastTheFirstScreenHaveTheirOwnPage() throws {
+        let (provider, model) = setUp()
+        defer { model.stop() }
+        let glyphs = EmojiCatalog.bundled.entries(in: .foodDrink).prefix(20).map(\.id)
+        provider.update(in: model) { preferences in
+            for glyph in glyphs { preferences.togglePin(glyph) }
+        }
+        let pinnedGroup = try #require(model.groups.first { $0.id == "emoji.pinned" })
+        #expect(pinnedGroup.items.count == EmojiProvider.browseLimit + 1)
+        #expect(pinnedGroup.items.last?.title == "All Pinned")
+        try browse(model, "All Pinned")
+        #expect(model.orderedResults.filter { $0.id.hasPrefix("emoji-tile.") }.map(\.title) == glyphs)
+        #expect(model.groups.first { $0.id == "emoji.pinned" }?.title == "Pinned")
+    }
+
     @Test func searchRanksResultsInOneGroup() throws {
         let (_, model) = setUp()
         defer { model.stop() }

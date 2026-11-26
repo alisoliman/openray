@@ -115,33 +115,40 @@ final class EmojiProvider: CommandProvider {
     private func searchItems(_ scope: ProvidedScope, query: String, in model: LauncherModel) -> [LauncherItem] {
         let preferences = preferences(in: model)
         let tone = preferences.defaultSkinTone
+        let showsPinned = scope.arguments["category"] == "pinned"
         let category = scope.arguments["category"].flatMap(EmojiCategory.init(rawValue:))
         if !query.isEmpty {
             guard query.count <= Self.maximumQueryLength else { return [] }
             return catalog.search(query, preferences: preferences, category: category, now: now())
+                .filter { !showsPinned || preferences.isPinned($0.id) }
                 .prefix(Self.pageSize).map { tile($0, section: "results", tone: tone) }
         }
-        if let category {
-            let entries = catalog.entries(in: category)
+        if showsPinned || category != nil {
+            let name = category?.rawValue ?? "pinned"
+            let entries = category.map { catalog.entries(in: $0) } ?? preferences.pinned.compactMap { catalog.entry(for: $0) }
             let pages = max(1, (entries.count + Self.pageSize - 1) / Self.pageSize)
             let page = min(max(scope.arguments["page"].flatMap(Int.init) ?? 0, 0), pages - 1)
             let start = page * Self.pageSize
             var items = [navigationTile("all", title: "All Categories", symbol: "square.grid.2x2", section: "start")]
             if page > 0 {
-                items.append(
-                    navigationTile("\(category.rawValue)/\(page - 1)", title: "Previous", symbol: "chevron.left", section: "start"))
+                items.append(navigationTile("\(name)/\(page - 1)", title: "Previous", symbol: "chevron.left", section: "start"))
             }
-            items += entries[start..<min(start + Self.pageSize, entries.count)].map { tile($0, section: category.rawValue, tone: tone) }
+            items += entries[start..<min(start + Self.pageSize, entries.count)].map { tile($0, section: name, tone: tone) }
             if page < pages - 1 {
-                items.append(navigationTile("\(category.rawValue)/\(page + 1)", title: "More", symbol: "chevron.right", section: "end"))
+                items.append(navigationTile("\(name)/\(page + 1)", title: "More", symbol: "chevron.right", section: "end"))
             }
             return items
         }
-        let pinned = preferences.pinned.compactMap { catalog.entry(for: $0) }.prefix(Self.browseLimit)
-        let pinnedIDs = Set(pinned.map(\.id))
+        let allPinned = preferences.pinned.compactMap { catalog.entry(for: $0) }
+        let pinned = allPinned.prefix(Self.browseLimit)
+        let pinnedIDs = Set(allPinned.map(\.id))
         let frequent = preferences.usage.ranked(at: now(), limit: Self.browseLimit + pinnedIDs.count)
             .compactMap { catalog.entry(for: $0) }.filter { !pinnedIDs.contains($0.id) }.prefix(Self.browseLimit)
-        return pinned.map { tile($0, section: "pinned", tone: tone) }
+        var morePinned: [LauncherItem] = []
+        if allPinned.count > Self.browseLimit {
+            morePinned = [navigationTile("pinned/0", title: "All Pinned", symbol: "pin", section: "pinned")]
+        }
+        return pinned.map { tile($0, section: "pinned", tone: tone) } + morePinned
             + frequent.map { tile($0, section: "frequent", tone: tone) }
             + EmojiCategory.allCases.filter { !catalog.entries(in: $0).isEmpty }.map { category in
                 navigationTile("\(category.rawValue)/0", title: category.title, symbol: category.systemImage, section: "categories")
@@ -303,9 +310,13 @@ final class EmojiProvider: CommandProvider {
     private func browse(_ destination: String, in model: LauncherModel) {
         var scope = Self.scope
         let parts = destination.split(separator: "/")
+        let page = parts.count > 1 ? String(parts[1]) : "0"
         if let first = parts.first, let category = EmojiCategory(rawValue: String(first)) {
-            scope.arguments = ["category": category.rawValue, "page": parts.count > 1 ? String(parts[1]) : "0"]
+            scope.arguments = ["category": category.rawValue, "page": page]
             scope.title = category.title
+        } else if parts.first == "pinned" {
+            scope.arguments = ["category": "pinned", "page": page]
+            scope.title = "Pinned"
         }
         model.navigate(to: .provided(scope))
     }

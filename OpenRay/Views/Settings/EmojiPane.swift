@@ -58,7 +58,7 @@ struct EmojiPane: View {
                 }
                 Section {
                     IconRow("Search by name, keyword or category, such as “thumbs up” or “arrow”", symbol: "magnifyingglass")
-                    IconRow("⌘E adds your own keywords; ⌘. pins an emoji", symbol: "tag")
+                    IconRow("⌘E adds your own keywords; ⇧⌘P pins an emoji", symbol: "tag")
                     IconRow("Names and keywords come from Unicode's CLDR data", symbol: "character.book.closed")
                 }
             }

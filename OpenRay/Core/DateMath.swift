@@ -17,17 +17,20 @@ enum DateMath {
     }
 
     /// Lowercased words, with "+" as its own word except inside ISO 8601 offsets and in a
-    /// signed number after a unix marker ("unix +86400").
+    /// signed number beside a unix marker ("unix +86400", "unix millis +86400", "+86400 unix").
     static func tokenize(_ input: String) -> [String] {
         let words = input.lowercased()
             .replacingOccurrences(of: ",", with: " ")
             .replacingOccurrences(of: "?", with: " ")
             .split(whereSeparator: \.isWhitespace).map(String.init)
+        let markers: Set<String> = ["unix", "timestamp", "epoch", "time", "ms", "millis", "milliseconds"]
         var tokens: [String] = []
-        for word in words {
-            let afterMarker = ["unix", "timestamp", "epoch", "time", "ms", "milliseconds"].contains(tokens.last ?? "")
+        for (position, word) in words.enumerated() {
+            let besideMarker =
+                markers.contains(tokens.last ?? "")
+                || position + 1 < words.count && markers.contains(words[position + 1])
             if !word.contains("+") || isoDate.groups(in: word) != nil
-                || afterMarker && signedNumber.groups(in: word) != nil
+                || besideMarker && signedNumber.groups(in: word) != nil
             {
                 tokens.append(word)
             } else {
@@ -39,20 +42,20 @@ enum DateMath {
 
     static let signedNumber = CalculatorPattern(#"^[+-]?\d{1,16}(?:\.\d+)?$"#)
 
-    /// Seconds since 1970 that unix phrases accept and produce, in both directions: the years
-    /// 0000 through 9999, as four-digit ISO dates allow.
-    static let unixRange: ClosedRange<Double> = -62_167_219_200...253_402_300_799
+    /// Seconds since 1970 that unix phrases accept and produce, in both directions: every
+    /// instant of the years 0000 through 9999, as four-digit ISO dates allow.
+    static let unixRange: Range<Double> = -62_167_219_200..<253_402_300_800
 
-    /// Unix seconds as text, to the millisecond, so a copied value converts back to the
-    /// same instant: "1710513000", "1710513000.001", "-86400".
+    /// Unix seconds as text, to the microsecond, so a copied value converts back to the same
+    /// instant: "1710513000", "1710513000.001", "-86400".
     static func unixString(_ seconds: TimeInterval) -> String {
-        let milliseconds = (seconds * 1_000).rounded()
-        let sign = milliseconds < 0 ? "-" : ""
-        let magnitude = Int64(abs(milliseconds))
-        let whole = magnitude / 1_000
-        let fraction = magnitude % 1_000
+        let microseconds = (seconds * 1_000_000).rounded()
+        let sign = microseconds < 0 ? "-" : ""
+        let magnitude = Int64(abs(microseconds))
+        let whole = magnitude / 1_000_000
+        let fraction = magnitude % 1_000_000
         guard fraction != 0 else { return "\(sign)\(whole)" }
-        var digits = String(format: "%03lld", fraction)
+        var digits = String(format: "%06lld", fraction)
         while digits.hasSuffix("0") { digits.removeLast() }
         return "\(sign)\(whole).\(digits)"
     }
