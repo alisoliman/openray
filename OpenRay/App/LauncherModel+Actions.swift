@@ -704,6 +704,7 @@ extension LauncherModel {
                         key: "c", modifiers: [.command, .shift], group: .item
                     ) { [weak self] in self?.copy(url.path, label: Self.shortenedPath(url)) })
             }
+            entries += deepLinkActions(for: item)
             if item.canEdit {
                 entries.append(
                     ActionEntry(
