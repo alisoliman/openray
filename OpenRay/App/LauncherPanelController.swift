@@ -366,6 +366,9 @@ final class OpenRayDelegate: NSObject, NSApplicationDelegate {
             self, selector: #selector(activeApplicationChanged(_:)),
             name: NSWorkspace.didActivateApplicationNotification, object: nil)
         panel.show()
+        // Slice 6: the Notes window reaches the launcher, and menu bar extras start drawing.
+        NotesCenter.shared.launcher = model
+        MenuBarExtrasController.shared.start(model: model)
         Task { await model.start() }
         if let pane = RuntimeMode.settingsPane(arguments: ProcessInfo.processInfo.arguments) {
             model.openSettings(pane)
@@ -379,6 +382,8 @@ final class OpenRayDelegate: NSObject, NSApplicationDelegate {
 
     func applicationWillTerminate(_ notification: Notification) {
         NSWorkspace.shared.notificationCenter.removeObserver(self)
+        NotesCenter.shared.flush()
+        MenuBarExtrasController.shared.stop()
         model.stop()
     }
 

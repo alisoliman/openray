@@ -6,7 +6,7 @@ struct OpenRayApp: App {
     @NSApplicationDelegateAdaptor(OpenRayDelegate.self) private var delegate
 
     var body: some Scene {
-        MenuBarExtra {
+        MenuBarExtra(isInserted: iconIsShown) {
             MenuBarContent(model: delegate.model)
         } label: {
             Image(nsImage: ORMarkImage.menuBar(paused: capturePaused))
@@ -21,6 +21,13 @@ struct OpenRayApp: App {
 
     /// The menu bar icon carries state: an amber dot means capture is paused.
     private var capturePaused: Bool { delegate.model.store.database.clipboardIsPaused }
+
+    /// Settings › Menu Bar can hide the icon; the launcher still opens Settings.
+    private var iconIsShown: Binding<Bool> {
+        Binding(
+            get: { !MenuBarExtras.hidesOpenRayIcon(in: delegate.model.store.database) },
+            set: { MenuBarExtras.setHidesOpenRayIcon(!$0, in: delegate.model.store) })
+    }
 }
 
 /// Shortcuts show the person's actual bindings, read from the library.
@@ -43,6 +50,8 @@ private struct MenuBarContent: View {
             }
         }
         .menuShortcut(model.store.database.binding(for: "ai.chat")?.shortcut)
+        Button("Notes") { NotesCenter.shared.model(for: model.store).toggle() }
+            .menuShortcut(model.store.database.binding(for: NotesCommandProvider.toggleID)?.shortcut)
         Divider()
         if preferences.clipboardEnabled {
             Text("Clipboard capture is on")

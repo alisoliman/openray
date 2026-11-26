@@ -14,6 +14,10 @@ enum CommandProviders {
         // Slice 4: files, screenshots, applications
         // Slice 5: system, windows
         // Slice 6: notes, calendar, focus
+        NotesCommandProvider.registration,
+        CalendarCommandProvider.registration,
+        FocusCommandProvider.registration,
+        MenuBarCommandProvider.registration,
         // Slice 7: AI commands, agents
         // Slice 8: script commands
     ]
