@@ -1141,3 +1141,36 @@ extension ScriptCommandLauncherTests {
         #expect(h.provider.setDirectory(record.id, enabled: true, approving: h.folder.identity, in: h.model))
     }
 }
+
+// MARK: - Slice 5's HUD
+
+extension ScriptCommandLauncherTests {
+    @Test("Silent scripts show their last line in Slice 5's HUD; failures use its error style")
+    func silentHUD() async throws {
+        let folder = try ScriptFolder()
+        try folder.script("quiet.sh", title: "Quiet", mode: "silent", body: "echo working\necho 'Session started'")
+        try folder.script("loud.sh", title: "Loud", mode: "silent", body: "echo 'No session'\nexit 2")
+        let screen = FakeHUDPresenter()
+        let hud = HUDController(presenter: screen, screenFrame: { CGRect(x: 0, y: 0, width: 1_440, height: 900) }, schedule: { _, _ in })
+        let provider = ScriptCommandProvider(
+            catalog: ScriptCatalog(),
+            runner: ScriptRunner(launcher: POSIXScriptLauncher(allowedRoots: [folder.url]), environment: folder.environment),
+            presenter: HUDScriptResultPresenter(hud: hud), refreshesAutomatically: false)
+        let model = LauncherModel(
+            store: LibraryStore(fileURL: nil), ai: AIChatModel(engine: TestAIEngine()),
+            pasteboard: NSPasteboard.withUniqueName(), registry: CommandRegistry(providers: [provider]))
+        let record = folder.record
+        model.store.update { $0.scriptDirectories = [record] }
+        LocalApprovalStore.for(model.store).approve(record)
+        provider.synchronize(with: model, synchronously: true)
+        for title in ["Quiet", "Loud"] {
+            model.perform(try #require(model.commandItems.first { $0.title == title }))
+            let script = try #require(provider.catalog.commands.first { $0.title == title })
+            await provider.runner.latestJob(for: script.id)?.task?.value
+        }
+        #expect(screen.presented.map(\.message.text) == ["Session started", "No session"])
+        #expect(screen.presented.map(\.message.style) == [.success, .error])
+        // The app's provider uses the shared HUD.
+        #expect(ScriptCommandProvider().presenter is HUDScriptResultPresenter)
+    }
+}

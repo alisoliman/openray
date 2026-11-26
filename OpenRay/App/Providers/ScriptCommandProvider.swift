@@ -7,17 +7,21 @@ protocol ScriptResultPresenting: AnyObject {
     func showHUD(_ text: String, isError: Bool, in model: LauncherModel)
 }
 
-/// Slice 5 hook: until Slice 5's `HUDController` lands on the integration branch, a silent
-/// script's message waits in the action bar, where the next look at the panel finds it. When it
-/// lands, add a presenter that calls `HUDController.shared.show(HUDMessage(text, style: isError ?
-/// .error : .success))` and pass it in `ScriptCommandProvider.init()` (the one place that picks
-/// the presenter); nothing else changes.
+/// Silent scripts' last line, in Slice 5's HUD: a small window that appears after the panel
+/// closes. Failures use its error style. (Compact scripts that finish after the panel closed
+/// report here too.)
 @MainActor
-final class FeedbackScriptResultPresenter: ScriptResultPresenting {
-    init() {}
+final class HUDScriptResultPresenter: ScriptResultPresenting {
+    let hud: HUDController
+
+    init(hud: HUDController = .shared) {
+        self.hud = hud
+    }
 
     func showHUD(_ text: String, isError: Bool, in model: LauncherModel) {
-        model.feedback = isError ? .error(text) : .success(text)
+        hud.show(
+            HUDMessage(
+                text, symbol: isError ? "exclamationmark.triangle.fill" : "terminal", style: isError ? .error : .success))
     }
 }
 
@@ -85,8 +89,7 @@ final class ScriptCommandProvider: CommandProvider {
         let inert = SideEffectGuard.current.isInert
         self.init(
             catalog: ScriptCatalog(watcher: inert ? nil : FSEventsDirectoryWatcher()), runner: ScriptRunner(),
-            // Slice 5 hook: swap in a HUD presenter here (see FeedbackScriptResultPresenter).
-            presenter: FeedbackScriptResultPresenter(), refreshesAutomatically: !inert)
+            presenter: HUDScriptResultPresenter(), refreshesAutomatically: !inert)
     }
 
     init(
