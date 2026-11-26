@@ -136,6 +136,14 @@ final class FakeCommandProvider: CommandProvider {
         return rows.contains(title) ? row(title) : nil
     }
 
+    /// False until its rows have “loaded”: it can't say whether a row is gone.
+    var rowsLoaded = true
+
+    func presence(ofItemWithID id: String, in model: LauncherModel) -> ProvidedItemPresence {
+        guard rowsLoaded, id.hasPrefix("test.row.") else { return .unknown }
+        return item(withID: id, in: model) == nil ? .gone : .present
+    }
+
     func scopeItems(_ scope: ProvidedScope, query: String, in model: LauncherModel) -> [LauncherItem] {
         scopeArguments.append(scope.arguments)
         if scope == Self.gridScope { return ["Zulu", "Alpha"].map(row) }

@@ -283,7 +283,7 @@ struct LauncherLibraryWiringTests {
         #expect(model.clipboard.readText() == "Re: HELLO — Ann")
     }
 
-    @Test func snippetsWithAMissingRequiredArgumentAreNotCopied() {
+    @Test func snippetsWithAMissingRequiredArgumentAreNotCopied() throws {
         let (model, _) = makeModel()
         let snippet = Snippet(name: "Ask", keyword: "", content: "Dear {argument name=\"who\"}")
         model.store.update { $0.snippets = [snippet] }
@@ -292,8 +292,14 @@ struct LauncherLibraryWiringTests {
             LauncherItem(id: "snippet.\(snippet.id)", title: "Ask", subtitle: "", symbol: "curlybraces", kind: .snippet,
                 badge: "Snippet", action: .snippet(snippet)))
         #expect(model.clipboard.readText() == "unchanged")
-        // It runs as its command, whose fields ask; until Slice 1 draws them, the registry says what's missing.
-        #expect(model.feedback?.style == .warning && model.feedback?.text == "Enter who.")
+        // It runs as its command, whose argument fields ask for the value.
+        let session = try #require(model.argumentSession)
+        #expect(session.specs.map(\.name) == ["who"])
+        model.setArgumentValue("Ann", at: 0)
+        model.submitArguments()
+        #expect(model.argumentSession == nil)
+        #expect(model.clipboard.readText() == "Dear Ann")
+        #expect(model.clipboard.copy("unchanged"))
         let command = model.registry.item(withID: LibraryCommandProvider.commandID(for: snippet, action: .copy), in: model)
         guard case .provided(var ref)? = command?.action, let command else {
             Issue.record("Expected the snippet's copy command")
@@ -329,12 +335,13 @@ struct LauncherLibraryWiringTests {
         #expect(model.registry.descriptor(for: ref, in: model)?.arguments.map(\.name) == ["org", "repo"])
         #expect(!model.registry.commandItems(in: model).contains { $0.id == command.id })
 
-        // The built-in row's ↩ asks through the command, which warns about the missing values.
+        // The built-in row's ↩ runs the command, whose argument fields ask for the values.
         model.perform(
             LauncherItem(id: "quicklink.\(link.id)", title: "Repo", subtitle: "", symbol: "link", kind: .quicklink,
                 badge: "Quicklink", action: .quicklink(link, "")))
-        #expect(model.feedback?.style == .warning)
+        #expect(model.argumentSession?.specs.map(\.name) == ["org", "repo"])
         #expect(opener.opened.isEmpty)
+        model.cancelArguments()
 
         // Slice 1's fields fill ref.arguments and perform it.
         ref.arguments = ["org": "apple", "repo": "swift"]

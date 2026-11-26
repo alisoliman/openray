@@ -172,6 +172,11 @@ final class LauncherPanelController: NSObject, NSWindowDelegate {
         return window.isVisible && window.alphaValue >= 1 && window.isKeyWindow && window.occlusionState.contains(.visible)
     }
 
+    /// When the panel last started revealing itself or took key, while it's visible and key; nil
+    /// otherwise. Prompt approval counts its exposure from here, so the reveal itself never counts.
+    var surfaceVisibleSince: Date? { isSurfaceVisible ? revealedAt : nil }
+    private var revealedAt: Date?
+
     func toggle() {
         if window?.isVisible == true { dismiss() } else { show() }
     }
@@ -212,8 +217,10 @@ final class LauncherPanelController: NSObject, NSWindowDelegate {
         model.resumeSearch()
         model.focusRequest += 1
         if !wasVisible {
-            DispatchQueue.main.async { [model] in
+            revealedAt = nil
+            DispatchQueue.main.async { [weak self, model] in
                 window.alphaValue = 1
+                self?.revealedAt = Date()
                 let reduceMotion = NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
                 withAnimation(OR.Motion.resolve(OR.Motion.panel, reduceMotion: reduceMotion)) { model.isPresented = true }
             }
@@ -222,6 +229,7 @@ final class LauncherPanelController: NSObject, NSWindowDelegate {
 
     func dismiss(restoreFocus: Bool = true) {
         guard let window, window.isVisible else { return }
+        revealedAt = nil
         model.panelDidHide()
         window.orderOut(nil)
         if isQuickLookVisible { QLPreviewPanel.shared().orderOut(nil) }
@@ -334,6 +342,12 @@ final class LauncherPanelController: NSObject, NSWindowDelegate {
             case .dark: NSAppearance(named: .darkAqua)
             }
         window?.appearance = appearance
+    }
+
+    /// Taking key back from a sheet or Quick Look restarts prompt exposure: what was on top may
+    /// have covered the prompt.
+    func windowDidBecomeKey(_ notification: Notification) {
+        if revealedAt != nil { revealedAt = Date() }
     }
 
     func windowDidResignKey(_ notification: Notification) {

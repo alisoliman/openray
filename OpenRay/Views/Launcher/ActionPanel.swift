@@ -212,7 +212,7 @@ struct ShortcutsOverlay: View {
     /// confirmations, because shortcuts keep working underneath.
     private var bar: some View {
         ActionBar(
-            feedback: model.feedback, confirmation: model.confirmation,
+            feedback: model.feedback, confirmation: model.confirmation, confirmationInstance: model.confirmationInstanceID,
             context: { Text("Shortcuts").font(OR.Font.calloutEmphasis).foregroundStyle(OR.Color.text) },
             actions: {
                 ActionBarButton(title: "Close", keys: ["esc"], style: .ghost, isOn: true) { model.showShortcuts = false }

@@ -132,6 +132,8 @@ struct Step0FollowUpTests {
         let command = try #require(model.commandItems.first { $0.id == "test.confirm" })
         model.perform(command)
         #expect(model.confirmation != nil)
+        // A fresh Return in the field answers it.
+        model.currentKeyPressIsFresh = { true }
         model.performSelected()
         #expect(fake.performed == ["test.confirm"])
         // Answering didn't also advance onboarding.
@@ -168,14 +170,17 @@ struct Step0FollowUpTests {
         #expect(ActionConfirmation.clearClipboardHistory(pinnedCount: 0).isDestructive)
         #expect(!CommandConfirmation(question: "Q?", detail: "", confirmTitle: "Go").isDestructive)
         let command = try #require(model.commandItems.first { $0.id == "test.confirm" })
-        model.confirmationSurfaceIsVisible = { true }
+        model.confirmationSurfaceVisibleSince = { .distantPast }
+        var now = Date(timeIntervalSinceReferenceDate: 1_000)
+        model.promptClock = { now }
         model.perform(command)
         let prompt = try #require(model.confirmation)
         #expect(prompt.isDestructive && prompt.requiresVisibleApproval)
         // Not yet drawn: nothing approves it.
         #expect(model.confirmFromReturn(isRepeat: false))
         #expect(fake.performed.isEmpty)
-        model.confirmationDidAppear(prompt.id)
+        model.confirmationDidAppear(try #require(model.confirmationInstanceID))
+        now += LauncherModel.minimumPromptExposure
         #expect(model.confirmFromReturn(isRepeat: true))
         #expect(fake.performed.isEmpty)
         #expect(model.confirmFromReturn(isRepeat: false))
@@ -191,6 +196,7 @@ struct Step0FollowUpTests {
         let model = model([fake])
         defer { model.stop() }
         let command = try #require(model.commandItems.first { $0.id == "test.confirm" })
+        model.currentKeyPressIsFresh = { true }
 
         model.perform(command)
         fake.withdrawn = ["test.confirm"]

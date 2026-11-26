@@ -6,8 +6,8 @@ import Foundation
 enum ModifierInput: Equatable, Sendable {
     /// The physical modifier keys now down.
     case flags(ModifierSides, time: TimeInterval)
-    /// Any other key went down, or the mouse was clicked, so a modifier gesture in progress is
-    /// really a shortcut or a modified click.
+    /// Any other key went down, or the mouse was clicked, dragged or scrolled, so a modifier
+    /// gesture in progress is really a shortcut or modified pointer use.
     case key(time: TimeInterval)
 }
 
@@ -89,11 +89,7 @@ struct ModifierGestureDetector: Sendable {
 
     private func matches(_ gesture: ShortcutGesture, pressed: ModifierSides) -> [String] {
         gestures.compactMap { id, shortcut in
-            guard shortcut.gesture == gesture else { return nil }
-            if let sides = shortcut.sides { return sides == pressed ? id : nil }
-            // Either side counts, but every pressed key must belong to the shortcut.
-            return pressed.modifiers == shortcut.modifiers && pressed.count == shortcut.modifiers.rawValue.nonzeroBitCount
-                ? id : nil
+            shortcut.gesture == gesture && shortcut.isMatched(byPress: pressed) ? id : nil
         }
     }
 }
@@ -128,7 +124,11 @@ final class NSEventModifierSource: ModifierEventSource {
             let input = Self.input(for: event)
             MainActor.assumeIsolated { handler(input) }
         }
-        let events: NSEvent.EventTypeMask = [.flagsChanged, .keyDown, .leftMouseDown, .rightMouseDown, .otherMouseDown]
+        // Clicks, drags and scrolls with a modifier held are modified pointer use, not a gesture.
+        let events: NSEvent.EventTypeMask = [
+            .flagsChanged, .keyDown, .leftMouseDown, .rightMouseDown, .otherMouseDown,
+            .leftMouseDragged, .rightMouseDragged, .otherMouseDragged, .scrollWheel,
+        ]
         guard let global = NSEvent.addGlobalMonitorForEvents(matching: events, handler: deliver) else { return false }
         monitors.append(global)
         if let local = NSEvent.addLocalMonitorForEvents(matching: events, handler: { event in

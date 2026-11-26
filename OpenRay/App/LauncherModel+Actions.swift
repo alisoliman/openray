@@ -26,10 +26,11 @@ extension LauncherModel {
     // MARK: - Perform
 
     func performSelected() {
-        if let confirmation {
-            // A submission without key context can't answer a prompt that needs visible approval:
-            // only a fresh Return in the panel or a click on the shown button can.
-            if !confirmation.requiresVisibleApproval { confirm(confirmation) }
+        if confirmation != nil {
+            // Return itself is answered by the panel before any field sees it. Anything else that
+            // submits (insertNewline: from a key binding, an accessibility action) goes through
+            // the same fresh-key and visibility checks.
+            _ = confirmFromReturn(isRepeat: !currentKeyPressIsFresh())
             return
         }
         guard !showActions else { return }
@@ -410,41 +411,58 @@ extension LauncherModel {
         self.confirmation = confirmation
     }
 
-    /// Return while a question is pending. Only a fresh press approves it: a held Return's
-    /// autorepeat is consumed, so the press that asked can't also answer. Returns whether the
-    /// key was handled, which is whenever a question is pending.
+    /// The current prompt instance: its question and a token that changes every time a prompt
+    /// is asked. Action bars report and approve by it, so a stale view or click can't answer a
+    /// newer prompt, even one asking the same question.
+    var confirmationInstanceID: String? {
+        confirmation.map { "\($0.id)#\(confirmationToken.uuidString)" }
+    }
+
+    /// How long a prompt that loses something must have been on screen, uncovered, in a fully
+    /// revealed panel, before it can be approved. Longer than the panel's reveal and the prompt's
+    /// fade-in, so a press or click aimed at what was there before can't answer it.
+    static let minimumPromptExposure: TimeInterval = 0.45
+
+    /// A key press while a question is pending. Only a fresh press approves it: a held Return's
+    /// autorepeat, or a submission without a key behind it, is consumed, so the press that asked
+    /// can't also answer. Returns whether the key was handled, which is whenever a question is pending.
     func confirmFromReturn(isRepeat: Bool) -> Bool {
         guard let confirmation else { return false }
         if !isRepeat, canApprove(confirmation) { confirm(confirmation) }
         return true
     }
 
-    /// The approve button: it answers only the prompt it showed, so a click landing as a new
-    /// prompt replaces the old one approves neither.
-    func approveConfirmation(id: String) {
-        guard let confirmation, confirmation.id == id, canApprove(confirmation) else { return }
+    /// The approve button: it answers only the prompt instance it showed, so a click landing as a
+    /// new prompt replaces the old one approves neither.
+    func approveConfirmation(id instance: String) {
+        guard let confirmation, instance == confirmationInstanceID, canApprove(confirmation) else { return }
         confirm(confirmation)
     }
 
-    /// An action bar reports the prompt it's showing, once it's drawn uncovered.
-    func confirmationDidAppear(_ id: String) {
-        if confirmation?.id == id { shownConfirmationID = id }
+    /// An action bar reports the prompt instance it's showing, once it's drawn uncovered. The
+    /// first report starts its exposure; later ones for the same instance don't restart it.
+    func confirmationDidAppear(_ instance: String) {
+        guard instance == confirmationInstanceID, confirmationShown?.instance != instance else { return }
+        confirmationShown = (instance, promptClock())
     }
 
-    /// Whether the pending prompt can be approved now. One that needs visible approval must have
-    /// been shown as this very instance, on a surface that is visible and key.
+    /// Whether the pending prompt can be approved now. One that loses something must have been
+    /// shown as this very instance, on a surface that is visible and key, for long enough.
     func canApprove(_ confirmation: ActionConfirmation) -> Bool {
         guard confirmation.requiresVisibleApproval else { return true }
-        return shownConfirmationID == confirmation.id && isConfirmationVisible
+        guard let shown = confirmationShown, shown.instance == confirmationInstanceID,
+            let visibleSince = confirmationVisibleSince
+        else { return false }
+        return promptClock().timeIntervalSince(max(shown.at, visibleSince)) >= Self.minimumPromptExposure
     }
 
-    /// Whether prompts are on screen: the panel is visible, opaque and key, with nothing covering
-    /// its action bar. Tests without a panel set `confirmationSurfaceIsVisible`.
-    var isConfirmationVisible: Bool {
-        guard confirmation != nil, !showActions else { return false }
-        if let check = confirmationSurfaceIsVisible { return check() }
-        guard let panel else { return false }
-        return panel.isSurfaceVisible && isPresented
+    /// Since when prompts have been on screen: the panel visible, revealed, opaque and key, with
+    /// nothing covering its action bar. Nil while they aren't.
+    var confirmationVisibleSince: Date? {
+        guard confirmation != nil, !showActions else { return nil }
+        if let check = confirmationSurfaceVisibleSince { return check() }
+        guard let panel, isPresented else { return nil }
+        return panel.surfaceVisibleSince
     }
 
     func confirm(_ confirmation: ActionConfirmation) {
@@ -491,7 +509,10 @@ extension LauncherModel {
                 // deletion can leave Favorites and Recent pointing at the removed row.
                 let referenced =
                     store.database.favoriteIDs.contains(item.id) || store.database.usage.contains { $0.id == item.id }
-                if referenced {
+                // A retry of a row whose earlier deletion was already recorded keeps that record
+                // whatever happens now: the earlier deletion may have succeeded.
+                let wasJournaled = store.journaledCleanup[item.id] != nil
+                if referenced, !wasJournaled {
                     do {
                         try store.journalCleanup(of: item.id, provider: ref.provider)
                     } catch {
@@ -502,7 +523,7 @@ extension LauncherModel {
                     }
                 }
                 guard remove() else {
-                    store.unjournalCleanup(of: item.id)
+                    if !wasJournaled { store.unjournalCleanup(of: item.id) }
                     return false
                 }
                 if referenced, !store.forget(itemIDs: [item.id]) {

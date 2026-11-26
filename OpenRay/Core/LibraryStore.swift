@@ -114,13 +114,15 @@ final class LibraryStore {
         if (try? writeJournal(entries)) != nil { journaledCleanup = entries }
     }
 
-    /// Settles cleanup recorded in an earlier session. `isGone` says whether the row was really
+    /// Settles recorded cleanup whose outcome isn't known yet: from an earlier session, or from a
+    /// deletion that failed after it was recorded. `isGone` says whether the row was really
     /// deleted: true cleans its records, false drops the entry (the deletion never happened), and
-    /// nil keeps it for later (its provider isn't here to ask).
+    /// nil keeps it for later (its provider can't tell yet). Rows whose deletion this session
+    /// confirmed are already being cleaned and aren't asked about.
     func reconcileJournaledCleanup(isGone: (_ itemID: String, _ provider: String) -> Bool?) {
         guard !journaledCleanup.isEmpty, !isReadOnly else { return }
         var entries = journaledCleanup
-        for (id, provider) in journaledCleanup {
+        for (id, provider) in journaledCleanup where !pendingForgottenIDs.contains(id) {
             switch isGone(id, provider) {
             case true?: pendingForgottenIDs.insert(id)
             case false?: entries.removeValue(forKey: id)

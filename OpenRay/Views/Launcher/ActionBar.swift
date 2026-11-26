@@ -5,6 +5,9 @@ import SwiftUI
 struct ActionBar<Context: View, Actions: View>: View {
     var feedback: Feedback?
     var confirmation: ActionConfirmation?
+    /// The model's `confirmationInstanceID`. A bar that doesn't pass it can't approve a prompt
+    /// that loses something, because the instance it reports never matches.
+    var confirmationInstance: String? = nil
     @ViewBuilder var context: Context
     @ViewBuilder var actions: Actions
     var onCancelConfirmation: () -> Void = {}
@@ -29,10 +32,10 @@ struct ActionBar<Context: View, Actions: View>: View {
                             .lineLimit(1)
                     }
                     .transition(.opacity)
-                    // After it's drawn; a covered bar reports nothing until it's uncovered.
-                    .task(id: "\(confirmation.id)/\(isCovered)") {
-                        if !isCovered { onConfirmationShown?(confirmation.id) }
-                    }
+                    // A covered bar reports nothing until it's uncovered. The report starts the
+                    // prompt's exposure; the model waits out its fade-in and the panel's reveal.
+                    .onAppear { reportShown(confirmation) }
+                    .onChange(of: "\(confirmationInstance ?? confirmation.id)/\(isCovered)") { reportShown(confirmation) }
                 } else if let feedback {
                     ToastLabel(feedback: feedback).transition(.opacity)
                 } else {
@@ -56,7 +59,7 @@ struct ActionBar<Context: View, Actions: View>: View {
                 ActionBarButton(
                     title: confirmation.confirmTitle, keys: ["↩"], style: confirmation.isDestructive ? .danger : .accent
                 ) {
-                    if let onApprove { onApprove(confirmation.id) } else { onConfirm() }
+                    if let onApprove { onApprove(confirmationInstance ?? confirmation.id) } else { onConfirm() }
                 }
             } else {
                 actions
@@ -72,6 +75,13 @@ struct ActionBar<Context: View, Actions: View>: View {
         .opacity(isCovered ? 0 : 1)
         .animation(OR.Motion.quick, value: isCovered)
         .allowsHitTesting(!isCovered)
+    }
+}
+
+extension ActionBar {
+    fileprivate func reportShown(_ confirmation: ActionConfirmation) {
+        guard !isCovered else { return }
+        onConfirmationShown?(confirmationInstance ?? confirmation.id)
     }
 }
 
@@ -193,7 +203,7 @@ struct SearchActionBar: View {
 
     var body: some View {
         ActionBar(
-            feedback: model.feedback ?? storeFeedback, confirmation: model.confirmation,
+            feedback: model.feedback ?? storeFeedback, confirmation: model.confirmation, confirmationInstance: model.confirmationInstanceID,
             context: { context },
             actions: { actions },
             onCancelConfirmation: { model.confirmation = nil },

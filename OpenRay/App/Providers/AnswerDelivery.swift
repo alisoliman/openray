@@ -11,8 +11,10 @@ enum AnswerPrimaryAction: Equatable, Sendable {
     case copy
     case paste
 
-    /// The preference seam. Slice 1: return `.paste` when the person chose Paste.
-    @MainActor static func current(in model: LauncherModel) -> AnswerPrimaryAction { .copy }
+    /// Settings › General › Primary Action: ↩ pastes when the person chose Paste, ⌘↩ then copies.
+    @MainActor static func current(in model: LauncherModel) -> AnswerPrimaryAction {
+        model.store.database.preferences.primaryActionPastes ? .paste : .copy
+    }
 }
 
 /// Copies or pastes an answer for ↩ and ⌘↩, following `AnswerPrimaryAction`.

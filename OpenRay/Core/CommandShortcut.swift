@@ -94,23 +94,37 @@ struct CommandShortcut: Codable, Hashable, Sendable {
     /// Whether Carbon can register it: a key, with or without modifiers.
     var isKeyChord: Bool { gesture == nil }
 
-    /// Whether two modifier gestures would both fire from one press: a double tap and a single
-    /// tap of the same key, or two double taps of the same modifier. Only one of such a pair can work.
+    /// Whether a press of exactly these keys completes this gesture. The gesture detector's rule:
+    /// a sided gesture needs exactly its keys; an unsided one takes either side of each of its
+    /// modifiers, and no other key.
+    func isMatched(byPress pressed: ModifierSides) -> Bool {
+        guard gesture != nil else { return false }
+        if let sides { return sides == pressed }
+        return pressed.modifiers == modifiers && pressed.count == modifiers.rawValue.nonzeroBitCount
+    }
+
+    /// Every press that completes this gesture.
+    var matchingPresses: [ModifierSides] {
+        guard gesture != nil else { return [] }
+        if let sides { return [sides] }
+        var presses: [ModifierSides] = [[]]
+        for entry in ModifierSides.ordered where !entry.isRight && modifiers.contains(entry.modifier) {
+            guard let right = ModifierSides.ordered.first(where: { $0.modifier == entry.modifier && $0.isRight })
+            else { continue }
+            presses = presses.flatMap { [$0.union(entry.side), $0.union(right.side)] }
+        }
+        return presses
+    }
+
+    /// Whether two modifier gestures would both fire from one press, by the detector's own rule:
+    /// two of the same kind that some press completes, or a double tap and a single-key gesture
+    /// its second tap completes. Only one of such a pair can work.
     func gestureOverlaps(_ other: CommandShortcut) -> Bool {
         guard let gesture, let otherGesture = other.gesture else { return false }
-        if self == other { return true }
-        func sideMatches(_ double: CommandShortcut, _ single: CommandShortcut) -> Bool {
-            guard let key = single.sides, key.count == 1, key.modifiers == double.modifiers else { return false }
-            return double.sides.map { $0 == key } ?? true
-        }
-        switch (gesture, otherGesture) {
-        case (.doubleTap, .modifiersOnly): return sideMatches(self, other)
-        case (.modifiersOnly, .doubleTap): return sideMatches(other, self)
-        case (.doubleTap, .doubleTap):
-            guard modifiers == other.modifiers else { return false }
-            return sides == nil || other.sides == nil || sides == other.sides
-        case (.modifiersOnly, .modifiersOnly): return false
-        }
+        let shared = matchingPresses.filter(other.isMatched(byPress:))
+        if gesture == otherGesture { return !shared.isEmpty }
+        // A double tap fires only for one key, on a press that is also a single tap.
+        return shared.contains { $0.count == 1 }
     }
 
     var usesPrintableKey: Bool { isKeyChord && Self.printableKeyCodes.contains(keyCode) }

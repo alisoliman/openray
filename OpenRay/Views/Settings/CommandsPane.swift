@@ -137,7 +137,7 @@ struct FallbacksSection: View {
     let model: LauncherModel
 
     var body: some View {
-        let enabled = model.enabledFallbackIDs
+        let enabled = model.visibleFallbackIDs
         let candidates = model.fallbackCandidates
         let byID = Dictionary(candidates.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
         Section {
@@ -159,7 +159,7 @@ struct FallbacksSection: View {
                     .buttonStyle(.borderless)
                 }
             }
-            let available = candidates.filter { !enabled.contains($0.id) }
+            let available = candidates.filter { !model.enabledFallbackIDs.contains($0.id) }
             HStack {
                 Menu("Add Fallback") {
                     ForEach(available) { candidate in

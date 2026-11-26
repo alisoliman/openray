@@ -342,13 +342,35 @@ struct HotKeyGestureTests {
         }
         // The shortcut recorder watches nothing.
         #expect(CommandShortcutCaptureView().monitoring is InertLocalEventMonitoring)
-        // A model handed the system clipboard and a real hotkey registry still stays inert.
+        // A model handed the system clipboard and a real hotkey registry still stays inert: its
+        // clipboard is a private one, so a copy never reaches the system clipboard.
         let model = LauncherModel(store: LibraryStore(fileURL: nil), ai: AIChatModel(engine: TestAIEngine()), pasteboard: .general)
         defer { model.stop() }
         model.isStarted = true
         model.synchronizeCommandHotKeys()
         #expect(model.hotKey.modifierHotKeys.registeredIDs.isEmpty)
-        #expect(!model.copy("never written"))
-        #expect(model.feedback?.style == .error)
+        #expect(!model.clipboard.usesGeneralPasteboard)
+        let systemChangeCount = NSPasteboard.general.changeCount
+        model.copy("never written to the system clipboard")
+        #expect(NSPasteboard.general.changeCount == systemChangeCount)
+    }
+
+    /// Partials 1 and 2: a guard injected as live can't switch the live adapters on in this
+    /// inert process; each one checks the process's own rule at its boundary.
+    @Test func anInjectedLiveGuardCantStartLiveAdaptersInTheTestHost() throws {
+        let live = SideEffectGuard(mode: .live)
+        let tap = CGHyperEventTap(sideEffects: live)
+        let started = tap.start(map: { $0 })
+        #expect(!started)
+        #expect(!tap.isRunning)
+        #expect(!NSEventModifierSource(sideEffects: live).start { _ in })
+        #expect(live.localEventMonitoring is InertLocalEventMonitoring)
+        let installed = AppKitLocalEventMonitoring().add([.keyDown]) { $0 }
+        #expect(installed == nil)
+        let model = LauncherModel(
+            store: LibraryStore(fileURL: nil), ai: AIChatModel(engine: TestAIEngine()), pasteboard: .withUniqueName(),
+            sideEffects: live)
+        defer { model.stop() }
+        #expect(model.sideEffects.isInert)
     }
 }

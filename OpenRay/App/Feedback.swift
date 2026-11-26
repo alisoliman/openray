@@ -84,13 +84,11 @@ enum ActionConfirmation: Identifiable {
         }
     }
 
-    /// A provider's destructive question (Shut Down, Empty Trash) can be approved only after this
-    /// very prompt was shown on a visible surface, and never by a repeated or unfocused Return.
-    /// The built-in prompts are always asked from the visible panel, by a key pressed in it.
-    var requiresVisibleApproval: Bool {
-        if case .provided(let confirmation) = self { return confirmation.isDestructive }
-        return false
-    }
+    /// Every question that loses something (Delete, Discard Changes, Clear Clipboard History, a
+    /// provider's Shut Down or Empty Trash) can be approved only after this very prompt instance
+    /// was shown on a visible surface for `LauncherModel.minimumPromptExposure`, and only by a
+    /// fresh key press or its own button.
+    var requiresVisibleApproval: Bool { isDestructive }
 
     var symbol: String {
         switch self {

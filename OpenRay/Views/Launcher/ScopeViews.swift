@@ -205,7 +205,7 @@ struct ClipboardOptInView: View {
             ActionBar(
                 feedback: model.feedback ?? model.store.errorMessage.map { .error($0) },
                 // A command asked for from a hotkey can arrive here; its question replaces Turn On.
-                confirmation: model.confirmation,
+                confirmation: model.confirmation, confirmationInstance: model.confirmationInstanceID,
                 context: {
                     Image(systemName: "lock.fill").font(.system(size: 10, weight: .semibold)).accessibilityHidden(true)
                     Text("Stored in Application Support/OpenRay")

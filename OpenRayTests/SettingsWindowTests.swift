@@ -65,6 +65,8 @@ struct SettingsWindowTests {
         #expect(model.confirmation == nil)
         #expect(model.editor != nil)
         model.goBack()
+        // Discarding loses the edits, so the prompt must have been on screen before Return answers.
+        model.showPendingPromptLongEnough()
         model.performSelected()
         #expect(model.editor == nil)
         model.files.stop()

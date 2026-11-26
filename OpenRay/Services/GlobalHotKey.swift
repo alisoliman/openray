@@ -28,6 +28,8 @@ final class GlobalHotKey {
     /// Modifier-only and double-tap shortcuts, which Carbon can't register.
     let modifierHotKeys: ModifierHotKeys
     private var registrations: [String: Registration] = [:]
+    /// The key chord registered for the launcher right now, if any.
+    var registeredLauncherChord: CommandShortcut? { registrations[Self.launcherTargetID]?.shortcut }
     private var nextIdentifier: UInt32 = 1
     private var handlerInstalled = false
     private var onLauncher: (() -> Void)?
@@ -76,6 +78,10 @@ final class GlobalHotKey {
                 binding.shortcut.map { (binding.targetID, $0) }
             }
         issues += synchronizeGestures(all.filter { !$0.1.isKeyChord }, title: title)
+        // A launcher gesture that macOS delivers replaces the launcher's key chord; one that it
+        // doesn't leaves the working chord registered.
+        let launcherGestureWorks =
+            !launcherShortcut.isKeyChord && !issues.contains { $0.targetID == Self.launcherTargetID }
         let candidates = all.filter(\.1.isKeyChord)
         for (targetID, shortcut) in candidates {
             guard targetID == Self.launcherTargetID || CuratedCommand.supports(targetID) else {
@@ -101,8 +107,8 @@ final class GlobalHotKey {
         // Keep the old launcher until its replacement succeeds, unless macOS now reserves it.
         for (targetID, registration) in registrations {
             if targetID == Self.launcherTargetID {
-                // A launcher that's now a modifier gesture leaves Carbon entirely.
-                if !launcherShortcut.isKeyChord
+                // A launcher that's now a working modifier gesture leaves Carbon entirely.
+                if launcherGestureWorks
                     || (try? CommandShortcutPolicy.validate(shortcut: registration.shortcut, reservedShortcuts: reserved))
                         == nil
                 {
@@ -146,7 +152,8 @@ final class GlobalHotKey {
                 issues.append(.init(targetID: targetID, message: error.localizedDescription + fallback))
             }
         }
-        if !desired.contains(where: { $0.0 == Self.launcherTargetID }),
+        // A launcher gesture's issue is worded by the caller, which knows what opens OpenRay instead.
+        if launcherShortcut.isKeyChord, !desired.contains(where: { $0.0 == Self.launcherTargetID }),
             let previous = registrations[Self.launcherTargetID]
         {
             if let index = issues.firstIndex(where: { $0.targetID == Self.launcherTargetID }) {

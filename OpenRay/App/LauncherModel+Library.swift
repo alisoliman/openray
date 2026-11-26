@@ -52,10 +52,11 @@ extension LauncherModel {
     // MARK: Primary action
 
     /// What ↩ does on clipboard entries and snippets; ⌘↩ always does the other, so the
-    /// two keys never do the same thing. This is the one plug-in point for Slice 1's
-    /// preference: on merging, return `.paste` when `preferences.primaryActionPastes`
-    /// is true. `primaryActionOverride` lets tests drive both modes.
-    var contentPrimaryAction: ContentPrimaryAction { primaryActionOverride ?? .copy }
+    /// two keys never do the same thing. Follows Settings › General › Primary Action
+    /// (`preferences.primaryActionPastes`). `primaryActionOverride` lets tests drive both modes.
+    var contentPrimaryAction: ContentPrimaryAction {
+        primaryActionOverride ?? (store.database.preferences.primaryActionPastes ? .paste : .copy)
+    }
 
     /// ↩ on a clipboard entry or snippet.
     func performContent(_ item: LauncherItem) {

@@ -50,6 +50,26 @@ enum HyperKeyTrigger: String, Codable, CaseIterable, Identifiable, Sendable {
         }
     }
 
+    /// The device-dependent flag bit for the same modifier's left key.
+    var otherSideBit: UInt64 {
+        switch self {
+        case .rightCommand: 0x0000_0008
+        case .rightOption: 0x0000_0020
+        case .rightControl: 0x0000_0001
+        case .rightShift: 0x0000_0002
+        }
+    }
+
+    /// The modifier the key normally is.
+    var modifier: ShortcutModifiers {
+        switch self {
+        case .rightCommand: .command
+        case .rightOption: .option
+        case .rightControl: .control
+        case .rightShift: .shift
+        }
+    }
+
     /// The device-independent flag that must accompany the device bit.
     var genericFlag: UInt64 {
         switch self {
@@ -63,12 +83,18 @@ enum HyperKeyTrigger: String, Codable, CaseIterable, Identifiable, Sendable {
 
 /// The Hyper key's mapping of one key event's flags. Pure and stateless.
 enum HyperKeyMapping {
-    /// The flags a key event leaves with: the Hyper modifiers added when the event's own flags
-    /// show the trigger key physically down; otherwise exactly the flags it arrived with.
+    /// The flags a key event leaves with: the Hyper modifiers when the event's own flags show the
+    /// trigger key physically down; otherwise exactly the flags it arrived with. While held, the
+    /// trigger stands for Hyper only: a right ⇧ trigger with Shift left out of Hyper sends no ⇧,
+    /// unless left ⇧ is held too.
     static func flags(_ flags: UInt64, trigger: HyperKeyTrigger, modifiers: ShortcutModifiers) -> UInt64 {
         // Both the physical bit and its modifier must be set; anything else passes unchanged.
         guard flags & trigger.deviceBit != 0, flags & trigger.genericFlag != 0 else { return flags }
         var mapped = flags
+        if !modifiers.contains(trigger.modifier) {
+            mapped &= ~trigger.deviceBit
+            if flags & trigger.otherSideBit == 0 { mapped &= ~trigger.genericFlag }
+        }
         if modifiers.contains(.command) { mapped |= CGEventFlags.maskCommand.rawValue }
         if modifiers.contains(.control) { mapped |= CGEventFlags.maskControl.rawValue }
         if modifiers.contains(.option) { mapped |= CGEventFlags.maskAlternate.rawValue }
@@ -84,7 +110,14 @@ protocol HyperEventTap: AnyObject {
     /// inert launch).
     func start(map: @escaping @Sendable (UInt64) -> UInt64) -> Bool
     func stop()
+    /// True while it's installed and enabled, so key events really pass through it.
     var isRunning: Bool { get }
+    /// True once macOS reported it disabled on purpose (`tapDisabledByUserInput`). It stays off.
+    var isDisabledByUser: Bool { get }
+}
+
+extension HyperEventTap {
+    var isDisabledByUser: Bool { false }
 }
 
 /// A session event tap for key down and up. Its callback only rewrites flags with a pure
@@ -101,11 +134,13 @@ final class CGHyperEventTap: HyperEventTap {
         self.sideEffects = sideEffects
     }
 
-    var isRunning: Bool { port != nil }
+    var isRunning: Bool { port.map { CGEvent.tapIsEnabled(tap: $0) } ?? false }
+    private(set) var isDisabledByUser = false
 
     func start(map: @escaping @Sendable (UInt64) -> UInt64) -> Bool {
         stop()
         guard (try? sideEffects.check("changing keyboard events")) != nil else { return false }
+        isDisabledByUser = false
         self.map = map
         let mask = (1 << CGEventType.keyDown.rawValue) | (1 << CGEventType.keyUp.rawValue)
         let callback: CGEventTapCallBack = { _, type, event, refcon in
@@ -116,8 +151,8 @@ final class CGHyperEventTap: HyperEventTap {
                 // macOS disabled it for being slow. The mapping holds no state, so resuming is safe.
                 MainActor.assumeIsolated { tap.resume() }
             case .tapDisabledByUserInput:
-                // Disabled on purpose (Secure Input, for one): stay off.
-                break
+                // Disabled on purpose (Secure Input, for one): stay off, and say so.
+                MainActor.assumeIsolated { tap.isDisabledByUser = true }
             case .keyDown, .keyUp:
                 if let map = tap.map {
                     let mapped = map(event.flags.rawValue)
@@ -185,6 +220,11 @@ final class HyperKey {
         guard accessibilityAllowed else {
             stop()
             problem = "The Hyper key needs Accessibility. Allow OpenRay in System Settings › Privacy & Security."
+            return
+        }
+        if settings == applied, tap.isDisabledByUser {
+            // macOS turned it off on purpose. It stays off until the setting changes.
+            problem = "macOS turned the Hyper key off. Turn it off and on again here to resume."
             return
         }
         guard settings != applied || !tap.isRunning else { return }

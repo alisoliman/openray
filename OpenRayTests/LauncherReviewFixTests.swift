@@ -70,30 +70,43 @@ struct LauncherReviewFixTests {
         fake.confirmDestructive = true
         let model = model([fake])
         defer { model.stop() }
-        var visible = false
-        model.confirmationSurfaceIsVisible = { visible }
+        var now = Date(timeIntervalSinceReferenceDate: 1_000)
+        var visibleSince: Date?
+        model.promptClock = { now }
+        model.confirmationSurfaceVisibleSince = { visibleSince }
+        model.currentKeyPressIsFresh = { true }
         let command = try #require(model.commandItems.first { $0.id == "test.confirm" })
         model.perform(command)
-        let first = try #require(model.confirmation)
-        // Drawn, but the panel is still fading in (or hidden): a fresh Return does nothing.
-        model.confirmationDidAppear(first.id)
+        let first = try #require(model.confirmationInstanceID)
+        // Drawn, but the panel is hidden: a fresh Return does nothing.
+        model.confirmationDidAppear(first)
+        now += 5
         #expect(model.confirmFromReturn(isRepeat: false))
         #expect(fake.performed.isEmpty)
-        // A text field's submit has no key context, so it never answers it.
-        visible = true
+        // The panel starts revealing: its reveal doesn't count as exposure.
+        visibleSince = now
+        #expect(model.confirmFromReturn(isRepeat: false))
+        #expect(fake.performed.isEmpty)
+        // A text submission without a fresh key behind it never answers it.
+        now += 5
+        model.currentKeyPressIsFresh = { false }
         model.performSelected()
         #expect(fake.performed.isEmpty)
         // The prompt is asked again: the old button can't answer the new one, which isn't shown yet.
+        model.currentKeyPressIsFresh = { true }
         model.perform(command)
-        let second = try #require(model.confirmation)
-        #expect(second.id != first.id)
-        model.approveConfirmation(id: first.id)
+        let second = try #require(model.confirmationInstanceID)
+        #expect(second != first)
+        model.approveConfirmation(id: first)
         #expect(fake.performed.isEmpty)
-        #expect(model.confirmFromReturn(isRepeat: false))
+        model.performSelected()
         #expect(fake.performed.isEmpty)
-        // Shown and visible: its own button answers it.
-        model.confirmationDidAppear(second.id)
-        model.approveConfirmation(id: second.id)
+        // Shown just now, still fading in: its own button waits out the exposure.
+        model.confirmationDidAppear(second)
+        model.approveConfirmation(id: second)
+        #expect(fake.performed.isEmpty)
+        now += LauncherModel.minimumPromptExposure
+        model.approveConfirmation(id: second)
         #expect(fake.performed == ["test.confirm"])
     }
 
@@ -103,16 +116,21 @@ struct LauncherReviewFixTests {
             fake.confirmDestructive = true
             let model = model([fake])
             defer { model.stop() }
-            var visible = false
-            model.confirmationSurfaceIsVisible = { visible }
+            var now = Date(timeIntervalSinceReferenceDate: 1_000)
+            var visibleSince: Date?
+            model.promptClock = { now }
+            model.confirmationSurfaceVisibleSince = { visibleSince }
             let shortcut = CommandShortcut(keyCode: 15, modifiers: [.control, .option])
             #expect(model.store.saveCommandBinding(CommandBinding(targetID: "test.confirm", shortcut: shortcut)))
             model.performBoundCommand(targetID: "test.confirm")
-            let prompt = try #require(model.confirmation)
+            let prompt = try #require(model.confirmationInstanceID)
             #expect(model.confirmFromReturn(isRepeat: false))
             #expect(fake.performed.isEmpty)
-            visible = true
-            model.confirmationDidAppear(prompt.id)
+            visibleSince = now
+            model.confirmationDidAppear(prompt)
+            #expect(model.confirmFromReturn(isRepeat: false))
+            #expect(fake.performed.isEmpty)
+            now += LauncherModel.minimumPromptExposure
             #expect(model.confirmFromReturn(isRepeat: false))
             #expect(fake.performed == ["test.confirm"])
         }

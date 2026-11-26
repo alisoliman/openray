@@ -19,6 +19,17 @@ enum ProvidedDeletion {
     case store(@MainActor () -> Bool)
 }
 
+/// Whether a row a provider deleted from its own store is really gone. See
+/// `CommandProvider.presence(ofItemWithID:in:)`.
+enum ProvidedItemPresence: Sendable {
+    /// The row still exists: its deletion didn't happen, so Favorites and Recent keep it.
+    case present
+    /// The provider knows the row is gone: its data has loaded and the row isn't in it.
+    case gone
+    /// The provider can't tell yet, for example before its data has loaded. Asked again later.
+    case unknown
+}
+
 /// A question asked in the action bar before something runs. ↩ calls `perform`; esc cancels.
 struct ProvidedConfirmation {
     var id: String
@@ -93,6 +104,13 @@ protocol CommandProvider: AnyObject {
     /// Rebuilds a row from its item id, so favorites and recents of non-command rows still show.
     func item(withID id: String, in model: LauncherModel) -> LauncherItem?
 
+    /// Whether a row deleted with `ProvidedDeletion.store` is really gone, for cleanup an earlier
+    /// session recorded but couldn't finish. Say `.gone` only when you know. `.unknown` keeps the
+    /// record, and the launcher asks again at the next launch and `commandCatalogDidChange()`. The
+    /// default is `.present` when `item(withID:)` rebuilds the row, otherwise `.unknown`, so a
+    /// provider that deletes from its own store should implement this.
+    func presence(ofItemWithID id: String, in model: LauncherModel) -> ProvidedItemPresence
+
     /// The rows of one of this provider's scopes. Ranked by the shared matcher unless the scope
     /// sets `ranksItems = false`. `scope.arguments` holds the opening command's argument values.
     func scopeItems(_ scope: ProvidedScope, query: String, in model: LauncherModel) -> [LauncherItem]
@@ -161,6 +179,9 @@ extension CommandProvider {
     }
     func rootItems(for query: String, in model: LauncherModel) -> [LauncherItem] { [] }
     func item(withID id: String, in model: LauncherModel) -> LauncherItem? { nil }
+    func presence(ofItemWithID id: String, in model: LauncherModel) -> ProvidedItemPresence {
+        item(withID: id, in: model) == nil ? .unknown : .present
+    }
     func scopeItems(_ scope: ProvidedScope, query: String, in model: LauncherModel) -> [LauncherItem] { [] }
     func scopeGroups(_ scope: ProvidedScope, items: [LauncherItem], in model: LauncherModel) -> [LauncherResultGroup]? {
         nil
@@ -240,6 +261,12 @@ final class CommandRegistry {
     }
 
     /// A row by item id: a command first, then whatever a provider rebuilds.
+    /// Whether a row `provider` deleted from its own store is gone. `.unknown` while that
+    /// provider isn't registered.
+    func presence(ofItemWithID id: String, provider providerID: String, in model: LauncherModel) -> ProvidedItemPresence {
+        provider(id: providerID)?.presence(ofItemWithID: id, in: model) ?? .unknown
+    }
+
     func item(withID id: String, in model: LauncherModel) -> LauncherItem? {
         for provider in providers {
             if let descriptor = provider.commands(in: model).first(where: { $0.id == id }) {

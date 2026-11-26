@@ -40,14 +40,30 @@ final class LauncherModel {
     /// The writing command's attached text, shown in full over the AI view.
     var showsAttachmentPreview = false
     var feedback: Feedback? { didSet { scheduleFeedbackExpiry() } }
+    /// Every assignment is a new prompt instance, even when it asks the same question again, so
+    /// nothing armed for an earlier one carries over.
     var confirmation: ActionConfirmation? {
-        didSet { if confirmation?.id != oldValue?.id { shownConfirmationID = nil } }
+        didSet {
+            confirmationToken = UUID()
+            confirmationShown = nil
+        }
     }
-    /// The prompt a visible action bar last reported showing. Only it can be approved when the
-    /// prompt requires visible approval.
-    @ObservationIgnored var shownConfirmationID: String?
-    /// Whether the surface showing prompts is on screen and key. Nil asks the panel; tests set it.
-    @ObservationIgnored var confirmationSurfaceIsVisible: (() -> Bool)?
+    /// Identifies the current prompt instance; see `confirmationInstanceID`.
+    private(set) var confirmationToken = UUID()
+    /// The prompt instance a visible action bar last reported showing, and when. Only it can be
+    /// approved, and only once it has been on screen for `minimumPromptExposure`.
+    @ObservationIgnored var confirmationShown: (instance: String, at: Date)?
+    /// Since when the surface showing prompts has been on screen, opaque and key; nil while it
+    /// isn't. Nil asks the panel; tests set it.
+    @ObservationIgnored var confirmationSurfaceVisibleSince: (() -> Date?)?
+    /// Whether the key event being handled is a fresh press (not autorepeat, not synthesized
+    /// without a key). Every keyboard approval checks it. Tests set it.
+    @ObservationIgnored var currentKeyPressIsFresh: () -> Bool = {
+        guard let event = NSApp.currentEvent, event.type == .keyDown else { return false }
+        return !event.isARepeat
+    }
+    /// The clock prompt exposure is measured with. Tests set it.
+    @ObservationIgnored var promptClock: () -> Date = Date.init
     var focusRequest = 0
     /// Set when a remembered query returns; the field selects it so the next keystroke replaces it.
     var selectsQueryOnFocus = false
@@ -61,6 +77,9 @@ final class LauncherModel {
     @ObservationIgnored var panelSize = CGSize(width: OR.Metric.panelWidth, height: OR.Detent.list)
     /// Why the registered launcher shortcut isn't the saved one, or isn't working.
     var shortcutError: String?
+    /// The launcher shortcut registered right now, which can differ from the saved one when
+    /// registration fell back. Nil until registration runs, or while nothing is registered.
+    var activeLauncherShortcut: CommandShortcut?
     /// Why the last launcher shortcut choice was refused. The saved shortcut still works.
     var launcherHotKeyRefusal: String?
     var commandShortcutErrors: [String: String] = [:]
@@ -163,6 +182,8 @@ final class LauncherModel {
         registry: CommandRegistry = CommandRegistry(), hotKey: GlobalHotKey? = nil, hyperKey: HyperKey? = nil,
         sideEffects: SideEffectGuard = .current
     ) {
+        // An injected live guard never makes an inert process (tests, verification) act for real.
+        let sideEffects = sideEffects.effective
         self.sideEffects = sideEffects
         let store = store ?? LibraryStore(fileURL: sideEffects.isInert ? nil : LibraryStore.defaultURL)
         let pasteboard = pasteboard ?? (sideEffects.isInert ? NSPasteboard.withUniqueName() : .general)
@@ -179,11 +200,20 @@ final class LauncherModel {
         snippets.clipboardReader = { [clipboard] in clipboard.placeholderText() }
         fileScope = store.database.preferences.fileSearchScope ?? .home
         store.commandBindingsDidChange = { [weak self] in self?.synchronizeCommandHotKeys() }
-        // Deletions an earlier session recorded but couldn't finish: clean up after the rows that
-        // are really gone, keep the records of rows that still exist.
+        reconcileJournaledCleanup()
+    }
+
+    /// Deletions an earlier session recorded but couldn't finish: cleans up after rows their
+    /// provider says are gone, drops the records of rows that still exist, and keeps the rest for
+    /// the next launch or catalog change.
+    func reconcileJournaledCleanup() {
+        guard !store.journaledCleanup.isEmpty else { return }
         store.reconcileJournaledCleanup { [registry] id, provider in
-            guard registry.provider(id: provider) != nil else { return nil }
-            return registry.item(withID: id, in: self) == nil
+            switch registry.presence(ofItemWithID: id, provider: provider, in: self) {
+            case .gone: true
+            case .present: false
+            case .unknown: nil
+            }
         }
     }
 
@@ -1117,14 +1147,36 @@ final class LauncherModel {
                     let rows = await provider.liveItems(for: term, scope: scope, in: model)
                     guard let self, !Task.isCancelled, self.liveGeneration == generation else { return }
                     // Root-search rows never become the Top Hit; see searchGroups.
+                    // A row for a command keeps that identity, so it's refused rather than run
+                    // unconfirmed if the command is withdrawn while the row is still listed.
                     self.providedLiveItems[providerID] = rows.map { row in
-                        var row = row
+                        var row = self.markingCommandIdentity(row)
                         row.isLiveResult = scope == nil
                         return row
                     }
                     self.pendingLiveProviderIDs.remove(providerID)
                 })
         }
+    }
+
+    /// Forgets live rows that stand for a command the catalog no longer has. Rows are marked
+    /// with their command as they arrive, so this needs no new search (a provider that announces
+    /// catalog changes from its own search can't start a loop).
+    func dropLiveRowsForWithdrawnCommands() {
+        guard !providedLiveItems.isEmpty else { return }
+        var kept = providedLiveItems
+        var changed = false
+        for (providerID, rows) in providedLiveItems {
+            let remaining = rows.filter { row in
+                guard case .provided(let ref) = row.action, ref.has(.descriptor) else { return true }
+                return registry.descriptor(for: ref, in: self) != nil
+            }
+            if remaining.count != rows.count {
+                kept[providerID] = remaining
+                changed = true
+            }
+        }
+        if changed { providedLiveItems = kept }
     }
 
     /// Stops every live search and forgets its rows: on a new query, on hide, and on leaving search.

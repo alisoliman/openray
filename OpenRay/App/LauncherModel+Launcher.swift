@@ -283,7 +283,11 @@ extension LauncherModel {
             return builtIn.filter { isDefaultFallback($0.id, providerIDs: []) } + provided
         }
         let index = Dictionary((builtIn + provided).map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
-        return store.database.fallbackOrder.compactMap { index[$0] }
+        let saved = store.database.fallbackOrder
+        // A provider row Settings can't list (no `fallbackDescriptors`) was never a choice, so a
+        // saved order can't have turned it off: it keeps its default place after the chosen ones.
+        let known = Set(fallbackCandidates.map(\.id)).union(saved)
+        return saved.compactMap { index[$0] } + provided.filter { !known.contains($0.id) }
     }
 
     /// Every fallback the person can choose, for Settings: stable names, whatever is typed.
@@ -326,16 +330,32 @@ extension LauncherModel {
         return saveFallbacks(ids)
     }
 
-    func canMoveFallback(_ id: String, by offset: Int) -> Bool {
-        guard let index = enabledFallbackIDs.firstIndex(of: id) else { return false }
-        return enabledFallbackIDs.indices.contains(index + offset)
+    /// The enabled fallbacks Settings can show, in order. Saved ids with no candidate now (a
+    /// deleted quicklink, a provider not loaded) stay saved but aren't moved around.
+    var visibleFallbackIDs: [String] {
+        let candidates = Set(fallbackCandidates.map(\.id))
+        return enabledFallbackIDs.filter(candidates.contains)
     }
 
+    func canMoveFallback(_ id: String, by offset: Int) -> Bool {
+        let visible = visibleFallbackIDs
+        guard let index = visible.firstIndex(of: id) else { return false }
+        return visible.indices.contains(index + offset)
+    }
+
+    /// Moves a fallback past its visible neighbor, skipping saved ids that aren't shown, so every
+    /// move does something you can see.
     @discardableResult
     func moveFallback(_ id: String, by offset: Int) -> Bool {
         var ids = enabledFallbackIDs
-        guard let index = ids.firstIndex(of: id), ids.indices.contains(index + offset) else { return false }
-        ids.insert(ids.remove(at: index), at: index + offset)
+        let visible = visibleFallbackIDs
+        guard let position = visible.firstIndex(of: id), visible.indices.contains(position + offset),
+            let index = ids.firstIndex(of: id)
+        else { return false }
+        let neighbor = visible[position + offset]
+        ids.remove(at: index)
+        guard let target = ids.firstIndex(of: neighbor) else { return false }
+        ids.insert(id, at: offset > 0 ? target + 1 : target)
         let saved = saveFallbacks(ids)
         if saved, id.hasPrefix("fallback."), orderedResults.contains(where: { $0.id == id }) { selectedID = id }
         return saved
@@ -465,26 +485,31 @@ extension LauncherModel {
 
     /// The arguments a row asks for before it runs: a registered command's declared ones.
     func argumentSpecs(for item: LauncherItem) -> [ArgumentSpec] {
-        guard case .provided(let ref) = item.action, ref.arguments.isEmpty,
-            let descriptor = registry.descriptor(for: ref, in: self)
+        guard case .provided(let ref) = item.action, let descriptor = registry.descriptor(for: ref, in: self)
         else { return [] }
         return Array(descriptor.arguments.prefix(ArgumentSession.maximumFields))
     }
 
     /// Whether running a row would need its argument fields first: a required argument with no
-    /// default and no value yet.
+    /// default and no value yet, even when the row carries values for others (a quicklink's
+    /// keyword term fills only its first field). Says nothing about fields already open;
+    /// `perform` handles those.
     func needsArguments(_ item: LauncherItem) -> Bool {
-        argumentSession == nil && argumentSpecs(for: item).contains { !$0.isOptional && $0.defaultValue == nil }
+        guard case .provided(let ref) = item.action else { return false }
+        return argumentSpecs(for: item).contains { spec in
+            let value = ref.arguments[spec.name]?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            return !spec.isOptional && spec.defaultValue == nil && value.isEmpty
+        }
     }
 
-    /// Opens a command's argument fields, the first one holding `initial`. Returns false when
-    /// the row takes no arguments.
+    /// Opens a command's argument fields, holding the values the row already carries and, in the
+    /// first one, `initial` when it isn't empty. Returns false when the row takes no arguments.
     @discardableResult
     func beginArguments(for item: LauncherItem, initial: String = "") -> Bool {
         let item = markingCommandIdentity(item)
         let specs = argumentSpecs(for: item)
         guard !specs.isEmpty, case .provided(let ref) = item.action else { return false }
-        return beginArguments(item: item, specs: specs, initial: initial) { [weak self] values in
+        return beginArguments(item: item, specs: specs, initial: initial, prefilled: ref.arguments) { [weak self] values in
             var filled = item
             var resolved = ref
             resolved.arguments = values
@@ -497,7 +522,7 @@ extension LauncherModel {
     /// Slices use this for rows that aren't registered commands, such as multi-argument quicklinks.
     @discardableResult
     func beginArguments(
-        item: LauncherItem, specs: [ArgumentSpec], initial: String = "",
+        item: LauncherItem, specs: [ArgumentSpec], initial: String = "", prefilled: [String: String] = [:],
         run: @escaping @MainActor ([String: String]) -> Void
     ) -> Bool {
         let specs = Array(specs.prefix(ArgumentSession.maximumFields))
@@ -514,11 +539,22 @@ extension LauncherModel {
                 values[spec.name] = spec.defaultValue ?? (spec.isOptional ? nil : options.first?.value)
             }
         }
+        for spec in specs {
+            guard let value = prefilled[spec.name], !value.isEmpty else { continue }
+            // A dropdown keeps only one of its options.
+            if case .dropdown(let options) = spec.type, !options.contains(where: { $0.value == value }) { continue }
+            values[spec.name] = value
+        }
         if case .dropdown = specs[0].type {} else if !initial.isEmpty { values[specs[0].name] = initial }
+        // The keyboard starts at the first field still missing a required value.
+        let firstMissing = specs.firstIndex { spec in
+            !spec.isOptional && spec.defaultValue == nil && (values[spec.name] ?? "").isEmpty
+        }
         showActions = false
         confirmation = nil
         feedback = nil
-        argumentSession = ArgumentSession(item: item, specs: specs, values: values, run: run)
+        argumentSession = ArgumentSession(
+            item: item, specs: specs, values: values, focus: initial.isEmpty ? firstMissing ?? 0 : 0, run: run)
         selectedID = item.id
         focusRequest += 1
         return true

@@ -118,8 +118,10 @@ protocol LocalEventMonitoring {
 }
 
 struct AppKitLocalEventMonitoring: LocalEventMonitoring {
+    /// Installs nothing, and returns nil, while the process is inert, whatever guard chose it.
     func add(_ mask: NSEvent.EventTypeMask, handler: @escaping (NSEvent) -> NSEvent?) -> Any? {
-        NSEvent.addLocalMonitorForEvents(matching: mask, handler: handler)
+        guard (try? SideEffectGuard.check("watching keys to record a shortcut")) != nil else { return nil }
+        return NSEvent.addLocalMonitorForEvents(matching: mask, handler: handler)
     }
 
     func remove(_ monitor: Any) { NSEvent.removeMonitor(monitor) }
@@ -132,9 +134,9 @@ struct InertLocalEventMonitoring: LocalEventMonitoring {
 }
 
 extension SideEffectGuard {
-    /// The recorder's monitor for this launch.
+    /// The recorder's monitor for this launch: inert when this guard or the process is.
     @MainActor var localEventMonitoring: any LocalEventMonitoring {
-        isInert ? InertLocalEventMonitoring() : AppKitLocalEventMonitoring()
+        effective.isInert ? InertLocalEventMonitoring() : AppKitLocalEventMonitoring()
     }
 }
 

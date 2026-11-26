@@ -93,8 +93,10 @@ extension LauncherModel {
             hotKey.unregister()
             shortcutError = nil
             commandShortcutErrors = [:]
+            activeLauncherShortcut = nil
             return
         }
+        defer { activeLauncherShortcut = registeredLauncherShortcut }
         let stored = store.database.preferences.hotKey
         let bindings = registrableCommandBindings
         // A recorded launcher shortcut was checked when it was saved, so it registers as it is.
@@ -105,19 +107,24 @@ extension LauncherModel {
                 onCommand: { [weak self] in self?.performBoundCommand(targetID: $0) },
                 title: { [weak self] id in self?.bindableCommands.first { $0.id == id }?.title })
             shortcutError = issues.first { $0.targetID == GlobalHotKey.launcherTargetID }?.message
-            // A modifier shortcut macOS won't deliver yet mustn't leave no way to open OpenRay:
-            // the preset works until it can. Allowing Accessibility re-runs this and restores it.
+            // A modifier shortcut macOS won't deliver yet mustn't leave no way to open OpenRay. A
+            // key chord that still works stays registered; otherwise the preset is tried, and the
+            // message names whatever really opens OpenRay. Allowing Accessibility re-runs this.
             if let problem = shortcutError, !custom.isKeyChord {
-                let fallback =
-                    Self.launcherHotKey(
-                        for: stored, reserved: CommandShortcutPolicy.systemReservedShortcuts(),
-                        boundShortcuts: Set(bindings.compactMap(\.shortcut))) ?? stored
-                issues = hotKey.synchronize(
-                    launcher: fallback, bindings: bindings,
-                    onLauncher: { [weak self] in self?.launcherHotKeyPressed() },
-                    onCommand: { [weak self] in self?.performBoundCommand(targetID: $0) },
-                    title: { [weak self] id in self?.bindableCommands.first { $0.id == id }?.title })
-                shortcutError = "\(problem) Until then, \(fallback.title) opens OpenRay."
+                if hotKey.registeredLauncherChord == nil {
+                    let fallback =
+                        Self.launcherHotKey(
+                            for: stored, reserved: CommandShortcutPolicy.systemReservedShortcuts(),
+                            boundShortcuts: Set(bindings.compactMap(\.shortcut))) ?? stored
+                    issues = hotKey.synchronize(
+                        launcher: fallback, bindings: bindings,
+                        onLauncher: { [weak self] in self?.launcherHotKeyPressed() },
+                        onCommand: { [weak self] in self?.performBoundCommand(targetID: $0) },
+                        title: { [weak self] id in self?.bindableCommands.first { $0.id == id }?.title })
+                }
+                shortcutError =
+                    hotKey.registeredLauncherChord.map { "\(problem) Until then, \($0.title) opens OpenRay." }
+                    ?? "\(problem) No other launcher shortcut could be registered, so open OpenRay from the menu bar."
             }
             commandShortcutErrors = Dictionary(
                 issues.filter { $0.targetID != GlobalHotKey.launcherTargetID }.map { ($0.targetID, $0.message) },
@@ -149,6 +156,24 @@ extension LauncherModel {
             uniquingKeysWith: { first, second in first + " " + second })
     }
 
+    /// What opens OpenRay right now: a recorded gesture once macOS delivers it, otherwise the
+    /// registered key chord.
+    private var registeredLauncherShortcut: CommandShortcut? {
+        if let custom = store.database.preferences.launcherShortcut, !custom.isKeyChord,
+            hotKey.modifierHotKeys.isDelivering,
+            hotKey.modifierHotKeys.registeredIDs.contains(GlobalHotKey.launcherTargetID)
+        {
+            return custom
+        }
+        return hotKey.registeredLauncherChord
+    }
+
+    /// The launcher shortcut to show in the menu and onboarding: the one that works now, or the
+    /// saved one before registration runs.
+    var launcherShortcutInUse: CommandShortcut {
+        activeLauncherShortcut ?? store.database.preferences.launcherHotKeyShortcut
+    }
+
     /// The saved bindings whose command exists right now. A missing command, such as a script
     /// whose file is gone, keeps its saved binding but doesn't hold its shortcut, so another
     /// command can use it and pressing it never silently does nothing.
@@ -161,6 +186,10 @@ extension LauncherModel {
     /// selection follow the catalog.
     func commandCatalogDidChange() {
         synchronizeCommandHotKeys()
+        // A listed live row for a command that's gone now is dropped rather than kept to be run.
+        dropLiveRowsForWithdrawnCommands()
+        // A provider that just loaded can now say whether rows an earlier session deleted are gone.
+        reconcileJournaledCleanup()
         synchronizeSelection()
     }
 
@@ -274,6 +303,20 @@ extension LauncherModel {
         let front = NSWorkspace.shared.frontmostApplication
         if let front, front.processIdentifier != ProcessInfo.processInfo.processIdentifier {
             previousApplication = front
+        }
+        // A hotkey never submits argument fields, least of all ones hidden with the panel.
+        if argumentSession != nil {
+            // Showing applies the pop-to-root reset first, which may close them.
+            panel?.show()
+            if let session = argumentSession {
+                if session.item.id == command.id {
+                    // Its own form: now on screen, where ↩ runs it.
+                    requestFocus()
+                    return
+                }
+                // Another command: the open form is given up rather than run or left behind.
+                cancelArguments()
+            }
         }
         if runsWithoutPanel(command), !needsArguments(command) {
             perform(command)

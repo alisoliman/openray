@@ -167,7 +167,7 @@ struct AIView: View {
             model.feedback ?? model.ai.errorMessage.map { .error($0) }
             ?? (model.ai.isGenerating ? .working(model.ai.isCancelling ? "Stopping…" : "Writing on this Mac…") : nil)
         ActionBar(
-            feedback: feedback, confirmation: model.confirmation,
+            feedback: feedback, confirmation: model.confirmation, confirmationInstance: model.confirmationInstanceID,
             context: { context },
             actions: { actions },
             onCancelConfirmation: { model.confirmation = nil },
