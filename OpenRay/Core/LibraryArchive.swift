@@ -1,6 +1,7 @@
 import CommonCrypto
 import CryptoKit
 import Foundation
+import ImageIO
 import Observation
 
 // A single-file archive of the library: library.json, clipboard images, note assets and the
@@ -124,14 +125,34 @@ enum LibraryArchive {
     ]
 
     /// The stores whose files archives carry. A slice that keeps portable files beside the
-    /// library adds its folder here, with the file names it owns.
+    /// library adds its folder here, with an exact predicate for the file names it writes, and
+    /// adds the read rule its store applies (see `sideFileIsReadable` and `noteAssetIsReadable`)
+    /// to export and import, so only files the committed rows will read travel.
+    ///
+    /// Slice 7: saved AI chats will need the same treatment once their store lands: register its
+    /// folder under `.ai` (or `.otherData`), match its file names exactly, export only the chats
+    /// the library refers to, and validate them on import by the chat store's own read rule.
     static let portableStores: [PortableStore] = [
         PortableStore(folder: "ClipboardImages", category: .clipboard) { name in
             let stem = (name as NSString).deletingPathExtension
             let ext = (name as NSString).pathExtension
             return ClipboardImageStore.isDigest(stem) && ["png", "rich", "txt"].contains(ext)
-        }
+        },
+        // Slice 6: images pasted into notes, which notes reference as `NoteAssets/<name>`.
+        PortableStore(folder: NoteAssetStore.folderName, category: .notes) { isNoteAssetName($0) },
     ]
+
+    /// A note image's file name exactly as `NoteAssetStore.save` writes it: an uppercase UUID
+    /// and one of its lowercase image extensions, `3F2504E0-4F89-41D3-9A0C-0305E82C3301.png`.
+    /// It's also a name `NoteAssetStore.fileName(in:)` accepts when a note refers to it.
+    static func isNoteAssetName(_ name: String) -> Bool {
+        let stem = (name as NSString).deletingPathExtension
+        let ext = (name as NSString).pathExtension
+        guard ext == ext.lowercased(), NoteAssetStore.imageExtensions.contains(ext),
+            let uuid = UUID(uuidString: stem), uuid.uuidString == stem
+        else { return false }
+        return NoteAssetStore.fileName(in: "\(NoteAssetStore.folderName)/\(name)") == name
+    }
 
     struct Failure: LocalizedError, Equatable {
         var message: String
@@ -326,6 +347,22 @@ enum LibraryArchive {
                 byPath = byPath.filter { category(forFile: $0.key) != .clipboard || wanted.contains($0.key) }
                 if dropped > 0 {
                     omissions.append("\(dropped) clipboard image\(dropped == 1 ? " was" : "s were") missing and left out.")
+                }
+            }
+            if categories.contains(.notes) {
+                // Only the images the exported notes refer to, and only ones that would show.
+                let referenced = NoteAssetStore.referencedNames(in: library.notes)
+                var missing = 0
+                for name in referenced {
+                    let path = "\(NoteAssetStore.folderName)/\(name)"
+                    if byPath[path].map(noteAssetIsReadable) != true { missing += 1 }
+                }
+                byPath = byPath.filter { path, data in
+                    guard category(forFile: path) == .notes else { return true }
+                    return referenced.contains((path as NSString).lastPathComponent) && noteAssetIsReadable(data)
+                }
+                if missing > 0 {
+                    omissions.append("\(missing) image\(missing == 1 ? "" : "s") in notes \(missing == 1 ? "was" : "were") missing or unreadable and left out.")
                 }
             }
             for (path, data) in byPath.sorted(by: { $0.key < $1.key }) {
@@ -736,6 +773,15 @@ enum LibraryArchive {
         default:
             return false
         }
+    }
+
+    /// Whether a note image would show: within `NoteAssetStore`'s size limit, and an image
+    /// ImageIO can read.
+    static func noteAssetIsReadable(_ data: Data) -> Bool {
+        guard !data.isEmpty, data.count <= NoteAssetStore.maximumImageBytes,
+            let source = CGImageSourceCreateWithData(data as CFData, nil)
+        else { return false }
+        return CGImageSourceGetCount(source) > 0
     }
 
     /// Whether these bytes are the picture `image` refers to, as the store checks on read.
@@ -1196,6 +1242,22 @@ extension LibraryStore {
             }
             if lostFormatting > 0 {
                 notes.append("\(lostFormatting) clipboard entr\(lostFormatting == 1 ? "y keeps" : "ies keep") its text but not its formatting.")
+            }
+        }
+        if chosen.contains(.notes) {
+            // The images the imported notes refer to, by the note store's read rule. A note whose
+            // image isn't in the archive (or here) keeps its text; the import says so.
+            var missing = 0
+            for name in NoteAssetStore.referencedNames(in: contents.database.notes).sorted() {
+                let path = "\(NoteAssetStore.folderName)/\(name)"
+                guard LibraryArchive.isNoteAssetName(name) else {
+                    missing += 1
+                    continue
+                }
+                if directory == nil || !take(path, LibraryArchive.noteAssetIsReadable) { missing += 1 }
+            }
+            if missing > 0 {
+                notes.append("\(missing) image\(missing == 1 ? "" : "s") in notes \(missing == 1 ? "wasn't" : "weren't") in the archive, so \(missing == 1 ? "it" : "they") won't show.")
             }
         }
         do { try merged.validate() } catch { throw LibraryArchive.Failure(error.localizedDescription) }

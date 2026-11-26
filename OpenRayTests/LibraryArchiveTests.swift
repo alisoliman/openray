@@ -835,3 +835,80 @@ extension LibraryBackupTests {
         #expect(LibraryBackup.index(in: folder, setID: set).entries.map(\.name) == [name])
     }
 }
+
+// MARK: - Note images (Slice 6's NoteAssets)
+
+extension LibraryArchiveTests {
+    /// A small real PNG, as a note image.
+    func notePNG() throws -> Data { try ClipboardFixtures.image(width: 8, height: 8) }
+
+    @Test("A note's images travel with it and come back where the note refers to them")
+    func noteImagesRoundTrip() throws {
+        let source = try TemporaryLibrary()
+        let assets = NoteAssetStore(libraryURL: source.store.fileURL)
+        let png = try notePNG()
+        let reference = try assets.save(png, fileExtension: "png")
+        let orphan = try assets.save(try ClipboardFixtures.image(width: 4, height: 4), fileExtension: "png")
+        let name = try #require(NoteAssetStore.fileName(in: reference))
+        #expect(source.store.update {
+            $0.notes = [QuickNote(title: "Trip", content: "Trip\n![photo](\(reference))\nThe view.")]
+        })
+        let contents = try LibraryArchive.read(try make(source, [.notes]))
+        // Only images a note refers to travel; an image no note uses stays behind.
+        #expect(Set(contents.files.keys) == [reference])
+        #expect(!contents.files.keys.contains(orphan))
+
+        let target = try TemporaryLibrary()
+        let report = try target.store.importArchive(contents, categories: [.notes], mode: .merge)
+        #expect(report.filesWritten == 1)
+        #expect(target.store.database.notes.first?.content.contains(reference) == true)
+        let restored = NoteAssetStore(libraryURL: target.store.fileURL)
+        #expect(try Data(contentsOf: try #require(restored.url(for: reference))) == png)
+        #expect(LibraryArchive.isNoteAssetName(name))
+    }
+
+    @Test("Note image names must be exactly what the note store writes")
+    func noteAssetNames() throws {
+        let uuid = UUID().uuidString
+        #expect(LibraryArchive.isNoteAssetName("\(uuid).png"))
+        #expect(LibraryArchive.isNoteAssetName("\(uuid).jpeg"))
+        for bad in [
+            "\(uuid.lowercased()).png", "\(uuid).PNG", "\(uuid).pdf", "\(uuid)", "photo.png", ".pending-removal",
+            "\(uuid).png.txt", "../\(uuid).png",
+        ] {
+            #expect(!LibraryArchive.isNoteAssetName(bad), "\(bad)")
+        }
+        try LibraryArchive.validate("NoteAssets/\(uuid).png")
+        #expect(throws: LibraryArchive.Failure.self) { try LibraryArchive.validate("NoteAssets/photo.png") }
+        #expect(throws: LibraryArchive.Failure.self) { try LibraryArchive.validate("NoteAssets/.pending-removal") }
+        #expect(throws: LibraryArchive.Failure.self) { try LibraryArchive.validate("NoteAssets/sub/\(uuid).png") }
+        // The store's housekeeping file never travels.
+        let library = try TemporaryLibrary()
+        try library.write("NoteAssets/.pending-removal", "x")
+        try library.write("NoteAssets/notes.txt", "x")
+        #expect(try LibraryArchive.storeFiles(in: library.folder).files.isEmpty)
+    }
+
+    @Test("Missing or unreadable note images are left out and reported; the note keeps its text")
+    func noteImagesMissing() throws {
+        let source = try TemporaryLibrary()
+        let assets = NoteAssetStore(libraryURL: source.store.fileURL)
+        let good = try assets.save(try notePNG(), fileExtension: "png")
+        let broken = try assets.save(Data("not an image".utf8), fileExtension: "png")
+        let gone = "NoteAssets/\(UUID().uuidString).png"
+        source.store.update {
+            $0.notes = [QuickNote(title: "Mixed", content: "Mixed\n![a](\(good)) ![b](\(broken)) ![c](\(gone))")]
+        }
+        let built = try LibraryArchive.make(database: source.store.database, directory: source.folder, categories: [.notes])
+        #expect(built.omissions.contains { $0.contains("2 images in notes") })
+        let contents = try LibraryArchive.read(built.data)
+        #expect(Set(contents.files.keys) == [good])
+
+        let target = try TemporaryLibrary()
+        let report = try target.store.importArchive(contents, categories: [.notes], mode: .replace)
+        #expect(target.store.database.notes.first?.content.contains(gone) == true)
+        #expect(report.notes.contains { $0.contains("2 images in notes") })
+        #expect(target.exists(good))
+        #expect(!target.exists(broken))
+    }
+}
