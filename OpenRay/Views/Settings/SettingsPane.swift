@@ -61,6 +61,8 @@ extension SettingsPane {
         // Slice 4: applications
         .ai,
         // Slice 5: windows, system
+        .windows,
+        .system,
         // Slice 6: notes, calendar, focus
         // Slice 8: scripts
     ]
