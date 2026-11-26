@@ -15,6 +15,7 @@ final class AIWritingCommandProvider: CommandProvider {
     nonisolated static func commandID(for action: AIAction) -> String { "ai.\(action.id)" }
 
     var id: String { Self.registration.id }
+    var title: String { "AI Writing" }
 
     init() {}
 

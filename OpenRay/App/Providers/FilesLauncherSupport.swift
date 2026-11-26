@@ -302,9 +302,10 @@ extension LauncherModel {
         }
         if let path = filePathQuery, path.filter.isEmpty ? path.parentText(home: files.home) != nil : true {
             entries.append(
+                // The field's ⇧Tab (`backtab`) runs this; the entry shows the key without binding it twice.
                 ActionEntry(
                     id: "files.parent", title: "Enclosing Folder", symbol: "arrow.turn.left.up",
-                    shortcut: KeyShortcut(["⇧", "Tab"]), key: .tab, modifiers: .shift, group: .panel
+                    shortcut: KeyShortcut(["⇧", "Tab"]), group: .panel
                 ) { [weak self] in self?.browseEnclosingFolder() })
         }
         if section == .applications, let provider = applicationsProvider {
@@ -343,7 +344,10 @@ extension LauncherModel {
                 ActionEntry(
                     id: "openWith", title: "Open With", symbol: "arrow.up.forward.app", group: .item,
                     children: children
-                ) { [weak self] in self?.openWithDefaultApp(url, workspace: workspace) })
+                ) { [weak self] in
+                    // ⌘K and the context menu open the submenu; a surface without one only says how.
+                    self?.feedback = .info("Choose an app under Open With in ⌘K.")
+                })
         }
         if isFolder {
             entries.append(
@@ -463,10 +467,10 @@ extension LauncherModel {
 
     // MARK: - File effects
 
-    /// Asks in the action bar before running a destructive step.
+    /// Asks in the action bar through the launcher's one prompt path. Prompts marked destructive
+    /// are approved only once shown long enough, by a fresh Return or their own button.
     func askConfirmation(_ confirmation: ProvidedConfirmation) {
-        showActions = false
-        self.confirmation = .provided(confirmation)
+        presentConfirmation(.provided(confirmation))
     }
 
     /// Asks before moving a file to the Trash. The file is frozen as it is now; if something else
@@ -483,7 +487,7 @@ extension LauncherModel {
                 CommandConfirmation(
                     question: "Move “\(name.truncatedForFeedback)” to the Trash?",
                     detail: "You can put it back from the Trash until you empty it.", confirmTitle: "Move to Trash",
-                    symbol: "trash")
+                    symbol: "trash", isDestructive: true)
             ) { [weak self] in
                 guard let self else { return }
                 guard identity.isSameItem(as: FileIdentity.of(url)) else {
@@ -647,7 +651,7 @@ extension LauncherModel {
                 id: "applications.forceQuit.\(app.id)",
                 CommandConfirmation(
                     question: "Force quit \(app.name)?", detail: "Unsaved changes in its documents will be lost.",
-                    confirmTitle: "Force Quit", symbol: "exclamationmark.octagon")
+                    confirmTitle: "Force Quit", symbol: "exclamationmark.octagon", isDestructive: true)
             ) { [weak self] in
                 guard let self else { return }
                 let result = running.forceQuit(snapshot)
@@ -693,7 +697,9 @@ extension LauncherModel {
                 CommandConfirmation(
                     question: "\(verb) \(names.count) app\(names.count == 1 ? "" : "s")?",
                     detail: "\(listed).\(quitting ? " Apps can ask to save first." : "") Apps you keep running in Settings › Applications stay as they are.",
-                    confirmTitle: quitting ? "Quit All" : "Hide All", symbol: quitting ? "xmark.circle" : "eye.slash")
+                    confirmTitle: quitting ? "Quit All" : "Hide All", symbol: quitting ? "xmark.circle" : "eye.slash",
+                    // Quitting can lose unsaved work; hiding loses nothing.
+                    isDestructive: quitting)
             ) { [weak self] in
                 guard let self else { return }
                 let keepingNow = Set(self.applicationSettings.keepRunningBundleIDs)

@@ -134,7 +134,7 @@ struct ApplicationsTests {
             return
         }
         #expect(question.question == "Force quit Safari?")
-        model.performSelected()
+        model.approvePromptAsShown()
         #expect(controller.forceQuit == [10])
 
         // Relaunched while the prompt was up: the new process isn't the one that was named.
@@ -145,7 +145,7 @@ struct ApplicationsTests {
                 pid: 12, bundleID: "com.apple.Safari", name: "Safari", bundleURL: safariURL,
                 launchDate: Date(timeIntervalSince1970: 2_000))
         ]
-        model.performSelected()
+        model.approvePromptAsShown()
         #expect(controller.forceQuit == [10])
         #expect(model.feedback?.text == "Safari had already quit. Nothing else was touched.")
     }
@@ -211,7 +211,7 @@ struct ApplicationsTests {
             return
         }
         #expect(hideQuestion.question == "Hide 3 apps?")
-        model.performSelected()
+        model.approvePromptAsShown()
         #expect(controller.hidden == [1, 2, 3])
 
         // Quit All names its apps; one opened while it asks, and one kept meanwhile, are left alone.
@@ -225,7 +225,7 @@ struct ApplicationsTests {
         #expect(question.detail.hasPrefix("Safari, Mail."))
         controller.apps.append(running(7, "com.example.new", "New"))
         model.updateApplicationSettings { $0.keepRunningBundleIDs = ["com.apple.Music", "com.apple.mail"] }
-        model.performSelected()
+        model.approvePromptAsShown()
         #expect(controller.quit == [1])
         #expect(model.feedback?.text == "Asked 1 app to quit")
     }
@@ -486,7 +486,7 @@ struct ApplicationsTests {
             return
         }
         #expect(question.question == "Move XApp and 1 support file to the Trash?")
-        model.performSelected()
+        model.approvePromptAsShown()
         #expect(workspace.trashed.map(\.lastPathComponent) == ["XApp.app", "com.example.x"])
         #expect(workspace.trashed.last?.path.contains("Caches") == true)
         #expect(model.section == .home)
@@ -503,7 +503,7 @@ struct ApplicationsTests {
         provider.askToUninstall(app, in: model)
         try FileManager.default.removeItem(at: caches)
         try Data("not the reviewed folder".utf8).write(to: caches)
-        model.performSelected()
+        model.approvePromptAsShown()
         #expect(workspace.trashed.isEmpty)
         #expect(model.feedback?.text.contains("changed since you reviewed it") == true)
 
@@ -513,7 +513,7 @@ struct ApplicationsTests {
         controller.apps = [
             RunningApp(pid: 40, bundleID: "com.example.x", name: "XApp", bundleURL: app.url, launchDate: .now)
         ]
-        model.performSelected()
+        model.approvePromptAsShown()
         #expect(workspace.trashed.isEmpty)
         #expect(model.feedback?.text == "XApp is running now. Quit it, then review it again.")
     }
@@ -614,16 +614,47 @@ struct ApplicationsTests {
     @Test func openingAnAppGoesThroughTheGuardedController() async throws {
         let (model, controller, _, _) = setUp([])
         let app = InstalledApplication(name: "Notes", url: URL(fileURLWithPath: "/System/Applications/Notes.app"), bundleIdentifier: "com.apple.Notes")
+        // The test host refuses ↩ on an app before any controller is reached…
         model.perform(appItem(app))
-        try await waitFor { !controller.opened.isEmpty }
+        try await Task.sleep(for: .milliseconds(50))
+        #expect(controller.opened.isEmpty)
+        #expect(model.feedback?.text.contains("doesn't allow") == true)
+        // …and where it's allowed, the app opens through the running-app controller.
+        try await model.openApplication(app)
         #expect(controller.opened == [app.url])
-        // Without a fake, the live controller refuses in the test host and says so.
+        // Without a fake, the live controller refuses on its own.
         let plain = LauncherModel(
             store: LibraryStore(fileURL: nil), ai: AIChatModel(engine: TestAIEngine()),
             pasteboard: NSPasteboard.withUniqueName(), registry: CommandRegistry(providers: []))
-        plain.perform(appItem(InstalledApplication(name: "None", url: URL(fileURLWithPath: "/OpenRayNoSuchApp.app"), bundleIdentifier: nil)))
-        try await waitFor { plain.feedback != nil }
-        #expect(plain.feedback?.text.contains("doesn't allow") == true)
+        await #expect(throws: SideEffectGuard.Blocked.self) {
+            try await plain.openApplication(InstalledApplication(name: "None", url: URL(fileURLWithPath: "/OpenRayNoSuchApp.app"), bundleIdentifier: nil))
+        }
+    }
+
+    @Test func destructivePromptsWaitUntilShownAndHideAllDoesnt() throws {
+        let apps = [running(1, "com.apple.Safari", "Safari"), running(2, "com.apple.mail", "Mail")]
+        let (model, controller, _, _) = setUp(apps)
+        let safari = InstalledApplication(name: "Safari", url: safariURL, bundleIdentifier: "com.apple.Safari")
+
+        // Force Quit is destructive: a fresh Return before the prompt was shown does nothing.
+        model.askToForceQuit(safari)
+        #expect(model.confirmation?.isDestructive == true)
+        model.currentKeyPressIsFresh = { true }
+        model.confirmationSurfaceVisibleSince = { .distantPast }
+        model.performSelected()
+        #expect(controller.forceQuit.isEmpty)
+        model.approvePromptAsShown()
+        #expect(controller.forceQuit == [1])
+
+        // Quit All is destructive; Hide All loses nothing and isn't.
+        model.navigate(to: .applications)
+        model.askToBatch(quitting: true)
+        #expect(model.confirmation?.isDestructive == true)
+        model.confirmation = nil
+        model.askToBatch(quitting: false)
+        #expect(model.confirmation?.isDestructive == false)
+        model.performSelected()
+        #expect(controller.hidden == [2])
     }
 
     @Test func uninstallNeedsAFreshReviewWhenTheAppOrItsOwnersChange() throws {
@@ -638,7 +669,7 @@ struct ApplicationsTests {
         provider.askToUninstall(app, in: model)
         let copy = root.appending(path: "Copy/XApp.app")
         provider.installedCopies = { _ in [app.url, copy] }
-        model.performSelected()
+        model.approvePromptAsShown()
         #expect(workspace.trashed.isEmpty)
         #expect(model.feedback?.text.contains("Another copy of XApp is installed now") == true)
         provider.installedCopies = { _ in [app.url] }

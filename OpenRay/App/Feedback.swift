@@ -41,7 +41,7 @@ enum ActionConfirmation: Identifiable {
         case .delete(let item): "delete.\(item.id)"
         case .discardChanges: "discard"
         case .clearClipboardHistory: "clear"
-        case .provided(let confirmation): "provided.\(confirmation.id)"
+        case .provided(let confirmation): "provided.\(confirmation.id).\(confirmation.token.uuidString)"
         }
     }
 
@@ -74,6 +74,21 @@ enum ActionConfirmation: Identifiable {
         case .provided(let confirmation): confirmation.confirmTitle
         }
     }
+
+    /// Danger-styled, and approved by Return only while the prompt is on screen. The built-in
+    /// prompts all lose something; a provider's says so with `isDestructive`.
+    var isDestructive: Bool {
+        switch self {
+        case .delete, .discardChanges, .clearClipboardHistory: true
+        case .provided(let confirmation): confirmation.isDestructive
+        }
+    }
+
+    /// Every question that loses something (Delete, Discard Changes, Clear Clipboard History, a
+    /// provider's Shut Down or Empty Trash) can be approved only after this very prompt instance
+    /// was shown on a visible surface for `LauncherModel.minimumPromptExposure`, and only by a
+    /// fresh key press or its own button.
+    var requiresVisibleApproval: Bool { isDestructive }
 
     var symbol: String {
         switch self {

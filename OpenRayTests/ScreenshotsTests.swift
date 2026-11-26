@@ -400,7 +400,7 @@ struct ScreenshotsTests {
 
         try #require(entries.first { $0.id == "trash" }).perform()
         #expect(workspace.trashed.isEmpty)
-        model.performSelected()
+        model.approvePromptAsShown()
         #expect(workspace.trashed == [shot])
         #expect(provider.index.records.isEmpty)
     }

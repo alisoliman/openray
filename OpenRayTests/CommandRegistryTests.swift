@@ -39,14 +39,42 @@ final class FakeCommandProvider: CommandProvider {
     var secondaryPerformed: [String] = []
     var failDeletion = false
     var scopeArguments: [[String: String]] = []
+    /// Commands the provider has withdrawn since a row or prompt was built.
+    var withdrawn: Set<String> = []
+    /// Replaces test.confirm's question, as an update to the command would.
+    var confirmQuestion: String? = nil
+    /// Makes test.run ask first, as if the provider started requiring it.
+    var confirmRun = false
+    /// Makes test.confirm's question destructive, as Shut Down's is.
+    var confirmDestructive = false
+    /// Adds commands that opt out of bindings: one under the accepted prefix, one under a curated id.
+    var optOuts = false
 
     init() {}
 
     func commands(in model: LauncherModel) -> [CommandDescriptor] {
-        [
+        allCommands.filter { !withdrawn.contains($0.id) }
+    }
+
+    private var allCommands: [CommandDescriptor] {
+        var confirmation = Self.confirmation
+        if let confirmQuestion { confirmation.question = confirmQuestion }
+        confirmation.isDestructive = confirmDestructive
+        let optOutCommands =
+            optOuts
+            ? [
+                CommandDescriptor(
+                    id: "test.optout", title: "Yak Opt Out", subtitle: "Never bound", kind: .command, symbol: "nosign",
+                    mode: .noView, isBindable: false),
+                CommandDescriptor(
+                    id: "ai.summarize", title: "Yak Curated Opt Out", subtitle: "A curated id, opted out",
+                    kind: .command, symbol: "nosign", mode: .noView, isBindable: false),
+            ] : []
+        return [
             CommandDescriptor(
                 id: "test.run", title: "Zebra Fake Run", subtitle: "Runs without a view", kind: .command, symbol: "bolt",
-                keywords: ["quagga"], mode: .noView, detail: "Does the yodel thing", isUnavailable: !available),
+                keywords: ["quagga"], mode: .noView, detail: "Does the yodel thing", isUnavailable: !available,
+                confirmation: confirmRun ? Self.confirmation : nil),
             CommandDescriptor(
                 id: "test.open", title: "Zebra Fake List", subtitle: "Opens a list", kind: .note, symbol: "list.bullet",
                 mode: .view(.provided(Self.scope))),
@@ -63,7 +91,7 @@ final class FakeCommandProvider: CommandProvider {
                 mode: .noView),
             CommandDescriptor(
                 id: "test.confirm", title: "Yak Confirm", subtitle: "Asks first", kind: .command,
-                symbol: "exclamationmark.triangle", mode: .noView, confirmation: Self.confirmation),
+                symbol: "exclamationmark.triangle", mode: .noView, confirmation: confirmation),
             CommandDescriptor(
                 id: "test.scoped", title: "Yak Scoped List", subtitle: "Opens a filtered list", kind: .note,
                 symbol: "line.3.horizontal.decrease",
@@ -74,7 +102,7 @@ final class FakeCommandProvider: CommandProvider {
                 CommandDescriptor(
                     id: "test.script.\(name)", title: "Script \(name)", subtitle: "A script", kind: .command,
                     symbol: "terminal", mode: .noView)
-            }
+            } + optOutCommands
     }
 
     func rootItems(for query: String, in model: LauncherModel) -> [LauncherItem] {
@@ -106,6 +134,14 @@ final class FakeCommandProvider: CommandProvider {
         guard id.hasPrefix("test.row.") else { return nil }
         let title = String(id.dropFirst("test.row.".count))
         return rows.contains(title) ? row(title) : nil
+    }
+
+    /// False until its rows have “loaded”: it can't say whether a row is gone.
+    var rowsLoaded = true
+
+    func presence(ofItemWithID id: String, in model: LauncherModel) -> ProvidedItemPresence {
+        guard rowsLoaded, id.hasPrefix("test.row.") else { return .unknown }
+        return item(withID: id, in: model) == nil ? .gone : .present
     }
 
     func scopeItems(_ scope: ProvidedScope, query: String, in model: LauncherModel) -> [LauncherItem] {
@@ -256,7 +292,13 @@ struct CommandRegistryTests {
         let model = model([fake])
         defer { model.stop() }
         let item = try #require(model.commandItems.first { $0.id == "test.args" })
+        // Without its required argument, the command opens its argument fields instead of running.
         model.perform(item)
+        #expect(fake.performed.isEmpty)
+        #expect(model.argumentSession?.item.id == "test.args")
+        model.cancelArguments()
+        // A stale row that skips the fields is still refused by the registry.
+        model.registry.perform(item, ref: ProvidedRef(provider: "test.fake", id: "test.args", traits: [.descriptor]), in: model)
         #expect(fake.performed.isEmpty)
         #expect(model.feedback?.style == .warning)
         var filled = item
@@ -461,7 +503,8 @@ struct CommandRegistryTests {
         let model = model(ai: availability)
         defer { model.stop() }
         let available = availability.isAvailable
-        let rows = model.commandItems.filter { $0.id.hasPrefix("ai.") && $0.id != "ai.chat" }
+        // The ported writing commands only, by their provider; other AI commands may join later.
+        let rows = model.commandItems.filter { ref($0)?.provider == AIWritingCommandProvider.registration.id }
         #expect(rows.map(\.id) == AIAction.allCases.filter { $0 != .chat }.map { "ai.\($0.id)" })
         for (row, action) in zip(rows, AIAction.allCases.filter { $0 != .chat }) {
             #expect(row.title == action.title)

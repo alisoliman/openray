@@ -297,7 +297,7 @@ final class ApplicationsCommandProvider: CommandProvider {
             question: extra == 0
                 ? "Move \(app.name) to the Trash?" : "Move \(app.name) and \(extra) support file\(extra == 1 ? "" : "s") to the Trash?",
             detail: "You can put them back from the Trash until you empty it.", confirmTitle: "Uninstall",
-            symbol: "trash")
+            symbol: "trash", isDestructive: true)
         model.askConfirmation(ProvidedConfirmation(id: "applications.uninstall.\(app.url.path)", question) {
             [weak self, weak model] in
             guard let self, let model else { return }

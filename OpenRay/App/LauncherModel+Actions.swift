@@ -26,8 +26,11 @@ extension LauncherModel {
     // MARK: - Perform
 
     func performSelected() {
-        if let confirmation {
-            confirm(confirmation)
+        if confirmation != nil {
+            // Return itself is answered by the panel before any field sees it. Anything else that
+            // submits (insertNewline: from a key binding, an accessibility action) goes through
+            // the same fresh-key and visibility checks.
+            _ = confirmFromReturn(isRepeat: !currentKeyPressIsFresh())
             return
         }
         guard !showActions else { return }
@@ -48,8 +51,20 @@ extension LauncherModel {
         showActions = false
         confirmation = nil
         feedback = nil
+        // With argument fields open, running their command means running the form.
+        if let session = argumentSession {
+            if item.id == session.item.id { submitArguments() }
+            return
+        }
+        // A command that still needs an argument opens its fields instead of failing.
+        if needsArguments(item) {
+            beginArguments(for: item)
+            return
+        }
+        noteQueryPick(for: item)
         switch item.action {
         case .application(let app):
+            guard allowsSideEffect("opening apps") else { return }
             Task {
                 do {
                     try await openApplication(app)
@@ -80,6 +95,7 @@ extension LauncherModel {
             editor = .note(note)
             store.recordUse(of: item.id)
         case .window(let layout):
+            guard allowsSideEffect("arranging other apps' windows") else { return }
             guard accessibilityAllowed || windows.hasPermission else {
                 windows.requestPermission()
                 SystemSettingsLink.open(.accessibility)
@@ -135,8 +151,28 @@ extension LauncherModel {
         openQuicklink(link) { try link.resolution(query: query, values: $0) }
     }
 
+    /// Checks the launch's side-effect rule before an executor runs. Inert launches (the test host,
+    /// verification mode) say why instead of acting.
+    func allowsSideEffect(_ what: String) -> Bool {
+        do {
+            try sideEffects.check(what)
+            return true
+        } catch {
+            feedback = .error(error.localizedDescription)
+            return false
+        }
+    }
+
+    /// Inert launches never write the system clipboard, even when handed it.
+    private var mayWriteClipboard: Bool {
+        guard sideEffects.isInert, clipboard.usesGeneralPasteboard else { return true }
+        feedback = .error(SideEffectGuard.Blocked(what: "writing to the system clipboard", mode: sideEffects.mode).localizedDescription)
+        return false
+    }
+
     @discardableResult
     func copy(_ text: String, label: String? = nil) -> Bool {
+        guard mayWriteClipboard else { return false }
         if clipboard.copy(text) {
             toast("Copied “\((label ?? text).truncatedForFeedback)”")
             return true
@@ -147,6 +183,7 @@ extension LauncherModel {
 
     @discardableResult
     func copy(_ entry: ClipboardEntry) -> Bool {
+        guard mayWriteClipboard else { return false }
         if clipboard.copy(entry) {
             toast("Copied “\(entry.title.truncatedForFeedback)”")
             return true
@@ -167,7 +204,7 @@ extension LauncherModel {
     var targetAppName: String { previousApplicationName ?? "Your App" }
 
     func pasteSelected() {
-        if confirmation != nil || showActions || isCollapsedToBar { return }
+        if confirmation != nil || showActions || isCollapsedToBar || argumentSession != nil { return }
         if destination == .ai {
             pasteAIResponse()
             return
@@ -184,7 +221,7 @@ extension LauncherModel {
             registry.performSecondary(item, ref: ref, in: self)
             return
         }
-        guard item.supportsPaste else { return }
+        guard item.supportsPaste, mayWriteClipboard else { return }
         switch item.action {
         case .clipboard, .snippet:
             // ⌘↩ does what ↩ doesn't, so the two keys never both copy.
@@ -199,6 +236,7 @@ extension LauncherModel {
     }
 
     func paste(_ text: String, label: String? = nil) {
+        guard mayWriteClipboard else { return }
         finishPaste(copied: clipboard.copy(text), label: label ?? text)
     }
 
@@ -213,7 +251,7 @@ extension LauncherModel {
             feedback = .error(clipboard.lastCopyError ?? "Couldn't copy the content.")
             return
         }
-        guard clipboard.usesGeneralPasteboard else {
+        guard clipboard.usesGeneralPasteboard, !sideEffects.isInert else {
             feedback = .info("Copied to the isolated verification pasteboard. Cross-app paste is disabled in this mode.")
             return
         }
@@ -362,6 +400,70 @@ extension LauncherModel {
         confirmation = .delete(item)
     }
 
+    /// Asks a question in the action bar. Every screen that can hold one shows it (search,
+    /// scopes, the clipboard opt-in, onboarding, editors and AI), so the overlays that would
+    /// cover the bar close first.
+    func presentConfirmation(_ confirmation: ActionConfirmation) {
+        showActions = false
+        showShortcuts = false
+        showsAttachmentPreview = false
+        self.confirmation = confirmation
+    }
+
+    /// The current prompt instance: its question and a token that changes every time a prompt
+    /// is asked. Action bars report and approve by it, so a stale view or click can't answer a
+    /// newer prompt, even one asking the same question.
+    var confirmationInstanceID: String? {
+        confirmation.map { "\($0.id)#\(confirmationToken.uuidString)" }
+    }
+
+    /// How long a prompt that loses something must have been on screen, uncovered, in a fully
+    /// revealed panel, before it can be approved. Longer than the panel's reveal and the prompt's
+    /// fade-in, so a press or click aimed at what was there before can't answer it.
+    static let minimumPromptExposure: TimeInterval = 0.45
+
+    /// A key press while a question is pending. Only a fresh press approves it: a held Return's
+    /// autorepeat, or a submission without a key behind it, is consumed, so the press that asked
+    /// can't also answer. Returns whether the key was handled, which is whenever a question is pending.
+    func confirmFromReturn(isRepeat: Bool) -> Bool {
+        guard let confirmation else { return false }
+        if !isRepeat, canApprove(confirmation) { confirm(confirmation) }
+        return true
+    }
+
+    /// The approve button: it answers only the prompt instance it showed, so a click landing as a
+    /// new prompt replaces the old one approves neither.
+    func approveConfirmation(id instance: String) {
+        guard let confirmation, instance == confirmationInstanceID, canApprove(confirmation) else { return }
+        confirm(confirmation)
+    }
+
+    /// An action bar reports the prompt instance it's showing, once it's drawn uncovered. The
+    /// first report starts its exposure; later ones for the same instance don't restart it.
+    func confirmationDidAppear(_ instance: String) {
+        guard instance == confirmationInstanceID, confirmationShown?.instance != instance else { return }
+        confirmationShown = (instance, promptClock())
+    }
+
+    /// Whether the pending prompt can be approved now. One that loses something must have been
+    /// shown as this very instance, on a surface that is visible and key, for long enough.
+    func canApprove(_ confirmation: ActionConfirmation) -> Bool {
+        guard confirmation.requiresVisibleApproval else { return true }
+        guard let shown = confirmationShown, shown.instance == confirmationInstanceID,
+            let visibleSince = confirmationVisibleSince
+        else { return false }
+        return promptClock().timeIntervalSince(max(shown.at, visibleSince)) >= Self.minimumPromptExposure
+    }
+
+    /// Since when prompts have been on screen: the panel visible, revealed, opaque and key, with
+    /// nothing covering its action bar. Nil while they aren't.
+    var confirmationVisibleSince: Date? {
+        guard confirmation != nil, !showActions else { return nil }
+        if let check = confirmationSurfaceVisibleSince { return check() }
+        guard let panel, isPresented else { return nil }
+        return panel.surfaceVisibleSince
+    }
+
     func confirm(_ confirmation: ActionConfirmation) {
         self.confirmation = nil
         switch confirmation {
@@ -402,15 +504,36 @@ extension LauncherModel {
                 }
                 guard deleted else { return false }
             case .store(let remove):
-                guard remove() else { return false }
-                if !store.forget(itemIDs: [item.id]) {
+                // Record the cleanup first, so neither a failed save nor a quit after the
+                // deletion can leave Favorites and Recent pointing at the removed row.
+                let referenced =
+                    store.database.favoriteIDs.contains(item.id) || store.database.usage.contains { $0.id == item.id }
+                // A retry of a row whose earlier deletion was already recorded keeps that record
+                // whatever happens now: the earlier deletion may have succeeded.
+                let wasJournaled = store.journaledCleanup[item.id] != nil
+                if referenced, !wasJournaled {
+                    do {
+                        try store.journalCleanup(of: item.id, provider: ref.provider)
+                    } catch {
+                        feedback = .error(
+                            "“\(item.title.truncatedForFeedback)” wasn't deleted: OpenRay couldn't record the change. \(error.localizedDescription)"
+                        )
+                        return false
+                    }
+                }
+                guard remove() else {
+                    if !wasJournaled { store.unjournalCleanup(of: item.id) }
+                    return false
+                }
+                if referenced, !store.forget(itemIDs: [item.id]) {
                     feedback = .warning(
                         "Deleted “\(item.title.truncatedForFeedback)”, but Favorites and Recent couldn't be updated. "
                             + "OpenRay tries again with the next change it saves.")
                 }
             }
             selectedID = next
-            synchronizeSelection()
+            // The deleted row may have been a command with a hotkey; release it now.
+            commandCatalogDidChange()
             return true
         }
         let deleted = store.update { database in
@@ -423,6 +546,8 @@ extension LauncherModel {
             }
             database.favoriteIDs.remove(item.id)
             database.usage.removeAll { $0.id == item.id }
+            // A deleted quicklink or snippet won't come back, so its alias and hotkey go with it.
+            database.commandBindings.removeAll { $0.targetID == item.id }
         }
         guard deleted else { return false }
         selectedID = next
@@ -528,7 +653,7 @@ extension LauncherModel {
     }
 
     private func open(_ url: URL, itemID: String) {
-        guard mayOpenFile(url) else { return }
+        guard allowsSideEffect("opening files and links"), mayOpenFile(url) else { return }
         if openFileThroughWorkspace(url) {
             store.recordUse(of: itemID)
             panel?.dismiss(restoreFocus: false)
@@ -541,6 +666,7 @@ extension LauncherModel {
     // MARK: - Action panel
 
     func actionsDidToggle() {
+        actionPath = []
         if showActions {
             actionEntries = actions(for: selectedItem)
             actionFilter = ""
@@ -553,11 +679,8 @@ extension LauncherModel {
         }
     }
 
-    var filteredActionEntries: [ActionEntry] {
-        let filter = actionFilter.trimmingCharacters(in: .whitespaces)
-        guard !filter.isEmpty else { return actionEntries }
-        return actionEntries.filter { SearchMatcher.score(filter, in: $0.title) != nil }
-    }
+    /// The current level's entries, or every match including submenu entries while filtering.
+    var filteredActionEntries: [ActionEntry] { actionEntriesMatching(actionFilter) }
 
     /// Arrow keys in ⌘K. VoiceOver hears each action as the keyboard reaches it;
     /// hover moves the highlight too, so the announcement lives here, not in the view.
@@ -580,15 +703,31 @@ extension LauncherModel {
         performAction(entries[actionSelection])
     }
 
+    /// Runs an entry, or opens it when it's a submenu.
     func performAction(_ entry: ActionEntry) {
+        if !entry.children.isEmpty, showActions {
+            openActionSubmenu(entry)
+            return
+        }
         showActions = false
         entry.perform()
     }
 
     /// Item actions first, then organisation, then panel-level actions.
     func actions(for item: LauncherItem?) -> [ActionEntry] {
+        // Entries outlive this call (⌘K snapshots them), so a command row keeps its identity.
+        let item = item.map(markingCommandIdentity)
         var entries: [ActionEntry] = []
         if destination == .ai { return aiActions() }
+        if argumentSession != nil {
+            return [
+                ActionEntry(id: "primary", title: "Run", symbol: "play", shortcut: .return, group: .item) { [weak self] in
+                    self?.submitArguments()
+                },
+                ActionEntry(id: "cancelArguments", title: "Close Arguments", symbol: "xmark", shortcut: .escape, group: .item)
+                { [weak self] in self?.cancelArguments() },
+            ]
+        }
         // Before history exists, the opt-in's two choices are the only actions.
         if showsClipboardOptIn {
             return [
@@ -700,7 +839,10 @@ extension LauncherModel {
                     ActionEntry(
                         id: "reveal", title: "Reveal in Finder", symbol: "folder", shortcut: .command("R", shift: true),
                         key: "r", modifiers: [.command, .shift], group: .item
-                    ) { [weak self] in self?.revealInFinder(url) })
+                    ) { [weak self] in
+                        guard self?.allowsSideEffect("revealing files in Finder") == true else { return }
+                        self?.revealInFinder(url)
+                    })
                 entries.append(
                     ActionEntry(
                         id: "copyPath", title: "Copy Path", symbol: "doc.on.doc", shortcut: .command("C", shift: true),
@@ -718,7 +860,7 @@ extension LauncherModel {
                         self?.edit(item)
                     })
             }
-            if CuratedCommand.supports(item.id) {
+            if canBind(item) {
                 entries.append(
                     ActionEntry(
                         id: "assign", title: "Assign Alias or Shortcut…", symbol: "keyboard", group: .organize
@@ -732,6 +874,42 @@ extension LauncherModel {
                         symbol: favorite ? "star.slash" : "star", shortcut: .command("F", shift: true), key: "f",
                         modifiers: [.command, .shift], group: .organize
                     ) { [weak self] in self?.toggleFavorite(item) })
+                if favorite {
+                    if canMoveFavorite(item, by: -1) {
+                        entries.append(
+                            ActionEntry(
+                                id: "favoriteUp", title: "Move Favorite Up", symbol: "arrow.up",
+                                shortcut: KeyShortcut(["⌥", "⌘", "↑"]), key: .upArrow, modifiers: [.command, .option],
+                                group: .organize, section: "Favorites"
+                            ) { [weak self] in self?.moveFavorite(item, by: -1) })
+                    }
+                    if canMoveFavorite(item, by: 1) {
+                        entries.append(
+                            ActionEntry(
+                                id: "favoriteDown", title: "Move Favorite Down", symbol: "arrow.down",
+                                shortcut: KeyShortcut(["⌥", "⌘", "↓"]), key: .downArrow, modifiers: [.command, .option],
+                                group: .organize, section: "Favorites"
+                            ) { [weak self] in self?.moveFavorite(item, by: 1) })
+                    }
+                }
+            }
+            entries += fallbackActions(for: item)
+            if canResetRanking(item) {
+                entries.append(
+                    ActionEntry(id: "resetRanking", title: "Reset Ranking", symbol: "arrow.counterclockwise", group: .organize)
+                    { [weak self] in self?.resetRanking(for: item) })
+            }
+            if isDisableable(item) {
+                entries.append(
+                    ActionEntry(
+                        id: "configure", title: "Configure Command", symbol: "slider.horizontal.3",
+                        shortcut: KeyShortcut(["⇧", "⌘", ","]), key: ",", modifiers: [.command, .shift],
+                        group: .organize, section: "Command"
+                    ) { [weak self] in self?.openSettings(.commands, focusing: item.id) })
+                entries.append(
+                    ActionEntry(
+                        id: "disable", title: "Disable Command", symbol: "nosign", group: .organize, section: "Command"
+                    ) { [weak self] in self?.disableCommand(item) })
             }
             if item.canDelete {
                 let noun: String =
@@ -785,7 +963,7 @@ extension LauncherModel {
         entries.append(
             ActionEntry(id: "shortcuts", title: "Show Shortcuts", symbol: "keyboard", shortcut: .command("/"), group: .panel)
             { [weak self] in self?.showShortcuts = true })
-        return entries
+        return markingTertiary(entries)
     }
 
     private func aiActions() -> [ActionEntry] {

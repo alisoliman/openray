@@ -46,7 +46,7 @@ extension ClipboardPolicy {
 extension SideEffectGuard {
     /// The policy an adapter enforces. An injected policy can only add restrictions:
     /// when this process is inert, its own policy wins over an injected live one.
-    var restrictedByProcess: SideEffectGuard { isInert ? self : .current }
+    var restrictedByProcess: SideEffectGuard { effective }
 }
 
 struct ClipboardCaptureContext: Sendable {

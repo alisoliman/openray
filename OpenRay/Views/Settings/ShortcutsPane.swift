@@ -16,6 +16,11 @@ struct ShortcutsPane: View {
     @State private var reservedShortcuts: Set<CommandShortcut> = []
     @State private var hotKeyPickerRevision = 0
     @State private var highlightedCommandID: String?
+    @State private var isRecordingLauncher = false
+    /// A recorded launcher shortcut that would get in the way of typing or apps, until Keep Anyway.
+    @State private var pendingLauncher: CommandShortcut?
+    /// An app, quicklink or snippet Settings was opened for, listed until the pane closes.
+    @State private var extraRowID: String?
 
     var body: some View {
         ScrollViewReader { proxy in
@@ -33,6 +38,53 @@ struct ShortcutsPane: View {
                     }
                     .neutralMenus()
                     .id(hotKeyPickerRevision)
+                    .disabled(model.store.database.preferences.launcherShortcut != nil)
+                    LabeledContent {
+                        ShortcutRecorderControl(
+                            title: "OpenRay", shortcut: model.store.database.preferences.launcherShortcut,
+                            isRecording: isRecordingLauncher, minWidth: 176,
+                            onStart: {
+                                model.beginShortcutRecording()
+                                isRecordingLauncher = true
+                            },
+                            onStop: stopRecordingLauncher,
+                            onRecord: { event in
+                                defer { stopRecordingLauncher() }
+                                if CommandShortcutRecording.isRemoveKey(event) {
+                                    model.setLauncherShortcut(nil)
+                                } else if let shortcut = try? CommandShortcutRecording.shortcut(from: event) {
+                                    recordLauncher(shortcut)
+                                } else {
+                                    model.launcherHotKeyRefusal =
+                                        "Use Command, Control, Option or Shift with a key, F13 to F20 alone, or modifier keys on their own."
+                                }
+                            },
+                            onRecordGesture: { shortcut in
+                                defer { stopRecordingLauncher() }
+                                recordLauncher(shortcut)
+                            },
+                            onClear: model.store.database.preferences.launcherShortcut == nil
+                                ? nil : { model.setLauncherShortcut(nil) })
+                        .frame(width: 176)
+                    } label: {
+                        SettingRowLabel(
+                            title: "Custom shortcut",
+                            detail: "Any key with modifiers, F13–F20 alone, two modifiers together, Right ⌘, or a double tap such as ⌘ ⌘.")
+                    }
+                    if let pending = pendingLauncher {
+                        HStack(spacing: 6) {
+                            Image(systemName: "exclamationmark.triangle.fill").font(.system(size: 11))
+                            Text(CommandShortcutPolicy.conflictWarnings(for: pending).joined(separator: " "))
+                                .fixedSize(horizontal: false, vertical: true)
+                            Button("Keep Anyway") {
+                                model.setLauncherShortcut(pending)
+                                pendingLauncher = nil
+                            }
+                            .buttonStyle(.link)
+                            Button("Undo") { pendingLauncher = nil }.buttonStyle(.link)
+                        }
+                        .font(.system(size: 12)).foregroundStyle(OR.Color.warning)
+                    }
                     if let error = model.launcherHotKeyRefusal ?? model.shortcutError {
                         Label(error, systemImage: "exclamationmark.triangle.fill").foregroundStyle(OR.Color.warning)
                             .font(.system(size: 12))
@@ -70,11 +122,28 @@ struct ShortcutsPane: View {
     /// While searching, only the commands whose title or alias matches. All of them when
     /// none do, because then the pane itself matched.
     private var commands: [LauncherItem] {
-        let all = model.bindableCommands
+        let all = model.bindingRows(focusing: extraRowID)
         let query = navigation.search.trimmingCharacters(in: .whitespaces)
         guard !query.isEmpty else { return all }
         let matching = all.filter { SettingsSearch.wordPrefixScore(query, in: model.settingsSearchText(for: $0)) != nil }
         return matching.isEmpty ? all : matching
+    }
+
+    /// Saves a recorded launcher shortcut, or holds one that gets in the way of typing or apps
+    /// until Keep Anyway, as command shortcuts do.
+    private func recordLauncher(_ shortcut: CommandShortcut) {
+        if CommandShortcutPolicy.conflictWarnings(for: shortcut).isEmpty {
+            pendingLauncher = nil
+            model.setLauncherShortcut(shortcut)
+        } else {
+            pendingLauncher = shortcut
+        }
+    }
+
+    private func stopRecordingLauncher() {
+        guard isRecordingLauncher else { return }
+        isRecordingLauncher = false
+        model.endShortcutRecording()
     }
 
     private func hotKeyTitle(_ hotKey: LauncherHotKey) -> String {
@@ -88,7 +157,8 @@ struct ShortcutsPane: View {
     private func focusRequestedCommand(_ proxy: ScrollViewProxy) {
         guard let id = navigation.focusCommandID else { return }
         navigation.focusCommandID = nil
-        guard model.bindableCommands.contains(where: { $0.id == id }) else { return }
+        guard model.bindingRows(focusing: id).contains(where: { $0.id == id }) else { return }
+        extraRowID = id
         if !commands.contains(where: { $0.id == id }) { navigation.search = "" }
         // Wait a turn, so the rows exist when the pane has only just appeared.
         Task { @MainActor in
@@ -172,6 +242,7 @@ struct CommandBindingRow: View {
             hasWarning: !warnings.isEmpty || model.commandShortcutErrors[command.id] != nil,
             minWidth: 176,
             onStart: { start() }, onStop: { stop() }, onRecord: { record($0) },
+            onRecordGesture: { apply($0) },
             onClear: clearAction
         )
         .frame(width: 176)
@@ -243,14 +314,25 @@ struct CommandBindingRow: View {
     }
 
     private func record(_ event: NSEvent) {
-        defer { stop() }
         if CommandShortcutRecording.isRemoveKey(event) {
+            defer { stop() }
             clear()
             return
         }
         do {
+            apply(try CommandShortcutRecording.shortcut(from: event))
+        } catch {
+            self.error = error.localizedDescription
+            stop()
+        }
+    }
+
+    /// Saves a recorded shortcut, a key or a modifier gesture, or holds it for Keep Anyway.
+    private func apply(_ shortcut: CommandShortcut) {
+        defer { stop() }
+        do {
             var binding = model.commandBinding(for: command.id)
-            binding.shortcut = try CommandShortcutRecording.shortcut(from: event)
+            binding.shortcut = shortcut
             try model.validateCommandBinding(binding)
             let found = model.bindingWarnings(for: binding)
             if found.isEmpty {

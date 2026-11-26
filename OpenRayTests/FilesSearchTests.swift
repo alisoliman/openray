@@ -76,6 +76,15 @@ struct FixedIgnoreFiles: IgnoreFileReading {
     func patterns(inFolder folder: URL) -> [IgnorePattern] { IgnorePattern.parse(rules[folder.path] ?? "") }
 }
 
+extension LauncherModel {
+    /// Approves the pending prompt the way a person does: shown uncovered long enough, then a
+    /// fresh Return. Uses Slice 1's `showPendingPromptLongEnough()`.
+    func approvePromptAsShown() {
+        showPendingPromptLongEnough()
+        performSelected()
+    }
+}
+
 @MainActor
 func waitFor(_ condition: () -> Bool, timeout: Int = 600) async throws {
     for _ in 0..<timeout {
@@ -221,7 +230,10 @@ struct FilesSearchTests {
         #expect(model.orderedResults.map(\.title) == ["Taxes", "2026.pdf"])
 
         // ⇧Tab goes back up, and the folder action panel offers it.
-        #expect(model.actions(for: model.selectedItem).contains { $0.id == "files.parent" && $0.modifiers == .shift })
+        // The search field's ⇧Tab runs it; the ⌘K entry shows the key without binding it a second time.
+        let parent = try #require(model.actions(for: model.selectedItem).first { $0.id == "files.parent" })
+        #expect(parent.shortcut?.caps == ["⇧", "Tab"])
+        #expect(parent.key == nil)
         #expect(model.browseEnclosingFolder())
         #expect(model.query == rootText)
         try await waitFor { model.files.browsedFolder?.path == root.path && !model.files.isSearching }
@@ -456,16 +468,23 @@ struct FilesSearchTests {
         try await waitFor { !workspace.opened.isEmpty }
         #expect(workspace.opened.first?.app.lastPathComponent == "Xcode.app")
         let share = try #require(entries.first { $0.id == "share" })
-        // Without a submenu, Share only says where to choose; it never picks a destination itself.
+        // Without a submenu, Share and Open With only say where to choose; they never pick a destination.
         share.perform()
+        openWith.perform()
         #expect(workspace.shared.isEmpty)
+        #expect(workspace.opened.count == 1)
         #expect(model.feedback?.style == .info)
         share.children[1].perform()
         #expect(workspace.shared.map(\.target) == ["com.apple.share.Mail.compose"])
-        // Reveal and ↩ go through the workspace, never straight to the Finder.
+        // In the test host the launcher refuses ↩ and Reveal before any adapter is reached…
         try #require(entries.first { $0.id == "reveal" }).perform()
-        #expect(workspace.revealed == [file])
         model.perform(item)
+        #expect(workspace.revealed.isEmpty && workspace.openedFiles.isEmpty)
+        #expect(model.feedback?.text.contains("doesn't allow") == true)
+        // …and where it allows them, they go through the workspace, never straight to the Finder.
+        model.revealInFinder(file)
+        #expect(model.openFileThroughWorkspace(file))
+        #expect(workspace.revealed == [file])
         #expect(workspace.openedFiles == [file])
         let trash = try #require(entries.first { $0.id == "trash" })
         #expect(trash.modifiers == .command && trash.isDestructive)
@@ -478,7 +497,7 @@ struct FilesSearchTests {
             return
         }
         #expect(question.confirmTitle == "Move to Trash")
-        model.performSelected()
+        model.approvePromptAsShown()
         #expect(workspace.trashed == [file])
         #expect(model.feedback?.style == .success)
 
@@ -501,7 +520,7 @@ struct FilesSearchTests {
         workspace.trashFailures = ["locked.txt"]
         let model = model([FilesCommandProvider(workspace: workspace)])
         model.askToTrash(locked, workspace: workspace)
-        model.performSelected()
+        model.approvePromptAsShown()
         #expect(model.feedback?.style == .error)
         #expect(workspace.trashed.isEmpty)
         // Nothing at the path: nothing to ask about.
@@ -519,7 +538,7 @@ struct FilesSearchTests {
         model.askToTrash(file, workspace: workspace)
         try FileManager.default.removeItem(at: file)
         try Data("something else entirely".utf8).write(to: file)
-        model.performSelected()
+        model.approvePromptAsShown()
         #expect(workspace.trashed.isEmpty)
         #expect(model.feedback?.text.contains("changed since you asked") == true)
     }
@@ -618,6 +637,56 @@ struct FilesSearchTests {
         let realImage = URL(fileURLWithPath: "/System/Library/CoreServices/Finder.app/Contents/Resources/Finder.icns")
         #expect(ScreenshotImageData.png(at: realImage, sideEffects: SideEffectGuard(mode: .live)) == nil)
         #expect(!InertReadBoundary.allows(realImage, sideEffects: SideEffectGuard(mode: .live)))
+    }
+
+    @Test func trashAsksADestructivePromptThatWaitsUntilShown() throws {
+        let root = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let file = root.appending(path: "old.txt")
+        try Data("x".utf8).write(to: file)
+        let workspace = FakeFileWorkspace()
+        let model = model([FilesCommandProvider(workspace: workspace)])
+        model.askToTrash(file, workspace: workspace)
+        #expect(model.confirmation?.isDestructive == true)
+        // A fresh Return on a prompt nobody has seen yet moves nothing.
+        model.currentKeyPressIsFresh = { true }
+        model.confirmationSurfaceVisibleSince = { .distantPast }
+        model.performSelected()
+        #expect(workspace.trashed.isEmpty)
+        model.approvePromptAsShown()
+        #expect(workspace.trashed == [file])
+    }
+
+    @Test func openWithAndShareOpenAsSubmenusInTheActionPanel() async throws {
+        let root = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        try Data("x".utf8).write(to: root.appending(path: "notes.txt"))
+        let workspace = FakeFileWorkspace()
+        let model = model([FilesCommandProvider(workspace: workspace)])
+        model.query = root.path + "/"
+        try await waitFor { model.files.browsedFolder?.path == root.path && !model.files.isSearching }
+        model.selectedID = try #require(model.orderedResults.first { $0.title == "notes.txt" }).id
+        model.showActions = true
+        let openWith = try #require(model.filteredActionEntries.first { $0.id == "openWith" })
+        // Choosing the parent opens its submenu; nothing opens until an app is chosen.
+        model.performAction(openWith)
+        #expect(model.showActions)
+        #expect(model.actionPath.map(\.id) == ["openWith"])
+        #expect(model.filteredActionEntries.map(\.title) == ["TextEdit (Default)", "Xcode"])
+        #expect(workspace.opened.isEmpty)
+        model.performAction(model.filteredActionEntries[1])
+        try await waitFor { !workspace.opened.isEmpty }
+        #expect(workspace.opened.first?.app.lastPathComponent == "Xcode.app")
+        // Share works the same way, and the search finds its destinations inside the submenu.
+        model.showActions = true
+        model.actionFilter = "Mail"
+        #expect(model.filteredActionEntries.contains { $0.title.contains("Share") && $0.title.contains("Mail") })
+        model.actionFilter = ""
+        model.performAction(try #require(model.filteredActionEntries.first { $0.id == "share" }))
+        #expect(model.actionPath.map(\.id) == ["share"])
+        #expect(workspace.shared.isEmpty)
+        model.showActions = false
+        model.files.stop()
     }
 
     @Test func filesSettingsRoundTripThroughCommandPreferences() {

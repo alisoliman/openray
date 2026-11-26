@@ -203,7 +203,9 @@ struct ClipboardOptInView: View {
             .frame(maxHeight: .infinity, alignment: .top)
 
             ActionBar(
-                feedback: model.feedback ?? model.store.errorMessage.map { .error($0) }, confirmation: nil,
+                feedback: model.feedback ?? model.store.errorMessage.map { .error($0) },
+                // A command asked for from a hotkey can arrive here; its question replaces Turn On.
+                confirmation: model.confirmation, confirmationInstance: model.confirmationInstanceID,
                 context: {
                     Image(systemName: "lock.fill").font(.system(size: 10, weight: .semibold)).accessibilityHidden(true)
                     Text("Stored in Application Support/OpenRay")
@@ -211,7 +213,10 @@ struct ClipboardOptInView: View {
                 actions: {
                     ActionBarButton(title: "Not Now", keys: ["esc"], style: .ghost) { model.goBack() }
                     ActionBarButton(title: "Turn On", keys: ["↩"], style: .accent) { model.enableClipboardHistory() }
-                })
+                },
+                onCancelConfirmation: { model.confirmation = nil },
+                onConfirm: { if let confirmation = model.confirmation { model.confirm(confirmation) } },
+                onConfirmationShown: model.confirmationDidAppear, onApprove: model.approveConfirmation)
         }
     }
 
