@@ -478,6 +478,7 @@ struct PlaceholderReviewFixTests {
         #expect(plan.requirements.snippets == ["Quote"])
         // Unnamed arguments of the template keep their numbers whatever snippets add.
         #expect(plan.arguments.map(\.id) == [.snippetUnnamed(snippet: "Quote", index: 1), .unnamed(1)])
+        #expect(plan.argumentSpecs.map(\.name) == ["#1@Quote", "#1"])
         #expect(template.arguments.map(\.id) == [.unnamed(1)])
         _ = template.arguments
         _ = template.validationIssues

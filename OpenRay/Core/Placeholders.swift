@@ -344,6 +344,9 @@ enum PlaceholderIssue: Hashable, Sendable {
     case unavailable(Placeholder.Kind)
     /// The output passed `PlaceholderRenderOptions.maximumOutputBytes`. Rendering stopped.
     case outputTooLong
+    /// Planning stopped: referenced snippets expand to more than `PlaceholderPlan.maximumNodes`
+    /// placeholders and text runs. Nothing is read or rendered.
+    case tooComplex
 
     /// Whether a command should refuse to run. Missing inputs it can't make up,
     /// failed lookups and oversized output block. Invalid syntax stays literal and
@@ -351,7 +354,8 @@ enum PlaceholderIssue: Hashable, Sendable {
     /// consumer that can't accept literal braces, such as a URL, checks for it.
     var blocksExecution: Bool {
         switch self {
-        case .tooManyArguments, .missingSnippet, .nestedSnippet, .missingArgument, .calculationFailed, .outputTooLong:
+        case .tooManyArguments, .missingSnippet, .nestedSnippet, .missingArgument, .calculationFailed, .outputTooLong,
+            .tooComplex:
             true
         case .invalid, .notHonored, .unsupported, .duplicateCursor, .unavailable:
             false
@@ -374,6 +378,7 @@ extension PlaceholderIssue {
         case .calculationFailed(let expression): "“\(expression)” couldn't be calculated."
         case .unavailable(let kind): "\(kind.title) wasn't available."
         case .outputTooLong: "The result is too long."
+        case .tooComplex: "This template expands to too much text. Use fewer snippet references."
         }
     }
 }
@@ -584,16 +589,16 @@ struct PlaceholderTemplate: Hashable, Sendable {
     }
 }
 
-/// Limits and switches for rendering.
+/// Limits and switches for rendering. Immutable, so limits are always validated.
 struct PlaceholderRenderOptions: Equatable, Sendable {
     /// Set to false to skip the context's default formatting, e.g. to render a
     /// quicklink file path whose values must not be percent-encoded.
-    var appliesContextFormatting: Bool
-    /// Characters kept from each inserted value before modifiers.
-    var maximumValueLength: Int
+    let appliesContextFormatting: Bool
+    /// Characters kept from each inserted value before modifiers. Never negative.
+    let maximumValueLength: Int
     /// The UTF-8 size the whole output may reach, counting literals, modifiers,
     /// formatting and referenced snippets. Past it, rendering stops with `.outputTooLong`.
-    var maximumOutputBytes: Int
+    let maximumOutputBytes: Int
 
     init(appliesContextFormatting: Bool = true, maximumValueLength: Int = 200_000, maximumOutputBytes: Int = 1_000_000) {
         self.appliesContextFormatting = appliesContextFormatting
@@ -633,15 +638,16 @@ struct PlaceholderArgumentCollector {
 // MARK: - Command arguments
 
 extension PlaceholderArgument.ID {
-    /// The `ArgumentSpec.name` for this argument, unique within a template and
-    /// reversible: a name as written (a leading `#` is doubled, so it can't look
-    /// like the others), `#1` for the template's first unnamed argument, and
-    /// `#Signature#1` for the first unnamed argument inside the snippet "Signature".
+    /// The `ArgumentSpec.name` for this argument. The three kinds never collide:
+    /// - a name as written, so `{query}` stays `query`; a name starting with `#`
+    ///   becomes `#=` plus the name;
+    /// - `#1` for the template's first unnamed argument (`#` and digits only);
+    /// - `#1@Signature` for the first unnamed argument inside the snippet "Signature".
     var specName: String {
         switch self {
-        case .named(let name): name.hasPrefix("#") ? "#" + name : name
+        case .named(let name): name.hasPrefix("#") ? "#=" + name : name
         case .unnamed(let index): "#\(index)"
-        case .snippetUnnamed(let snippet, let index): "#\(snippet)#\(index)"
+        case .snippetUnnamed(let snippet, let index): "#\(index)@\(snippet)"
         }
     }
 }

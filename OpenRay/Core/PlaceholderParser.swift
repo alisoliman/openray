@@ -174,7 +174,15 @@ struct PlaceholderParser {
             let character = source[index]
             guard !character.isNewline else { return nil }
             if let open = quote {
-                if character == open || (open == "\"" && (character == "”" || character == "“")) { quote = nil }
+                // The same escapes as quoted values: \" and \\ never close a double-quoted run.
+                if open == "\"", character == "\\", source.index(after: index) < source.endIndex,
+                    source[source.index(after: index)] == "\"" || source[source.index(after: index)] == "\\"
+                {
+                    index = source.index(after: index)
+                    scanned += 1
+                } else if character == open || (open == "\"" && (character == "”" || character == "“")) {
+                    quote = nil
+                }
             } else {
                 switch character {
                 case "\"", "“", "”", "'": quote = character == "'" ? "'" : "\""
@@ -187,6 +195,36 @@ struct PlaceholderParser {
             scanned += 1
         }
         return nil
+    }
+
+    /// `source` rewritten so the engine renders it as earlier OpenRay did: every
+    /// placeholder `keep` rejects is escaped and stays literal, and a backslash that
+    /// already escaped one is kept visible. Used to migrate snippets written before
+    /// dynamic placeholders, where only exact `{date}` and `{time}` were filled in.
+    static func escaping(_ source: String, context: PlaceholderContext, keep: (Placeholder) -> Bool) -> String {
+        let parser = PlaceholderParser(source: source, context: context)
+        var output = ""
+        var index = source.startIndex
+        while index < source.endIndex {
+            let character = source[index]
+            let next = source.index(after: index)
+            if character == "\\", next < source.endIndex, source[next] == "{",
+                case .placeholder(let placeholder) = parser.scan(at: next)
+            {
+                // `\{x}` showed as written; `\\{x}` renders the same backslash and literal token.
+                output += "\\\\" + placeholder.source
+                index = placeholder.range.upperBound
+                continue
+            }
+            if character == "{", case .placeholder(let placeholder) = parser.scan(at: index) {
+                output += keep(placeholder) ? placeholder.source : "\\" + placeholder.source
+                index = placeholder.range.upperBound
+                continue
+            }
+            output.append(character)
+            index = next
+        }
+        return output
     }
 
     private static func excerpt(of source: String, from start: String.Index) -> String {

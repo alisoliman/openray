@@ -28,18 +28,47 @@ struct PlaceholderPlan: Hashable, Sendable {
     let issues: [PlaceholderIssue]
     let requirements: PlaceholderRequirements
 
+    /// The most placeholders and text runs a plan may expand to, counting every
+    /// repeated snippet reference. Past it, planning stops with `.tooComplex`, so
+    /// neither planning nor rendering can grow without bound.
+    static let maximumNodes = 50_000
+
     init(template: PlaceholderTemplate, snippets: (String) -> String?) {
         var builder = PlanBuilder(context: template.context)
-        nodes = builder.build(template, depth: 0, snippet: nil, lookup: snippets)
+        let built = builder.build(template, depth: 0, snippet: nil, lookup: snippets)
         context = template.context
-        arguments = builder.collector.arguments
         var seen = Set<PlaceholderIssue>()
-        issues = builder.issues.filter { seen.insert($0).inserted }
-        requirements = builder.requirements
+        if builder.tooComplex {
+            nodes = []
+            arguments = []
+            issues = [.tooComplex]
+            requirements = PlaceholderRequirements()
+        } else {
+            nodes = built
+            arguments = builder.collector.arguments
+            issues = builder.issues.filter { seen.insert($0).inserted }
+            requirements = builder.requirements
+        }
     }
 
-    /// Blocking issues known before any value is read.
+    /// Blocking issues known before any value is read. Check them before reading inputs.
     var blockingIssues: [PlaceholderIssue] { issues.filter(\.blocksExecution) }
+
+    /// The fields a command shows for this plan, one per argument, named by
+    /// `PlaceholderArgument.ID.specName`. This is the Step 0 bridge.
+    var argumentSpecs: [ArgumentSpec] { arguments.map(\.argumentSpec) }
+
+    /// Values typed into `argumentSpecs`, by `ArgumentSpec.name` (as `ProvidedRef.arguments`
+    /// carries them), resolved through `ArgumentSpec.resolve`: trimmed, defaults applied,
+    /// required values and dropdown choices checked. Throws with a sentence to show.
+    func resolveArguments(_ typed: [String: String]) throws -> [PlaceholderArgument.ID: String] {
+        let values = try ArgumentSpec.resolve(argumentSpecs, typed: typed)
+        var resolved: [PlaceholderArgument.ID: String] = [:]
+        for argument in arguments {
+            if let value = values[argument.id.specName] { resolved[argument.id] = value }
+        }
+        return resolved
+    }
 
     func render(_ source: some PlaceholderDataSource, options: PlaceholderRenderOptions = .init())
         -> PlaceholderRendering
@@ -56,9 +85,14 @@ private struct PlanBuilder {
     var collector = PlaceholderArgumentCollector()
     var issues: [PlaceholderIssue] = []
     var requirements = PlaceholderRequirements()
+    private(set) var tooComplex = false
     private var topLevelUnnamed = 0
     private var snippetUnnamed = 0
     private var sawCursor = false
+    /// Nodes as they'll render, counting each repeated reference again.
+    private var expandedNodes = 0
+    /// Each referenced snippet is parsed and planned once, then reused.
+    private var snippetBodies: [String: (nodes: [PlaceholderPlan.Node]?, weight: Int)] = [:]
 
     /// Referenced snippets plan one level deep; calculator expressions two.
     private static let maximumDepth = 2
@@ -73,6 +107,9 @@ private struct PlanBuilder {
         issues += template.parseIssues
         var nodes: [PlaceholderPlan.Node] = []
         for segment in template.segments {
+            expandedNodes += 1
+            if expandedNodes > PlaceholderPlan.maximumNodes { tooComplex = true }
+            guard !tooComplex else { return nodes }
             let placeholder: Placeholder
             switch segment {
             case .literal(let text):
@@ -125,22 +162,32 @@ private struct PlanBuilder {
                     nodes.append(.literal(placeholder.source))
                 }
             case .snippet(let name):
-                requirements.snippets.append(name)
+                if !requirements.snippets.contains(name) { requirements.snippets.append(name) }
                 guard depth == 0 else {
                     issues.append(.nestedSnippet(name))
                     nodes.append(.snippet(placeholder, nil))
                     continue
                 }
+                if let body = snippetBodies[name] {
+                    // A repeat costs its full expansion, but is planned and looked up only once.
+                    expandedNodes += body.weight
+                    if expandedNodes > PlaceholderPlan.maximumNodes { tooComplex = true }
+                    nodes.append(.snippet(placeholder, body.nodes))
+                    continue
+                }
                 guard let text = lookup(name) else {
                     issues.append(.missingSnippet(name))
+                    snippetBodies[name] = (nil, 0)
                     nodes.append(.snippet(placeholder, nil))
                     continue
                 }
-                // Each reference numbers its unnamed arguments from 1, so two
-                // references to one snippet share their values.
+                // Each reference numbers its unnamed arguments from 1, so references
+                // to one snippet share their values.
                 snippetUnnamed = 0
+                let before = expandedNodes
                 let nested = build(
                     PlaceholderTemplate(text, context: .snippet), depth: depth + 1, snippet: name, lookup: lookup)
+                snippetBodies[name] = (nested, expandedNodes - before)
                 nodes.append(.snippet(placeholder, nested))
             case .calculator(let expression):
                 requirements.calculator = true
