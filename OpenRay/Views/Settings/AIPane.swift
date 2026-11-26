@@ -4,9 +4,9 @@ import SwiftUI
 extension SettingsPane {
     static let ai = SettingsPane(
         id: "ai", title: "Apple Intelligence",
-        subtitle: "Ask AI and writing commands, on this Mac.",
+        subtitle: "Chat, AI Commands, agents and tools, on this Mac.",
         kind: .ai, symbol: "sparkles",
-        keywords: "apple intelligence model on-device privacy chat writing"
+        keywords: "apple intelligence model on-device privacy chat writing agent quick fix tools private cloud compute dictation"
     ) { model, _ in AnyView(AIPane(model: model)) }
 }
 
@@ -48,11 +48,197 @@ struct AIPane: View {
                     }
                 }
             }
+            AIModelSection(model: model)
+            AIChatSettingsSection(model: model)
+            AICommandsSettingsSection(model: model)
+            AIToolsSettingsSection(model: model)
             Section("Privacy") {
-                IconRow("Runs on Apple's on-device model. Nothing is sent to a server, and there's no cloud fallback.", symbol: "lock.fill")
-                IconRow("Clipboard and selected text reach the model only when you attach them or start a writing command.", symbol: "paperclip")
-                IconRow("Chats are kept in memory. Save as Note is the only way a response is stored.", symbol: "note.text")
+                IconRow(
+                    model.aiHub.settings.model == .privateCloud
+                        ? "Runs on this Mac. When the larger model is on, requests go to Apple's Private Cloud Compute, which keeps nothing."
+                        : "Runs on Apple's on-device model. Nothing is sent to a server, and there's no cloud fallback.",
+                    symbol: "lock.fill")
+                IconRow("Clipboard, files, notes and the screen reach the model only when you attach or @-mention them.", symbol: "paperclip")
+                IconRow("Chats in the launcher are kept in memory. Chats in the AI Chat window are saved on this Mac.", symbol: "note.text")
             }
+        }
+    }
+}
+
+/// On this Mac, or the opt-in larger model.
+private struct AIModelSection: View {
+    let model: LauncherModel
+
+    var body: some View {
+        let hub = model.aiHub
+        let status = hub.privateCloudStatus
+        Section {
+            Toggle(isOn: Binding(
+                get: { hub.settings.model == .privateCloud },
+                set: { on in hub.updateSettings { $0.model = on ? .privateCloud : .onDevice } })
+            ) {
+                SettingRowLabel(
+                    title: "Use the larger model (Private Cloud Compute)",
+                    detail: "Off by default. Apple's larger model answers through Private Cloud Compute, within a usage limit. When it isn't available, requests stay on this Mac.")
+            }
+            .settingsSwitch()
+            .disabled(status == nil)
+            if hub.settings.model == .privateCloud || status != nil {
+                LabeledContent("Larger model") {
+                    StatusLabel(
+                        tone: status?.isUsable == true ? .success : .warning,
+                        text: status?.summary ?? "Not available in this version of macOS")
+                }
+                LabeledContent("Requests use") { Text(hub.effectiveModel.title).foregroundStyle(.secondary) }
+            }
+        } header: {
+            Text("Model")
+        }
+    }
+}
+
+/// The default agent, the agents themselves, and saved chats.
+private struct AIChatSettingsSection: View {
+    let model: LauncherModel
+    @State private var confirmsDeleteAll = false
+
+    var body: some View {
+        let hub = model.aiHub
+        Section {
+            Picker(
+                "Default agent",
+                selection: Binding(
+                    get: { hub.settings.defaultAgentID ?? Agent.assistantID },
+                    set: { id in hub.updateSettings { $0.defaultAgentID = id == Agent.assistantID ? nil : id } })
+            ) {
+                ForEach(hub.agents) { Text($0.name).tag($0.id) }
+            }
+            .neutralMenus()
+            ForEach(hub.agents.filter { !$0.isAssistant }) { agent in
+                LabeledContent {
+                    Button("Edit…") { hub.requestEditor(.agent(agent.id)) }
+                } label: {
+                    Label(agent.name, systemImage: agent.symbol)
+                }
+            }
+            HStack {
+                Button("New Agent…") { hub.requestEditor(.newAgent) }
+                Spacer()
+                Button("Open AI Chat") { hub.openChatWindow() }
+            }
+            Picker(
+                "Keep chats",
+                selection: Binding(
+                    get: { hub.settings.chatRetention },
+                    set: { value in
+                        hub.updateSettings { $0.chatRetention = value }
+                        hub.chatStore.purge(retention: value)
+                    })
+            ) {
+                ForEach(ChatRetention.allCases) { Text($0.title).tag($0) }
+            }
+            .neutralMenus()
+            Toggle(isOn: Binding(get: { hub.settings.chatWindowOnTop }, set: { on in hub.updateSettings { $0.chatWindowOnTop = on } })) {
+                SettingRowLabel(title: "Keep the chat window on top", detail: nil)
+            }
+            .settingsSwitch()
+            LabeledContent {
+                Button("Delete All Chats…", role: .destructive) { confirmsDeleteAll = true }
+                    .disabled(hub.chatStore.chats.isEmpty)
+            } label: {
+                SettingRowLabel(
+                    title: "\(hub.chatStore.chats.count.formatted()) saved chat\(hub.chatStore.chats.count == 1 ? "" : "s")",
+                    detail: hub.chatStore.errorMessage ?? "Saved in chats.json beside your library. Deleted chats stay in Recently Deleted for \(ChatStore.recentlyDeletedDays) days.")
+            }
+        } header: {
+            Text("Chat")
+        }
+        .alert("Delete all chats?", isPresented: $confirmsDeleteAll) {
+            Button("Delete All", role: .destructive) { hub.deleteAllChats() }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("Every saved chat is removed from this Mac, including Recently Deleted. This can't be undone.")
+        }
+    }
+}
+
+/// Quick Fix and custom AI Commands.
+private struct AICommandsSettingsSection: View {
+    let model: LauncherModel
+
+    var body: some View {
+        let hub = model.aiHub
+        Section {
+            Picker(
+                "Quick Fix runs",
+                selection: Binding(get: { hub.settings.quickFixCommandID }, set: { id in hub.updateSettings { $0.quickFixCommandID = id } })
+            ) {
+                ForEach(hub.quickFixChoices, id: \.id) { Text($0.title).tag($0.id) }
+            }
+            .neutralMenus()
+            if let quickFix = model.bindableCommands.first(where: { $0.id == AICommandProvider.quickFixID }) {
+                CommandBindingRow(model: model, command: quickFix)
+            }
+            ForEach(hub.aiCommands.filter { !$0.isBuiltIn }) { command in
+                LabeledContent {
+                    Button("Edit…") { hub.requestEditor(.command(command.id)) }
+                } label: {
+                    Label(command.name, systemImage: command.symbol)
+                }
+            }
+            HStack {
+                Button("New AI Command…") { hub.requestEditor(.newCommand) }
+                Spacer()
+                Button("Import…") { AICommandFiles.importCommands(model) }
+                Button("Export…") { AICommandFiles.exportCommands(model) }
+                    .disabled(!hub.aiCommands.contains { !$0.isBuiltIn })
+            }
+        } header: {
+            Text("AI Commands")
+        } footer: {
+            Text("Quick Fix runs a command on the text selected in any app. Give it a shortcut above.")
+                .font(.system(size: 11.5)).foregroundStyle(.secondary)
+        }
+    }
+}
+
+/// What tools may do without asking, plus screen context and dictation.
+private struct AIToolsSettingsSection: View {
+    let model: LauncherModel
+
+    var body: some View {
+        let hub = model.aiHub
+        Section {
+            ForEach(hub.toolExtensions) { item in
+                ForEach(item.tools) { tool in
+                    Picker(
+                        selection: Binding(
+                            get: { hub.settings.toolPermissions[tool.id] ?? .auto },
+                            set: { value in hub.updateSettings { $0.toolPermissions[tool.id] = value } })
+                    ) {
+                        ForEach(AIToolPermission.allCases) { Text($0.title).tag($0) }
+                    } label: {
+                        SettingRowLabel(title: "\(tool.title)  ·  @\(item.id)", detail: tool.isAction ? "Changes your library" : nil)
+                    }
+                    .neutralMenus()
+                }
+            }
+            Toggle(isOn: Binding(get: { hub.settings.screenContextEnabled }, set: { on in hub.updateSettings { $0.screenContextEnabled = on } })) {
+                SettingRowLabel(
+                    title: "Allow screen context",
+                    detail: "Attach the frontmost window or the screen to a chat. macOS asks for Screen Recording permission the first time.")
+            }
+            .settingsSwitch()
+            Toggle(isOn: Binding(get: { hub.settings.dictationEnabled }, set: { on in hub.updateSettings { $0.dictationEnabled = on } })) {
+                SettingRowLabel(
+                    title: "Dictation (⌃M)", detail: hub.dictation.unavailableReason ?? "Transcribed on this Mac with the Speech framework.")
+            }
+            .settingsSwitch()
+        } header: {
+            Text("Tools and context")
+        } footer: {
+            Text("Ask: always ask first. Auto: read without asking, ask before changing anything. Always: never ask. Type @ and a name in chat to use a tool.")
+                .font(.system(size: 11.5)).foregroundStyle(.secondary)
         }
     }
 }
