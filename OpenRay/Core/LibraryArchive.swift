@@ -1140,7 +1140,7 @@ final class LibraryBackupScheduler {
 
     /// Checks now and then every half hour. Does nothing while inert.
     func start() {
-        guard !sideEffects.isEffectivelyInert, task == nil else { return }
+        guard !sideEffects.effective.isInert, task == nil else { return }
         task = Task { [weak self] in
             while !Task.isCancelled {
                 await self?.backUpIfDue()

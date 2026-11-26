@@ -169,7 +169,7 @@ struct POSIXScriptLauncher: ScriptProcessLaunching {
     }
 
     func checkAllowed(_ invocation: ScriptInvocation) throws {
-        guard sideEffects.isEffectivelyInert else { return }
+        guard sideEffects.effective.isInert else { return }
         func resolved(_ url: URL) -> String { url.standardizedFileURL.resolvingSymlinksInPath().path }
         func isInsideRoots(_ path: String) -> Bool {
             allowedRoots.contains { root in
@@ -183,7 +183,6 @@ struct POSIXScriptLauncher: ScriptProcessLaunching {
             program == script || Self.systemInterpreterFolders.contains { program.hasPrefix($0) }
         guard isInsideRoots(script), programIsAllowed, isInsideRoots(resolved(invocation.workingDirectory)) else {
             try sideEffects.check("running script commands")
-            try SideEffectGuard.check("running script commands")
             return
         }
     }

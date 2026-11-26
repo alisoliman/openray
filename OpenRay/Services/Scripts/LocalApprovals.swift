@@ -118,23 +118,15 @@ final class LocalApprovalStore {
     }
 }
 
-extension SideEffectGuard {
-    /// The stricter of this rule and the process's own: an injected live rule can't make an
-    /// inert launch (the test host, verification) act.
-    var isEffectivelyInert: Bool { isInert || SideEffectGuard.isInert }
-}
-
 /// While OpenRay is inert (tests, verification), files may be written only inside the
 /// temporary folder. A normal launch writes wherever the person chose.
 enum InertWrites {
     static func check(_ folder: URL, sideEffects: SideEffectGuard = .current, what: String) throws {
-        guard sideEffects.isEffectivelyInert else { return }
+        // `effective`: an injected live rule can't make an inert process act.
+        guard sideEffects.effective.isInert else { return }
         let temporary = FileManager.default.temporaryDirectory.standardizedFileURL.resolvingSymlinksInPath().path
         let target = folder.standardizedFileURL.resolvingSymlinksInPath().path
         let root = temporary.hasSuffix("/") ? temporary : temporary + "/"
-        if target != temporary, !target.hasPrefix(root) {
-            try sideEffects.check(what)
-            try SideEffectGuard.check(what)
-        }
+        if target != temporary, !target.hasPrefix(root) { try sideEffects.check(what) }
     }
 }

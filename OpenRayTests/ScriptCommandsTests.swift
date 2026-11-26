@@ -511,7 +511,9 @@ struct ScriptRunnerTests {
         let result = await launcher.run(invocation(script, timeout: .milliseconds(400))) { _ in }
         #expect(result.termination == .timedOut)
         #expect(ContinuousClock.now - start < .seconds(5))
-        let pid = try #require(result.output.split(separator: " ").last.flatMap { pid_t($0.trimmingCharacters(in: .whitespacesAndNewlines)) })
+        // Standard output says "child <pid>"; standard error may add the shell's own report.
+        let line = try #require(result.standardOutput?.split(separator: "\n").first { $0.hasPrefix("child ") })
+        let pid = try #require(pid_t(line.dropFirst("child ".count).trimmingCharacters(in: .whitespaces)))
         var gone = false
         for _ in 0..<30 {
             if kill(pid, 0) == -1 {
