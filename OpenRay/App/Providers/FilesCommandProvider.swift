@@ -26,6 +26,12 @@ protocol FileWorkspace: AnyObject {
     func trash(_ url: URL) throws
     func shareTargets(for url: URL) -> [ShareTarget]
     func share(_ url: URL, via target: ShareTarget) throws
+    /// Why `open(_:)` would refuse, such as an inert run, or nil when it would try.
+    func refusal(toOpen url: URL) -> String?
+    /// Opens a file or folder in its default app.
+    func open(_ url: URL) throws
+    /// Shows an item selected in a Finder window.
+    func reveal(_ url: URL) throws
     /// Opens a folder, such as an app's Contents, in the Finder.
     func showFolder(_ folder: URL) throws
     /// Terminal apps installed on this Mac, Terminal first.
@@ -123,6 +129,25 @@ final class LiveFileWorkspace: FileWorkspace {
             service.canPerform(withItems: [url])
         else { throw FileWorkspaceError.refused("share with \(target.title)") }
         service.perform(withItems: [url])
+    }
+
+    func refusal(toOpen url: URL) -> String? {
+        do {
+            try sideEffects.check("opening \(url.lastPathComponent)")
+            return nil
+        } catch {
+            return error.localizedDescription
+        }
+    }
+
+    func open(_ url: URL) throws {
+        try sideEffects.check("opening \(url.lastPathComponent)")
+        guard NSWorkspace.shared.open(url) else { throw FileWorkspaceError.refused("open “\(url.lastPathComponent)”. It may have moved") }
+    }
+
+    func reveal(_ url: URL) throws {
+        try sideEffects.check("showing \(url.lastPathComponent) in the Finder")
+        NSWorkspace.shared.activateFileViewerSelecting([url])
     }
 
     func showFolder(_ folder: URL) throws {

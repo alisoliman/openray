@@ -49,6 +49,8 @@ final class FileSearchService: NSObject {
     @ObservationIgnored var options: @MainActor () -> FileSearchOptions = { FileSearchOptions() }
     @ObservationIgnored let home: URL
     @ObservationIgnored private let folders: any FolderReading
+    /// While inert, Spotlight is never asked: its answers are the person's real files.
+    @ObservationIgnored private let sideEffects: SideEffectGuard
     @ObservationIgnored private var metadataQuery: NSMetadataQuery?
     @ObservationIgnored private var pendingSearch: Task<Void, Never>?
     @ObservationIgnored private var filtering: Task<Void, Never>?
@@ -70,9 +72,13 @@ final class FileSearchService: NSObject {
         var contentTerms: [String] = []
     }
 
-    init(home: URL = FileManager.default.homeDirectoryForCurrentUser, folders: any FolderReading = LiveFolderReader()) {
+    init(
+        home: URL = FileManager.default.homeDirectoryForCurrentUser, folders: any FolderReading = LiveFolderReader(),
+        sideEffects: SideEffectGuard = .current
+    ) {
         self.home = home
         self.folders = folders
+        self.sideEffects = SideEffectGuard.atLeastCurrent(sideEffects)
     }
 
     func search(_ text: String, showRecent: Bool = false, scope: FileSearchScope = .home) {
@@ -181,6 +187,12 @@ final class FileSearchService: NSObject {
     // MARK: Spotlight
 
     private func startQuery(_ text: String, scope: FileSearchScope, matchingContent: Bool) {
+        guard !sideEffects.isInert else {
+            // Tests and isolated verification never read the real Spotlight index.
+            results = []
+            isSearching = false
+            return
+        }
         var options = self.options()
         options.matchesContent = options.matchesContent && matchingContent
         let parsed = FileQuery.parse(text)

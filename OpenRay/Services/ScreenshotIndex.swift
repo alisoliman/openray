@@ -29,6 +29,7 @@ enum ScreenshotImageData {
     static let maximumPixels = 40_000_000
 
     static func png(at url: URL, sideEffects: SideEffectGuard = .current) -> Data? {
+        // `allows` floors the rule at this process's own, so a passed live rule can't widen it.
         guard InertReadBoundary.allows(url, sideEffects: sideEffects),
             let size = (try? url.resourceValues(forKeys: [.fileSizeKey]))?.fileSize, size > 0, size <= maximumBytes,
             let source = CGImageSourceCreateWithURL(url as CFURL, [kCGImageSourceShouldCache: false] as CFDictionary),
@@ -262,11 +263,14 @@ enum ScreenshotScanner {
     }
 
     /// The images directly inside each folder (not its subfolders). Unreadable folders are skipped.
-    static func scan(_ folders: [ScreenshotFolder], fileManager: FileManager = .default) -> [ScannedImage] {
+    static func scan(
+        _ folders: [ScreenshotFolder], fileManager: FileManager = .default, sideEffects: SideEffectGuard = .current
+    ) -> [ScannedImage] {
         let keys: [URLResourceKey] = [.creationDateKey, .contentModificationDateKey, .fileSizeKey, .isRegularFileKey]
         var seen = Set<String>()
         var found: [ScannedImage] = []
-        for folder in folders {
+        // Whatever folders are passed in, an inert run reads fixtures only.
+        for folder in folders where InertReadBoundary.allows(folder.url, sideEffects: sideEffects) {
             guard
                 let urls = try? fileManager.contentsOfDirectory(
                     at: folder.url, includingPropertiesForKeys: keys, options: [.skipsHiddenFiles])
@@ -453,7 +457,8 @@ final class ScreenshotIndex {
         guard !folders.isEmpty else { return }
         isScanning = true
         defer { isScanning = false }
-        let scanned = await Task.detached(priority: .utility) { ScreenshotScanner.scan(folders) }.value
+        let sideEffects = self.sideEffects
+        let scanned = await Task.detached(priority: .utility) { ScreenshotScanner.scan(folders, sideEffects: sideEffects) }.value
         let merged = ScreenshotScanner.merge(records, scanned: scanned, retentionDays: settings.retentionDays, now: now())
         let limited = Array(merged.prefix(Self.limit))
         if limited != records {
@@ -495,10 +500,10 @@ final class ScreenshotIndex {
                 self.pendingRecognition = pending.count
                 guard let next = pending.first else { break }
                 let url = next.url
-                let text = await Task.detached(priority: .background) {
-                    (try? await recognizer.recognizeText(inImageAt: url, accurate: accurate)) ?? ""
-                }.value
-                guard !Task.isCancelled else { break }
+                // Called from this task, so cancelling the pass cancels the recognition in flight.
+                let text = (try? await recognizer.recognizeText(inImageAt: url, accurate: accurate)) ?? ""
+                // Turned off or cancelled meanwhile: the answer isn't kept.
+                guard !Task.isCancelled, self.settings().recognizesText else { break }
                 if let index = self.records.firstIndex(where: { $0.path == next.path && $0.modifiedAt == next.modifiedAt }) {
                     self.records[index].text = text
                     self.save()
@@ -523,6 +528,7 @@ final class ScreenshotIndex {
         recognition?.cancel()
         recognition = nil
         recognitionPass = nil
+        pendingRecognition = 0
     }
 
     private func save() {

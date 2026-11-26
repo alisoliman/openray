@@ -42,6 +42,12 @@ final class FakeFileWorkspace: FileWorkspace {
 
     func showFolder(_ folder: URL) throws { shownFolders.append(folder) }
 
+    private(set) var openedFiles: [URL] = []
+    private(set) var revealed: [URL] = []
+    func refusal(toOpen url: URL) -> String? { nil }
+    func open(_ url: URL) throws { openedFiles.append(url) }
+    func reveal(_ url: URL) throws { revealed.append(url) }
+
     func installedTerminals() -> [OpenWithApp] { terminals }
 }
 
@@ -456,6 +462,11 @@ struct FilesSearchTests {
         #expect(model.feedback?.style == .info)
         share.children[1].perform()
         #expect(workspace.shared.map(\.target) == ["com.apple.share.Mail.compose"])
+        // Reveal and ↩ go through the workspace, never straight to the Finder.
+        try #require(entries.first { $0.id == "reveal" }).perform()
+        #expect(workspace.revealed == [file])
+        model.perform(item)
+        #expect(workspace.openedFiles == [file])
         let trash = try #require(entries.first { $0.id == "trash" })
         #expect(trash.modifiers == .command && trash.isDestructive)
 
@@ -570,6 +581,43 @@ struct FilesSearchTests {
         #expect(model.destination == .ai)
         #expect(model.ai.draft.contains("old.pdf"))
         model.files.stop()
+    }
+
+    @Test func eachVerificationSwitchKeepsFilesFromOpeningAnything() throws {
+        for argument in ["--in-memory-library", "--verification-pasteboard"] {
+            let rule = SideEffectGuard(arguments: ["OpenRay", argument], environment: [:], xcTestLoaded: false)
+            #expect(rule.mode == .verification)
+            let live = LiveFileWorkspace(sideEffects: rule)
+            let nowhere = URL(fileURLWithPath: "/OpenRayTestsNoSuchFolder/\(argument).txt")
+            #expect(live.refusal(toOpen: nowhere) != nil)
+            let model = model([FilesCommandProvider(workspace: live)])
+            model.perform(model.fileRow(FileSearchResult(url: nowhere)))
+            #expect(model.feedback?.text.contains("doesn't allow") == true)
+            model.revealInFinder(nowhere)
+            #expect(model.feedback?.text.contains("doesn't allow") == true)
+        }
+    }
+
+    @Test func inertRunsOfferNoRealFoldersAndAskSpotlightNothing() async throws {
+        let model = model()
+        // A real folder typed while inert gives no row to open, reveal or preview.
+        model.query = "~/"
+        #expect(model.fileSearchRows?.isEmpty == true)
+        model.query = "/Applications/"
+        #expect(model.fileSearchRows?.isEmpty == true)
+        model.files.stop()
+        // Spotlight is never asked while inert.
+        let service = FileSearchService(sideEffects: SideEffectGuard(mode: .verification))
+        service.search("report")
+        try await Task.sleep(for: .milliseconds(300))
+        #expect(!service.isSearching)
+        #expect(service.results.isEmpty)
+        service.stop()
+        // The screenshot scanner and image reader honor the same boundary, whatever they're given.
+        #expect(ScreenshotScanner.scan([ScreenshotFolder(url: URL(fileURLWithPath: "/"), includesAllImages: true)]).isEmpty)
+        let realImage = URL(fileURLWithPath: "/System/Library/CoreServices/Finder.app/Contents/Resources/Finder.icns")
+        #expect(ScreenshotImageData.png(at: realImage, sideEffects: SideEffectGuard(mode: .live)) == nil)
+        #expect(!InertReadBoundary.allows(realImage, sideEffects: SideEffectGuard(mode: .live)))
     }
 
     @Test func filesSettingsRoundTripThroughCommandPreferences() {

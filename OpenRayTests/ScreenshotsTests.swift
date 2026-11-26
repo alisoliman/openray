@@ -321,10 +321,12 @@ struct ScreenshotsTests {
         let pastedBox = Box<[ScreenshotsCommandProvider.PasteDestination]>([])
         let frontBox = Box<pid_t>(501)
         var pasted: [ScreenshotsCommandProvider.PasteDestination] { pastedBox.value }
+        let confirmBox = Box<Bool>(true)
         provider.destination = { _ in editor }
         provider.frontmostPID = { frontBox.value }
         provider.canPasteAcrossApps = { _ in true }
-        provider.pasteInto = { destination, _ in pastedBox.value.append(destination) }
+        provider.confirmDestination = { _ in confirmBox.value }
+        provider.post = { destination, _ in pastedBox.value.append(destination) }
         let command = try #require(model.commandItems.first { $0.id == ScreenshotsCommandProvider.pasteLatestID })
 
         // The destination is captured when the command runs, before the scan awaits.
@@ -347,6 +349,21 @@ struct ScreenshotsTests {
         model.perform(command)
         try await waitFor { pasted.count == 2 }
         try await Task.sleep(for: .milliseconds(50))
+        #expect(pasted.count == 2)
+
+        // Showing the panel again while the scan runs ends the request: nothing is pasted or copied.
+        model.feedback = nil
+        let changeCount = pasteboard.changeCount
+        model.perform(command)
+        model.panelWillShow()
+        try await Task.sleep(for: .milliseconds(150))
+        #expect(pasted.count == 2)
+        #expect(pasteboard.changeCount == changeCount)
+
+        // The destination or its field changed by the time it's brought forward: copy only.
+        confirmBox.value = false
+        model.perform(command)
+        try await waitFor { model.feedback?.text.contains("or its field changed") == true }
         #expect(pasted.count == 2)
     }
 

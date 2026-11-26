@@ -205,6 +205,7 @@ final class LauncherPanelController: NSObject, NSWindowDelegate {
 
     /// Previews a file in the shared Quick Look panel above the launcher, or closes it.
     func toggleQuickLook(_ url: URL) {
+        guard InertReadBoundary.allows(url) else { return }
         guard let window, window.isVisible, let preview = QLPreviewPanel.shared() else { return }
         if preview.isVisible {
             preview.orderOut(nil)

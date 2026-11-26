@@ -19,11 +19,30 @@ final class ScreenshotsCommandProvider: CommandProvider {
         summary: "Find screenshots by name, date or the text inside", shortTitle: "Screenshots",
         itemNoun: "screenshot", style: .grid, ranksItems: false, columns: ScreenshotSettings.defaultColumns)
 
-    /// The app a paste goes to, captured when the command runs.
+    /// The app a paste goes to, captured when the command runs, with the field focused in it
+    /// then (when Accessibility allows reading it).
     struct PasteDestination: Equatable {
         var pid: pid_t
         var name: String
         var launchDate: Date?
+        var focusedElement: AXUIElement? = nil
+
+        static func == (lhs: PasteDestination, rhs: PasteDestination) -> Bool {
+            guard lhs.pid == rhs.pid, lhs.name == rhs.name, lhs.launchDate == rhs.launchDate else { return false }
+            switch (lhs.focusedElement, rhs.focusedElement) {
+            case (nil, nil): return true
+            case (let left?, let right?): return CFEqual(left, right)
+            default: return false
+            }
+        }
+    }
+
+    /// The interaction a copy or paste belongs to. A newer request, the panel showing again, or
+    /// the panel being dismissed while it waits, ends it.
+    struct PasteSession: Equatable {
+        var request: UUID
+        var presentation: Int
+        var panelWasVisible: Bool
     }
 
     var id: String { Self.registration.id }
@@ -36,13 +55,33 @@ final class ScreenshotsCommandProvider: CommandProvider {
         guard let app, !app.isTerminated, app.processIdentifier != ProcessInfo.processInfo.processIdentifier else {
             return nil
         }
-        return PasteDestination(pid: app.processIdentifier, name: app.localizedName ?? "your app", launchDate: app.launchDate)
+        return PasteDestination(
+            pid: app.processIdentifier, name: app.localizedName ?? "your app", launchDate: app.launchDate,
+            focusedElement: SideEffectGuard.isInert ? nil : ScreenshotsCommandProvider.focusedElement(of: app.processIdentifier))
     }
     var frontmostPID: @MainActor () -> pid_t? = { NSWorkspace.shared.frontmostApplication?.processIdentifier }
     /// Whether a paste may reach another app: never with the isolated pasteboard.
     var canPasteAcrossApps: @MainActor (LauncherModel) -> Bool = { $0.clipboard.usesGeneralPasteboard }
-    /// Sends ⌘V to the destination, once it's frontmost and the clipboard is unchanged.
-    var pasteInto: @MainActor (PasteDestination, Int) async throws -> Void = { destination, changeCount in
+    /// Brings the destination forward and checks, right before posting, that it's the same
+    /// process and the same focused field the command started over.
+    var confirmDestination: @MainActor (PasteDestination) async -> Bool = { destination in
+        guard (try? SideEffectGuard.check("pasting into \(destination.name)")) != nil,
+            let app = NSRunningApplication(processIdentifier: destination.pid), !app.isTerminated,
+            app.launchDate == destination.launchDate
+        else { return false }
+        app.activate()
+        for _ in 0..<20 where NSWorkspace.shared.frontmostApplication?.processIdentifier != destination.pid {
+            try? await Task.sleep(for: .milliseconds(25))
+        }
+        guard NSWorkspace.shared.frontmostApplication?.processIdentifier == destination.pid else { return false }
+        if let expected = destination.focusedElement {
+            guard let current = ScreenshotsCommandProvider.focusedElement(of: destination.pid), CFEqual(expected, current)
+            else { return false }
+        }
+        return true
+    }
+    /// Sends ⌘V to the confirmed destination, if the clipboard is unchanged.
+    var post: @MainActor (PasteDestination, Int) async throws -> Void = { destination, changeCount in
         try SideEffectGuard.check("pasting into \(destination.name)")
         guard let app = NSRunningApplication(processIdentifier: destination.pid), !app.isTerminated,
             app.launchDate == destination.launchDate
@@ -51,6 +90,30 @@ final class ScreenshotsCommandProvider: CommandProvider {
     }
     /// The latest copy or paste request. An older one still scanning gives way to it.
     private var invocation = UUID()
+
+    /// The focused element of an app, read through Accessibility. Nil without permission.
+    static func focusedElement(of pid: pid_t) -> AXUIElement? {
+        guard AXIsProcessTrusted() else { return nil }
+        var value: CFTypeRef?
+        guard
+            AXUIElementCopyAttributeValue(AXUIElementCreateApplication(pid), kAXFocusedUIElementAttribute as CFString, &value)
+                == .success, let value, CFGetTypeID(value) == AXUIElementGetTypeID()
+        else { return nil }
+        return (value as! AXUIElement)
+    }
+
+    /// Starts a request bound to this interaction.
+    private func beginSession(in model: LauncherModel) -> PasteSession {
+        let request = UUID()
+        invocation = request
+        return PasteSession(request: request, presentation: model.presentation, panelWasVisible: model.panel?.isVisible == true)
+    }
+
+    /// Whether a request still belongs to what the person is doing.
+    func isCurrent(_ session: PasteSession, in model: LauncherModel, checkingVisibility: Bool = true) -> Bool {
+        guard invocation == session.request, model.presentation == session.presentation else { return false }
+        return !checkingVisibility || !session.panelWasVisible || model.panel?.isVisible == true
+    }
 
     convenience init() {
         self.init(index: ScreenshotIndex(), workspace: LiveFileWorkspace())
@@ -96,22 +159,21 @@ final class ScreenshotsCommandProvider: CommandProvider {
         case Self.pasteLatestID, Self.copyLatestID:
             let pastes = ref.id == Self.pasteLatestID
             // The destination is fixed now, before the scan, so a paste can't land in an app the
-            // person switched to meanwhile.
+            // person switched to meanwhile; the session ends if they dismiss or reopen the panel.
             let destination = pastes ? destination(model) : nil
-            let request = UUID()
-            invocation = request
+            let session = beginSession(in: model)
             Task { [weak self, weak model] in
                 guard let self, let model else { return }
                 self.index.startWatchingIfNeeded()
                 await self.index.refresh()
-                guard self.invocation == request else { return }
+                guard self.isCurrent(session, in: model) else { return }
                 guard let latest = self.index.latest else {
                     model.feedback = .info("No screenshots yet. Take one with ⇧⌘3 or ⇧⌘4.")
                     return
                 }
                 model.store.recordUse(of: item.id)
                 if pastes {
-                    await self.paste(latest.url, to: destination, request: request, in: model)
+                    await self.paste(latest.url, to: destination, session: session, in: model)
                 } else {
                     self.copy(latest.url, in: model)
                 }
@@ -137,11 +199,10 @@ final class ScreenshotsCommandProvider: CommandProvider {
     func performSecondary(_ item: LauncherItem, ref: ProvidedRef, in model: LauncherModel) {
         guard let path = ref.payload else { return }
         let destination = destination(model)
-        let request = UUID()
-        invocation = request
+        let session = beginSession(in: model)
         Task { [weak self, weak model] in
             guard let self, let model else { return }
-            await self.paste(URL(fileURLWithPath: path), to: destination, request: request, in: model)
+            await self.paste(URL(fileURLWithPath: path), to: destination, session: session, in: model)
         }
     }
 
@@ -165,11 +226,12 @@ final class ScreenshotsCommandProvider: CommandProvider {
         return true
     }
 
-    /// Copies the image, then pastes it into the destination captured when the command ran,
-    /// only if that app is still where the person is. Otherwise the image stays copied, and
-    /// the launcher says so.
-    func paste(_ url: URL, to destination: PasteDestination?, request: UUID, in model: LauncherModel) async {
-        guard invocation == request, copy(url, in: model, announce: false) else { return }
+    /// Copies the image, then pastes it into the destination captured when the command ran:
+    /// only while the request still belongs to the interaction that made it, only if that app is
+    /// still where the person is, and only after it's confirmed again right before posting.
+    /// Otherwise the image stays copied, and the launcher says so.
+    func paste(_ url: URL, to destination: PasteDestination?, session: PasteSession, in model: LauncherModel) async {
+        guard isCurrent(session, in: model), copy(url, in: model, announce: false) else { return }
         let name = url.lastPathComponent.truncatedForFeedback
         guard canPasteAcrossApps(model) else {
             model.feedback = .info("Copied “\(name)” to the isolated verification pasteboard. Cross-app paste is disabled in this mode.")
@@ -186,8 +248,13 @@ final class ScreenshotsCommandProvider: CommandProvider {
         }
         let changeCount = model.clipboard.changeCount
         model.panel?.dismiss(restoreFocus: false)
+        // The panel's own dismissal is ours; a new request or the panel showing again still cancels.
+        guard await confirmDestination(destination), isCurrent(session, in: model, checkingVisibility: false) else {
+            model.toast("Copied “\(name)” to the clipboard instead: \(destination.name) or its field changed.")
+            return
+        }
         do {
-            try await pasteInto(destination, changeCount)
+            try await post(destination, changeCount)
         } catch {
             model.panel?.show()
             model.feedback = .error("Copied “\(name)” to the clipboard, but couldn't paste into \(destination.name). \(error.localizedDescription)")

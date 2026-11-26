@@ -574,7 +574,8 @@ struct FileIdentity: Equatable, Sendable {
 /// the temporary folder, so a verification run never lists or reads the person's real files.
 enum InertReadBoundary {
     static func allows(_ url: URL, sideEffects: SideEffectGuard = .current) -> Bool {
-        guard sideEffects.isInert else { return true }
+        // An injected live rule never widens what an inert process may read.
+        guard SideEffectGuard.atLeastCurrent(sideEffects).isInert else { return true }
         let temporary = FileManager.default.temporaryDirectory.standardizedFileURL.resolvingSymlinksInPath().path
         let path = url.standardizedFileURL.resolvingSymlinksInPath().path
         return path == temporary || path.hasPrefix(temporary + "/")
@@ -582,7 +583,8 @@ enum InertReadBoundary {
 
     static func check(_ url: URL, sideEffects: SideEffectGuard = .current) throws {
         guard allows(url, sideEffects: sideEffects) else {
-            throw SideEffectGuard.Blocked(what: "reading \(url.lastPathComponent)", mode: sideEffects.mode)
+            throw SideEffectGuard.Blocked(
+                what: "reading \(url.lastPathComponent)", mode: SideEffectGuard.atLeastCurrent(sideEffects).mode)
         }
     }
 }

@@ -62,7 +62,8 @@ final class AutoQuit {
         var quit: [RunningApp] = []
         for app in apps where app.isRegular {
             guard canAutoQuit(app.bundleID), let bundleID = app.bundleID,
-                let minutes = settings.autoQuitMinutes(for: bundleID)
+                // The rule's own copy only: same bundle id and the same bundle on disk.
+                let minutes = settings.autoQuitMinutes(for: bundleID, at: app.bundleURL)
             else { continue }
             stillArmed.insert(app.pid)
             if app.isActive || !armed.contains(app.pid) {

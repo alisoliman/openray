@@ -271,14 +271,19 @@ struct ApplicationsTests {
             running(3, "com.apple.finder", "Finder"), running(4, own, "OpenRay"), running(5, "com.example.other", "Other"),
         ]
         let (model, controller, _, provider) = setUp(apps, now: { clock })
+        func target(_ id: String, _ name: String) -> AutoQuitTarget {
+            AutoQuitTarget(bundleID: id, url: URL(fileURLWithPath: "/Applications/\(name).app"))
+        }
         model.updateApplicationSettings { settings in
             settings.autoQuit = [
-                "com.example.chat": Int?.none, "com.example.editor": 1, "com.apple.finder": 1,
-                own: 1,
+                target("com.example.chat", "Chat"): Int?.none, target("com.example.editor", "Editor"): 1,
+                target("com.apple.finder", "Finder"): 1, target(own, "OpenRay"): 1,
             ]
         }
         let autoQuit = provider.autoQuit
-        #expect(model.applicationSettings.autoQuitMinutes(for: "com.example.chat") == 3)
+        #expect(
+            model.applicationSettings.autoQuitMinutes(for: "com.example.chat", at: URL(fileURLWithPath: "/Applications/Chat.app"))
+                == 3)
 
         // The first check starts each clock.
         #expect(autoQuit.check().isEmpty)
@@ -310,7 +315,9 @@ struct ApplicationsTests {
     @Test func autoQuitRetriesLaterWhenAnAppDoesntQuit() {
         var clock = Date(timeIntervalSince1970: 0)
         let (model, controller, _, provider) = setUp([running(1, "com.example.chat", "Chat")], now: { clock })
-        model.updateApplicationSettings { $0.autoQuit = ["com.example.chat": .some(1)] }
+        model.updateApplicationSettings {
+            $0.autoQuit = [AutoQuitTarget(bundleID: "com.example.chat", url: URL(fileURLWithPath: "/Applications/Chat.app")): 1]
+        }
         controller.quitRemoves = false
         provider.autoQuit.check()
         clock += 60
@@ -336,11 +343,12 @@ struct ApplicationsTests {
         let enable = try #require(model.actions(for: appItem(app)).first { $0.id == "autoQuit" })
         #expect(enable.title == "Enable Auto Quit")
         enable.perform()
-        #expect(model.applicationSettings.autoQuitMinutes(for: "com.example.chat") == 3)
+        #expect(model.applicationSettings.autoQuitMinutes(for: "com.example.chat", at: app.url) == 3)
+        #expect(model.applicationSettings.autoQuitTarget(for: app)?.path == AutoQuitTarget.canonicalPath(app.url))
         let disable = try #require(model.actions(for: appItem(app)).first { $0.id == "autoQuit" })
         #expect(disable.title == "Disable Auto Quit")
         disable.perform()
-        #expect(model.applicationSettings.autoQuitMinutes(for: "com.example.chat") == nil)
+        #expect(model.applicationSettings.autoQuitMinutes(for: "com.example.chat", at: app.url) == nil)
     }
 
     @Test func optingInStartsAFreshClock() {
@@ -348,13 +356,17 @@ struct ApplicationsTests {
         let (model, controller, _, provider) = setUp(
             [running(1, "com.example.chat", "Chat"), running(2, "com.example.mail", "Mail", active: true)], now: { clock })
         // Another app's rule keeps Auto Quit checking while Chat isn't opted in.
-        model.updateApplicationSettings { $0.autoQuit = ["com.example.mail": 15] }
+        model.updateApplicationSettings {
+            $0.autoQuit = [AutoQuitTarget(bundleID: "com.example.mail", url: URL(fileURLWithPath: "/Applications/Mail.app")): 15]
+        }
         provider.autoQuit.noteDeactivated(1)
         provider.autoQuit.check()
         clock += 3_600
         provider.autoQuit.check()
         // Opting in now must not count the hour Chat already spent in the background.
-        model.updateApplicationSettings { $0.autoQuit["com.example.chat"] = 1 }
+        model.updateApplicationSettings {
+            $0.autoQuit[AutoQuitTarget(bundleID: "com.example.chat", url: URL(fileURLWithPath: "/Applications/Chat.app"))] = 1
+        }
         #expect(provider.autoQuit.check().isEmpty)
         clock += 59
         #expect(provider.autoQuit.check().isEmpty)
@@ -404,7 +416,7 @@ struct ApplicationsTests {
         #expect(UninstallPlan.supportFiles(bundleID: nil, library: library).isEmpty)
 
         // Another installed copy shares the files, so none are offered.
-        let app = InstalledApplication(name: "XApp", url: root.appending(path: "XApp.app"), bundleIdentifier: "com.example.x")
+        let app = try makeApp(root.appending(path: "XApp.app"), bundleID: "com.example.x", name: "XApp")
         let shared = UninstallPlan.make(for: app, library: library, otherCopies: [app.url, root.appending(path: "Copy/XApp.app")])
         #expect(shared.supportFiles.isEmpty)
         #expect(shared.supportFilesNote?.contains("Another copy") == true)
@@ -571,22 +583,102 @@ struct ApplicationsTests {
         #expect(!model.results.contains { $0.id == "app.com.example.beta" })
     }
 
+    @Test func autoQuitQuitsOnlyTheChosenCopy() {
+        var clock = Date(timeIntervalSince1970: 0)
+        let chosen = URL(fileURLWithPath: "/Applications/Tool.app")
+        let other = URL(fileURLWithPath: "/Users/Shared/Tool.app")
+        let apps = [
+            RunningApp(pid: 1, bundleID: "com.example.tool", name: "Tool", bundleURL: other, launchDate: nil),
+            RunningApp(pid: 2, bundleID: "com.example.tool", name: "Tool", bundleURL: chosen, launchDate: nil),
+        ]
+        let (model, controller, _, provider) = setUp(apps, now: { clock })
+        model.updateApplicationSettings { $0.autoQuit = [AutoQuitTarget(bundleID: "com.example.tool", url: chosen): 1] }
+        provider.autoQuit.check()
+        clock += 60
+        #expect(provider.autoQuit.check().map(\.pid) == [2])
+        #expect(controller.quit == [2])
+
+        // A rule saved with the id alone does nothing until a copy is chosen.
+        controller.apps = [RunningApp(pid: 3, bundleID: "com.example.legacy", name: "Legacy", bundleURL: chosen, launchDate: nil)]
+        model.updateApplicationSettings { $0.autoQuit = [AutoQuitTarget(bundleID: "com.example.legacy", path: nil): 1] }
+        provider.autoQuit.check()
+        clock += 3_600
+        #expect(provider.autoQuit.check().isEmpty)
+        // Choosing the copy from ⌘K settles it.
+        let legacy = InstalledApplication(name: "Legacy", url: chosen, bundleIdentifier: "com.example.legacy")
+        model.setAutoQuit(true, for: legacy)
+        #expect(model.applicationSettings.ambiguousAutoQuitTargets.isEmpty)
+        #expect(model.applicationSettings.autoQuitTarget(for: legacy) != nil)
+    }
+
+    @Test func openingAnAppGoesThroughTheGuardedController() async throws {
+        let (model, controller, _, _) = setUp([])
+        let app = InstalledApplication(name: "Notes", url: URL(fileURLWithPath: "/System/Applications/Notes.app"), bundleIdentifier: "com.apple.Notes")
+        model.perform(appItem(app))
+        try await waitFor { !controller.opened.isEmpty }
+        #expect(controller.opened == [app.url])
+        // Without a fake, the live controller refuses in the test host and says so.
+        let plain = LauncherModel(
+            store: LibraryStore(fileURL: nil), ai: AIChatModel(engine: TestAIEngine()),
+            pasteboard: NSPasteboard.withUniqueName(), registry: CommandRegistry(providers: []))
+        plain.perform(appItem(InstalledApplication(name: "None", url: URL(fileURLWithPath: "/OpenRayNoSuchApp.app"), bundleIdentifier: nil)))
+        try await waitFor { plain.feedback != nil }
+        #expect(plain.feedback?.text.contains("doesn't allow") == true)
+    }
+
+    @Test func uninstallNeedsAFreshReviewWhenTheAppOrItsOwnersChange() throws {
+        let (root, model, _, workspace, provider, app) = try uninstallFixture()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let caches = provider.library.appending(path: "Caches/com.example.x")
+
+        // Another copy appears after the support file was chosen: the files are shared now.
+        provider.beginReview(of: app, in: model)
+        _ = model.orderedResults
+        provider.selection.included[app.url.path] = [caches.path]
+        provider.askToUninstall(app, in: model)
+        let copy = root.appending(path: "Copy/XApp.app")
+        provider.installedCopies = { _ in [app.url, copy] }
+        model.performSelected()
+        #expect(workspace.trashed.isEmpty)
+        #expect(model.feedback?.text.contains("Another copy of XApp is installed now") == true)
+        provider.installedCopies = { _ in [app.url] }
+
+        // The app replaced by a different app at the same path after the review was built.
+        provider.beginReview(of: app, in: model)
+        _ = model.orderedResults
+        try FileManager.default.removeItem(at: app.url)
+        try makeApp(app.url, bundleID: "com.example.other", name: "Other")
+        provider.askToUninstall(app, in: model)
+        #expect(model.confirmation == nil)
+        #expect(workspace.trashed.isEmpty)
+        #expect(model.feedback?.text.contains("XApp") == true)
+    }
+
     @Test func applicationSettingsRoundTrip() {
         var settings = ApplicationSettings()
         #expect(settings.values.isEmpty)
         settings.extraFolders = ["/Volumes/Apps"]
         settings.deepSearch = true
         settings.hiddenAppIDs = ["app.com.example.a"]
-        settings.autoQuit = ["com.example.a": Int?.none, "com.example.b": 10]
+        let a = URL(fileURLWithPath: "/Applications/A.app")
+        let b = URL(fileURLWithPath: "/Applications/B=1.app")
+        settings.autoQuit = [
+            AutoQuitTarget(bundleID: "com.example.a", url: a): Int?.none, AutoQuitTarget(bundleID: "com.example.b", url: b): 10,
+            AutoQuitTarget(bundleID: "com.example.old", path: nil): 5,
+        ]
         settings.autoQuitDefaultMinutes = 5
         settings.keepRunningBundleIDs = ["com.apple.Music"]
         let decoded = ApplicationSettings(settings.values)
         #expect(decoded == settings)
-        #expect(decoded.autoQuitMinutes(for: "com.example.a") == 5)
-        #expect(decoded.autoQuitMinutes(for: "com.example.b") == 10)
-        #expect(decoded.autoQuitMinutes(for: "com.example.c") == nil)
-        // Out-of-range minutes fall back to the default.
-        #expect(ApplicationSettings(["autoQuit": "com.example.a=7", "autoQuitMinutes": "4"]).autoQuitMinutes(for: "com.example.a") == 3)
+        #expect(decoded.autoQuitMinutes(for: "com.example.a", at: a) == 5)
+        #expect(decoded.autoQuitMinutes(for: "com.example.b", at: b) == 10)
+        #expect(decoded.autoQuitMinutes(for: "com.example.c", at: a) == nil)
+        // A rule saved with a bundle id alone stays inactive until a copy is chosen.
+        #expect(decoded.autoQuitMinutes(for: "com.example.old", at: a) == nil)
+        #expect(decoded.ambiguousAutoQuitTargets.map(\.bundleID) == ["com.example.old"])
+        let legacy = ApplicationSettings(["autoQuit": "com.example.a=7", "autoQuitMinutes": "4"])
+        #expect(legacy.autoQuitMinutes(for: "com.example.a", at: a) == nil)
+        #expect(legacy.ambiguousAutoQuitTargets.count == 1)
     }
 
     @Test func registrationsAcceptAppAndCommandBindings() {

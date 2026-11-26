@@ -52,8 +52,7 @@ extension LauncherModel {
         case .application(let app):
             Task {
                 do {
-                    _ = try await NSWorkspace.shared.openApplication(
-                        at: app.url, configuration: NSWorkspace.OpenConfiguration())
+                    try await openApplication(app)
                     store.recordUse(of: item.id)
                     panel?.dismiss(restoreFocus: false)
                 } catch {
@@ -529,7 +528,8 @@ extension LauncherModel {
     }
 
     private func open(_ url: URL, itemID: String) {
-        if NSWorkspace.shared.open(url) {
+        guard mayOpenFile(url) else { return }
+        if openFileThroughWorkspace(url) {
             store.recordUse(of: itemID)
             panel?.dismiss(restoreFocus: false)
         } else {
@@ -700,7 +700,7 @@ extension LauncherModel {
                     ActionEntry(
                         id: "reveal", title: "Reveal in Finder", symbol: "folder", shortcut: .command("R", shift: true),
                         key: "r", modifiers: [.command, .shift], group: .item
-                    ) { NSWorkspace.shared.activateFileViewerSelecting([url]) })
+                    ) { [weak self] in self?.revealInFinder(url) })
                 entries.append(
                     ActionEntry(
                         id: "copyPath", title: "Copy Path", symbol: "doc.on.doc", shortcut: .command("C", shift: true),

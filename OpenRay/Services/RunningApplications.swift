@@ -138,7 +138,9 @@ final class RunningApplications {
 
     /// Force quits exactly the processes a prompt named, skipping any that are gone or replaced.
     func forceQuit(_ snapshot: [RunningApp]) -> BatchResult {
-        batch(stillRunning(snapshot)) { try controller.forceQuit($0) }
+        batch(stillRunning(snapshot).filter { ownBundleID == nil || $0.bundleID != ownBundleID }) {
+            try controller.forceQuit($0)
+        }
     }
 
     func isRunning(_ app: InstalledApplication) -> Bool { !instances(of: app).isEmpty }

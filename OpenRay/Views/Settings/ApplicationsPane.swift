@@ -63,13 +63,14 @@ struct ApplicationsPane: View {
     }
 }
 
-/// Auto Quit: the default idle time, and each chosen app with its own time or the default.
+/// Auto Quit: the default idle time, and each chosen copy of an app with its own time or the
+/// default. A rule saved with a bundle id alone is shown as inactive until a copy is chosen.
 private struct AutoQuitSection: View {
     let model: LauncherModel
 
     var body: some View {
         let settings = model.applicationSettings
-        let ids = settings.autoQuit.keys.sorted { AppListSection.name(for: $0) < AppListSection.name(for: $1) }
+        let targets = settings.autoQuit.keys.sorted { Self.label(for: $0) < Self.label(for: $1) }
         Section {
             Picker(
                 "Quit after", selection: Binding(
@@ -79,44 +80,71 @@ private struct AutoQuitSection: View {
                 ForEach(ApplicationSettings.autoQuitChoices, id: \.self) { Text(Self.title($0)).tag($0) }
             }
             .neutralMenus()
-            ForEach(ids, id: \.self) { id in
+            ForEach(targets, id: \.self) { target in
                 HStack(spacing: 10) {
-                    AppListSection.icon(for: id)
-                    Text(AppListSection.name(for: id))
-                    Spacer()
-                    Picker(
-                        "Idle time for \(AppListSection.name(for: id))",
-                        selection: Binding(
-                            get: { model.applicationSettings.autoQuit[id] ?? nil },
-                            set: { minutes in model.updateApplicationSettings { $0.autoQuit[id] = .some(minutes) } })
-                    ) {
-                        Text("Default").tag(Int?.none)
-                        ForEach(ApplicationSettings.autoQuitChoices, id: \.self) { Text(Self.title($0)).tag(Int?.some($0)) }
+                    if let path = target.path {
+                        WorkspaceIcon(url: URL(fileURLWithPath: path), size: 20)
+                    } else {
+                        AppListSection.icon(for: target.bundleID)
                     }
-                    .labelsHidden().neutralMenus().fixedSize()
-                    Button("Remove") { model.updateApplicationSettings { $0.autoQuit[id] = nil } }
-                        .accessibilityLabel("Stop auto quitting \(AppListSection.name(for: id))")
+                    VStack(alignment: .leading, spacing: 1) {
+                        Text(Self.label(for: target))
+                        Text(target.path.map { LauncherModel.shortenedPath(URL(fileURLWithPath: $0)) } ?? "Inactive: choose which copy")
+                            .font(.system(size: 11)).foregroundStyle(target.path == nil ? OR.Color.warning : .secondary)
+                            .lineLimit(1).truncationMode(.middle)
+                    }
+                    Spacer()
+                    if target.path == nil {
+                        Button("Choose…") { choose(replacing: target) }
+                    } else {
+                        Picker(
+                            "Idle time for \(Self.label(for: target))",
+                            selection: Binding(
+                                get: { model.applicationSettings.autoQuit[target] ?? nil },
+                                set: { minutes in model.updateApplicationSettings { $0.autoQuit[target] = .some(minutes) } })
+                        ) {
+                            Text("Default").tag(Int?.none)
+                            ForEach(ApplicationSettings.autoQuitChoices, id: \.self) { Text(Self.title($0)).tag(Int?.some($0)) }
+                        }
+                        .labelsHidden().neutralMenus().fixedSize()
+                    }
+                    Button("Remove") { model.updateApplicationSettings { $0.autoQuit[target] = nil } }
+                        .accessibilityLabel("Stop auto quitting \(Self.label(for: target))")
                 }
             }
-            Button {
-                let added = AppListSection.chooseApps(title: "Choose apps to auto quit", prompt: "Add")
-                    .filter { $0 != Bundle.main.bundleIdentifier && !AutoQuit.excluded.contains($0) }
-                guard !added.isEmpty else { return }
-                model.updateApplicationSettings { settings in
-                    for id in added where settings.autoQuit[id] == nil { settings.autoQuit[id] = .some(nil) }
-                }
-            } label: {
-                Label("Add App…", systemImage: "plus")
-            }
-            .buttonStyle(.borderless)
+            Button { choose(replacing: nil) } label: { Label("Add App…", systemImage: "plus") }
+                .buttonStyle(.borderless)
         } header: {
             Text("Auto Quit")
         } footer: {
             Text(
-                "Chosen apps quit once they've been in the background this long. Being frontmost restarts the clock. Apps can still ask to save first. Turn it on for an app from ⌘K too."
+                "Chosen apps quit once they've been in the background this long. Being frontmost restarts the clock. Only the copy you choose is quit, never another copy with the same name. Apps can still ask to save first."
             )
             .font(.system(size: 12)).foregroundStyle(.secondary)
         }
+    }
+
+    /// Picks app copies to auto quit, replacing an inactive rule when one is given.
+    private func choose(replacing old: AutoQuitTarget?) {
+        let chosen = AppListSection.chooseAppCopies(title: "Choose apps to auto quit", prompt: "Add")
+            .filter { $0.bundleID != Bundle.main.bundleIdentifier && !AutoQuit.excluded.contains($0.bundleID) }
+        guard !chosen.isEmpty else { return }
+        model.updateApplicationSettings { settings in
+            let minutes = old.flatMap { settings.autoQuit[$0] } ?? nil
+            if let old { settings.autoQuit[old] = nil }
+            for target in chosen where settings.autoQuit[target] == nil {
+                settings.autoQuit[target] = .some(minutes)
+                // A copy chosen for an id settles that id's inactive rule too.
+                settings.autoQuit[AutoQuitTarget(bundleID: target.bundleID, path: nil)] = nil
+            }
+        }
+    }
+
+    static func label(for target: AutoQuitTarget) -> String {
+        if let path = target.path {
+            return FileManager.default.displayName(atPath: path).replacingOccurrences(of: ".app", with: "")
+        }
+        return AppListSection.name(for: target.bundleID)
     }
 
     static func title(_ minutes: Int) -> String { minutes == 1 ? "1 minute" : "\(minutes) minutes" }
@@ -170,6 +198,21 @@ struct AppListSection: View {
     static func name(for id: String) -> String {
         guard let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: id) else { return id }
         return FileManager.default.displayName(atPath: url.path).replacingOccurrences(of: ".app", with: "")
+    }
+
+    /// Chosen app bundles as Auto Quit targets: the bundle id and the canonical path of that copy.
+    static func chooseAppCopies(title: String, prompt: String) -> [AutoQuitTarget] {
+        let panel = NSOpenPanel()
+        panel.title = title
+        panel.prompt = prompt
+        panel.directoryURL = URL(fileURLWithPath: "/Applications")
+        panel.allowedContentTypes = [.applicationBundle]
+        panel.allowsMultipleSelection = true
+        panel.canChooseDirectories = false
+        guard panel.runModal() == .OK else { return [] }
+        return panel.urls.compactMap { url in
+            Bundle(url: url)?.bundleIdentifier.map { AutoQuitTarget(bundleID: $0, url: url) }
+        }
     }
 
     static func chooseApps(title: String, prompt: String) -> [String] {

@@ -234,26 +234,43 @@ final class ApplicationsCommandProvider: CommandProvider {
     /// about share the support files, so their presence withholds them.
     func plan(for app: InstalledApplication, in model: LauncherModel? = nil) -> UninstallPlan {
         if let plan = plans[app.url.path] { return plan }
-        var copies: [URL] = []
-        if let bundleID = app.bundleIdentifier {
-            copies = installedCopies(bundleID)
-            copies += (model?.applications.applications ?? []).filter { $0.bundleIdentifier == bundleID }.map(\.url)
-        }
-        let plan = UninstallPlan.make(for: app, library: library, otherCopies: copies)
+        let bundleID = UninstallPlan.bundleIdentifier(at: app.url) ?? app.bundleIdentifier
+        let plan = UninstallPlan.make(for: app, library: library, otherCopies: copies(of: bundleID, in: model))
         plans[app.url.path] = plan
         return plan
     }
 
+    /// Every known copy of a bundle id: Launch Services, every path the catalog's scan found,
+    /// and the bundles of running processes. Any besides the app itself share its support files.
+    func copies(of bundleID: String?, in model: LauncherModel?) -> [URL] {
+        guard let bundleID else { return [] }
+        var copies = installedCopies(bundleID)
+        copies += model?.applications.copies[bundleID] ?? []
+        copies += running.controller.runningApplications().filter { $0.bundleID == bundleID }.compactMap(\.bundleURL)
+        return copies
+    }
     /// The files an uninstall would move now: the app, then the support files ticked.
     func filesToTrash(for plan: UninstallPlan) -> [URL] {
         let chosen = selection.included[plan.app.url.path] ?? []
         return [plan.app.url] + plan.supportFiles.filter { chosen.contains($0.path) }
     }
 
-    /// One file an uninstall will move, as it was when the person approved the list.
+    /// One file an uninstall will move, as it was when the review was built.
     struct ReviewedFile: Equatable {
         var url: URL
         var identity: FileIdentity
+    }
+
+    /// The app and the chosen support files, with the identities the review captured. Nil when
+    /// a chosen file had no identity then.
+    func reviewedFiles(for plan: UninstallPlan) -> [ReviewedFile]? {
+        guard let appIdentity = plan.appIdentity else { return nil }
+        var files = [ReviewedFile(url: plan.app.url, identity: appIdentity)]
+        for url in filesToTrash(for: plan).dropFirst() {
+            guard let identity = plan.supportIdentities[url.path] else { return nil }
+            files.append(ReviewedFile(url: url, identity: identity))
+        }
+        return files
     }
 
     func askToUninstall(_ app: InstalledApplication, in model: LauncherModel) {
@@ -266,15 +283,14 @@ final class ApplicationsCommandProvider: CommandProvider {
             return
         }
         let plan = plan(for: app, in: model)
-        // What the prompt names is frozen here, file by file; approval checks each again.
-        var reviewed: [ReviewedFile] = []
-        for url in filesToTrash(for: plan) {
-            guard let identity = FileIdentity.of(url) else {
-                plans[app.url.path] = nil
-                model.feedback = .warning("“\(url.lastPathComponent)” is gone. Review \(app.name) again.")
-                return
-            }
-            reviewed.append(ReviewedFile(url: url, identity: identity))
+        // What's moved is what the review showed, checked against disk before asking and again on approval.
+        guard let reviewed = reviewedFiles(for: plan), revalidate(plan, reviewed: reviewed, in: model) == nil else {
+            let problem =
+                reviewedFiles(for: plan).flatMap { revalidate(plan, reviewed: $0, in: model) }
+                ?? "\(app.name) changed since you opened its review."
+            plans[app.url.path] = nil
+            model.feedback = .warning(problem)
+            return
         }
         let extra = reviewed.count - 1
         let question = CommandConfirmation(
@@ -285,25 +301,48 @@ final class ApplicationsCommandProvider: CommandProvider {
         model.askConfirmation(ProvidedConfirmation(id: "applications.uninstall.\(app.url.path)", question) {
             [weak self, weak model] in
             guard let self, let model else { return }
-            self.uninstall(app, reviewed: reviewed, in: model)
+            self.uninstall(plan, reviewed: reviewed, in: model)
         })
     }
 
-    /// Why the reviewed list can't be moved as approved, or nil when everything still matches:
-    /// the app isn't running, it's still an app bundle, and every file is the one reviewed.
-    func revalidate(_ app: InstalledApplication, reviewed: [ReviewedFile]) -> String? {
-        if running.isRunning(app) { return "\(app.name) is running now. Quit it, then review it again." }
+    /// Why the reviewed list can't be moved as reviewed, or nil when it still matches: the app
+    /// isn't running, it's still the same app bundle with the same bundle id, every file is the
+    /// one reviewed and still inside Library, and no other copy now shares the support files.
+    func revalidate(_ plan: UninstallPlan, reviewed: [ReviewedFile], in model: LauncherModel?) -> String? {
+        let app = plan.app
+        let again = " Nothing was moved; review \(app.name) again."
+        if running.isRunning(app)
+            || running.controller.runningApplications().contains(where: {
+                $0.bundleURL.map { RunningApplications.isSameBundle($0, app.url) } ?? false
+            })
+        {
+            return "\(app.name) is running now. Quit it, then review it again."
+        }
         if let refusal = UninstallPlan.refusal(for: app, ownBundleID: running.ownBundleID) { return refusal }
+        guard let reviewedID = plan.bundleID, UninstallPlan.bundleIdentifier(at: app.url) == reviewedID else {
+            return "\(app.name) was replaced since you reviewed it." + again
+        }
         for file in reviewed where !file.identity.isSameItem(as: FileIdentity.of(file.url)) {
-            return "“\(file.url.lastPathComponent)” changed since you reviewed it. Nothing was moved; review \(app.name) again."
+            return "“\(file.url.lastPathComponent)” changed since you reviewed it." + again
+        }
+        let support = reviewed.dropFirst()
+        if !support.isEmpty {
+            if !UninstallPlan.others(than: app.url, in: copies(of: reviewedID, in: model)).isEmpty {
+                return "Another copy of \(app.name) is installed now, so its support files are shared." + again
+            }
+            for file in support where !UninstallPlan.isContained(file.url, in: library) {
+                return "“\(file.url.lastPathComponent)” isn't inside your Library folder anymore." + again
+            }
         }
         return nil
     }
 
-    /// Moves the reviewed app and support files to the Trash, after checking nothing changed.
-    func uninstall(_ app: InstalledApplication, reviewed: [ReviewedFile], in model: LauncherModel) {
+    /// Moves the reviewed app and support files to the Trash after checking nothing changed,
+    /// and checks each one again right before it moves.
+    func uninstall(_ plan: UninstallPlan, reviewed: [ReviewedFile], in model: LauncherModel) {
+        let app = plan.app
         plans[app.url.path] = nil
-        if let problem = revalidate(app, reviewed: reviewed) {
+        if let problem = revalidate(plan, reviewed: reviewed, in: model) {
             model.feedback = .warning(problem)
             return
         }
@@ -311,6 +350,9 @@ final class ApplicationsCommandProvider: CommandProvider {
         var moved = 0
         for (index, file) in reviewed.enumerated() {
             do {
+                guard file.identity.isSameItem(as: FileIdentity.of(file.url)) else {
+                    throw FileWorkspaceError.refused("move a file that changed")
+                }
                 try workspace.trash(file.url)
                 moved += 1
             } catch {

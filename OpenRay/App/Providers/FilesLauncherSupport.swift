@@ -127,10 +127,13 @@ extension LauncherModel {
             return excluded.contains { path == $0 || path.hasPrefix($0 + "/") }
         }
         if let path = filePathQuery {
-            guard files.browsedFolder == path.directory else { return path.filter.isEmpty ? [folderRow(path.directory)] : [] }
+            // Tests and verification never offer a real folder: no row to open, reveal or preview.
+            guard InertReadBoundary.allows(path.directory) else { return [] }
+            let folder = path.filter.isEmpty && !isExcluded(path.directory) ? [folderRow(path.directory)] : []
+            guard files.browsedFolder == path.directory else { return folder }
             let rows = files.orderedListing(filter: path.filter, sort: settings.sort).lazy.filter { !isExcluded($0.url) }
                 .prefix(100).map(fileRow)
-            return Array(((path.filter.isEmpty ? [folderRow(path.directory)] : []) + rows).prefix(100))
+            return Array((folder + rows).prefix(100))
         }
         let parsed = FileQuery.parse(trimmed)
         guard section == .files || section == .home && parsed.hasFilters else { return nil }
@@ -434,7 +437,7 @@ extension LauncherModel {
         }
         let settings = applicationSettings
         if let bundleID = app.bundleIdentifier, provider.autoQuit.canAutoQuit(bundleID) {
-            let enabled = settings.autoQuitMinutes(for: bundleID) != nil
+            let enabled = settings.autoQuitTarget(for: app) != nil
             entries.append(
                 ActionEntry(
                     id: "autoQuit", title: enabled ? "Disable Auto Quit" : "Enable Auto Quit",
@@ -497,20 +500,45 @@ extension LauncherModel {
             })
     }
 
+    /// The workspace file actions go through: the Files provider's, or a guarded live one when
+    /// a test registry has no Files provider.
+    var fileWorkspace: any FileWorkspace { filesProvider?.workspace ?? LiveFileWorkspace() }
+
     func revealInFinder(_ url: URL) {
         do {
-            try SideEffectGuard.check("showing \(url.lastPathComponent) in the Finder")
-            NSWorkspace.shared.activateFileViewerSelecting([url])
+            try fileWorkspace.reveal(url)
         } catch {
             feedback = .info(error.localizedDescription)
+        }
+    }
+
+    /// The shared ↩ on a file row asks here first: never in tests or verification, and only
+    /// fixtures could be opened there anyway. Says why when it refuses.
+    func mayOpenFile(_ url: URL) -> Bool {
+        guard let refusal = fileWorkspace.refusal(toOpen: url) else { return true }
+        feedback = .info(refusal)
+        return false
+    }
+
+    /// The shared ↩ on a file row: opens it through the guarded workspace.
+    func openFileThroughWorkspace(_ url: URL) -> Bool {
+        (try? fileWorkspace.open(url)) != nil
+    }
+
+    /// The shared ↩ on an app row: opens it through the guarded running-app controller.
+    func openApplication(_ app: InstalledApplication) async throws {
+        if let running = applicationsProvider?.running {
+            try await running.controller.open(app.url)
+        } else {
+            try await LiveRunningApplications().open(app.url)
         }
     }
 
     func openWithDefaultApp(_ url: URL, workspace: any FileWorkspace) {
         guard let app = workspace.applications(toOpen: url).first(where: \.isDefault) else {
             do {
-                try SideEffectGuard.check("opening \(url.lastPathComponent)")
-                if NSWorkspace.shared.open(url) { panel?.dismiss(restoreFocus: false) }
+                try workspace.open(url)
+                panel?.dismiss(restoreFocus: false)
             } catch {
                 feedback = .info(error.localizedDescription)
             }
@@ -685,8 +713,11 @@ extension LauncherModel {
 
     func setAutoQuit(_ enabled: Bool, for app: InstalledApplication) {
         guard let bundleID = app.bundleIdentifier else { return }
+        // The rule names this copy. Choosing a copy also settles a rule saved with the id alone.
+        let target = AutoQuitTarget(bundleID: bundleID, url: app.url)
         if updateApplicationSettings({ settings in
-            if enabled { settings.autoQuit[bundleID] = .some(nil) } else { settings.autoQuit[bundleID] = nil }
+            settings.autoQuit[AutoQuitTarget(bundleID: bundleID, path: nil)] = nil
+            if enabled { settings.autoQuit[target] = .some(nil) } else { settings.autoQuit[target] = nil }
         }) {
             let minutes = applicationSettings.autoQuitDefaultMinutes
             toast(enabled ? "\(app.name) quits after \(minutes) idle minute\(minutes == 1 ? "" : "s")" : "Auto Quit is off for \(app.name)")

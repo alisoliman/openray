@@ -277,6 +277,7 @@ struct FileThumbnail: View {
         .frame(height: 160)
         .task(id: url) {
             image = nil
+            guard InertReadBoundary.allows(url) else { return }
             let request = QLThumbnailGenerator.Request(
                 fileAt: url, size: CGSize(width: 268, height: 150), scale: 2, representationTypes: .thumbnail)
             if let representation = try? await QLThumbnailGenerator.shared.generateBestRepresentation(for: request) {
