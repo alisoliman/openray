@@ -141,10 +141,11 @@ struct DeepLinkTests {
     @Test("Every root command has Copy Deeplink; content rows don't")
     func copyDeeplink() throws {
         let (model, _, _, pasteboard, _) = harness()
-        for id in ["section.files", "ai.chat", "settings", "window.leftHalf", "linktest.greet"] {
+        for id in ["section.files", "ai.chat", "settings", "window.leftHalf", "linktest.plain", "linktest.greet"] {
             let item = try #require(model.commandItems.first { $0.id == id }, "\(id)")
             let entries = model.actions(for: item).map(\.id)
-            #expect(entries.contains("deeplinkTrust"), "\(id)")
+            // Greet takes a password, so links always ask for it and it has no such switch.
+            #expect(entries.contains("deeplinkTrust") == (id != "linktest.greet"), "\(id)")
             let entry = try #require(model.actions(for: item).first { $0.id == "copyDeeplink" }, "\(id)")
             entry.perform()
             #expect(model.feedback?.style == .success)
@@ -377,5 +378,54 @@ struct DeepLinkTests {
         #expect(router.handle(url, source: browser, in: model) == .waiting)
         for _ in 0..<50 where router.pending == nil { try await Task.sleep(for: .milliseconds(50)) }
         #expect(router.pending?.title == "Hello Script")
+    }
+}
+
+extension DeepLinkTests {
+    @Test("Commands that ask first or take a password never run from links without asking")
+    func trustScope() throws {
+        let (model, router, target, _, _) = harness()
+        target.asksFirst = true
+        let approvals = LocalApprovalStore.for(model.store)
+        for id in ["linktest.greet", "linktest.secret"] {
+            let item = try #require(model.commandItems.first { $0.id == id })
+            #expect(!DeepLinkRouter.mayRunWithoutAsking(item, in: model), "\(id)")
+            #expect(!model.actions(for: item).contains { $0.id == "deeplinkTrust" }, "\(id)")
+            // A grant made some other way is never honored.
+            approvals.setLinksRunWithoutAsking(true, for: id)
+            #expect(isAsked(router.handle(DeepLink.url(forCommandID: id, arguments: ["name": "x", "token": "y"])!, source: browser, in: model)), "\(id)")
+            router.cancel(in: model)
+            // …but it can still be revoked from ⌘K.
+            let revoke = try #require(model.actions(for: item).first { $0.id == "deeplinkTrust" })
+            #expect(revoke.title == "Ask Before Running from Links")
+            revoke.perform()
+            #expect(!approvals.linksRunWithoutAsking(id))
+        }
+        #expect(target.runs.isEmpty)
+    }
+
+    @Test("Fallback text used as a password never lands in the search field of the scope the command opens")
+    func noPasswordPrefill() async throws {
+        let folder = try ScriptFolder()
+        let file = try folder.script(
+            "secret.sh", title: "Show Secret", mode: "fullOutput",
+            extra: [#"argument1 { "type": "password", "placeholder": "Token" }"#], body: "echo done")
+        let scripts = ScriptCommandProvider(
+            catalog: ScriptCatalog(), runner: ScriptRunner(launcher: CannedScriptLauncher(
+                execution: ScriptExecution(termination: .exited(0), output: "done", duration: .zero))),
+            presenter: RecordingScriptPresenter(), refreshesAutomatically: false)
+        let (model, router, _, _, _) = harness(extra: [scripts])
+        let record = folder.record
+        model.store.update { $0.scriptDirectories = [record] }
+        LocalApprovalStore.for(model.store).approve(record)
+        scripts.synchronize(with: model, synchronously: true)
+        let url = try #require(URL(string: "openray://scripts/\(ScriptCommand.id(for: file).dropFirst(7))?fallbackText=hunter2"))
+        router.handle(url, source: browser, in: model)
+        pressReturn(model)
+        #expect(model.section.providedScope?.id == ScriptCommandProvider.outputScope.id)
+        #expect(model.query.isEmpty)
+        let job = try #require(scripts.runner.jobs.first)
+        #expect(job.values == ["argument1": "hunter2"])
+        await job.task?.value
     }
 }

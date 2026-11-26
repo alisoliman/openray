@@ -314,7 +314,9 @@ final class DeepLinkRouter: CommandProvider {
             let request = DeepLinkRequest(
                 url: url, commandID: commandID, title: item.title, arguments: values, specs: specs,
                 fallbackText: fallbackText, fallbackFillsArgument: filled, source: source, background: background)
-            if LocalApprovalStore.for(model.store).linksRunWithoutAsking(commandID) {
+            if LocalApprovalStore.for(model.store).linksRunWithoutAsking(commandID),
+                Self.mayRunWithoutAsking(item, in: model)
+            {
                 run(request, item: item, in: model)
                 return .ran(commandID: commandID)
             }
@@ -369,6 +371,15 @@ final class DeepLinkRouter: CommandProvider {
         let item = candidates.first { $0.id == id } ?? model.registry.item(withID: id, in: model)
         guard let item, item.isBuiltInCommand, DeepLink.url(for: item) != nil else { return nil }
         return item
+    }
+
+    /// Whether a command may ever run from links without asking. Commands that ask before they
+    /// run (destructive ones, scripts with `needsConfirmation`) and commands that take a password
+    /// always ask, whatever was granted.
+    static func mayRunWithoutAsking(_ item: LauncherItem, in model: LauncherModel) -> Bool {
+        guard case .provided(let ref) = item.action else { return true }
+        guard let descriptor = model.registry.descriptor(for: ref, in: model) else { return false }
+        return descriptor.confirmation == nil && !descriptor.arguments.contains { $0.type == .password }
     }
 
     static func argumentSpecs(of item: LauncherItem, in model: LauncherModel) -> [ArgumentSpec] {
@@ -477,7 +488,10 @@ final class DeepLinkRouter: CommandProvider {
             model.feedback = feedback
             model.confirmation = confirmation
         }
-        if let text = request.fallbackText, model.section != .home, model.destination == .search, model.query.isEmpty {
+        // Fallback text that became an argument (perhaps a password) is never typed into search.
+        if let text = request.fallbackText, !request.fallbackFillsArgument, model.section != .home,
+            model.destination == .search, model.query.isEmpty
+        {
             model.query = text
         }
     }
@@ -490,10 +504,14 @@ extension LauncherModel {
         guard let url = DeepLink.url(for: item) else { return [] }
         let approvals = LocalApprovalStore.for(store)
         let trusted = approvals.linksRunWithoutAsking(item.id)
-        return [
+        var entries = [
             ActionEntry(id: "copyDeeplink", title: "Copy Deeplink", symbol: "link", group: .organize) { [weak self] in
                 self?.copy(url.absoluteString, label: "Deeplink to \(item.title)")
-            },
+            }
+        ]
+        // Commands that always ask from links don't offer the switch; one granted earlier can still be revoked.
+        guard trusted || DeepLinkRouter.mayRunWithoutAsking(item, in: self) else { return entries }
+        entries.append(
             ActionEntry(
                 id: "deeplinkTrust", title: trusted ? "Ask Before Running from Links" : "Run from Links Without Asking",
                 symbol: trusted ? "lock" : "lock.open", group: .organize
@@ -505,7 +523,7 @@ extension LauncherModel {
                 } else {
                     self.feedback = .error(approvals.errorMessage ?? "Couldn't save the change.")
                 }
-            },
-        ]
+            })
+        return entries
     }
 }
