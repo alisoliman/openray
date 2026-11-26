@@ -56,12 +56,10 @@ final class LauncherModel {
     /// Since when the surface showing prompts has been on screen, opaque and key; nil while it
     /// isn't. Nil asks the panel; tests set it.
     @ObservationIgnored var confirmationSurfaceVisibleSince: (() -> Date?)?
-    /// Whether the key event being handled is a fresh press (not autorepeat, not synthesized
-    /// without a key). Every keyboard approval checks it. Tests set it.
-    @ObservationIgnored var currentKeyPressIsFresh: () -> Bool = {
-        guard let event = NSApp.currentEvent, event.type == .keyDown else { return false }
-        return !event.isARepeat
-    }
+    /// Whether a field's submit stands for a fresh Return. Always false in the app: only the
+    /// panel's own Return, judged from its key event, answers a prompt, and a submit is no
+    /// evidence of a key press. Tests set it to stand in for that Return.
+    @ObservationIgnored var currentKeyPressIsFresh: () -> Bool = { false }
     /// The clock prompt exposure is measured with. Tests set it.
     @ObservationIgnored var promptClock: () -> Date = Date.init
     var focusRequest = 0
@@ -306,7 +304,13 @@ final class LauncherModel {
             // First in the list so the cap never drops it; searchGroups decides where it shows.
             items.insert(answer, at: 0)
         }
-        let shown = Self.capped(items, in: section)
+        // On blank Home, favorites and pinned clipboard entries are what you put there: however
+        // many commands the slices add ahead of them, the cap never pushes them out.
+        let kept: Set<String> =
+            section == .home && trimmed.isEmpty
+            ? store.database.favoriteIDs.union(store.database.clipboard.lazy.filter(\.isPinned).map { "clipboard.\($0.id)" })
+            : []
+        let shown = Self.capped(items, in: section, keeping: kept)
         return trimmed.isEmpty ? shown : shown.map { Self.explainingMatch($0, query: trimmed) }
     }
 
@@ -333,12 +337,22 @@ final class LauncherModel {
     }
 
     /// Home keeps up to 45 instant rows and 20 Spotlight rows, capped separately
-    /// so a flood of late files can never push out the Top Hit. Scopes show 100.
-    nonisolated static func capped(_ items: [LauncherItem], in section: LauncherSection) -> [LauncherItem] {
+    /// so a flood of late files can never push out the Top Hit. Scopes show 100. Rows in `kept`
+    /// stay wherever they are and don't count toward Home's 45.
+    nonisolated static func capped(
+        _ items: [LauncherItem], in section: LauncherSection, keeping kept: Set<String> = []
+    ) -> [LauncherItem] {
         guard section == .home else { return Array(items.prefix(100)) }
-        let instant = items.filter { !$0.isLiveResult }.prefix(45)
+        var budget = 45
+        let instant = items.filter { item in
+            guard !item.isLiveResult else { return false }
+            if kept.contains(item.id) { return true }
+            guard budget > 0 else { return false }
+            budget -= 1
+            return true
+        }
         let live = items.filter(\.isLiveResult).prefix(20)
-        return Array(instant) + Array(live)
+        return instant + Array(live)
     }
 
     /// True when the query is empty or only whitespace.
@@ -1144,13 +1158,22 @@ final class LauncherModel {
                     guard !Task.isCancelled, let model = self, model.liveGeneration == generation,
                         let provider = model.registry.provider(id: providerID)
                     else { return }
+                    // The provider's commands as the search starts: a row it builds for one of them
+                    // keeps that identity even if the command is withdrawn before the row arrives.
+                    let commandIDs = Set(provider.commands(in: model).map(\.id))
                     let rows = await provider.liveItems(for: term, scope: scope, in: model)
                     guard let self, !Task.isCancelled, self.liveGeneration == generation else { return }
-                    // Root-search rows never become the Top Hit; see searchGroups.
-                    // A row for a command keeps that identity, so it's refused rather than run
-                    // unconfirmed if the command is withdrawn while the row is still listed.
-                    self.providedLiveItems[providerID] = rows.map { row in
-                        var row = self.markingCommandIdentity(row)
+                    // Root-search rows never become the Top Hit; see searchGroups. A row for a
+                    // command keeps that identity, so it's refused rather than run unconfirmed if
+                    // the command goes while the row is listed; one whose command already went
+                    // during the search isn't listed at all.
+                    self.providedLiveItems[providerID] = rows.compactMap { row in
+                        var row = self.markingCommandIdentity(row, provider: providerID, commandIDs: commandIDs)
+                        if case .provided(let ref) = row.action, ref.has(.descriptor),
+                            self.registry.descriptor(for: ref, in: self) == nil
+                        {
+                            return nil
+                        }
                         row.isLiveResult = scope == nil
                         return row
                     }
