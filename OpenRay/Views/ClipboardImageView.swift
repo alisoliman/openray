@@ -4,25 +4,26 @@ struct ClipboardImageView: View {
     let resource: ClipboardImageResource
     var maxPixelSize = 600
     var showsFailureText = true
+    /// Thumbnails fill their square; previews fit inside it.
+    var fills = false
     @State private var thumbnail: NSImage?
     @State private var isLoading = true
 
     var body: some View {
         Group {
             if let thumbnail {
-                Image(nsImage: thumbnail).resizable().scaledToFit()
+                Image(nsImage: thumbnail).resizable().aspectRatio(contentMode: fills ? .fill : .fit)
                     .accessibilityLabel(
                         "Clipboard image, \(resource.image.pixelWidth) by \(resource.image.pixelHeight) pixels")
             } else if isLoading {
-                ProgressView().controlSize(.small)
+                if showsFailureText { Spinner() } else { OR.Color.fill2 }
             } else {
                 VStack(spacing: 8) {
-                    Image(systemName: "photo.badge.exclamationmark").foregroundStyle(.secondary)
+                    Image(systemName: "photo.badge.exclamationmark").foregroundStyle(OR.Color.text2)
                     if showsFailureText {
-                        Text("This saved image is missing or damaged.").font(.system(size: 11)).foregroundStyle(
-                            .secondary
-                        )
-                        .multilineTextAlignment(.center)
+                        Text("This saved image is missing or damaged.").font(OR.Font.callout)
+                            .foregroundStyle(OR.Color.text2)
+                            .multilineTextAlignment(.center)
                     }
                 }
             }

@@ -1,0 +1,41 @@
+/// Every command provider, one line each. Order is the order their commands appear in
+/// Settings › Shortcuts after the original twenty, and the order rows from different
+/// providers tie in.
+///
+/// To register, insert your line directly below your slice's comment. Keep the comment; never
+/// replace it. The retained comment lines separate the slots, so additions from parallel
+/// branches never touch the same or adjacent lines and merge without conflicts.
+enum CommandProviders {
+    static let all: [CommandProviderRegistration] = [
+        AIWritingCommandProvider.registration,
+        // Slice 1: launcher core
+        LauncherCommandProvider.registration,
+        // Slice 2: clipboard, snippets, quicklinks
+        LibraryCommandProvider.registration,
+        // Slice 3: calculator, emoji, translator
+        CalculatorProvider.registration,
+        EmojiProvider.registration,
+        TranslatorProvider.registration,
+        // Slice 4: files, screenshots, applications
+        FilesCommandProvider.registration,
+        ScreenshotsCommandProvider.registration,
+        ApplicationsCommandProvider.registration,
+        // Slice 5: system, windows
+        SystemCommandProvider.registration,
+        WindowCommandProvider.registration,
+        // Slice 6: notes, calendar, focus
+        NotesCommandProvider.registration,
+        CalendarCommandProvider.registration,
+        FocusCommandProvider.registration,
+        MenuBarCommandProvider.registration,
+        // Slice 7: AI commands, agents
+        AICommandProvider.registration,
+        // Slice 8: script commands
+        ScriptCommandProvider.registration,
+        DeepLinkRouter.registration,
+        LibraryArchiveProvider.registration,
+        // main: pomodoro, caffeinate
+        PomodoroCommandProvider.registration,
+        CaffeinateCommandProvider.registration,
+    ]
+}

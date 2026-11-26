@@ -1,5 +1,7 @@
 # OpenRay usability review — 8–12 September 2026
 
+> **Status after the OpenRay 2.0 / Raycast-parity merge (November 2026).** This is a historical review of the pre-2.0 launcher. Its AI key decisions (UX-04) and the writing journey (UX-01–03, UX-08–09, UX-15) were carried into the 2.0 AI view; its navigation decisions (UX-05, UX-06: Escape hides, ⌘1–⌘6, five-minute resume) were replaced by the Raycast keyboard model, with Escape's behavior (Settings → Keyboard) and the Back to Everything delay (Settings → General) as preferences and ⌘[ kept as Back. See the README for current behavior.
+
 The main journey is now defined as **select text → open a writing command → refine → accept into the original app**. Hiding the launcher is a pause; Back is navigation. These distinctions remove the manual copy/paste loop without allowing a resumed result to replace text in an unrelated app.
 
 This is a broad expert review of the native macOS application, with source and test inspection followed by implementation verification. It is **not a recruited participant study**: no participant sample, success-rate measurement, interview findings, or statistical claims are implied. The initial source baseline was `05dac2112cdefd3d00eca71f5f364e73e889b18f`. The earlier [September 5 review](../UI-UX-REVIEW.md) is historical evidence, not proof that its live checks were rerun for this change.

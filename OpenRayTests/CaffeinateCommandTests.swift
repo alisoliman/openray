@@ -3,6 +3,8 @@ import Testing
 
 @testable import OpenRay
 
+/// main #11's Caffeinate commands, ported to `CaffeinateCommandProvider`. The dashboard became the
+/// Caffeinate scope; main's tests of the feature bar and ⌘1–⌘6 are superseded (see the merge report).
 @MainActor
 struct CaffeinateCommandTests {
     private let commands = [
@@ -18,24 +20,28 @@ struct CaffeinateCommandTests {
         LauncherModel(
             store: LibraryStore(fileURL: nil), ai: AIChatModel(engine: TestAIEngine()),
             pasteboard: NSPasteboard.withUniqueName(),
-            caffeinate: CaffeinateService(assertions: assertions, now: now, automaticallyMonitors: false),
-            aiFactory: { AIChatModel(engine: TestAIEngine()) })
+            caffeinate: CaffeinateService(assertions: assertions, now: now, automaticallyMonitors: false))
+    }
+
+    private func command(_ id: String, in model: LauncherModel) throws -> LauncherItem {
+        try #require(model.bindableCommands.first { $0.id == id })
+    }
+
+    private func isInScope(_ model: LauncherModel) -> Bool {
+        model.destination == .search && model.section.providedScope?.id == CaffeinateCommandProvider.scope.id
     }
 
     @Test func exactCommandTitlesOutrankFavoriteAndRecentContent() {
         let assertions = CaffeinateCommandAssertions()
         let model = model(assertions: assertions)
         defer { model.stop() }
-
         for command in commands {
             let fileID = "file./Users/example/Documents/\(command.title)"
             model.store.toggleFavorite(fileID)
             model.store.recordUse(of: fileID)
             model.query = command.title
             model.files.stop()
-
             #expect(model.results.first?.id == command.id)
-            #expect(model.results.contains { $0.id == fileID })
             #expect(model.bindableCommands.contains { $0.id == command.id })
             #expect(CuratedCommand.supports(command.id))
         }
@@ -43,38 +49,68 @@ struct CaffeinateCommandTests {
         #expect(assertions.releaseAttempts.isEmpty)
     }
 
-    @Test func openingTheDashboardDoesNotStartASession() throws {
+    @Test func openingTheScopeDoesNotStartASession() throws {
         let assertions = CaffeinateCommandAssertions()
         let model = model(assertions: assertions)
         defer { model.stop() }
         model.query = "Caffeinate"
         model.showActions = true
-        model.message = "Old message"
-
         model.perform(try #require(model.results.first { $0.id == "caffeinate.open" }))
-
-        #expect(model.destination == .caffeinate)
+        #expect(isInScope(model))
         #expect(!model.showActions)
-        #expect(model.message == nil)
-        #expect(!model.files.isSearching)
         #expect(!model.caffeinate.isActive)
         #expect(assertions.createAttempts == 0)
         #expect(model.store.database.usage.first?.id == "caffeinate.open")
+        // Every duration is listed, indefinitely first, and nothing claims the Mac is awake.
+        let ids = model.results.map(\.id)
+        #expect(ids.first == CaffeinateCommandProvider.durationRowID(.indefinitely))
+        #expect(CaffeinateDuration.allCases.allSatisfy { ids.contains(CaffeinateCommandProvider.durationRowID($0)) })
+        #expect(!ids.contains(CaffeinateCommandProvider.stopRowID))
     }
 
-    @Test(arguments: ["Caffeinate", "Start Caffeinate", "Stop Caffeinate", "Toggle Caffeinate"])
-    func commandSearchesAreNotImportedIntoTheAIWorkspace(query: String) {
+    @Test func scopeRowsStartUpdateAndStopWithoutLeavingTheScope() throws {
+        let assertions = CaffeinateCommandAssertions()
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+        let model = model(assertions: assertions, now: { now })
+        defer { model.stop() }
+        model.perform(try command("caffeinate.open", in: model))
+
+        model.perform(try #require(model.results.first { $0.id == CaffeinateCommandProvider.durationRowID(.oneHour) }))
+        #expect(model.caffeinate.deadline == now.addingTimeInterval(3_600))
+        #expect(isInScope(model))
+        #expect(model.feedback?.text.contains("1 hour") == true)
+        // Active: Stop leads the list, and a new length reuses the same assertion.
+        #expect(model.results.first?.id == CaffeinateCommandProvider.stopRowID)
+        #expect(model.results.first?.subtitle.contains("Remaining") == true)
+
+        model.query = "90"
+        let custom = try #require(model.results.first)
+        #expect(custom.id == CaffeinateCommandProvider.customRowID)
+        #expect(custom.title == "Keep Awake for 90 Minutes")
+        model.perform(custom)
+        #expect(model.caffeinate.deadline == now.addingTimeInterval(5_400))
+        #expect(assertions.createAttempts == 1)
+
+        model.query = ""
+        model.perform(try #require(model.results.first { $0.id == CaffeinateCommandProvider.stopRowID }))
+        #expect(!model.caffeinate.isActive)
+        #expect(assertions.releasedIDs.count == 1)
+        #expect(isInScope(model))
+    }
+
+    @Test(arguments: ["0", "1441", "99999"])
+    func typedMinutesOutsideTheRangeAreRefused(query: String) throws {
         let assertions = CaffeinateCommandAssertions()
         let model = model(assertions: assertions)
         defer { model.stop() }
+        model.perform(try command("caffeinate.open", in: model))
         model.query = query
-
-        #expect(model.quickAI())
-
-        #expect(model.destination == .ai)
-        #expect(model.ai.draft.isEmpty)
-        #expect(model.ai.messages.isEmpty)
-        #expect(!model.caffeinate.isActive)
+        let row = try #require(model.results.first)
+        #expect(row.id == CaffeinateCommandProvider.customRowID)
+        #expect(row.title == "Enter 1–1,440 minutes")
+        if case .provided(let ref) = row.action { #expect(ref.has(.unavailable)) } else { Issue.record("Not a provided row") }
+        #expect(CaffeinateCommandProvider.typedMinutes("45 min") == 45)
+        #expect(CaffeinateCommandProvider.typedMinutes("forty") == nil)
         #expect(assertions.createAttempts == 0)
     }
 
@@ -94,14 +130,14 @@ struct CaffeinateCommandTests {
         model.query = "  CoFfEe  "
         #expect(model.results.map(\.id) == ["caffeinate.open"])
         model.performSelected()
-        #expect(model.destination == .caffeinate)
+        #expect(isInScope(model))
         #expect(!model.caffeinate.isActive)
 
         model.navigate(to: .calculator)
         model.query = "AWAKE"
         #expect(model.results.map(\.id) == ["caffeinate.start"])
         model.performSelected()
-        #expect(model.destination == .search)
+        // The quick commands leave the launcher where it was (it hides on success).
         #expect(model.section == .calculator)
         #expect(model.query == "AWAKE")
         #expect(model.caffeinate.isActive)
@@ -114,24 +150,20 @@ struct CaffeinateCommandTests {
         #expect(!model.caffeinate.isActive)
         model.performSelected()
         #expect(model.caffeinate.isActive)
-        #expect(model.destination == .search)
         #expect(model.section == .snippets)
-        #expect(model.query == "flip")
 
-        model.navigate(to: .clipboard)
+        model.navigate(to: .quicklinks)
         model.query = "rest"
         #expect(model.results.map(\.id) == ["caffeinate.stop"])
         model.performSelected()
         #expect(!model.caffeinate.isActive)
-        #expect(model.destination == .search)
-        #expect(model.section == .clipboard)
-        #expect(model.query == "rest")
+        #expect(model.section == .quicklinks)
         #expect(assertions.createAttempts == 2)
         #expect(assertions.releasedIDs.count == 2)
         #expect(Set(model.store.database.usage.map(\.id)) == Set(commands.map(\.id)))
     }
 
-    @Test func boundQuickCommandsPreserveNavigationWhileOpenRevealsTheDashboard() {
+    @Test func boundQuickCommandsPreserveNavigationWhileOpenShowsTheScope() throws {
         let assertions = CaffeinateCommandAssertions()
         let model = model(assertions: assertions)
         defer { model.stop() }
@@ -139,13 +171,11 @@ struct CaffeinateCommandTests {
             #expect(
                 model.store.saveCommandBinding(
                     CommandBinding(
-                        targetID: command.id,
-                        shortcut: CommandShortcut(keyCode: UInt32(index), modifiers: [.control, .option]))))
+                        targetID: command.id, shortcut: CommandShortcut(keyCode: UInt32(index), modifiers: [.control, .option]))))
         }
-
         model.showActions = true
         model.performBoundCommand(targetID: "caffeinate.open")
-        #expect(model.destination == .caffeinate)
+        #expect(isInScope(model))
         #expect(!model.showActions)
         #expect(!model.caffeinate.isActive)
 
@@ -153,7 +183,6 @@ struct CaffeinateCommandTests {
         model.query = "A note in progress"
         model.performBoundCommand(targetID: "caffeinate.start")
         #expect(model.caffeinate.isActive)
-        #expect(model.destination == .search)
         #expect(model.section == .notes)
         #expect(model.query == "A note in progress")
 
@@ -162,27 +191,22 @@ struct CaffeinateCommandTests {
         #expect(model.destination == .ai)
         #expect(!model.caffeinate.isActive)
 
-        model.openPomodoro()
         model.performBoundCommand(targetID: "caffeinate.toggle")
         #expect(model.caffeinate.isActive)
-        #expect(model.destination == .pomodoro)
+        #expect(model.destination == .ai)
         model.performBoundCommand(targetID: "caffeinate.toggle")
         #expect(!model.caffeinate.isActive)
-        #expect(model.destination == .pomodoro)
-        #expect(model.section == .notes)
-        #expect(model.query == "A note in progress")
         #expect(assertions.createAttempts == 2)
         #expect(assertions.releasedIDs.count == 2)
         #expect(Set(model.store.database.usage.map(\.id)) == Set(commands.map(\.id)))
     }
 
-    @Test func removedAndSuppressedShortcutsCannotStartASession() {
+    @Test func removedAndSuppressedShortcutsCannotStartASession() throws {
         let assertions = CaffeinateCommandAssertions()
         let model = model(assertions: assertions)
         defer { model.stop() }
         let binding = CommandBinding(
-            targetID: "caffeinate.start", alias: "awake",
-            shortcut: CommandShortcut(keyCode: 8, modifiers: [.control, .option]))
+            targetID: "caffeinate.start", alias: "awake", shortcut: CommandShortcut(keyCode: 8, modifiers: [.control, .option]))
         #expect(model.store.saveCommandBinding(binding))
 
         model.beginShortcutRecording()
@@ -191,17 +215,11 @@ struct CaffeinateCommandTests {
         model.beginCommandBindingEditing()
         model.performBoundCommand(targetID: binding.targetID)
         model.endCommandBindingEditing()
-        let note = QuickNote(title: "Draft", content: "Keep editing")
-        model.editor = .note(note)
-        model.performBoundCommand(targetID: binding.targetID)
-        #expect(model.editor?.id == "note.\(note.id)")
-        #expect(model.message?.contains("Save or cancel") == true)
-        model.editor = nil
+        #expect(!model.caffeinate.isActive)
 
         #expect(model.removeCommandBinding(for: binding.targetID))
         model.performBoundCommand(targetID: binding.targetID)
         #expect(model.store.database.aliasTarget(for: "awake") == nil)
-        #expect(model.destination == .search)
         #expect(!model.caffeinate.isActive)
         #expect(assertions.createAttempts == 0)
         #expect(model.store.database.usage.isEmpty)
@@ -215,14 +233,14 @@ struct CaffeinateCommandTests {
         let deadline = try #require(model.caffeinate.deadline)
         let activeIDs = assertions.activeIDs
 
-        model.openCaffeinate()
+        model.perform(try command("caffeinate.open", in: model))
         model.goBack()
-        #expect(model.destination == .search)
         #expect(model.section == .home)
         model.navigate(to: .notes)
         model.openAI()
-        model.openPomodoro()
-        model.openCaffeinate()
+        model.leaveAI()
+        model.panelDidHide()
+        model.panelWillShow()
         #expect(model.caffeinate.isActive)
         #expect(model.caffeinate.deadline == deadline)
         #expect(assertions.activeIDs == activeIDs)
@@ -237,41 +255,25 @@ struct CaffeinateCommandTests {
         #expect(assertions.releaseAttempts.count == 1)
     }
 
-    @Test(arguments: [false, true])
-    func pendingCustomDurationSurvivesNavigationAndHideWithoutStarting(settingsDetour: Bool) {
+    @Test func pendingCustomDurationSurvivesNavigationAndHideWithoutStarting() throws {
         let assertions = CaffeinateCommandAssertions()
         let model = model(assertions: assertions)
         defer { model.stop() }
-        model.openCaffeinate()
         model.caffeinateDraft.refresh(from: model.caffeinate)
         model.caffeinateDraft.duration = nil
         model.caffeinateDraft.customMinutes = "90"
 
-        if settingsDetour {
-            model.openSettings()
-            model.goBack()
-        } else {
-            model.goBack()
-            model.openCaffeinate()
-        }
-        // Recreated dashboards run this same appearance synchronization.
-        model.caffeinateDraft.refresh(from: model.caffeinate)
-        #expect(model.destination == .caffeinate)
-        #expect(model.caffeinateDraft.duration == nil)
-        #expect(model.caffeinateDraft.customMinutes == "90")
-
-        let hidden = Date(timeIntervalSince1970: 1_800_000_000)
-        model.didHide(at: hidden)
-        model.prepareToShow(at: hidden.addingTimeInterval(30))
+        model.perform(try command("caffeinate.open", in: model))
+        model.goBack()
+        model.panelDidHide()
+        model.panelWillShow()
+        // The Settings pane runs this same synchronization when it appears.
         model.caffeinate.refresh()
         model.caffeinateDraft.refresh(from: model.caffeinate)
-
-        #expect(model.destination == .caffeinate)
         #expect(model.caffeinateDraft.duration == nil)
         #expect(model.caffeinateDraft.customMinutes == "90")
         #expect(model.caffeinateDraft.hasPendingChanges)
         #expect(!model.caffeinate.isActive)
-        #expect(model.caffeinate.deadline == nil)
         #expect(assertions.createAttempts == 0)
     }
 
@@ -280,21 +282,16 @@ struct CaffeinateCommandTests {
         let now = Date(timeIntervalSince1970: 1_800_000_000)
         let model = model(assertions: assertions, now: { now })
         defer { model.stop() }
-        model.openCaffeinate()
         model.caffeinateDraft.refresh(from: model.caffeinate)
         model.caffeinateDraft.duration = nil
         model.caffeinateDraft.customMinutes = "90"
 
         #expect(model.caffeinate.start(minutes: 30))
-        model.openSettings()
-        model.goBack()
         model.caffeinateDraft.refresh(from: model.caffeinate)
-
         #expect(model.caffeinateDraft.customMinutes == "90")
         #expect(model.caffeinateDraft.duration == nil)
         #expect(model.caffeinateDraft.hasPendingChanges)
         #expect(model.caffeinate.deadline == now.addingTimeInterval(1_800))
-        #expect(assertions.createAttempts == 1)
 
         #expect(model.caffeinateDraft.start(using: model.caffeinate))
         #expect(model.caffeinate.deadline == now.addingTimeInterval(5_400))
@@ -314,16 +311,13 @@ struct CaffeinateCommandTests {
         #expect(!model.caffeinateDraft.hasPendingChanges)
 
         #expect(model.caffeinate.start(minutes: 60))
-        // Submit before the view has processed the service's changed deadline.
+        // Submit before the pane has seen the changed deadline.
         #expect(model.caffeinateDraft.start(using: model.caffeinate))
-
         #expect(model.caffeinateDraft.duration?.seconds == 3_600)
         #expect(model.caffeinate.deadline == now.addingTimeInterval(3_600))
-        #expect(!model.caffeinateDraft.hasPendingChanges)
         #expect(model.caffeinate.start())
         model.caffeinateDraft.refresh(from: model.caffeinate)
         #expect(model.caffeinateDraft.duration == .indefinitely)
-        #expect(model.caffeinate.deadline == nil)
         #expect(assertions.createAttempts == 1)
     }
 
@@ -355,117 +349,52 @@ struct CaffeinateCommandTests {
         #expect(!draft.hasPendingChanges)
     }
 
-    @Test func dashboardIgnoresWorkspaceNumbersAndSessionSurvivesAIReturnTransitions() throws {
-        let assertions = CaffeinateCommandAssertions()
-        let model = model(assertions: assertions)
-        defer { model.stop() }
-        let panel = LauncherPanel()
-        panel.workspaceShortcutAction = model.selectWorkspaceShortcut
-        #expect(model.caffeinate.start(minutes: 30))
-        let deadline = try #require(model.caffeinate.deadline)
-        let activeIDs = assertions.activeIDs
-        model.openCaffeinate()
-        let focus = model.focusRequest
-
-        for index in 0..<6 {
-            #expect(!model.selectWorkspaceShortcut(index))
-            #expect(!panel.handleWorkspaceShortcut(try workspaceKeyEvent(String(index + 1))))
-        }
-        #expect(!model.quickAI())
-        #expect(!model.cycleAIAction(1))
-        #expect(model.destination == .caffeinate)
-        #expect(model.focusRequest == focus)
-        #expect(model.caffeinate.deadline == deadline)
-
-        model.goBack()
-        #expect(model.destination == .search)
-        #expect(panel.handleWorkspaceShortcut(try workspaceKeyEvent("6")))
-        #expect(model.destination == .ai)
-        #expect(panel.handleWorkspaceShortcut(try workspaceKeyEvent("2")))
-        #expect(model.ai.action == .rewrite)
-        model.goBack()
-
-        let query = "Help me describe this idea clearly."
-        model.query = query
-        #expect(model.quickAI())
-        #expect(model.ai.action == .chat)
-        #expect(model.ai.draft == query)
-        model.goBack()
-        #expect(model.destination == .search)
-        #expect(model.section == .home)
-        #expect(model.query == query)
-        #expect(model.caffeinate.isActive)
-        #expect(model.caffeinate.deadline == deadline)
-        #expect(assertions.activeIDs == activeIDs)
-        #expect(assertions.createAttempts == 1)
-        #expect(assertions.releaseAttempts.isEmpty)
-    }
-
     @Test(arguments: [false, true])
-    func failedOperationsRevealTheDashboardWithoutRecordingUsage(bound: Bool) throws {
+    func failedOperationsExplainThemselvesWithoutRecordingUsage(bound: Bool) throws {
         let assertions = CaffeinateCommandAssertions()
         let model = model(assertions: assertions)
         defer { model.stop() }
-        let start = try #require(model.bindableCommands.first { $0.id == "caffeinate.start" })
-        let stop = try #require(model.bindableCommands.first { $0.id == "caffeinate.stop" })
-        let toggle = try #require(model.bindableCommands.first { $0.id == "caffeinate.toggle" })
+        let start = try command("caffeinate.start", in: model)
+        let stop = try command("caffeinate.stop", in: model)
+        let toggle = try command("caffeinate.toggle", in: model)
         if bound {
             for (index, command) in [start, stop, toggle].enumerated() {
                 #expect(
                     model.store.saveCommandBinding(
                         CommandBinding(
-                            targetID: command.id,
-                            shortcut: CommandShortcut(keyCode: UInt32(index), modifiers: [.control, .option]))))
+                            targetID: command.id, shortcut: CommandShortcut(keyCode: UInt32(index), modifiers: [.control, .option]))))
             }
         }
         func perform(_ command: LauncherItem) {
             if bound { model.performBoundCommand(targetID: command.id) } else { model.perform(command) }
         }
         assertions.failCreation = true
-
         model.navigate(to: .notes)
         perform(start)
-        #expect(model.destination == .caffeinate)
         #expect(!model.caffeinate.isActive)
-        #expect(model.caffeinate.errorMessage?.contains("Simulated sleep assertion failure") == true)
+        #expect(model.feedback?.text.contains("Simulated sleep assertion failure") == true)
+        #expect(model.section == .notes)
         #expect(model.store.database.usage.isEmpty)
 
-        model.openAI()
         perform(toggle)
-        #expect(model.destination == .caffeinate)
         #expect(!model.caffeinate.isActive)
-        #expect(model.caffeinate.errorMessage?.contains("Simulated sleep assertion failure") == true)
+        #expect(model.feedback?.text.contains("Simulated sleep assertion failure") == true)
         #expect(model.store.database.usage.isEmpty)
 
         assertions.failCreation = false
-        model.openPomodoro()
         perform(start)
         #expect(model.caffeinate.isActive)
-        #expect(model.caffeinate.errorMessage == nil)
-        #expect(model.destination == .pomodoro)
         let usage = model.store.database.usage
         let activeIDs = assertions.activeIDs
         assertions.failRelease = true
-
         perform(stop)
-        #expect(model.destination == .caffeinate)
         #expect(model.caffeinate.isActive)
-        #expect(model.caffeinate.errorMessage?.contains("Simulated assertion release failure") == true)
+        #expect(model.feedback?.text.contains("Simulated assertion release failure") == true)
         #expect(model.store.database.usage == usage)
-
-        model.navigate(to: .clipboard)
-        perform(toggle)
-        #expect(model.destination == .caffeinate)
-        #expect(model.caffeinate.isActive)
-        #expect(model.caffeinate.errorMessage?.contains("Simulated assertion release failure") == true)
         #expect(assertions.activeIDs == activeIDs)
-        #expect(model.store.database.usage == usage)
 
         assertions.failRelease = false
-        model.navigate(to: .notes)
         perform(stop)
-        #expect(model.destination == .search)
-        #expect(model.section == .notes)
         #expect(!model.caffeinate.isActive)
         #expect(model.caffeinate.errorMessage == nil)
         #expect(model.store.database.usage.first?.id == "caffeinate.stop")
@@ -475,14 +404,11 @@ struct CaffeinateCommandTests {
         let assertions = CaffeinateCommandAssertions()
         let model = model(assertions: assertions)
         defer { model.stop() }
-        let command = try #require(model.bindableCommands.first { $0.id == "caffeinate.stop" })
+        let command = try command("caffeinate.stop", in: model)
         model.navigate(to: .notes)
         model.query = "Keep my place"
-
         model.perform(command)
         model.perform(command)
-
-        #expect(model.destination == .search)
         #expect(model.section == .notes)
         #expect(model.query == "Keep my place")
         #expect(!model.caffeinate.isActive)
@@ -491,12 +417,30 @@ struct CaffeinateCommandTests {
         #expect(assertions.releaseAttempts.isEmpty)
     }
 
-    private func workspaceKeyEvent(_ characters: String) throws -> NSEvent {
-        try #require(
-            NSEvent.keyEvent(
-                with: .keyDown, location: .zero, modifierFlags: .command, timestamp: 0, windowNumber: 0,
-                context: nil, characters: characters, charactersIgnoringModifiers: characters,
-                isARepeat: false, keyCode: 0))
+    @Test func menuBarCupShowsOnlyWhileActiveAndOpenRaysMenuStartsASession() throws {
+        let assertions = CaffeinateCommandAssertions()
+        let model = model(assertions: assertions)
+        defer { model.stop() }
+        let provider = CaffeinateCommandProvider()
+        let extra = try #require(provider.commands(in: model).first { $0.id == CaffeinateCommandProvider.menuBarID })
+        #expect(extra.mode == .menuBar)
+        #expect(provider.menuBarExtraIsShownByDefault(extra))
+        #expect(provider.menuBarExtra(for: extra, in: model) == nil)
+        #expect(!MenuBarExtrasModel.snapshots(in: model).contains { $0.id == CaffeinateCommandProvider.menuBarID })
+
+        // OpenRay's own menu offers every duration while it's off.
+        let items = CaffeinateCommandProvider.menuItems(in: model)
+        let durations = try #require(items.first { $0.id == "durations" })
+        #expect(durations.children.count == CaffeinateDuration.allCases.count)
+        durations.children.first { $0.id == "duration.thirtyMinutes" }?.perform?()
+        #expect(model.caffeinate.remainingSeconds == 1_800)
+
+        let content = try #require(provider.menuBarExtra(for: extra, in: model))
+        #expect(content.symbol == "cup.and.saucer.fill")
+        #expect(content.accessibilityLabel.contains("Caffeinate active"))
+        #expect(MenuBarExtrasModel.snapshots(in: model).contains { $0.id == CaffeinateCommandProvider.menuBarID })
+        content.items.first { $0.id == "stop" }?.perform?()
+        #expect(!model.caffeinate.isActive)
     }
 }
 

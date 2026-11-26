@@ -36,10 +36,11 @@ jobs:
   macos:
     name: Apple silicon build and tests
     needs: workflow-checks
-    runs-on: macos-26
+    # GitHub's Xcode 27 image runs macOS 27; there is no macos-27 label yet.
+    runs-on: xcode-27
     timeout-minutes: 25
     env:
-      DEVELOPER_DIR: /Applications/Xcode_26.6.app/Contents/Developer
+      DEVELOPER_DIR: /Applications/Xcode_27.0.app/Contents/Developer
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -47,7 +48,11 @@ jobs:
       - name: Verify toolchain and architecture
         run: |
           test "$(uname -m)" = arm64
-          xcodebuild -version
+          sw_vers
+          test "$(sw_vers -productVersion | cut -d. -f1)" -ge 27
+          openray_xcode=$(xcodebuild -version)
+          printf '%s\n' "$openray_xcode"
+          [[ "$openray_xcode" == "Xcode 27."* ]]
           zsh -n scripts/package-release.sh scripts/verify.sh
       - name: Run deterministic tests
         run: ./scripts/verify.sh
@@ -72,6 +77,6 @@ jobs:
           name: OpenRay-checks-${{ github.run_id }}-${{ github.run_attempt }}
           path: |
             .build/verification/Logs/Test/*.xcresult
-            ${{ runner.temp }}/openray-preview/archive.log
+            ${{ runner.temp }}/openray-preview/*.log
           include-hidden-files: true
           retention-days: 14

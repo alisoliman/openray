@@ -44,6 +44,14 @@ struct LauncherTests {
         #expect(model.selectedID == model.orderedResults.last?.id)
         model.moveSelection(1)
         #expect(model.selectedID == first)
+        // Searches with no matches still offer the fallbacks, last.
+        model.query = "zzzzzzzzzzzzzzzz"
+        model.files.stop()
+        model.synchronizeSelection()
+        #expect(model.results.isEmpty)
+        #expect(model.orderedResults.map(\.id) == ["fallback.ai", "fallback.web"])
+        // Scopes have no fallbacks, so an empty list is simply empty.
+        model.navigate(to: .snippets)
         model.query = "zzzzzzzzzzzzzzzz"
         model.synchronizeSelection()
         model.moveSelection(1)
@@ -52,16 +60,43 @@ struct LauncherTests {
         model.files.stop()
     }
 
-    @Test func committingUnchangedQueryKeepsKeyboardSelection() {
+    @Test func favoritesStripMovesHorizontallyAndCommittingUnchangedQueryKeepsSelection() {
         let model = makeModel()
         model.synchronizeSelection()
-        model.moveSelection(1)
+        #expect(model.arrowsMoveSelection)
+        #expect(model.moveSelectionHorizontally(1))
         let selected = model.selectedID
+        #expect(selected == "section.clipboard")
         let committedText = model.query
         model.query = committedText
         #expect(model.selectedID == selected)
         model.performSelected()
         #expect(model.section == .clipboard)
+    }
+
+    @Test func downInAGridLandsOnThePartialLastRow() {
+        let model = makeModel()
+        for id in ["section.windows", "section.calculator", "section.quicklinks", "section.applications", "settings"] {
+            model.store.toggleFavorite(id)
+        }
+        let favorites = model.orderedResults
+        #expect(favorites.count == 10)
+        model.selectedID = favorites[3].id
+        model.moveSelection(1)
+        #expect(model.selectedID == favorites[9].id)
+        // From the partial row itself, ↓ leaves the grid.
+        model.moveSelection(1)
+        #expect(model.selectedID != favorites[9].id)
+
+        // “h” matches six layouts: the four halves and the two right quarters.
+        model.navigate(to: .windows)
+        model.query = "h"
+        let layouts = model.orderedResults
+        #expect(layouts.count == 6)
+        model.selectedID = layouts[3].id
+        model.moveSelection(1)
+        #expect(model.selectedID == layouts[5].id)
+        model.files.stop()
     }
 
     @Test func editingAndDeletionStayInLocalLibrary() {
@@ -71,7 +106,7 @@ struct LauncherTests {
         model.navigate(to: .snippets)
         let item = model.results.first
         #expect(item?.title == "Test")
-        model.editSelected()
+        if let item { model.edit(item) }
         #expect(model.editor?.id == "snippet.\(snippet.id)")
         if let item { model.delete(item) }
         #expect(model.store.database.snippets.isEmpty)
@@ -86,7 +121,11 @@ struct LauncherTests {
         let clipboardID = "clipboard.\(model.store.database.clipboard[0].id)"
         model.store.toggleFavorite(clipboardID)
         model.store.toggleFavorite("file./Users/example/Documents/note.txt")
+        // Root search finds both. (A blank Home shows favorites and recents, not these rows,
+        // and its unranked list is capped, so registered commands can fill it.)
+        model.query = "Pinned text"
         #expect(model.results.contains { $0.id == clipboardID })
+        model.query = "note.txt"
         #expect(model.results.contains { $0.id == "file./Users/example/Documents/note.txt" })
         #expect(Set(model.results.map(\.id)).count == model.results.count)
         model.query = "zzzzzzzzzzzzzzzzz"

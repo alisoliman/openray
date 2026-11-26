@@ -13,6 +13,13 @@ struct SearchAndLinksTests {
         #expect(SearchMatcher.score("unrelated", in: "Notes") == nil)
     }
 
+    @Test func fuzzyMatchesStartAtAWordAndIgnoreScatteredLetters() {
+        #expect(SearchMatcher.score("notes", in: "Epson Connect Printer Setup") == nil)
+        #expect(SearchMatcher.score("nts", in: "Notes") != nil)
+        #expect(SearchMatcher.score("wmg", in: "Window Management") != nil)
+        #expect(SearchMatcher.score("ndow", in: "Window Management") != nil)
+    }
+
     @Test func supportsCaseAccentsAndMultipleTerms() {
         #expect(SearchMatcher.score("cafe", in: "Café") == 1_000)
         #expect(SearchMatcher.score("WIN MAN", in: "Window Management") != nil)
@@ -38,14 +45,17 @@ struct SearchAndLinksTests {
         #expect(try web.resolvedURL().absoluteString == web.template)
     }
 
-    @Test(arguments: [
-        "javascript:alert(1)", "data:text/html,unsafe", "https://", "not a URL", "ftp://example.com",
-        "https://example.com/{unknown}", "/tmp/{query}",
-    ])
+    @Test(arguments: ["javascript:alert(1)", "data:text/html,unsafe", "https://", "not a URL", "https://example.com/{date x}"])
     func rejectsUnsupportedQuicklinks(_ template: String) {
         #expect(throws: LibraryValidationError.self) {
             try Quicklink(name: "Test", template: template, keyword: "").validate()
         }
+    }
+
+    /// Any URL scheme, Raycast-style `{Name}` arguments and placeholders in paths are links now.
+    @Test(arguments: ["ftp://example.com", "https://example.com/{unknown}", "/tmp/{query}"])
+    func acceptsAnySchemeAndNamedArguments(_ template: String) throws {
+        try Quicklink(name: "Test", template: template, keyword: "").validate()
     }
 
     @Test func queryRequiredOnlyForTemplates() {

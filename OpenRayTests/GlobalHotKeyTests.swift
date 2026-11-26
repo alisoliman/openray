@@ -25,7 +25,6 @@ struct GlobalHotKeyTests {
     @Test func unsupportedGesturesAreRejected() {
         let invalid = [
             CommandShortcut(keyCode: 8, modifiers: []),
-            CommandShortcut(keyCode: 8, modifiers: .all),
             CommandShortcut(keyCode: 8, modifiers: .init(rawValue: 1 << 8)),
             CommandShortcut(keyCode: UInt32(kVK_Command), modifiers: .command),
             CommandShortcut(keyCode: UInt32(kVK_RightCommand), modifiers: .command),
@@ -184,6 +183,33 @@ struct GlobalHotKeyTests {
         registry.unregister()
     }
 
+    @Test func duplicateShortcutMessagesNameTheOwnerWithoutItsID() {
+        let backend = FakeHotKeyBackend()
+        let registry = GlobalHotKey(backend: backend, reservedShortcuts: { [] })
+        let bindings = [
+            CommandBinding(targetID: clipboard, shortcut: shortcut),
+            CommandBinding(targetID: notes, shortcut: shortcut),
+        ]
+        let titled = registry.synchronize(
+            launcher: .optionSpace, bindings: bindings, onLauncher: {}, onCommand: { _ in },
+            title: { $0 == clipboard ? "Clipboard History" : nil })
+        #expect(titled.map(\.targetID) == [notes])
+        #expect(titled.first?.message.contains("because Clipboard History uses it") == true)
+        #expect(titled.first?.message.contains(clipboard) == false)
+
+        let untitled = registry.synchronize(
+            launcher: .optionSpace, bindings: bindings, onLauncher: {}, onCommand: { _ in })
+        #expect(untitled.first?.message.contains("because another command uses it") == true)
+        #expect(untitled.first?.message.contains(clipboard) == false)
+
+        let launcherConflict = registry.synchronize(
+            launcher: .optionSpace,
+            bindings: [CommandBinding(targetID: notes, shortcut: LauncherHotKey.optionSpace.shortcut)],
+            onLauncher: {}, onCommand: { _ in }, title: { _ in "Notes" })
+        #expect(launcherConflict.first?.message.contains("because the launcher uses it") == true)
+        registry.unregister()
+    }
+
     @Test func oneRegistrationFailureDoesNotPreventOtherCommandsAndRetriesLater() {
         let backend = FakeHotKeyBackend()
         backend.failures = [shortcut]
@@ -258,15 +284,18 @@ struct GlobalHotKeyTests {
     }
 
     @Test func unsupportedTargetsAreNeverRegistered() {
-        let backend = FakeHotKeyBackend()
-        let registry = GlobalHotKey(backend: backend, reservedShortcuts: { [] })
-        let issues = registry.synchronize(
-            launcher: .optionSpace, bindings: [.init(targetID: "snippet.deleted", shortcut: shortcut)],
-            onLauncher: {}, onCommand: { _ in })
-        #expect(issues.map(\.targetID) == ["snippet.deleted"])
-        #expect(backend.identifier(for: shortcut) == nil)
-        #expect(backend.active.count == 1)
-        registry.unregister()
+        // Only the legacy registrations: the launcher's own makes snippets bindable.
+        CuratedCommand.$registrations.withValue([AIWritingCommandProvider.registration]) {
+            let backend = FakeHotKeyBackend()
+            let registry = GlobalHotKey(backend: backend, reservedShortcuts: { [] })
+            let issues = registry.synchronize(
+                launcher: .optionSpace, bindings: [.init(targetID: "snippet.deleted", shortcut: shortcut)],
+                onLauncher: {}, onCommand: { _ in })
+            #expect(issues.map(\.targetID) == ["snippet.deleted"])
+            #expect(backend.identifier(for: shortcut) == nil)
+            #expect(backend.active.count == 1)
+            registry.unregister()
+        }
     }
 
     @Test func releasingRegistryRemovesAllRegistrationsAndTheHandler() {

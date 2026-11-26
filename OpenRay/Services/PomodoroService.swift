@@ -31,13 +31,20 @@ final class PomodoroService {
 
     init(
         store: LibraryStore, now: @escaping () -> Date = { .now },
-        playCompletionSound: @escaping () -> Void = { NSSound(named: "Glass")?.play() }
+        playCompletionSound: @escaping () -> Void = PomodoroService.playSystemSound
     ) {
         self.store = store
         self.now = now
         self.playCompletionSound = playCompletionSound
         currentDate = now()
         refresh(at: currentDate)
+    }
+
+    /// The phase-change chime. Sound is a side effect on the Mac, so tests and isolated
+    /// verification stay silent.
+    nonisolated static func playSystemSound() {
+        guard (try? SideEffectGuard.check("playing sounds")) != nil else { return }
+        NSSound(named: "Glass")?.play()
     }
 
     func startMonitoring() {

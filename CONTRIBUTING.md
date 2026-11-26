@@ -23,7 +23,7 @@ For a feature, describe the task you want to accomplish, your current workaround
 
 ## Set up a development build
 
-Use an Apple silicon Mac running macOS 26 or later and Xcode with the macOS 26 SDK or later. The project is tested with Xcode 26.6 / Swift 6.3.3. Apple Intelligence is needed only for live AI features and the optional model integration test.
+Use an Apple silicon Mac running macOS 27 or later and Xcode with the macOS 27 SDK or later. The project is tested with Xcode 27.0 / Swift 6.4 on macOS 27. Apple Intelligence is needed only for live AI features and the optional model integration test.
 
 1. Fork [alisoliman/openray](https://github.com/alisoliman/openray) on GitHub and clone your fork.
 2. Create a descriptive branch from the current upstream `main`.

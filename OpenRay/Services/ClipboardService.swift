@@ -22,6 +22,33 @@ enum ClipboardPolicy {
     }
 }
 
+extension ClipboardPolicy {
+    /// What `{clipboard}` may insert: the board's plain text, read within one
+    /// pasteboard generation, unless macOS denies access, Secure Input is on, or the
+    /// copy is marked concealed, transient or auto-generated. OpenRay's own copies are fine.
+    @MainActor static func placeholderText(
+        from pasteboard: NSPasteboard, secureInput: Bool = IsSecureEventInputEnabled(), expectedGeneration: Int? = nil
+    ) -> String? {
+        guard !secureInput, pasteboard.accessBehavior != .alwaysDeny else { return nil }
+        let generation = pasteboard.changeCount
+        // The generation the caller already judged, e.g. for its source app, or nothing.
+        if let expectedGeneration, generation != expectedGeneration { return nil }
+        let types = Set((pasteboard.types ?? []).map(\.rawValue))
+        guard ignoredTypes.subtracting(["com.openray.generated"]).isDisjoint(with: types),
+            types.contains(NSPasteboard.PasteboardType.string.rawValue),
+            let data = pasteboard.data(forType: .string), data.count <= ClipboardLimits.textBytes,
+            pasteboard.changeCount == generation
+        else { return nil }
+        return String(data: data, encoding: .utf8)
+    }
+}
+
+extension SideEffectGuard {
+    /// The policy an adapter enforces. An injected policy can only add restrictions:
+    /// when this process is inert, its own policy wins over an injected live one.
+    var restrictedByProcess: SideEffectGuard { effective }
+}
+
 struct ClipboardCaptureContext: Sendable {
     var sourceName: String
     var sourceBundleID: String?
@@ -40,8 +67,21 @@ struct ClipboardCaptureContext: Sendable {
 @Observable
 final class ClipboardService {
     private(set) var accessMessage: String?
+    /// The last capture failure. Copy failures go to `lastCopyError` instead.
     private(set) var contentMessage: String?
+    /// Why the last copy didn't reach the clipboard. Cleared when the next copy starts.
+    private(set) var lastCopyError: String?
+    /// How macOS treats OpenRay's background reads of the clipboard.
+    private(set) var accessBehavior: NSPasteboard.AccessBehavior
     private(set) var isProcessing = false
+    /// Whether Secure Input is on (a password field, or the lock screen), which keeps the
+    /// clipboard out of placeholders. The test host reads it as off, because its real value
+    /// depends on whether the Mac's screen happens to be locked; tests that cover Secure Input
+    /// set this or pass `secureInput:` to `ClipboardPolicy` directly.
+    @ObservationIgnored
+    var isSecureInputActive: @MainActor () -> Bool = {
+        SideEffectGuard.current.isTestHost ? false : IsSecureEventInputEnabled()
+    }
     var usesGeneralPasteboard: Bool { pasteboard.name == .general }
     var changeCount: Int { pasteboard.changeCount }
     @ObservationIgnored private let store: LibraryStore
@@ -53,6 +93,16 @@ final class ClipboardService {
     @ObservationIgnored private let imageProcessor: any ClipboardImagePreparing
     @ObservationIgnored private let captureContext: @MainActor () -> ClipboardCaptureContext
     @ObservationIgnored private var previousPolicy: CapturePolicy?
+    @ObservationIgnored private let sideEffects: SideEffectGuard
+    @ObservationIgnored private let textRecognizer: (any TextRecognizing)?
+    /// The pasteboard generation last copied from an excluded app, so `{clipboard}`
+    /// never inserts it. Known only while capture runs.
+    @ObservationIgnored private var excludedGeneration: Int?
+    /// The last generation whose source app is known: classified by the capture poll,
+    /// or written by OpenRay itself.
+    @ObservationIgnored private var attributedGeneration: Int?
+    /// Text recognition for the last captured image, while it runs. Tests await it.
+    @ObservationIgnored private(set) var pendingRecognition: Task<Void, Never>?
 
     private struct CapturePolicy: Equatable {
         var enabled: Bool
@@ -64,13 +114,20 @@ final class ClipboardService {
     init(
         store: LibraryStore, pasteboard: NSPasteboard = .general,
         imageProcessor: any ClipboardImagePreparing = ClipboardImageProcessor.shared,
-        captureContext: @escaping @MainActor () -> ClipboardCaptureContext = ClipboardCaptureContext.current
+        captureContext: @escaping @MainActor () -> ClipboardCaptureContext = ClipboardCaptureContext.current,
+        textRecognizer: (any TextRecognizing)? = VisionTextRecognizer(),
+        sideEffects: SideEffectGuard = .current
     ) {
         self.store = store
+        let sideEffects = sideEffects.restrictedByProcess
+        self.sideEffects = sideEffects
+        self.textRecognizer = textRecognizer
+        let pasteboard = Self.pasteboard(for: pasteboard, sideEffects: sideEffects)
         self.pasteboard = pasteboard
         self.imageProcessor = imageProcessor
         self.captureContext = captureContext
         lastChange = pasteboard.changeCount
+        accessBehavior = pasteboard.accessBehavior
     }
 
     func configure() {
@@ -80,7 +137,7 @@ final class ClipboardService {
         let preferences = store.database.preferences
         let policy = CapturePolicy(
             enabled: preferences.clipboardEnabled, images: preferences.capturesClipboardImages,
-            files: preferences.capturesClipboardFiles, excluded: preferences.excludedClipboardBundleIDs)
+            files: preferences.capturesClipboardFiles, excluded: preferences.effectiveClipboardExclusions)
         if previousPolicy != policy {
             captureGeneration += 1
             previousPolicy = policy
@@ -109,7 +166,7 @@ final class ClipboardService {
         }
         guard store.database.preferences.clipboardEnabled, !isProcessing else { return }
         refreshAccessStatus()
-        guard pasteboard.accessBehavior != .alwaysDeny else { return }
+        guard accessBehavior != .alwaysDeny else { return }
         guard pasteboard.changeCount != lastChange else { return }
         lastChange = pasteboard.changeCount
         let change = lastChange
@@ -119,14 +176,19 @@ final class ClipboardService {
         guard
             ClipboardPolicy.shouldCapture(
                 types: [], sourceBundleID: source.sourceBundleID,
-                excluded: store.database.preferences.excludedClipboardBundleIDs,
+                excluded: store.database.preferences.effectiveClipboardExclusions,
                 secureInput: source.secureInput)
-        else { return }
+        else {
+            excludedGeneration = change
+            attributedGeneration = change
+            return
+        }
+        attributedGeneration = change
         let types = Set((pasteboard.types ?? []).map(\.rawValue))
         guard
             ClipboardPolicy.shouldCapture(
                 types: types, sourceBundleID: source.sourceBundleID,
-                excluded: store.database.preferences.excludedClipboardBundleIDs,
+                excluded: store.database.preferences.effectiveClipboardExclusions,
                 secureInput: source.secureInput)
         else { return }
         contentMessage = nil
@@ -152,7 +214,7 @@ final class ClipboardService {
                     throw LibraryValidationError("These file references exceed the supported clipboard limits.")
                 }
                 guard pasteboard.changeCount == change else { return }
-                store.capture(entry)
+                if !store.capture(entry) { contentMessage = store.captureRejection }
             } else if types.contains(NSPasteboard.PasteboardType.png.rawValue)
                 || types.contains(NSPasteboard.PasteboardType.tiff.rawValue)
             {
@@ -166,17 +228,27 @@ final class ClipboardService {
                 guard !Task.isCancelled, generation == captureGeneration, store.database.preferences.clipboardEnabled,
                     store.database.preferences.capturesClipboardImages
                 else { return }
-                store.captureImage(
+                if store.captureImage(
                     prepared, copiedAt: copiedAt, sourceName: source.sourceName, sourceBundleID: source.sourceBundleID)
+                {
+                    recognizeText(in: prepared)
+                } else {
+                    contentMessage = store.captureRejection
+                }
             } else if let data = pasteboard.data(forType: .string) {
                 guard data.count <= ClipboardLimits.textBytes else {
                     throw LibraryValidationError("This copied text exceeds the 128 KB clipboard-entry limit.")
                 }
+                // Formatting is kept next to the text for Paste As, but only from the item
+                // the text came from. Oversized formatting is dropped, not the copy.
+                let richText = Self.richText(matching: data, in: pasteboard.pasteboardItems ?? [])
                 guard let text = String(data: data, encoding: .utf8), pasteboard.changeCount == change else { return }
-                store.capture(
-                    ClipboardEntry(
-                        text: text, copiedAt: copiedAt, sourceName: source.sourceName,
-                        sourceBundleID: source.sourceBundleID))
+                var entry = ClipboardEntry(
+                    text: text, copiedAt: copiedAt, sourceName: source.sourceName,
+                    sourceBundleID: source.sourceBundleID)
+                entry.richText = richText
+                let captured = store.capture(entry)
+                if !captured { contentMessage = store.captureRejection }
             }
         } catch is CancellationError {
             return
@@ -188,21 +260,89 @@ final class ClipboardService {
 
     func readText() -> String? { pasteboard.string(forType: .string) }
 
+    /// Text in an entry's image, recognized now if it wasn't at capture, and saved.
+    func recognizedText(of entry: ClipboardEntry) async -> String? {
+        guard let image = entry.image, let png = store.imageData(for: image) else { return nil }
+        let recognizer = textRecognizer ?? VisionTextRecognizer()
+        guard let text = try? await recognizer.recognizeText(in: png).storableText else { return nil }
+        store.setRecognizedText(text, forImage: image.id)
+        return text
+    }
+
+    /// The payloads of QR codes and barcodes in an entry's image.
+    func barcodePayloads(of entry: ClipboardEntry) async -> [String] {
+        guard let image = entry.image, let png = store.imageData(for: image) else { return [] }
+        let recognizer = textRecognizer ?? VisionTextRecognizer()
+        return (try? await recognizer.barcodePayloads(in: png)) ?? []
+    }
+
+    /// Finds text in a captured image on this Mac, off the main actor, and saves it
+    /// beside the image so the entry is searchable by it. Images already recognized are skipped.
+    private func recognizeText(in prepared: PreparedClipboardImage) {
+        guard let textRecognizer else { return }
+        let imageID = prepared.image.id
+        guard !store.database.clipboard.contains(where: { $0.image?.id == imageID && $0.recognizedText != nil }) else {
+            return
+        }
+        let png = prepared.png
+        pendingRecognition = Task { [weak self] in
+            guard let result = try? await textRecognizer.recognizeText(in: png), !Task.isCancelled,
+                let text = result.storableText
+            else { return }
+            self?.store.setRecognizedText(text, forImage: imageID)
+        }
+    }
+
+    /// The current text for `{clipboard}`, read now and only when asked, with the
+    /// same concealed and transient checks capture uses.
+    /// The current text for `{clipboard}`. A copy known to come from an excluded app is
+    /// never returned. With `unattributedIsExcluded`, as for quicklinks, which send it
+    /// elsewhere, a copy the capture poll hasn't attributed to an app yet isn't either.
+    /// The decision and the read are tied to one pasteboard generation.
+    func placeholderText(unattributedIsExcluded: Bool = false) -> String? {
+        refreshAccessStatus()
+        let generation = pasteboard.changeCount
+        guard generation != excludedGeneration else { return nil }
+        if unattributedIsExcluded, generation != attributedGeneration { return nil }
+        return ClipboardPolicy.placeholderText(
+            from: pasteboard, secureInput: isSecureInputActive(), expectedGeneration: generation)
+    }
+
+    /// The board a service uses: a private one instead of the general pasteboard
+    /// while side effects are inert, so default construction in tests and
+    /// verification never touches the person's clipboard.
+    static func pasteboard(for requested: NSPasteboard, sideEffects: SideEffectGuard) -> NSPasteboard {
+        sideEffects.mayWrite(to: requested) ? requested : NSPasteboard.withUniqueName()
+    }
+
+    /// RTF and HTML from the first item whose plain text is `text`. Representations
+    /// from different items are never paired.
+    static func richText(matching text: Data, in items: [NSPasteboardItem]) -> ClipboardRichText? {
+        guard let item = items.first(where: { $0.types.contains(.string) }), item.data(forType: .string) == text
+        else { return nil }
+        return ClipboardRichText.capture(
+            rtf: item.types.contains(.rtf) ? item.data(forType: .rtf) : nil,
+            html: item.types.contains(.html) ? item.data(forType: .html) : nil)
+    }
+
+    func clearContentMessage() { contentMessage = nil }
+
     func refreshAccessStatus() {
+        // Stored so views that show the permission state update when it changes.
+        let behavior = pasteboard.accessBehavior
+        if accessBehavior != behavior { accessBehavior = behavior }
         guard store.database.preferences.clipboardEnabled else {
             accessMessage = nil
             return
         }
-        switch pasteboard.accessBehavior {
+        switch accessBehavior {
         case .alwaysAllow: accessMessage = nil
         case .alwaysDeny:
-            accessMessage =
-                "macOS is blocking clipboard access. Allow OpenRay’s clipboard access in System Settings, then copy text again."
+            accessMessage = "macOS is blocking clipboard access. Allow it in System Settings, then copy again."
         case .default, .ask:
-            accessMessage =
-                "macOS may ask to allow clipboard access. For uninterrupted history, choose Always Allow for OpenRay’s clipboard access in System Settings."
+            accessMessage = "macOS asks before each capture. Choose Always Allow to keep capturing in the background."
         @unknown default:
-            accessMessage = "Check OpenRay’s clipboard access in System Settings if copied text does not appear."
+            accessMessage = "If copied text doesn't appear, check OpenRay's clipboard access in System Settings."
         }
     }
 
@@ -216,43 +356,71 @@ final class ClipboardService {
 
     @discardableResult
     func copy(_ text: String) -> Bool {
+        lastCopyError = nil
         let item = NSPasteboardItem()
         item.setString(text, forType: .string)
         return write([item])
     }
 
+    /// Copies text with optional formatting, e.g. a formatted snippet.
     @discardableResult
-    func copy(_ entry: ClipboardEntry) -> Bool {
-        contentMessage = nil
-        guard entry.isValid else {
-            contentMessage = "This saved clipboard entry is invalid."
+    func copy(_ text: String, richText: ClipboardRichText?, as format: ClipboardPasteFormat = .original) -> Bool {
+        lastCopyError = nil
+        guard let items = ClipboardPayload.items(text: text, richText: richText, format: format) else {
+            lastCopyError = "This text has no \(format.title.replacingOccurrences(of: "Paste as ", with: "")) version."
             return false
         }
-        switch entry.content {
-        case .text(let text): return copy(text)
-        case .image(let image):
-            guard let data = store.imageData(for: image) else {
-                contentMessage = "This saved image is missing or damaged. The current clipboard was not changed."
-                return false
-            }
-            let item = NSPasteboardItem()
-            item.setData(data, forType: .png)
-            return write([item])
-        case .files(let urls):
-            let items = urls.map { url in
-                let item = NSPasteboardItem()
-                item.setString(url.absoluteString, forType: .fileURL)
-                return item
-            }
-            return write(items)
-        }
+        return write(items.map(Self.pasteboardItem))
     }
 
+    @discardableResult
+    func copy(_ entry: ClipboardEntry) -> Bool { copy(entry, as: .original) }
+
+    /// Copies an entry in one of its formats; see `ClipboardPayload.formats(for:)`.
+    @discardableResult
+    func copy(_ entry: ClipboardEntry, as format: ClipboardPasteFormat) -> Bool {
+        lastCopyError = nil
+        var entry = entry
+        // Formatting that couldn't be read at launch is tried again now.
+        if entry.richText == nil, let digest = entry.richTextDigest { entry.richText = store.richText(digest: digest) }
+        guard entry.isValid else {
+            lastCopyError = "This saved clipboard entry is invalid."
+            return false
+        }
+        var imageData: Data?
+        if case .image(let image) = entry.content, format == .original {
+            guard let data = store.imageData(for: image) else {
+                lastCopyError = "This saved image is missing or damaged. The current clipboard was not changed."
+                return false
+            }
+            imageData = data
+        }
+        guard let items = ClipboardPayload.items(for: entry, format: format, imageData: imageData) else {
+            lastCopyError = "“\(format.title)” isn't available for this entry. The current clipboard was not changed."
+            return false
+        }
+        return write(items.map(Self.pasteboardItem))
+    }
+
+    private static func pasteboardItem(_ representations: [ClipboardRepresentation]) -> NSPasteboardItem {
+        let item = NSPasteboardItem()
+        for representation in representations {
+            item.setData(representation.data, forType: NSPasteboard.PasteboardType(representation.type))
+        }
+        return item
+    }
+
+    /// Every write goes through here, so the general pasteboard is refused while inert.
     private func write(_ items: [NSPasteboardItem]) -> Bool {
+        do { try sideEffects.checkWrite(to: pasteboard) } catch {
+            lastCopyError = error.localizedDescription
+            return false
+        }
         for item in items { item.setString("1", forType: NSPasteboard.PasteboardType("com.openray.generated")) }
         pasteboard.clearContents()
         let success = pasteboard.writeObjects(items)
         lastChange = pasteboard.changeCount
+        attributedGeneration = lastChange
         return success
     }
 }
@@ -261,51 +429,83 @@ final class ClipboardService {
 enum SyntheticInput {
     static let marker: Int64 = 0x4F52_4159
 
+    /// What a paste reads and does on the Mac. The live one is guarded; tests pass a fake, so the
+    /// order of checks is tested without touching another app.
+    struct PasteEnvironment {
+        var checkAllowed: @MainActor () throws -> Void = { try SideEffectGuard.check("pasting into other apps") }
+        var isTrusted: @MainActor () -> Bool = { AXIsProcessTrusted() }
+        var activate: @MainActor (NSRunningApplication) -> Void = { $0.activate() }
+        var frontmostProcess: @MainActor () -> pid_t? = { NSWorkspace.shared.frontmostApplication?.processIdentifier }
+        var changeCount: @MainActor () -> Int = { NSPasteboard.general.changeCount }
+        var secureInput: @MainActor () -> Bool = { IsSecureEventInputEnabled() }
+        var pause: @MainActor () async throws -> Void = { try await Task.sleep(for: .milliseconds(25)) }
+        var postPaste: @MainActor (pid_t) throws -> Void = {
+            try SyntheticInput.key(CGKeyCode(kVK_ANSI_V), flags: .maskCommand, toProcess: $0)
+        }
+
+        static var live: PasteEnvironment { PasteEnvironment() }
+    }
+
+    /// `validateTarget` runs last, right before ⌘V, so a writing result never replaces text that
+    /// changed after its selection was captured (`SelectedTextContext.validateForPaste`). If it
+    /// throws, no key is sent.
     static func paste(
         into application: NSRunningApplication, expectedChangeCount: Int,
-        validateTarget: () throws -> Void = {}
+        validateTarget: () throws -> Void = {}, environment: PasteEnvironment = .live
     ) async throws {
-        guard AXIsProcessTrusted() else {
+        try environment.checkAllowed()
+        guard environment.isTrusted() else {
             throw LibraryValidationError(
                 "Copied to the clipboard. Enable Accessibility in Settings for direct paste, or press ⌘V in your app.")
         }
-        application.activate()
+        environment.activate(application)
+        let pid = application.processIdentifier
         for _ in 0..<20 {
-            if NSWorkspace.shared.frontmostApplication?.processIdentifier == application.processIdentifier { break }
-            try await Task.sleep(for: .milliseconds(25))
+            if environment.frontmostProcess() == pid { break }
+            try await environment.pause()
         }
-        guard NSWorkspace.shared.frontmostApplication?.processIdentifier == application.processIdentifier,
-            NSPasteboard.general.changeCount == expectedChangeCount,
-            !IsSecureEventInputEnabled()
-        else {
+        func stillTargeted() -> Bool {
+            environment.frontmostProcess() == pid && environment.changeCount() == expectedChangeCount
+                && !environment.secureInput()
+        }
+        guard stillTargeted() else {
             throw LibraryValidationError("The target app or clipboard changed. Your text is copied; paste it with ⌘V.")
         }
         try validateTarget()
-        guard NSWorkspace.shared.frontmostApplication?.processIdentifier == application.processIdentifier,
-            NSPasteboard.general.changeCount == expectedChangeCount, !IsSecureEventInputEnabled()
-        else {
+        // The validation can take a moment over Accessibility; check again right before the key.
+        guard stillTargeted() else {
             throw LibraryValidationError("The target app or clipboard changed. Your text is copied; paste it with ⌘V.")
         }
-        try key(CGKeyCode(kVK_ANSI_V), flags: .maskCommand)
+        try environment.postPaste(pid)
     }
 
-    static func replace(keyword: String, with text: String, in pid: pid_t) throws {
-        guard AXIsProcessTrusted(), !IsSecureEventInputEnabled(),
-            NSWorkspace.shared.frontmostApplication?.processIdentifier == pid
-        else { return }
-        // This path never touches the clipboard. Keywords are validated as ASCII.
-        for _ in keyword { try key(CGKeyCode(kVK_Delete)) }
-        for chunk in unicodeChunks(text) {
-            guard let down = CGEvent(keyboardEventSource: nil, virtualKey: 0, keyDown: true),
-                let up = CGEvent(keyboardEventSource: nil, virtualKey: 0, keyDown: false)
-            else {
-                throw LibraryValidationError("macOS could not insert the snippet.")
-            }
-            for event in [down, up] {
-                event.keyboardSetUnicodeString(stringLength: chunk.count, unicodeString: chunk)
-                event.setIntegerValueField(.eventSourceUserData, value: marker)
-                event.post(tap: .cghidEventTap)
-            }
+    /// Posts one key press to `pid` only. Every synthetic key event OpenRay sends
+    /// for snippets goes through here or `postText`.
+    static func postKey(_ code: CGKeyCode, toProcess pid: pid_t, sideEffects: SideEffectGuard = .current) throws {
+        try sideEffects.restrictedByProcess.check("typing into other apps")
+        guard let down = CGEvent(keyboardEventSource: nil, virtualKey: code, keyDown: true),
+            let up = CGEvent(keyboardEventSource: nil, virtualKey: code, keyDown: false)
+        else {
+            throw LibraryValidationError("macOS could not create a keyboard event.")
+        }
+        for event in [down, up] {
+            event.setIntegerValueField(.eventSourceUserData, value: marker)
+            event.postToPid(pid)
+        }
+    }
+
+    /// Types up to 20 UTF-16 code units into `pid` only.
+    static func postText(_ chunk: [UInt16], toProcess pid: pid_t, sideEffects: SideEffectGuard = .current) throws {
+        try sideEffects.restrictedByProcess.check("typing into other apps")
+        guard let down = CGEvent(keyboardEventSource: nil, virtualKey: 0, keyDown: true),
+            let up = CGEvent(keyboardEventSource: nil, virtualKey: 0, keyDown: false)
+        else {
+            throw LibraryValidationError("macOS could not insert the snippet.")
+        }
+        for event in [down, up] {
+            event.keyboardSetUnicodeString(stringLength: chunk.count, unicodeString: chunk)
+            event.setIntegerValueField(.eventSourceUserData, value: marker)
+            event.postToPid(pid)
         }
     }
 
@@ -324,7 +524,9 @@ enum SyntheticInput {
         return result
     }
 
-    private static func key(_ code: CGKeyCode, flags: CGEventFlags = []) throws {
+    /// ⌘V goes to the app it's meant for only, so a focus change can't send it elsewhere.
+    private static func key(_ code: CGKeyCode, flags: CGEventFlags = [], toProcess pid: pid_t) throws {
+        try SideEffectGuard.check("pasting into other apps")
         guard let down = CGEvent(keyboardEventSource: nil, virtualKey: code, keyDown: true),
             let up = CGEvent(keyboardEventSource: nil, virtualKey: code, keyDown: false)
         else {
@@ -333,7 +535,26 @@ enum SyntheticInput {
         for event in [down, up] {
             event.flags = flags
             event.setIntegerValueField(.eventSourceUserData, value: marker)
-            event.post(tap: .cghidEventTap)
+            event.postToPid(pid)
         }
+    }
+}
+
+// Slice 4 (screenshots): an additive image copy. It writes through the same writer as every
+// other copy, after the same general-pasteboard check, so it is refused while inert.
+extension ClipboardService {
+    /// Copies an image as PNG data, with its file URL when there is one, so apps that take
+    /// pictures paste the image and Finder-like targets paste the file.
+    @discardableResult
+    func copyImage(pngData: Data, fileURL: URL?) -> Bool {
+        lastCopyError = nil
+        do { try SideEffectGuard.checkWrite(to: pasteboard) } catch {
+            lastCopyError = error.localizedDescription
+            return false
+        }
+        let item = NSPasteboardItem()
+        item.setData(pngData, forType: .png)
+        if let fileURL { item.setString(fileURL.absoluteString, forType: .fileURL) }
+        return write([item])
     }
 }

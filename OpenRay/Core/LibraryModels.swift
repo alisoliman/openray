@@ -1,9 +1,37 @@
 import Foundation
 
-enum LauncherSection: String, CaseIterable, Identifiable, Sendable {
+/// Where the launcher is: Everything, a built-in scope, or a provider's own scope.
+enum LauncherSection: CaseIterable, Identifiable, Hashable, Sendable {
     case home, applications, files, clipboard, snippets, quicklinks, notes, calculator, windows
+    /// A list a registered provider pushes. Its scope supplies the title, symbol and the rest.
+    case provided(ProvidedScope)
+
+    /// The built-in scopes. Provided scopes are open-ended, so they aren't listed.
+    static let allCases: [LauncherSection] = [
+        .home, .applications, .files, .clipboard, .snippets, .quicklinks, .notes, .calculator, .windows,
+    ]
+
+    var rawValue: String {
+        switch self {
+        case .home: "home"
+        case .applications: "applications"
+        case .files: "files"
+        case .clipboard: "clipboard"
+        case .snippets: "snippets"
+        case .quicklinks: "quicklinks"
+        case .notes: "notes"
+        case .calculator: "calculator"
+        case .windows: "windows"
+        case .provided(let scope): scope.id
+        }
+    }
 
     var id: String { rawValue }
+
+    /// The provider's scope, when this is one.
+    var providedScope: ProvidedScope? {
+        if case .provided(let scope) = self { scope } else { nil }
+    }
 
     var title: String {
         switch self {
@@ -16,6 +44,7 @@ enum LauncherSection: String, CaseIterable, Identifiable, Sendable {
         case .notes: "Notes"
         case .calculator: "Calculator & Conversions"
         case .windows: "Window Management"
+        case .provided(let scope): scope.title
         }
     }
 
@@ -30,21 +59,111 @@ enum LauncherSection: String, CaseIterable, Identifiable, Sendable {
         case .notes: "note.text"
         case .calculator: "equal.square"
         case .windows: "rectangle.split.2x1"
+        case .provided(let scope): scope.symbol
         }
     }
 
     var placeholder: String {
         switch self {
-        case .home: "Search apps and commands…"
-        case .applications: "Search your applications…"
-        case .files: "Search files and folders…"
-        case .clipboard: "Search your clipboard history…"
-        case .snippets: "Search snippets by name, keyword, or content…"
-        case .quicklinks: "Search quicklinks…"
-        case .notes: "Search your notes…"
-        case .calculator: "Type a calculation or conversion…"
-        case .windows: "Search window commands…"
+        case .home: "Search apps, commands and files"
+        case .applications: "Search applications"
+        case .files: "Search files and folders"
+        case .clipboard: "Search clipboard history"
+        case .snippets: "Search snippets"
+        case .quicklinks: "Search quicklinks"
+        case .notes: "Search notes"
+        case .calculator: "Type a calculation or conversion"
+        case .windows: "Filter layouts"
+        case .provided(let scope): scope.placeholder
         }
+    }
+
+    /// A compact name for favorites tiles.
+    var shortTitle: String {
+        switch self {
+        case .clipboard: "Clipboard"
+        case .calculator: "Calculator"
+        case .windows: "Windows"
+        case .provided(let scope): scope.shortTitle ?? scope.title
+        default: title
+        }
+    }
+
+    /// The one-line description shown as a command's subtitle.
+    var summary: String {
+        switch self {
+        case .home: "Search everything"
+        case .applications: "Open any app on this Mac"
+        case .files: "Find files and folders with Spotlight"
+        case .clipboard: "Search and paste what you've copied"
+        case .snippets: "Text you type often, behind a keyword"
+        case .quicklinks: "Websites, folders and search templates"
+        case .notes: "Quick notes, saved on this Mac"
+        case .calculator: "Arithmetic and unit conversions"
+        case .windows: "Halves, quarters, center and more"
+        case .provided(let scope): scope.summary
+        }
+    }
+
+    var kind: Kind {
+        switch self {
+        case .home: .command
+        case .applications: .system
+        case .files: .file
+        case .clipboard: .clipboard
+        case .snippets: .snippet
+        case .quicklinks: .quicklink
+        case .notes: .note
+        case .calculator: .calculator
+        case .windows: .window
+        case .provided(let scope): scope.kind
+        }
+    }
+
+    var tileSymbol: String {
+        switch self {
+        case .applications: "square.grid.2x2"
+        case .files: "folder"
+        case .provided(let scope): scope.symbol
+        default: kind.symbol
+        }
+    }
+
+    /// Scopes that show a preview pane beside a two-line list.
+    var showsPreview: Bool { providedScope?.showsPreview ?? [.clipboard, .snippets, .notes, .files, .quicklinks].contains(self) }
+
+    /// Scopes whose items can be created from the panel.
+    var createsItems: Bool { [.snippets, .quicklinks, .notes].contains(self) }
+
+    var itemNoun: String {
+        switch self {
+        case .snippets: "snippet"
+        case .quicklinks: "quicklink"
+        case .notes: "note"
+        case .provided(let scope): scope.itemNoun
+        default: "item"
+        }
+    }
+}
+
+/// Where Files looks. Narrowing to one folder makes Spotlight faster.
+enum FileSearchScope: String, CaseIterable, Identifiable, Codable, Sendable {
+    case home, documents, desktop, downloads, developer
+    var id: String { rawValue }
+    var title: String { self == .home ? "Home" : rawValue.capitalized }
+    var symbol: String {
+        switch self {
+        case .home: "house"
+        case .documents: "doc.text"
+        case .desktop: "menubar.dock.rectangle"
+        case .downloads: "arrow.down.circle"
+        case .developer: "hammer"
+        }
+    }
+
+    var url: URL {
+        let home = FileManager.default.homeDirectoryForCurrentUser
+        return self == .home ? home : home.appending(path: rawValue.capitalized, directoryHint: .isDirectory)
     }
 }
 
@@ -72,128 +191,78 @@ struct AppPreferences: Codable, Equatable, Sendable {
     var clipboardEnabled = false
     // Missing fields in a version-1 library mean media capture was never approved.
     var clipboardImagesEnabled: Bool? = true
-    var clipboardFilesEnabled: Bool? = true
+    // File references start off; people opt in on the clipboard screen or in Settings.
+    var clipboardFilesEnabled: Bool? = false
     var clipboardRetentionDays = 7
     var clipboardLimit = 100
     var snippetExpansionEnabled = false
-    var excludedClipboardBundleIDs = [
+    var excludedClipboardBundleIDs = AppPreferences.builtInClipboardExclusions
+    // Added in OpenRay 2.0. Optional so earlier libraries keep decoding; nil
+    // means the person upgraded and has already seen the app.
+    var firstRunCompleted: Bool? = false
+    var rememberLastQuery: Bool? = true
+    var barMode: Bool? = false
+    var fileSearchScope: FileSearchScope? = .home
+    // Whether capture was paused (true) or turned off (false) while it isn't
+    // running. Nil until either is chosen; see LibraryDatabase.clipboardIsPaused.
+    var clipboardPaused: Bool? = nil
+    // Added by the launcher slice (Slice 1). Optional, so earlier libraries keep decoding; nil
+    // means the default. Read them through the computed properties below.
+    /// Supersedes `rememberLastQuery` once set.
+    var popToRoot: PopToRootDelay? = nil
+    var escapeBehavior: EscapeBehavior? = nil
+    /// ⌃J and ⌃K move the selection, as ⌃N and ⌃P already do.
+    var vimNavigation: Bool? = nil
+    var launcherScreen: LauncherScreen? = nil
+    var interfaceSize: InterfaceSize? = nil
+    /// Slices 2 and 3 read `primaryActionPastes` for what ↩ does with copyable rows.
+    var primaryAction: PrimaryAction? = nil
+    /// A recorded launcher shortcut. Supersedes the `hotKey` preset once set.
+    var launcherShortcut: CommandShortcut? = nil
+    /// True once fallbacks were chosen by hand; `LibraryDatabase.fallbackOrder` then lists them.
+    var customFallbacks: Bool? = nil
+    var hyperKey: HyperKeySettings? = nil
+    /// Whether searches are remembered for ↑ in an empty field.
+    var searchHistory: Bool? = nil
+    // Slice 2: clipboard, snippets, quicklinks. Optional, so earlier libraries keep decoding.
+    /// An explicit retention choice, including 3 months and unlimited. Nil uses `clipboardRetentionDays`.
+    var clipboardRetention: ClipboardRetention? = nil
+    /// Clipboard entries in Everything's search. Off unless turned on.
+    var clipboardInRootSearch: Bool? = nil
+    /// When typed keywords expand. Nil keeps the original behavior.
+    var snippetExpansion: SnippetExpansionSettings? = nil
+
+    var capturesClipboardImages: Bool { clipboardImagesEnabled ?? false }
+    var showsClipboardInRootSearch: Bool { clipboardInRootSearch ?? false }
+    var capturesClipboardFiles: Bool { clipboardFilesEnabled ?? false }
+    var remembersLastQuery: Bool { rememberLastQuery ?? true }
+    var usesBarMode: Bool { barMode ?? false }
+    var needsFirstRun: Bool { firstRunCompleted == false }
+    var popToRootDelay: PopToRootDelay { popToRoot ?? (remembersLastQuery ? .seconds90 : .immediately) }
+    var escapeClosesWindow: Bool { escapeBehavior == .closeWindow }
+    var usesVimNavigation: Bool { vimNavigation ?? false }
+    var screen: LauncherScreen { launcherScreen ?? .mouse }
+    var size: InterfaceSize { interfaceSize ?? .standard }
+    /// True when ↩ pastes copyable rows and ⌘↩ copies them; false (the default) for the reverse.
+    var primaryActionPastes: Bool { primaryAction == .paste }
+    /// The shortcut that opens the launcher: a recorded one, else the preset.
+    var launcherHotKeyShortcut: CommandShortcut { launcherShortcut ?? hotKey.shortcut }
+    /// The launcher shortcut's name, recorded or preset, for menus and messages.
+    var launcherHotKeyTitle: String { launcherShortcut?.title ?? hotKey.title }
+    var hyper: HyperKeySettings { hyperKey ?? HyperKeySettings() }
+    var remembersSearchHistory: Bool { searchHistory ?? true }
+
+    /// The apps capture and expansion skip. Built-in password managers always
+    /// apply, even if the saved list no longer contains them.
+    var effectiveClipboardExclusions: [String] {
+        var seen = Set<String>()
+        return (Self.builtInClipboardExclusions + excludedClipboardBundleIDs).filter { seen.insert($0).inserted }
+    }
+
+    static let builtInClipboardExclusions = [
         "com.1password.1password", "com.agilebits.onepassword7",
         "com.bitwarden.desktop", "com.apple.Passwords", "org.keepassxc.keepassxc",
     ]
-
-    var capturesClipboardImages: Bool { clipboardImagesEnabled ?? false }
-    var capturesClipboardFiles: Bool { clipboardFilesEnabled ?? false }
-}
-
-struct Quicklink: Codable, Identifiable, Equatable, Sendable {
-    var id: UUID = UUID()
-    var name: String
-    var template: String
-    var keyword: String
-
-    var needsQuery: Bool { template.contains("{query}") }
-
-    func argument(in input: String) -> String? {
-        guard !keyword.isEmpty else { return nil }
-        let parts = input.trimmingCharacters(in: .whitespacesAndNewlines).split(
-            maxSplits: 1, whereSeparator: \.isWhitespace)
-        guard let first = parts.first, String(first).caseInsensitiveCompare(keyword) == .orderedSame else { return nil }
-        return parts.count == 2 ? String(parts[1]).trimmingCharacters(in: .whitespacesAndNewlines) : ""
-    }
-
-    func resolvedURL(query: String = "") throws -> URL {
-        let trimmed = template.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { throw LibraryValidationError("Enter a URL or an absolute file path.") }
-        if needsQuery && query.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-            throw LibraryValidationError("Enter a search term for this quicklink.")
-        }
-        if trimmed.hasPrefix("/") || trimmed.hasPrefix("~/") {
-            guard !needsQuery else {
-                throw LibraryValidationError("Query placeholders are only supported in web links.")
-            }
-            return URL(fileURLWithPath: (trimmed as NSString).expandingTildeInPath)
-        }
-        // Only RFC 3986 unreserved characters may remain unescaped inside a query.
-        let unreserved = CharacterSet(
-            charactersIn: "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-._~")
-        let encoded = query.addingPercentEncoding(withAllowedCharacters: unreserved) ?? ""
-        let substituted = trimmed.replacingOccurrences(of: "{query}", with: encoded)
-        guard let url = URL(string: substituted),
-            let scheme = url.scheme?.lowercased(),
-            ["https", "http", "file", "mailto"].contains(scheme),
-            !["http", "https"].contains(scheme) || url.host?.isEmpty == false
-        else {
-            throw LibraryValidationError("Use an http(s) URL, mailto link, or an absolute file path.")
-        }
-        return url
-    }
-
-    func validate() throws {
-        guard !name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
-            throw LibraryValidationError("Give this quicklink a name.")
-        }
-        guard keyword.count <= 32, !keyword.contains(where: \.isWhitespace) else {
-            throw LibraryValidationError("Use a quicklink keyword of up to 32 characters without spaces.")
-        }
-        _ = try resolvedURL(query: needsQuery ? "test" : "")
-        let withoutPlaceholder = template.replacingOccurrences(of: "{query}", with: "")
-        guard !withoutPlaceholder.contains("{") && !withoutPlaceholder.contains("}") else {
-            throw LibraryValidationError("The supported placeholder is {query}.")
-        }
-    }
-
-    static let defaults = [
-        Quicklink(name: "Search the Web", template: "https://duckduckgo.com/?q={query}", keyword: "web"),
-        Quicklink(name: "Search GitHub", template: "https://github.com/search?q={query}", keyword: "gh"),
-    ]
-}
-
-struct Snippet: Codable, Identifiable, Equatable, Sendable {
-    var id: UUID = UUID()
-    var name: String
-    var keyword: String
-    var content: String
-
-    func expanded(at date: Date = .now, locale: Locale = .current, timeZone: TimeZone = .current) -> String {
-        let dateFormatter = DateFormatter()
-        dateFormatter.locale = locale
-        dateFormatter.timeZone = timeZone
-        dateFormatter.dateStyle = .medium
-        let timeFormatter = DateFormatter()
-        timeFormatter.locale = locale
-        timeFormatter.timeZone = timeZone
-        timeFormatter.timeStyle = .short
-        return
-            content
-            .replacingOccurrences(of: "{date}", with: dateFormatter.string(from: date))
-            .replacingOccurrences(of: "{time}", with: timeFormatter.string(from: date))
-    }
-
-    func validate(against others: [Snippet]) throws {
-        guard !name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
-            throw LibraryValidationError("Give this snippet a name.")
-        }
-        guard !content.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty, content.count <= 32_000 else {
-            throw LibraryValidationError("Snippet text must contain between 1 and 32,000 characters.")
-        }
-        if !keyword.isEmpty {
-            let allowed = CharacterSet(
-                charactersIn: "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789;:/._-")
-            guard (2...32).contains(keyword.count), keyword.unicodeScalars.allSatisfy(allowed.contains) else {
-                throw LibraryValidationError("Use a 2–32 character keyword without spaces, such as ;email.")
-            }
-            guard !others.contains(where: { $0.id != id && $0.keyword == keyword }) else {
-                throw LibraryValidationError("Another snippet already uses this keyword.")
-            }
-        }
-    }
-}
-
-struct QuickNote: Codable, Identifiable, Equatable, Sendable {
-    var id: UUID = UUID()
-    var title: String
-    var content: String
-    var modifiedAt: Date = .now
 }
 
 struct UsageRecord: Codable, Equatable, Sendable {
@@ -203,21 +272,73 @@ struct UsageRecord: Codable, Equatable, Sendable {
 }
 
 struct LibraryDatabase: Codable, Equatable, Sendable {
-    static let currentSchemaVersion = 4
+    // Version 4 is OpenRay 2.0. Version 5 adds the collections the parity slices fill in.
+    // A build opens libraries newer than it understands read-only.
+    // main's builds also wrote a version 4 (version 3 plus `pomodoro`); version 5 reads both.
+    static let currentSchemaVersion = 5
     var schemaVersion = LibraryDatabase.currentSchemaVersion
     var preferences = AppPreferences()
     var quicklinks = Quicklink.defaults
     var snippets: [Snippet] = []
     var notes: [QuickNote] = []
     var clipboard: [ClipboardEntry] = []
-    var favoriteIDs: Set<String> = ["section.clipboard", "ai.chat", "section.notes"]
+    var favoriteIDs: Set<String> = Set(LibraryDatabase.defaultFavorites)
+    /// The order favorites appear in, for ⌘1–⌘8. IDs missing here follow in a stable order.
+    var favoriteOrder: [String] = LibraryDatabase.defaultFavorites
     var usage: [UsageRecord] = []
     var commandBindings: [CommandBinding] = []
+
+    // Added in schema 5. Each is decoded with decodeIfPresent, so version 4 libraries load
+    // with them empty, and each belongs to one slice; see LibraryRecords.swift.
+    /// Slice 7: user-defined AI commands.
+    var aiCommands: [AICommandRecord] = []
+    /// Slice 7: agents.
+    var agents: [AgentRecord] = []
+    /// Slice 1: commands turned off in Settings, by command id.
+    var disabledCommandIDs: Set<String> = []
+    /// Slice 1: fallback commands in the order the person chose, by item id.
+    var fallbackOrder: [String] = []
+    /// Slice 8: folders of script commands.
+    var scriptDirectories: [ScriptDirectoryRecord] = []
+    /// Slice 5: saved multi-app window layouts.
+    var windowLayouts: [WindowLayoutRecord] = []
+    /// Slice 6: focus categories.
+    var focusCategories: [FocusCategoryRecord] = []
+    /// Slice 3: emoji frecency.
+    var emojiUsage: [EmojiUsageRecord] = []
+    /// Slice 3: kept calculations.
+    var calculatorHistory: [CalculatorHistoryRecord] = []
+    /// Per-command settings: command id → key → value. Any slice can store small values here
+    /// without a schema change, e.g. `commandPreferences["system.sleep", default: [:]]["confirm"] = "false"`.
+    var commandPreferences: [String: [String: String]] = [:]
+    // main: pomodoro, caffeinate
+    /// Pomodoro's configuration, timer and completed sessions. main's version 4 wrote it under the
+    /// same key, so its libraries keep their timer and history. Caffeinate stores nothing.
     var pomodoro = PomodoroData()
 
+    static let defaultFavorites = ["ai.chat", "section.clipboard", "section.files", "section.notes", "section.snippets"]
+
     private enum CodingKeys: String, CodingKey {
-        case schemaVersion, preferences, quicklinks, snippets, notes, clipboard, favoriteIDs, usage, commandBindings,
-            pomodoro
+        case schemaVersion, preferences, quicklinks, snippets, notes, clipboard, favoriteIDs, favoriteOrder, usage,
+            commandBindings
+        // Schema 5.
+        case aiCommands, agents, disabledCommandIDs, fallbackOrder, scriptDirectories, windowLayouts,
+            focusCategories, emojiUsage, calculatorHistory, commandPreferences
+        // main: pomodoro, caffeinate
+        case pomodoro
+    }
+
+    var orderedFavoriteIDs: [String] {
+        let ordered = favoriteOrder.filter(favoriteIDs.contains)
+        let remaining = favoriteIDs.subtracting(ordered).sorted()
+        var seen = Set<String>()
+        return (ordered + remaining).filter { seen.insert($0).inserted }
+    }
+
+    /// Capture is off but meant to resume. An explicit choice wins; libraries
+    /// without one count as paused while they still hold history.
+    var clipboardIsPaused: Bool {
+        !preferences.clipboardEnabled && (preferences.clipboardPaused ?? !clipboard.isEmpty)
     }
 
     /// Retired commands may have obsolete payloads. Ignore them before decoding
@@ -245,10 +366,25 @@ struct LibraryDatabase: Codable, Equatable, Sendable {
         notes = try container.decode([QuickNote].self, forKey: .notes)
         clipboard = try container.decode([ClipboardEntry].self, forKey: .clipboard)
         favoriteIDs = try container.decode(Set<String>.self, forKey: .favoriteIDs)
+        favoriteOrder = try container.decodeIfPresent([String].self, forKey: .favoriteOrder) ?? []
         usage = try container.decode([UsageRecord].self, forKey: .usage)
         commandBindings =
             try container.decodeIfPresent([AvailableCommandBinding].self, forKey: .commandBindings)?
             .compactMap(\.binding) ?? []
+        aiCommands = try container.decodeIfPresent([AICommandRecord].self, forKey: .aiCommands) ?? []
+        agents = try container.decodeIfPresent([AgentRecord].self, forKey: .agents) ?? []
+        disabledCommandIDs = try container.decodeIfPresent(Set<String>.self, forKey: .disabledCommandIDs) ?? []
+        fallbackOrder = try container.decodeIfPresent([String].self, forKey: .fallbackOrder) ?? []
+        scriptDirectories =
+            try container.decodeIfPresent([ScriptDirectoryRecord].self, forKey: .scriptDirectories) ?? []
+        windowLayouts = try container.decodeIfPresent([WindowLayoutRecord].self, forKey: .windowLayouts) ?? []
+        focusCategories = try container.decodeIfPresent([FocusCategoryRecord].self, forKey: .focusCategories) ?? []
+        emojiUsage = try container.decodeIfPresent([EmojiUsageRecord].self, forKey: .emojiUsage) ?? []
+        calculatorHistory =
+            try container.decodeIfPresent([CalculatorHistoryRecord].self, forKey: .calculatorHistory) ?? []
+        commandPreferences =
+            try container.decodeIfPresent([String: [String: String]].self, forKey: .commandPreferences) ?? [:]
+        // main: pomodoro, caffeinate
         pomodoro = try container.decodeIfPresent(PomodoroData.self, forKey: .pomodoro) ?? PomodoroData()
     }
 
@@ -276,6 +412,9 @@ struct LibraryDatabase: Codable, Equatable, Sendable {
             quicklinks.map { $0.id.uuidString }, snippets.map { $0.id.uuidString },
             notes.map { $0.id.uuidString }, clipboard.map { $0.id.uuidString }, usage.map(\.id),
             commandBindings.map(\.targetID),
+            aiCommands.map { $0.id.uuidString }, agents.map { $0.id.uuidString },
+            scriptDirectories.map { $0.id.uuidString }, windowLayouts.map { $0.id.uuidString },
+            focusCategories.map(\.id), emojiUsage.map(\.id), calculatorHistory.map { $0.id.uuidString },
         ]
         guard identities.allSatisfy({ Set($0).count == $0.count }) else {
             throw LibraryValidationError("The library contains duplicate item identifiers.")

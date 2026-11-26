@@ -24,6 +24,7 @@ from urllib.parse import quote
 
 
 PACKAGE_ASSETS = ("OpenRay-macos-arm64.dmg", "OpenRay-macos-arm64.zip")
+MINIMUM_MACOS = "27.0"  # Matches MACOSX_DEPLOYMENT_TARGET in the Xcode project.
 RELEASE_ASSETS = (*PACKAGE_ASSETS, "SHA256SUMS", "release.json")
 SEMVER = re.compile(
     r"v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)"
@@ -150,7 +151,7 @@ def stage(package_dir: Path, output: Path, version: Version, build_number: int, 
             "build_number": build_number,
             "commit": sha,
             "architecture": "arm64",
-            "minimum_macos": "26.0",
+            "minimum_macos": MINIMUM_MACOS,
             "artifacts": artifacts,
         }
         (staged / "release.json").write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
@@ -171,7 +172,7 @@ def validate_staged(directory: Path, version: Version, sha: str) -> dict[str, st
     expected = {
         "schema_version": 1, "name": "OpenRay", "tag": version.tag, "version": version.version,
         "marketing_version": version.marketing_version, "commit": sha,
-        "architecture": "arm64", "minimum_macos": "26.0",
+        "architecture": "arm64", "minimum_macos": MINIMUM_MACOS,
     }
     if not isinstance(manifest, dict) or any(manifest.get(key) != value for key, value in expected.items()):
         raise ReleaseError("Release manifest provenance does not match this release.")

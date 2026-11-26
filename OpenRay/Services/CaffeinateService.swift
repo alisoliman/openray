@@ -11,6 +11,8 @@ protocol CaffeinatePowerAssertions {
 @MainActor
 struct SystemCaffeinatePowerAssertions: CaffeinatePowerAssertions {
     func create() throws -> UInt32 {
+        // Power state is the person's Mac; tests and isolated verification never change it.
+        try SideEffectGuard.check("keeping the Mac awake")
         var id: IOPMAssertionID = 0
         // Preventing idle display sleep also prevents idle system sleep. Explicit
         // sleep, closing a laptop's lid, and macOS emergency sleep remain available.
@@ -26,6 +28,8 @@ struct SystemCaffeinatePowerAssertions: CaffeinatePowerAssertions {
     }
 
     func release(_ id: UInt32) throws {
+        // Inert launches can't create one; the release still refuses, as every live adapter does.
+        try SideEffectGuard.check("changing the Mac's sleep settings")
         let result = IOPMAssertionRelease(id)
         guard result == kIOReturnSuccess else {
             throw CaffeinatePowerError(operation: "stop", code: result)

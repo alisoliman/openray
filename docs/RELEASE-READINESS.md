@@ -1,5 +1,7 @@
 # Release readiness — 7 September 2026
 
+> **Update, 2 October 2026:** OpenRay now requires macOS 27, and CI and release builds use Xcode 27.0 on macOS 27. This record describes the macOS 26 preview. Repeat the verification below on the macOS 27 toolchain before the next release.
+
 The selected product is a direct-download OpenRay app for **Apple silicon Macs on macOS 26 or later**. Intel and Mac App Store distribution are outside this release's scope. Cross-app functionality remains available with the user's macOS permissions.
 
 **Status: locally validated release preview; production signing and notarization are pending.** No production release was uploaded or published. The preview must not be presented as a notarized download.

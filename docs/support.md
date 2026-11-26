@@ -4,7 +4,7 @@ Report reproducible problems in the [OpenRay public issue tracker](https://githu
 
 ## Install and open
 
-OpenRay requires an Apple silicon Mac with macOS 26 or later. Intel Macs are not supported. Download the signed, notarized release from the publisher's official download location, extract the ZIP or open the disk image, and move OpenRay to Applications. Open it from Finder. Keep this copy in a stable location before granting permissions or enabling launch at login.
+OpenRay requires an Apple silicon Mac with macOS 27 or later. Intel Macs are not supported. Download the signed, notarized release from the publisher's official download location, extract the ZIP or open the disk image, and move OpenRay to Applications. Open it from Finder. Keep this copy in a stable location before granting permissions or enabling launch at login.
 
 OpenRay runs in the menu bar. Press **Option-Space** to show or hide the launcher, or choose **Open OpenRay** in its menu. If the shortcut is already used by another app, choose another launcher shortcut in Settings. Use **Quit OpenRay** in its menu to exit; dismissing the launcher leaves it running.
 
@@ -28,7 +28,7 @@ If macOS reports an unidentified developer, a damaged app, or a verification fai
 
 ## Pomodoro timer
 
-Search **Start Pomodoro** to start or resume the current timer phase, or **Pomodoro** to open the timer and view today's completed sessions, focus minutes, and the latest 20 completed focus sessions. A new cycle begins with focus. Both commands can have aliases and global shortcuts in Settings. The menu bar shows the active countdown and offers timer controls; closing the launcher leaves the timer running.
+Search **Start Pomodoro** to start or resume the current timer phase, or **Pomodoro** to open the timer and view today's completed sessions, focus minutes, and the latest 20 completed focus sessions. A new cycle begins with focus. Both commands can have aliases and global shortcuts in Settings. While a phase runs, the menu bar shows the countdown and offers timer controls (Settings → Pomodoro can hide it); closing the launcher leaves the timer running. Pomodoro is separate from Focus, which hides distracting apps for a session.
 
 The defaults are 25 minutes of focus, a 5-minute short break, and a 15-minute long break after every four completed focus sessions, with a daily goal of eight sessions. **Settings → Pomodoro** lets you adjust these values, enable automatic break starts, and choose whether to play a completion sound. Each focus session starts manually. Pause and resume to preserve remaining time, skip a break, or reset the cycle. Only fully completed focus sessions add to your progress. Changed durations apply to the next phase.
 
@@ -36,7 +36,7 @@ The defaults are 25 minutes of focus, a 5-minute short break, and a 15-minute lo
 
 ## Back up, reset, and uninstall
 
-Choose **Reveal Library in Finder** in Settings to locate the saved library. Quit the app before making a manual backup, and copy both `library.json` and the `ClipboardImages` folder together. AI conversations are not included unless you explicitly saved a response as a note.
+**Settings → Library** exports an archive of the parts you choose, optionally encrypted with a passphrase, and can write one on a schedule to a folder you pick. Import merges an archive into your library or replaces chosen parts. For a manual copy, choose **Reveal Library in Finder**, quit OpenRay, and copy the whole `OpenRay` folder: `library.json`, `ClipboardImages`, `NoteAssets` and `AIChats` belong together. Launcher conversations are not saved unless you save a response as a note or continue in the AI Chat window. This Mac's script and deeplink approvals and backup settings are never part of an archive.
 
 If OpenRay says the library could not be loaded, preserve the original file before attempting repair or a reset. An invalid or newer library is left untouched rather than overwritten. Do not send a full library to support by default; it can contain sensitive notes, snippets, clipboard history, and file paths.
 

@@ -109,11 +109,16 @@ plutil -lint "$OPENRAY_APP/Contents/Resources/PrivacyInfo.xcprivacy"
 [[ -f "$OPENRAY_APP/Contents/Resources/AppIcon.icns" ]] || fail 'The archive is missing its app icon.'
 
 OPENRAY_NAME="OpenRay-$OPENRAY_VERSION"
+# The archive is built unsigned, so the hardened-runtime signature below must carry the
+# app's entitlements itself; without them, Automation (Apple Events) is refused at runtime.
+OPENRAY_ENTITLEMENTS="$OPENRAY_ROOT/OpenRay.entitlements"
+plutil -lint "$OPENRAY_ENTITLEMENTS" >/dev/null || fail 'The entitlements file is missing or invalid.'
 if (( OPENRAY_PREVIEW )); then
   OPENRAY_NAME+="-local-preview"
-  codesign --force --sign - --options runtime "$OPENRAY_APP"
+  codesign --force --sign - --options runtime --entitlements "$OPENRAY_ENTITLEMENTS" "$OPENRAY_APP"
 else
-  codesign --force --sign "$OPENRAY_SIGNING_IDENTITY" "${OPENRAY_SIGNING_KEYCHAIN_ARGS[@]}" --options runtime --timestamp "$OPENRAY_APP"
+  codesign --force --sign "$OPENRAY_SIGNING_IDENTITY" "${OPENRAY_SIGNING_KEYCHAIN_ARGS[@]}" --options runtime --timestamp \
+    --entitlements "$OPENRAY_ENTITLEMENTS" "$OPENRAY_APP"
 fi
 codesign --verify --strict --verbose=2 "$OPENRAY_APP" 2>"$OPENRAY_OUTPUT/signature-verification.log"
 codesign -d --verbose=4 "$OPENRAY_APP" 2>"$OPENRAY_OUTPUT/signature-details.txt"
@@ -122,10 +127,25 @@ if (( ! OPENRAY_PREVIEW )); then
   /usr/bin/grep -q '^Authority=Developer ID Application:' "$OPENRAY_OUTPUT/signature-details.txt" || fail 'Unexpected signing authority.'
   /usr/bin/grep -q '^Timestamp=' "$OPENRAY_OUTPUT/signature-details.txt" || fail 'The signature has no secure timestamp.'
 fi
-codesign -d --entitlements - "$OPENRAY_APP" >"$OPENRAY_OUTPUT/entitlements.plist" 2>/dev/null
-# This app requires no code-signing entitlements. Refuse a debugger entitlement if one appears.
-if [[ -s "$OPENRAY_OUTPUT/entitlements.plist" ]] &&
-  [[ "$(/usr/libexec/PlistBuddy -c 'Print :com.apple.security.get-task-allow' "$OPENRAY_OUTPUT/entitlements.plist" 2>/dev/null || true)" == true ]]; then
+codesign -d --entitlements - --xml "$OPENRAY_APP" >"$OPENRAY_OUTPUT/entitlements.plist" 2>/dev/null
+# System commands send Apple events (Automation), which the hardened runtime allows only with
+# this entitlement and a usage description. Refuse a debugger entitlement if one appears.
+[[ "$(/usr/libexec/PlistBuddy -c 'Print :com.apple.security.automation.apple-events' "$OPENRAY_OUTPUT/entitlements.plist" 2>/dev/null || true)" == true ]] ||
+  fail 'The release signature is missing the Automation (Apple Events) entitlement.'
+# Calendar commands (My Schedule) read EventKit, which the hardened runtime allows only with this.
+[[ "$(/usr/libexec/PlistBuddy -c 'Print :com.apple.security.personal-information.calendars' "$OPENRAY_OUTPUT/entitlements.plist" 2>/dev/null || true)" == true ]] ||
+  fail 'The release signature is missing the Calendars entitlement.'
+/usr/libexec/PlistBuddy -c 'Print :NSAppleEventsUsageDescription' "$OPENRAY_APP/Contents/Info.plist" >/dev/null 2>&1 ||
+  fail 'The app is missing NSAppleEventsUsageDescription.'
+# Dictation (AI chat, opt-in) captures the microphone, which the hardened runtime allows only
+# with this entitlement, plus the microphone and speech usage descriptions.
+[[ "$(/usr/libexec/PlistBuddy -c 'Print :com.apple.security.device.audio-input' "$OPENRAY_OUTPUT/entitlements.plist" 2>/dev/null || true)" == true ]] ||
+  fail 'The release signature is missing the Audio Input entitlement.'
+for key in NSMicrophoneUsageDescription NSSpeechRecognitionUsageDescription; do
+  /usr/libexec/PlistBuddy -c "Print :$key" "$OPENRAY_APP/Contents/Info.plist" >/dev/null 2>&1 ||
+    fail "The app is missing $key."
+done
+if [[ "$(/usr/libexec/PlistBuddy -c 'Print :com.apple.security.get-task-allow' "$OPENRAY_OUTPUT/entitlements.plist" 2>/dev/null || true)" == true ]]; then
   fail 'Release signature unexpectedly permits debugger attachment.'
 fi
 
@@ -160,7 +180,7 @@ ditto -c -k --keepParent "$OPENRAY_APP" "$OPENRAY_OUTPUT/$OPENRAY_NAME.zip"
 ln -s /Applications "$OPENRAY_STAGING/Applications"
 cat >"$OPENRAY_STAGING/Install OpenRay.txt" <<'INSTALL'
 Drag OpenRay to Applications, then open it there.
-OpenRay requires an Apple silicon Mac with macOS 26 or later. Press Option-Space to open the launcher.
+OpenRay requires an Apple silicon Mac with macOS 27 or later. Press Option-Space to open the launcher.
 If that shortcut is in use, choose another in Settings from the OpenRay menu bar item.
 Clipboard history and snippet expansion are off by default. Accessibility is optional.
 For help and privacy information, choose OpenRay Help from the menu bar.
@@ -168,8 +188,9 @@ INSTALL
 if (( OPENRAY_PREVIEW )); then
   print 'LOCAL PREVIEW ONLY — ad-hoc signed, not notarized, not for distribution.' >"$OPENRAY_STAGING/LOCAL PREVIEW ONLY.txt"
 fi
-hdiutil create -volname "${OPENRAY_NAME}" -srcfolder "$OPENRAY_STAGING" -format UDZO \
-  "$OPENRAY_OUTPUT/$OPENRAY_NAME.dmg" >"$OPENRAY_OUTPUT/dmg.log"
+# macOS 27 deprecates `hdiutil create`; diskutil builds the same read-only image from the folder.
+diskutil image create from --format UDZO --volumeName "$OPENRAY_NAME" \
+  "$OPENRAY_STAGING" "$OPENRAY_OUTPUT/$OPENRAY_NAME.dmg" >"$OPENRAY_OUTPUT/dmg.log"
 if (( ! OPENRAY_PREVIEW )); then
   codesign --force --sign "$OPENRAY_SIGNING_IDENTITY" "${OPENRAY_SIGNING_KEYCHAIN_ARGS[@]}" --timestamp "$OPENRAY_OUTPUT/$OPENRAY_NAME.dmg"
   notarize "$OPENRAY_OUTPUT/$OPENRAY_NAME.dmg" dmg

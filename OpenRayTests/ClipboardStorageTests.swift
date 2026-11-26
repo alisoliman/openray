@@ -17,7 +17,7 @@ struct ClipboardStorageTests {
         legacy.preferences.clipboardEnabled = true
         legacy.clipboard = [entry]
         legacy.notes = [QuickNote(title: "Keep this", content: "Existing notes survive")]
-        var object = try #require(JSONSerialization.jsonObject(with: JSONEncoder().encode(legacy)) as? [String: Any])
+        var object = try LegacyLibraryFixture.object(from: legacy)
         var preferences = try #require(object["preferences"] as? [String: Any])
         preferences.removeValue(forKey: "clipboardImagesEnabled")
         preferences.removeValue(forKey: "clipboardFilesEnabled")
@@ -34,6 +34,7 @@ struct ClipboardStorageTests {
         #expect(store.database.preferences.clipboardEnabled)
         #expect(!store.database.preferences.capturesClipboardImages)
         #expect(!store.database.preferences.capturesClipboardFiles)
+        #expect(!store.database.preferences.needsFirstRun)
         #expect(try Data(contentsOf: url) == original)
         #expect(store.save(QuickNote(title: "Another", content: "New note")))
         let reopened = LibraryStore(fileURL: url)
@@ -41,6 +42,7 @@ struct ClipboardStorageTests {
         #expect(reopened.database.notes.count == 2)
         #expect(reopened.database.schemaVersion == LibraryDatabase.currentSchemaVersion)
         #expect(!reopened.database.preferences.capturesClipboardImages)
+        #expect(!reopened.database.preferences.needsFirstRun)
     }
 
     @Test func imagesPersistOutsideJSONWithOwnerOnlyPermissions() throws {
@@ -174,6 +176,81 @@ struct ClipboardStorageTests {
         #expect(store.database.clipboard.reduce(0) { $0 + $1.byteCount } <= ClipboardLimits.historyBytes)
     }
 
+    @Test func pinnedEntriesClaimTheByteBudgetBeforeNewerCaptures() {
+        let store = LibraryStore(fileURL: nil)
+        #expect(store.update { $0.preferences.clipboardEnabled = true })
+        func imageID(_ index: Int) -> String { String(format: "%064x", index) }
+        func image(_ index: Int, megabytes: Int) -> ClipboardEntry {
+            ClipboardEntry(
+                content: .image(
+                    ClipboardImage(
+                        id: imageID(index), pixelWidth: 1, pixelHeight: 1, byteCount: megabytes * 1_000_000)),
+                sourceName: "Budget fixture")
+        }
+        // 9 MB pinned plus seven newer 8 MB captures is 65 MB, over the 64 MB budget.
+        let pinned = image(1, megabytes: 9)
+        #expect(store.capture(pinned))
+        #expect(store.setPinned(true, clipboardEntry: pinned.id))
+        #expect(store.toggleFavorite("clipboard.\(pinned.id)"))
+        for index in 2...8 { store.capture(image(index, megabytes: 8)) }
+
+        let entries = store.database.clipboard
+        #expect(entries.contains { $0.id == pinned.id && $0.isPinned })
+        #expect(store.database.favoriteIDs.contains("clipboard.\(pinned.id)"))
+        // The oldest unpinned capture no longer fits; order is unchanged.
+        #expect(entries.compactMap(\.image?.id) == [8, 7, 6, 5, 4, 3, 1].map(imageID))
+        #expect(entries.reduce(0) { $0 + $1.byteCount } <= ClipboardLimits.historyBytes)
+    }
+
+    @Test func aCaptureThePinnedBudgetLeavesNoRoomForIsRefusedWithAReason() {
+        let store = LibraryStore(fileURL: nil)
+        #expect(store.update { $0.preferences.clipboardEnabled = true })
+        func image(_ index: Int, megabytes: Int) -> ClipboardEntry {
+            ClipboardEntry(
+                content: .image(
+                    ClipboardImage(
+                        id: String(format: "%064x", index), pixelWidth: 1, pixelHeight: 1,
+                        byteCount: megabytes * 1_000_000)),
+                sourceName: "Budget fixture")
+        }
+        // Six pinned 10 MB images leave 4 MB of the 64 MB budget.
+        for index in 1...6 {
+            let entry = image(index, megabytes: 10)
+            #expect(store.capture(entry))
+            #expect(store.setPinned(true, clipboardEntry: entry.id))
+        }
+        let before = store.database.clipboard
+        #expect(!store.capture(image(7, megabytes: 8)))
+        #expect(store.database.clipboard == before)
+        #expect(store.captureRejection?.contains("Unpin") == true)
+        #expect(store.errorMessage == nil)
+        // A capture that fits clears the reason.
+        #expect(store.capture(ClipboardEntry(text: "small", sourceName: "Budget fixture")))
+        #expect(store.captureRejection == nil)
+    }
+
+    @Test func builtInExclusionsApplyEvenWhenTheSavedListIsEmpty() throws {
+        var database = LibraryDatabase()
+        database.preferences.excludedClipboardBundleIDs = []
+        let decoded = try JSONDecoder().decode(LibraryDatabase.self, from: JSONEncoder().encode(database))
+        let preferences = decoded.preferences
+        #expect(preferences.excludedClipboardBundleIDs.isEmpty)
+        #expect(preferences.effectiveClipboardExclusions == AppPreferences.builtInClipboardExclusions)
+        #expect(
+            !ClipboardPolicy.shouldCapture(
+                types: [], sourceBundleID: "com.bitwarden.desktop",
+                excluded: preferences.effectiveClipboardExclusions, secureInput: false))
+        #expect(
+            ClipboardPolicy.shouldCapture(
+                types: [], sourceBundleID: "com.apple.TextEdit",
+                excluded: preferences.effectiveClipboardExclusions, secureInput: false))
+
+        var custom = preferences
+        custom.excludedClipboardBundleIDs = ["com.example.vault", "com.bitwarden.desktop"]
+        #expect(
+            custom.effectiveClipboardExclusions == AppPreferences.builtInClipboardExclusions + ["com.example.vault"])
+    }
+
     @Test func failedMetadataSaveDoesNotLeaveNewImageDataBehind() throws {
         let directory = FileManager.default.temporaryDirectory.appending(path: "OpenRayMediaRollback-\(UUID())")
         defer { try? FileManager.default.removeItem(at: directory) }
@@ -206,7 +283,10 @@ struct ClipboardStorageTests {
         let service = ClipboardService(store: store, pasteboard: board)
         #expect(!service.copy(entry))
         #expect(board.string(forType: .string) == "Keep current clipboard")
-        #expect(service.contentMessage?.contains("missing or damaged") == true)
+        #expect(service.lastCopyError?.contains("missing or damaged") == true)
+        #expect(service.contentMessage == nil)
+        #expect(service.copy("Next copy"))
+        #expect(service.lastCopyError == nil)
     }
 
     @Test func imageStoreNeverTraversesASymbolicLinkDirectory() throws {

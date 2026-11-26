@@ -31,12 +31,13 @@ struct CommandDispatchTests {
         #expect(model.results.map(\.id) == ["section.notes"])
     }
 
-    @Test func aliasMatchingIsExactAndActionsKeepTheirExistingRouting() {
+    @Test func aliasPrefixesRankFirstExactAliasesWinAndActionsKeepTheirRouting() {
         let model = model()
         defer { model.stop() }
         #expect(model.store.saveCommandBinding(CommandBinding(targetID: "section.clipboard", alias: "zzclip")))
+        // A prefix of an alias ranks its command first; only the exact alias makes it the sole result.
         model.query = "zzcli"
-        #expect(model.results.isEmpty)
+        #expect(model.results.first?.id == "section.clipboard")
         model.query = "zzclip"
         model.showActions = true
         model.performSelected()
@@ -47,15 +48,45 @@ struct CommandDispatchTests {
         #expect(model.section == .clipboard)
     }
 
-    @Test func curatedTargetsAreExplicitAndExcludeContentAndOtherAICommands() {
+    @Test func curatedTargetsAreExplicitIncludeWritingCommandsAndExcludeContent() {
         let model = model()
         defer { model.stop() }
-        #expect(model.bindableCommands.map(\.id) == CuratedCommand.targetIDs)
-        #expect(model.bindableCommands.count == 21)
-        #expect(!CuratedCommand.supports("ai.summarize"))
-        #expect(!CuratedCommand.supports("window.nextDisplay"))
-        #expect(!CuratedCommand.supports("quicklink.any"))
-        #expect(!CuratedCommand.supports("clipboard.any"))
+        // The original twenty lead in their order; registered providers may add more after them.
+        #expect(Array(model.bindableCommands.map(\.id).prefix(CuratedCommand.targetIDs.count)) == CuratedCommand.targetIDs)
+        #expect(CuratedCommand.targetIDs.count == 20)
+        // Only the legacy registrations: later slices may make more ids bindable through their own.
+        let legacy = [AIWritingCommandProvider.registration]
+        for action in AIAction.allCases where action != .chat {
+            #expect(CuratedCommand.supports("ai.\(action.id)", registrations: legacy))
+        }
+        #expect(!CuratedCommand.supports("window.nextDisplay", registrations: legacy))
+        #expect(!CuratedCommand.supports("quicklink.any", registrations: legacy))
+        #expect(!CuratedCommand.supports("clipboard.any", registrations: legacy))
+    }
+
+    @Test func mainsPomodoroAndCaffeinateCommandsJoinTheCatalogUnderTheIDsMainSaved() {
+        let model = model()
+        defer { model.stop() }
+        // main appended these to the curated list; here the providers' namespaces accept them, so
+        // bindings, favorites and usage saved by main's builds keep working.
+        let ids = [
+            "pomodoro.open", "pomodoro.start", "caffeinate.open", "caffeinate.start", "caffeinate.stop",
+            "caffeinate.toggle",
+        ]
+        #expect(CuratedCommand.targetIDs.count == 20)
+        let bindable = model.bindableCommands.map(\.id)
+        for id in ids {
+            #expect(CuratedCommand.supports(id))
+            #expect(bindable.contains(id))
+        }
+        #expect(bindable.filter(ids.contains) == ids)
+        // An alias runs them from any scope.
+        #expect(model.store.saveCommandBinding(CommandBinding(targetID: "pomodoro.open", alias: "pom")))
+        model.navigate(to: .snippets)
+        model.query = "pom"
+        #expect(model.results.map(\.id) == ["pomodoro.open"])
+        model.performSelected()
+        #expect(model.section.providedScope?.id == PomodoroCommandProvider.scope.id)
     }
 
     @Test func boundInvocationUsesSharedDispatchAndRemovedBindingsCannotRun() {

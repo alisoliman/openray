@@ -80,6 +80,39 @@ struct CalculatorTests {
         #expect(Calculator.evaluate(input)?.result == expected)
     }
 
+    @Test(arguments: ["2 days to go", "10 tips to improve", "5 minutes to midnight"])
+    func proseShapedLikeAConversionIsNotAnIssueWhileSearching(_ input: String) {
+        #expect(Calculator.issue(for: input) == .unsupportedConversion)
+        #expect(Calculator.searchIssue(for: input) == nil)
+    }
+
+    @Test func unknownUnitConvertedIntoAKnownOneIsAnIssueWhileSearching() {
+        #expect(Calculator.searchIssue(for: "1 parsec in m") == .unsupportedConversion)
+        #expect(Calculator.searchIssue(for: "1 m in parsec") == nil)
+    }
+
+    @Test func divisionByZeroMessageDoesNotPointAtExamples() {
+        let message = Calculator.Issue.divisionByZero.message
+        #expect(message == "The divisor is zero, so there's no result. Check the divisor.")
+    }
+
+    @Test func relatedUnitsShowGroupedValuesAndCopyRawOnes() throws {
+        let conversion = try #require(Calculator.evaluate("10 km in mi")?.conversion)
+        let feet = try #require(conversion.related.first { $0.symbol == "ft" })
+        #expect(feet.value == "32,808.4")
+        #expect(feet.copyValue == "32808.3989501")
+        let meters = try #require(conversion.related.first { $0.symbol == "m" })
+        #expect(meters.value == "10,000")
+        #expect(meters.copyValue == "10000")
+        #expect(conversion.target.value == "6.21371")
+        #expect(conversion.target.copyValue == "6.21371192237")
+        // Shortening drops decimals, never whole-number digits.
+        #expect(Calculator.evaluate("1234567 m in km")?.conversion?.target.value == "1234.57")
+        #expect(Calculator.evaluate("1234567 km in m")?.conversion?.target.value == "1234567000")
+        // 4,050,416.67 ft, which six significant digits would have shown as 4,050,420.
+        #expect(Calculator.evaluate("1234567 m in km")?.conversion?.related.first { $0.symbol == "ft" }?.value == "4,050,417")
+    }
+
     @Test func emptyInputHasNoIssue() {
         #expect(Calculator.issue(for: "  \n") == nil)
     }

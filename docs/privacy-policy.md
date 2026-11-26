@@ -1,16 +1,20 @@
 # OpenRay privacy information
 
-Last updated: 8 September 2026. This notice describes the OpenRay application and its public GitHub help links. It does not describe a separate download website or support service that is not part of this repository.
+Last updated: 26 November 2026. This notice describes the OpenRay application and its public GitHub help links. It does not describe a separate download website or support service that is not part of this repository.
 
 ## What OpenRay does with your data
 
 OpenRay is a local macOS launcher. Its current app implementation has no account system, advertising, analytics SDK, cloud sync, or cloud AI provider. It does not upload your local library to an OpenRay server.
+
+OpenRay makes one kind of network request of its own, and only after you turn it on: currency conversion can download the European Central Bank's daily reference rates (Settings → Calculator). It is off by default, checks at most once a day, sends no data about you beyond the request itself, and keeps the rates in `currency-rates.json` beside your library. Everything else in this notice stays on your Mac unless you open a link, paste into another app, or export an archive yourself.
 
 The app stores your notes, snippets, quicklinks, favorites, settings, and recent-use records on your Mac. Recent-use records include item identifiers, counts, and last-used times to support recents and ranking. Identifiers may contain application identifiers or file paths. The app scans standard Applications locations to list installed apps and uses Spotlight for filename search. The current file-search result list is kept in memory; a file you favorite or use can also be represented in your saved library records.
 
 ## Pomodoro
 
 Pomodoro configuration, timer state, and completed focus sessions are stored in the local JSON library. State includes the current phase, its deadline or paused remaining time, and progress through the cycle. Completed-session records include timing and duration information used to show daily progress and the latest 20 sessions. Older records remain in the library, and resetting the cycle preserves them. OpenRay does not monitor the content of your work or share these records with a server. Timer state is restored after relaunch, including completion of an overdue phase.
+
+Caffeinate holds a macOS power assertion while it's on and stores nothing; quitting OpenRay releases it.
 
 ## Clipboard history
 
@@ -28,13 +32,13 @@ OpenRay requests Accessibility access only when you explicitly choose to enable 
 
 Automatic snippet expansion is off by default. When enabled, it observes keyboard input to match your snippet keywords. Its matching buffer holds only a bounded recent suffix in memory; it does not write a transcript of your typing to disk. Secure Input and configured app exclusions suppress expansion.
 
-When you open OpenRay from another app, supported selected text and its source app are retained in memory so that a writing command can use the selection and later return the result to the same place. Choosing a writing command such as Improve Writing starts with that selection when the tool has no existing work. Running that command again with a new selection also starts a new task after a completed response with no unsent draft or error. Drafts, ongoing responses, and stopped or failed requests are preserved until you explicitly choose to replace that work. Hiding, reopening, or browsing tools does not replace a previous result with a new selection. OpenRay checks the original selection before replacing it; if it has changed, the result remains available to copy. Selected text is not saved to the library simply because you open the launcher.
+When you choose a writing command, a `{selection}` placeholder or an AI Command that uses the selection, OpenRay reads the text selected in the app you opened it from, with that app and the text's place, and keeps them in memory for that task so the result can go back to the same place. Protected text fields and Secure Input are refused. OpenRay checks the original selection before replacing it; if it has changed, the result is copied instead. Starting a new chat, choosing another passage or inserting the result releases that target. Selected text is not read just because you open the launcher, and it is not saved to the library.
 
 ## Apple Intelligence
 
 AI text generation uses Apple's on-device Foundation Models implementation. OpenRay has no cloud fallback or external AI API key. The feature requires an eligible Mac and an available Apple Intelligence model. [Apple's SystemLanguageModel documentation](https://developer.apple.com/documentation/foundationmodels/systemlanguagemodel).
 
-Your typed AI prompt and the content you choose to work on are processed by the on-device model. A writing command can use selected text as described above; Ask does not import a selection automatically. Clipboard content enters AI only when you choose Use Clipboard. Follow-up instructions use the writing result already in the conversation. Conversations, drafts, and captured selection context remain in memory; OpenRay does not automatically write them to the local library. Hiding the launcher retains its current workspace for five minutes. After a longer pause it opens All, while AI drafts and conversations remain available until you start fresh or quit. Choosing Save as Note saves the selected AI response as a regular local note. Apple controls the model's installation and operating-system services under its own terms and privacy practices.
+Your typed AI prompt and the content you choose to work on are processed by the on-device model. A writing command can use selected text as described above; Ask does not import a selection automatically. Clipboard, files, notes and screen captures reach the model when you attach or @-mention them, and an agent you give tools can read the library items those tools cover; every write or action a tool takes asks you first. Follow-up instructions use the writing result already in the conversation. Conversations in the launcher, drafts, and captured selection context remain in memory; how long the launcher keeps its place after hiding follows Settings → General → Back to Everything. The AI Chat window saves its chats on this Mac in `AIChats/chats.json`, which you can delete from the window or its Recently Deleted. Choosing Save as Note saves the selected AI response as a regular local note. Dictation, when you turn it on, uses the microphone and Apple's on-device speech recognition. Apple controls the model's installation and operating-system services under its own terms and privacy practices.
 
 ## Links and other applications
 
@@ -51,6 +55,19 @@ For the direct-download app, the default library is stored in:
 ~/Library/Application Support/OpenRay/ClipboardImages/
 ```
 
+Beside the library, OpenRay can also keep:
+
+- `NoteAssets/` and `NoteRecovery/`: images pasted into notes, and copies kept while a note can still be restored from Recently Deleted.
+- `AIChats/chats.json`: chats saved by the AI Chat window.
+- `launcher-memory.json`: which result you picked for a search, and recent searches when search history is on.
+- `local-approvals.json`: the script folders and deeplink commands you allowed on this Mac. It never travels in an archive.
+- `backup-settings.json`: the folder and schedule for automatic backups, when you set them. Backups are encrypted archives written to the folder you choose, which can be in iCloud Drive; that folder's own sync and retention then apply.
+- `screenshots.json`: text recognized in your screenshots, for Search Screenshots.
+- `currency-rates.json`: the opt-in exchange rates described above.
+- `library-pending-cleanup.json`: a short record that lets an interrupted deletion finish.
+
+Archive export writes only the categories you choose, encrypted when you set a passphrase. Calendar access, when you grant it, is read on demand to show your schedule and is not copied into the library.
+
 The JSON library and saved PNG images are not encrypted by OpenRay. The app applies owner-only permissions to its data directories and files, but local system access, device backups, and other software with sufficient access can affect their confidentiality. Device encryption and backups are controlled separately by you and macOS.
 
 Delete notes, snippets, quicklinks, and clipboard history from the app to remove their saved records. To remove the entire local library, quit OpenRay, use Finder's Go to Folder to open `~/Library/Application Support/`, and move the `OpenRay` folder to Trash. Emptying Trash is a separate action. Keep a backup first if you may need the data. Removing the app alone does not remove that library. Copies in backups and content previously shared with other apps or websites must be managed separately.
@@ -61,4 +78,4 @@ The app's guide and support links open the [OpenRay GitHub repository](https://g
 
 If a separate website, private support channel, updater, analytics service, or cloud feature is introduced, update this notice to explain that service's actual data handling. The application's local storage statements must not be extended to an unreviewed external service.
 
-Implementation basis: `LibraryModels.swift`, `LibraryStore.swift`, `PomodoroModels.swift`, `PomodoroService.swift`, `ClipboardService.swift`, `ClipboardImageStore.swift`, `SnippetExpander.swift`, `ApplicationCatalog.swift`, `FileSearchService.swift`, `WindowManager.swift`, `AIChatModel.swift`, and `FoundationModelEngine.swift`. Recheck this notice whenever those data flows change.
+Implementation basis: `LibraryModels.swift`, `LibraryStore.swift`, `LibraryArchive.swift`, `LauncherMemory.swift`, `PomodoroModels.swift`, `PomodoroService.swift`, `CaffeinateService.swift`, `ClipboardService.swift`, `ClipboardImageStore.swift`, `SnippetExpander.swift`, `SelectedTextContext.swift`, `CurrencyRates.swift`, `LocalApprovals.swift`, `ScreenshotIndex.swift`, `ApplicationCatalog.swift`, `FileSearchService.swift`, `WindowManager.swift`, `ChatStore.swift`, `NoteExport.swift`, `AIChatModel.swift`, and `FoundationModelEngine.swift`. Recheck this notice whenever those data flows change.
