@@ -56,7 +56,8 @@ struct CommandDispatchTests {
         for action in AIAction.allCases where action != .chat {
             #expect(CuratedCommand.supports("ai.\(action.id)"))
         }
-        #expect(!CuratedCommand.supports("window.nextDisplay"))
+        // Every window command is bindable through WindowCommandProvider's `window.` namespace.
+        #expect(CuratedCommand.supports("window.nextDisplay"))
         #expect(!CuratedCommand.supports("quicklink.any"))
         #expect(!CuratedCommand.supports("clipboard.any"))
     }

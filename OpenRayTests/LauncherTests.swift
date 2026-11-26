@@ -121,7 +121,11 @@ struct LauncherTests {
         let clipboardID = "clipboard.\(model.store.database.clipboard[0].id)"
         model.store.toggleFavorite(clipboardID)
         model.store.toggleFavorite("file./Users/example/Documents/note.txt")
+        // Root search finds both. (A blank Home shows favorites and recents, not these rows,
+        // and its unranked list is capped, so registered commands can fill it.)
+        model.query = "Pinned text"
         #expect(model.results.contains { $0.id == clipboardID })
+        model.query = "note.txt"
         #expect(model.results.contains { $0.id == "file./Users/example/Documents/note.txt" })
         #expect(Set(model.results.map(\.id)).count == model.results.count)
         model.query = "zzzzzzzzzzzzzzzzz"

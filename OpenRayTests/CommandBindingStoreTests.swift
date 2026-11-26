@@ -169,7 +169,9 @@ struct CommandBindingStoreTests {
             !store.saveCommandBinding(
                 CommandBinding(
                     targetID: "section.clipboard", shortcut: CommandShortcut(keyCode: 49, modifiers: [.command]))))
-        for target in ["system.lock", "system.sleep", "system.emptyTrash", "app.unknown", "section.home"] {
+        // System and window commands are bindable through their providers' namespaces (and
+        // destructive ones confirm, even from a hotkey); content and unknown targets are not.
+        for target in ["clipboard.any", "snippet.any", "file.any", "app.unknown", "section.home"] {
             #expect(!store.saveCommandBinding(CommandBinding(targetID: target, alias: "unsafe")))
             #expect(!store.saveCommandBinding(CommandBinding(targetID: target)))
         }
