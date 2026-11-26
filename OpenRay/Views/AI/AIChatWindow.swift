@@ -106,7 +106,7 @@ struct AIChatWindowView: View {
                 .labelsHidden().pickerStyle(.menu).neutralMenus().fixedSize()
                 Spacer()
                 if scope == .deleted, !hub.chatStore.recentlyDeleted.isEmpty {
-                    Button("Empty") { hub.chatStore.emptyRecentlyDeleted() }.buttonStyle(.orGhost)
+                    Button("Empty") { hub.emptyRecentlyDeleted() }.buttonStyle(.orGhost)
                 }
             }
             .padding(.horizontal, 10).frame(height: 36)
@@ -134,8 +134,8 @@ struct AIChatWindowView: View {
         .tag(saved.id)
         .contextMenu {
             if saved.isDeleted {
-                Button("Restore") { hub.chatStore.restore(saved.id) }
-                Button("Delete Permanently", role: .destructive) { hub.chatStore.deletePermanently(saved.id) }
+                Button("Restore") { hub.restoreChat(saved.id) }
+                Button("Delete Permanently", role: .destructive) { hub.deletePermanently(saved.id) }
             } else {
                 Button(saved.isPinned ? "Unpin" : "Pin") {
                     if saved.isPinned { hub.chatStore.unpin(saved.id) } else { hub.chatStore.pin(saved.id) }
@@ -160,7 +160,15 @@ struct AIChatWindowView: View {
             notice = "Wait for the reply to finish, or stop it, before opening another chat."
             return
         }
-        hub.show(id)
+        // A conversation that couldn't be saved stays open, with the reason below.
+        guard hub.show(id) else { return }
+        notice = nil
+        focusRequest += 1
+    }
+
+    private func startNewChat() {
+        guard hub.newWindowChat() else { return }
+        notice = nil
         focusRequest += 1
     }
 
@@ -174,9 +182,12 @@ struct AIChatWindowView: View {
                 }
                 .padding(14)
             }
-            if let deleted = chat.chatID.flatMap(hub.chatStore.chat(id:)), deleted.isDeleted {
-                InlineNotice(.info, symbol: "trash", title: "This chat is in Recently Deleted.") {
-                    Button("Restore") { hub.chatStore.restore(deleted.id) }.buttonStyle(.orSecondary)
+            if chat.isReadOnly, let deleted = chat.chatID.flatMap(hub.chatStore.chat(id:)), deleted.isDeleted {
+                InlineNotice(
+                    .info, symbol: "trash", title: "This chat is in Recently Deleted.",
+                    detail: "It's read-only until you restore it."
+                ) {
+                    Button("Restore") { hub.restoreChat(deleted.id) }.buttonStyle(.orSecondary)
                 }
                 .padding(14)
             }
@@ -189,7 +200,7 @@ struct AIChatWindowView: View {
             .frame(maxWidth: .infinity, maxHeight: .infinity)
             ChatSuggestions(chat: chat, agents: hub.agents, extensions: hub.toolExtensions) { focusRequest += 1 }
             composer
-            if let message = notice ?? chat.errorMessage ?? hub.chatStore.errorMessage {
+            if let message = hub.saveError ?? notice ?? chat.errorMessage ?? hub.chatStore.errorMessage {
                 Text(message).font(OR.Font.callout).foregroundStyle(OR.Color.text2)
                     .frame(maxWidth: .infinity, alignment: .leading)
                     .padding(.horizontal, 18).padding(.bottom, 10)
@@ -211,7 +222,7 @@ struct AIChatWindowView: View {
                 notice = model.store.save(note) ? "Saved as a note." : (model.store.errorMessage ?? "The note couldn't be saved.")
             },
             retry: { chat.retry() },
-            branch: chat.chatID == nil ? nil : { message in hub.branch(from: message.id) })
+            branch: chat.chatID == nil || chat.isReadOnly ? nil : { message in hub.branch(from: message.id) })
     }
 
     private func chatTitle(for message: ChatMessage) -> String {
@@ -262,6 +273,7 @@ struct AIChatWindowView: View {
                 .accessibilityLabel(chat.isGenerating ? "Stop" : "Send message")
             }
         }
+        .disabled(chat.isReadOnly)
         .padding(.leading, 14).padding(.trailing, 10).padding(.top, 10).padding(.bottom, 8)
         .background(OR.Color.fill1, in: .rect(cornerRadius: OR.Radius.card, style: .continuous))
         .fieldRing(focused: composerFocused)
@@ -345,8 +357,7 @@ struct AIChatWindowView: View {
             }
             .help(hub.settings.chatWindowOnTop ? "Stop keeping this window on top" : "Keep this window on top")
             Button {
-                hub.newWindowChat()
-                focusRequest += 1
+                startNewChat()
             } label: {
                 Label("New Chat", systemImage: "square.and.pencil")
             }
@@ -385,11 +396,8 @@ struct AIChatWindowView: View {
 
     private var shortcuts: some View {
         ZStack {
-            Button("New Chat") {
-                hub.newWindowChat()
-                focusRequest += 1
-            }
-            .keyboardShortcut("n")
+            Button("New Chat") { startNewChat() }
+                .keyboardShortcut("n")
             Button("Agents") { showsAgents.toggle() }.keyboardShortcut("k")
             Button("Stop") { chat.cancel() }.keyboardShortcut(".")
             ForEach(1...9, id: \.self) { number in

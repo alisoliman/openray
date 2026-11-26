@@ -73,7 +73,9 @@ protocol AITextTranslating {
 /// What the chat reads from the rest of OpenRay: agents, tools, a translator. The hub fills
 /// it in; tests set what they need.
 struct AIChatEnvironment {
-    var agents: @MainActor () -> [Agent] = { [] }
+    /// The current agents. When set, chat looks its agent up here before every request, so an
+    /// edit or deletion takes effect in open conversations. Nil keeps the agent as chosen.
+    var agents: (@MainActor () -> [Agent])? = nil
     var defaultAgent: @MainActor () -> Agent? = { nil }
     var toolExtensions: @MainActor () -> [AIToolExtension] = { [] }
     var toolBroker: AIToolBroker? = nil
@@ -129,6 +131,11 @@ final class AIChatModel {
     private(set) var condensationNotice: String?
     /// The saved chat this conversation is, in the chat window.
     var chatID: UUID?
+    /// A chat in Recently Deleted: shown, but nothing can be sent until it's restored.
+    var isReadOnly = false
+    /// Changes whenever this becomes a different conversation, so work that finishes later
+    /// (a capture, a file read) can tell it no longer belongs here.
+    private(set) var conversationToken = UUID()
     @ObservationIgnored var environment = AIChatEnvironment()
     /// Called after each response finishes or fails, so the chat window can save.
     @ObservationIgnored var onConversationChange: (() -> Void)?
@@ -150,15 +157,21 @@ final class AIChatModel {
         var shortAttachments: [AIAttachment]
     }
 
-    init(engine: any AIEngine = FoundationModelEngine(), hub: AIHub? = nil) {
+    /// `engine` nil uses Apple's model, except in the test host, where nothing reaches a real
+    /// model unless a test passes one in.
+    init(engine: (any AIEngine)? = nil, hub: AIHub? = nil) {
+        let engine = engine ?? (SideEffectGuard.isTestHost ? InertAIEngine() : FoundationModelEngine())
         self.engine = engine
         availability = engine.availability
         self.hub = hub ?? AIHub()
         if hub == nil { self.hub.panelChat = self }
     }
 
-    /// The window and stores that live beside the panel's chat.
+    /// What the active model supports.
     var capabilities: AIModelCapabilities { engine.capabilities }
+    /// Engines that predate capabilities report none; tool calling is only withheld from
+    /// engines that report capabilities without it.
+    private var engineReportsCapabilities: Bool { !capabilities.isEmpty }
 
     /// What the header and result call this run.
     var title: String { command?.title ?? action.title }
@@ -190,7 +203,7 @@ final class AIChatModel {
     }
 
     var canSend: Bool {
-        availability.isAvailable && !isGenerating && hasPendingInput && pendingCharacterCount <= Self.inputLimit
+        availability.isAvailable && !isGenerating && !isReadOnly && hasPendingInput && pendingCharacterCount <= Self.inputLimit
     }
 
     /// The latest assistant reply. A stopped writing result never counts, so it can't be copied
@@ -203,7 +216,7 @@ final class AIChatModel {
 
     /// Try Again needs a finished run to repeat. A stopped writing result counts here,
     /// though it can't be copied or replaced.
-    var canRetry: Bool { !isGenerating && messages.last?.role == .assistant }
+    var canRetry: Bool { !isGenerating && !isReadOnly && messages.last?.role == .assistant }
 
     func refreshAvailability() { availability = engine.availability }
 
@@ -233,6 +246,8 @@ final class AIChatModel {
         activeProfile = nil
         turnRequests = [:]
         chatID = nil
+        isReadOnly = false
+        conversationToken = UUID()
         agent = environment.defaultAgent()
         environment.toolBroker?.clearActivity()
         if let action { self.action = action }
@@ -289,11 +304,27 @@ final class AIChatModel {
         errorMessage = nil
     }
 
+    /// Drops a deleted agent, even mid-reply; the next request goes to the assistant.
+    func forgetAgent(_ id: UUID) {
+        if agent?.id == id { agent = nil }
+    }
+
+    /// The agent as it's defined now: edits apply, and a deleted one falls back to the assistant.
+    private func currentAgent() -> Agent? {
+        guard let agent, let agents = environment.agents else { return agent }
+        let current = agents().first { $0.id == agent.id }
+        if current == nil || current?.isAssistant == true { self.agent = nil }
+        return current?.isAssistant == true ? nil : current
+    }
+
     // MARK: Sending
 
     func send() {
         refreshAvailability()
-        if action == .chat, let switched = AgentSwitch.parse(draft.trimmingCharacters(in: .whitespaces), agents: environment.agents()) {
+        guard !isReadOnly else { return }
+        if action == .chat,
+            let switched = AgentSwitch.parse(draft.trimmingCharacters(in: .whitespaces), agents: environment.agents?() ?? [])
+        {
             // “/writer” switches agents; anything after it is sent to the new agent.
             selectAgent(switched.agent)
             draft = switched.remainder
@@ -309,7 +340,7 @@ final class AIChatModel {
         if action == .chat {
             let plan = AIToolRouter.plan(
                 text: typed, extensions: environment.toolBroker == nil ? [] : environment.toolExtensions(),
-                agentToolIDs: agent?.toolIDs ?? [])
+                agentToolIDs: currentAgent()?.toolIDs ?? [])
             let question = plan.mode == .required ? plan.prompt : typed
             let short = attachments.filter { !$0.source.isCondensable && $0.hasContent }
             let long = attachments.filter { $0.source.isCondensable && !$0.text.isEmpty }
@@ -362,7 +393,7 @@ final class AIChatModel {
     /// Generates the latest response again from the same input. If the new run produces
     /// nothing, the previous response comes back.
     func retry() {
-        guard !isGenerating, let index = messages.lastIndex(where: { $0.role == .user }) else { return }
+        guard !isGenerating, !isReadOnly, let index = messages.lastIndex(where: { $0.role == .user }) else { return }
         let prompt = messages[index].text
         let previous = Array(messages[(index + 1)...])
         messages.removeSubrange((index + 1)...)
@@ -449,7 +480,18 @@ final class AIChatModel {
         if let turn, !turn.condensable.isEmpty {
             prompt = try await condenseAttachments(turn, userMessageID: userMessageID)
         }
-        let plan = turn?.plan ?? AIToolPlan(tools: [], mode: .none, prompt: prompt, mentionedExtensionIDs: [])
+        var plan = turn?.plan ?? AIToolPlan(tools: [], mode: .none, prompt: prompt, mentionedExtensionIDs: [])
+        let agent = currentAgent()
+        if plan.mode == .allowed {
+            // Tools the agent offered when this turn was planned, still granted now. A tool
+            // the person removed from the agent since then isn't offered again.
+            let granted = Set(agent?.toolIDs ?? [])
+            plan.tools.removeAll { !granted.contains($0.id) }
+            if plan.tools.isEmpty { plan.mode = .none }
+        }
+        if !capabilities.contains(.toolCalling), engineReportsCapabilities {
+            plan = AIToolPlan(tools: [], mode: .none, prompt: plan.prompt, mentionedExtensionIDs: plan.mentionedExtensionIDs)
+        }
         let profile = (agent ?? .assistant).profile(capabilities: capabilities, hasTools: !plan.tools.isEmpty)
         try await prepareContext(prompt: prompt, profile: profile, tools: plan.tools, before: userMessageID)
         try Task.checkCancellation()
@@ -590,8 +632,9 @@ final class AIChatModel {
             summarizedMessageCount: summarizedMessageCount, agentID: agent?.id, transcript: engine.exportTranscript())
     }
 
-    /// Resumes a saved conversation: the engine's own transcript when it can read it,
-    /// otherwise a session rebuilt from the summary and the recent turns.
+    /// Resumes a saved conversation: the engine's own transcript when it can read it, with its
+    /// instructions replaced by the agent's current ones, otherwise a session rebuilt from the
+    /// summary and the recent turns. What the model knows matches what's shown either way.
     func load(_ state: AIConversationState, agent: Agent?) {
         guard !isGenerating else { return }
         newConversation(action: .chat)
@@ -602,16 +645,18 @@ final class AIChatModel {
         refreshAvailability()
         guard !messages.isEmpty else { return }
         let profile = (self.agent ?? .assistant).profile(capabilities: capabilities, hasTools: false)
-        if let data = state.transcript, engine.restoreTranscript(data, profile: profile) {
+        let context = AIConversationContext(profile: profile, summary: summary, turns: turns(before: nil).map(\.turn))
+        if let data = state.transcript, engine.restoreTranscript(data, context: context) {
             activeProfile = profile
         } else {
-            engine.rebuild(AIConversationContext(profile: profile, summary: summary, turns: turns(before: nil).map(\.turn)))
+            engine.rebuild(context)
             activeProfile = profile
         }
     }
 
-    /// Moves this conversation out, leaving a fresh one: Continue in Chat.
-    func takeConversation() -> AIConversationState? {
+    /// This conversation as Continue in Chat moves it, without clearing it. The caller clears
+    /// it with `newConversation` only once the copy is saved.
+    func transferState() -> AIConversationState? {
         guard !isGenerating, messages.contains(where: { $0.role == .assistant && !$0.text.isEmpty }) else { return nil }
         var state = conversationState()
         if action != .chat {
@@ -620,7 +665,16 @@ final class AIChatModel {
             state.summary = nil
             state.summarizedMessageCount = 0
         }
-        newConversation(action: .chat)
         return state.messages.isEmpty ? nil : state
+    }
+
+    /// Stops any reply and empties the conversation, even mid-reply: its chat was deleted.
+    func detach() async {
+        isReadOnly = true
+        if isGenerating {
+            cancel()
+            await waitForResponse()
+        }
+        newConversation(action: .chat)
     }
 }

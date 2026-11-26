@@ -22,6 +22,8 @@ final class AIHub {
     @ObservationIgnored var presentEditor: ((AIEditorRequest) -> Void)?
     private(set) var windowRequests = 0
     private(set) var editorRequests: [AIEditorRequest] = []
+    /// Why the window's conversation couldn't be saved. It stays open until it can be.
+    private(set) var saveError: String?
     /// Makes the chat window's engine. Nil asks the panel's engine for a sibling.
     @ObservationIgnored var windowEngineFactory: (@MainActor () -> any AIEngine)?
     @ObservationIgnored var screenCapture: any AIScreenCapturing =
@@ -63,7 +65,7 @@ final class AIHub {
     /// Gives a conversation the agents, tools and translator.
     func configure(_ chat: AIChatModel) {
         chat.environment = AIChatEnvironment(
-            agents: { [weak self] in self?.agents ?? [] },
+            agents: { [weak self] in self?.agents ?? [Agent.assistant] },
             defaultAgent: { [weak self] in self?.defaultAgent },
             toolExtensions: { [weak self] in self?.toolExtensions ?? [] },
             toolBroker: chat.environment.toolBroker ?? makeBroker(), translator: translator)
@@ -88,9 +90,10 @@ final class AIHub {
         return saved
     }
 
-    /// Points both conversations' engines at the chosen model.
+    /// Points both conversations' engines at the chosen model. A build without Private Cloud
+    /// Compute stays on this Mac whatever is stored.
     func applySettings() {
-        let choice = settings.model
+        let choice = AIModelSelection.isBuildEnabled ? settings.model : .onDevice
         panelChat?.engine.setModelChoice(choice)
         windowChatStorage?.engine.setModelChoice(choice)
     }
@@ -155,8 +158,9 @@ final class AIHub {
         return AICommand(record: record)
     }
 
+    /// Saves an agent and, when given, whether it starts new chats, in one save: both or neither.
     @discardableResult
-    func save(_ agent: Agent) -> Bool {
+    func save(_ agent: Agent, isDefault: Bool? = nil) -> Bool {
         guard let launcher, !agent.isAssistant else { return false }
         if let message = agent.validationMessage {
             launcher.feedback = .warning(message)
@@ -169,9 +173,19 @@ final class AIHub {
             } else {
                 database.agents.append(record)
             }
+            if let isDefault {
+                var settings = AISettings(database: database)
+                if isDefault {
+                    settings.defaultAgentID = agent.id
+                } else if settings.defaultAgentID == agent.id {
+                    settings.defaultAgentID = nil
+                }
+                settings.write(into: &database)
+            }
         }
     }
 
+    /// Deletes an agent. Open chats drop it at once, even mid-reply.
     @discardableResult
     func deleteAgent(_ id: UUID) -> Bool {
         guard let launcher else { return false }
@@ -181,19 +195,21 @@ final class AIHub {
             if settings.defaultAgentID == id { settings.defaultAgentID = nil }
             settings.write(into: &database)
         }
-        for chat in [panelChat, windowChatStorage].compactMap({ $0 }) where chat.agent?.id == id { chat.selectAgent(nil) }
+        if saved {
+            for chat in [panelChat, windowChatStorage].compactMap({ $0 }) { chat.forgetAgent(id) }
+        }
         return saved
     }
 
-    /// Adds commands from a JSON export. Returns how many were added.
-    func importCommands(from data: Data) throws -> Int {
-        guard let launcher else { return 0 }
-        let records = try AICommandTransfer.importCommands(from: data)
-        guard launcher.store.update({ $0.aiCommands += records }) else {
+    /// Adds commands from a JSON export, all or none. Returns what was added and skipped.
+    func importCommands(from data: Data) throws -> AICommandTransfer.ImportResult {
+        guard let launcher else { return AICommandTransfer.ImportResult(records: [], skipped: 0) }
+        let result = try AICommandTransfer.importCommands(from: data)
+        guard launcher.store.update({ $0.aiCommands += result.records }) else {
             throw LibraryValidationError(launcher.store.errorMessage ?? "The commands couldn't be saved.")
         }
         launcher.commandCatalogDidChange()
-        return records.count
+        return result
     }
 
     func exportCommands() throws -> Data {
@@ -212,7 +228,7 @@ final class AIHub {
     var windowChat: AIChatModel {
         if let windowChatStorage { return windowChatStorage }
         let engine = windowEngineFactory?() ?? panelChat?.engine.makeSibling() ?? InertAIEngine()
-        engine.setModelChoice(settings.model)
+        engine.setModelChoice(AIModelSelection.isBuildEnabled ? settings.model : .onDevice)
         let chat = AIChatModel(engine: engine, hub: self)
         configure(chat)
         chat.onConversationChange = { [weak self] in self?.saveWindowChat() }
@@ -229,74 +245,129 @@ final class AIHub {
         presentWindow?()
     }
 
-    /// ⌘J: moves the panel's conversation into a new saved chat and shows it in the window.
+    /// ⌘J: copies the panel's conversation into a new saved chat, and only once that's saved
+    /// clears the panel and shows the chat in the window. A failed save changes nothing.
     @discardableResult
     func continueInChat() -> Bool {
-        guard let panelChat, let state = panelChat.takeConversation() else { return false }
-        saveWindowChat()
+        guard let panelChat, let state = panelChat.transferState() else { return false }
+        guard saveWindowChat() else {
+            launcher?.feedback = .error(saveError ?? "The chat window's conversation couldn't be saved.")
+            return false
+        }
         guard let saved = chatStore.save(state, id: nil) else {
             launcher?.feedback = .error(chatStore.errorMessage ?? "The chat couldn't be saved.")
             return false
         }
+        panelChat.newConversation(action: .chat)
         show(saved.id)
         openChatWindow()
         return true
     }
 
-    /// Saves the window's conversation, if it has anything to keep.
-    func saveWindowChat() {
-        guard let chat = windowChatStorage, !chat.isGenerating, chat.messages.contains(where: { $0.role == .assistant }) else {
-            return
+    /// Saves the window's conversation once a turn was submitted, whether or not the model
+    /// answered. A chat in Recently Deleted, or deleted for good, is never written or revived.
+    /// False, with `saveError`, when it couldn't be saved; the conversation stays as it is.
+    @discardableResult
+    func saveWindowChat() -> Bool {
+        guard let chat = windowChatStorage, !chat.isGenerating, !chat.isReadOnly,
+            chat.messages.contains(where: { $0.role == .user }), chatStore.refusal(forSaving: chat.chatID) == nil
+        else {
+            saveError = nil
+            return true
         }
-        if let saved = chatStore.save(chat.conversationState(), id: chat.chatID) { chat.chatID = saved.id }
+        guard let saved = chatStore.save(chat.conversationState(), id: chat.chatID) else {
+            saveError = chatStore.errorMessage ?? "This chat couldn't be saved."
+            return false
+        }
+        chat.chatID = saved.id
+        saveError = nil
+        return true
     }
 
-    /// Opens a saved chat in the window.
-    func show(_ chatID: UUID) {
-        guard let saved = chatStore.chat(id: chatID), !windowChat.isGenerating else { return }
-        saveWindowChat()
+    /// Opens a saved chat in the window, after saving the one that was open. A chat in
+    /// Recently Deleted opens read-only.
+    @discardableResult
+    func show(_ chatID: UUID) -> Bool {
+        guard let saved = chatStore.chat(id: chatID), !windowChat.isGenerating, saveWindowChat() else { return false }
         windowChat.load(saved.state, agent: agent(id: saved.agentID))
         windowChat.chatID = saved.id
+        windowChat.isReadOnly = saved.isDeleted
+        return true
     }
 
-    /// Starts a new conversation in the window.
-    func newWindowChat() {
-        guard !windowChat.isGenerating else { return }
-        saveWindowChat()
+    /// Starts a new conversation in the window, after saving the one that was open.
+    @discardableResult
+    func newWindowChat() -> Bool {
+        guard !windowChat.isGenerating, saveWindowChat() else { return false }
         windowChat.newConversation(action: .chat)
+        return true
     }
 
     /// Continues from a message in a new chat, leaving the original as it was.
-    func branch(from messageID: UUID) {
-        saveWindowChat()
-        guard let chatID = windowChat.chatID, let branch = chatStore.branch(chatID, through: messageID) else { return }
-        show(branch.id)
+    @discardableResult
+    func branch(from messageID: UUID) -> Bool {
+        guard saveWindowChat(), let chatID = windowChat.chatID, let branch = chatStore.branch(chatID, through: messageID)
+        else { return false }
+        return show(branch.id)
     }
 
-    /// Moves a chat to Recently Deleted; the window starts fresh if it was showing it.
+    /// Moves a chat to Recently Deleted. If the window shows it, its reply stops and the
+    /// window starts fresh; nothing saves into the deleted chat.
     func deleteChat(_ id: UUID) {
-        chatStore.delete(id)
-        if windowChatStorage?.chatID == id { windowChatStorage?.newConversation(action: .chat) }
+        guard chatStore.delete(id) else { return }
+        detachWindowChat(if: [id])
+    }
+
+    func deletePermanently(_ id: UUID) {
+        guard chatStore.deletePermanently(id) else { return }
+        detachWindowChat(if: [id])
+    }
+
+    func emptyRecentlyDeleted() {
+        let ids = Set(chatStore.recentlyDeleted.map(\.id))
+        guard chatStore.emptyRecentlyDeleted() else { return }
+        detachWindowChat(if: ids)
+    }
+
+    func restoreChat(_ id: UUID) {
+        guard chatStore.restore(id) else { return }
+        if let chat = windowChatStorage, chat.chatID == id { chat.isReadOnly = false }
     }
 
     func archiveChat(_ id: UUID) {
-        saveWindowChat()
+        guard saveWindowChat() else { return }
         chatStore.archive(id)
     }
 
     func deleteAllChats() {
-        chatStore.deleteAll()
-        windowChatStorage?.newConversation(action: .chat)
+        guard chatStore.deleteAll() else { return }
+        detachWindowChat(if: nil)
+    }
+
+    /// Detaches the window's conversation when its chat is among `ids` (nil: any chat).
+    private func detachWindowChat(if ids: Set<UUID>?) {
+        guard let chat = windowChatStorage else { return }
+        if let ids {
+            guard let id = chat.chatID, ids.contains(id) else { return }
+        }
+        // Read-only first, so a reply finishing now can't save into the deleted chat.
+        chat.isReadOnly = true
+        Task { await chat.detach() }
     }
 
     // MARK: Attachments
 
-    /// Attaches files to a conversation: text, code, PDFs and images. Problems show in the conversation.
+    /// Attaches files to a conversation: text, code, PDFs and images. Problems show in the
+    /// conversation. Files that finish reading after it became another conversation are dropped.
     func attachFiles(_ urls: [URL], to chat: AIChatModel) async {
+        let token = chat.conversationToken
         for url in urls {
             do {
-                chat.attach(try await AIAttachmentLoader.load(url, capabilities: chat.capabilities, recognizer: recognizer))
+                let attachment = try await AIAttachmentLoader.load(url, capabilities: chat.capabilities, recognizer: recognizer)
+                guard chat.conversationToken == token else { return }
+                chat.attach(attachment)
             } catch {
+                guard chat.conversationToken == token else { return }
                 chat.report(error.localizedDescription)
             }
         }
@@ -323,12 +394,17 @@ final class AIHub {
             chat.report(AIScreenCaptureError.noPermission.localizedDescription)
             return
         }
+        let token = chat.conversationToken
         do {
             let capture = try await screenCapture.capture(target)
-            chat.attach(
-                try await AIAttachmentLoader.image(
-                    capture.png, name: capture.title, source: .screen, capabilities: chat.capabilities, recognizer: recognizer))
+            guard chat.conversationToken == token else { return }
+            let attachment = try await AIAttachmentLoader.image(
+                capture.png, name: capture.title, source: .screen, capabilities: chat.capabilities, recognizer: recognizer)
+            // A capture that finishes after the conversation changed doesn't belong to the new one.
+            guard chat.conversationToken == token else { return }
+            chat.attach(attachment)
         } catch {
+            guard chat.conversationToken == token else { return }
             chat.report(error.localizedDescription)
         }
     }

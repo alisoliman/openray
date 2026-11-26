@@ -103,6 +103,8 @@ final class ChatStore {
     /// True when the file couldn't be read: nothing is written over it.
     private(set) var isReadOnly = false
     @ObservationIgnored let fileURL: URL?
+    /// Makes every write fail with this reason, so tests can check nothing is lost.
+    @ObservationIgnored var writeFailureForTesting: String?
 
     private struct File: Codable {
         var version = 1
@@ -159,97 +161,111 @@ final class ChatStore {
     }
 
     // MARK: Writing
+    //
+    // Every change builds the next list of chats, writes it, and only then publishes it, so
+    // what's on screen is never ahead of what's on disk. Each returns false when it couldn't
+    // be saved, with the reason in `errorMessage`.
 
-    /// Saves a conversation into a chat, creating it when `id` is new. Returns the chat.
+    enum SaveRefusal: Equatable {
+        /// The chat was deleted for good; saving would bring it back.
+        case removed
+        /// The chat is in Recently Deleted, which is read-only until it's restored.
+        case inRecentlyDeleted
+    }
+
+    /// Why a conversation with this chat id can't be saved, or nil when it can.
+    func refusal(forSaving id: UUID?) -> SaveRefusal? {
+        guard let id else { return nil }
+        guard let chat = chat(id: id) else { return .removed }
+        return chat.isDeleted ? .inRecentlyDeleted : nil
+    }
+
+    /// Saves a conversation: into the existing chat `id`, or a new chat when `id` is nil. A
+    /// chat that was deleted, or is in Recently Deleted, is never written or brought back.
     @discardableResult
     func save(_ state: AIConversationState, id: UUID?, now: Date = .now) -> SavedChat? {
         let messages = state.messages.map(StoredChatMessage.init)
-        guard !messages.isEmpty else { return nil }
-        var chat = id.flatMap(self.chat(id:)) ?? SavedChat(id: id ?? UUID(), title: SavedChat.derivedTitle(for: state.messages), createdAt: now)
+        guard !messages.isEmpty, refusal(forSaving: id) == nil else { return nil }
+        var chat = id.flatMap(self.chat(id:)) ?? SavedChat(title: SavedChat.derivedTitle(for: state.messages), createdAt: now)
         chat.messages = messages
         chat.summary = state.summary
         chat.summarizedMessageCount = state.summarizedMessageCount
         chat.agentID = state.agentID
         chat.transcript = state.transcript
         chat.updatedAt = now
-        chat.deletedAt = nil
-        upsert(chat)
-        return persist() ? chat : nil
+        var next = chats
+        if let index = next.firstIndex(where: { $0.id == chat.id }) { next[index] = chat } else { next.append(chat) }
+        return commit(next) ? chat : nil
     }
 
-    func rename(_ id: UUID, to title: String) {
+    @discardableResult
+    func rename(_ id: UUID, to title: String) -> Bool {
         let trimmed = title.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { return }
-        mutate(id) { $0.title = String(trimmed.prefix(120)) }
+        guard !trimmed.isEmpty else { return false }
+        return mutate(id) { $0.title = String(trimmed.prefix(120)) }
     }
 
     /// Pins at the end of the pinned list. At most nine pins, one per ⌘-number.
-    func pin(_ id: UUID) {
-        guard let chat = self.chat(id: id), !chat.isPinned, !chat.isDeleted else { return }
+    @discardableResult
+    func pin(_ id: UUID) -> Bool {
+        guard let chat = self.chat(id: id), !chat.isPinned, !chat.isDeleted else { return false }
         guard pinned.count < 9 else {
             errorMessage = "You can pin up to nine chats, one for each of ⌘1–⌘9. Unpin one first."
-            return
+            return false
         }
         let next = (pinned.compactMap(\.pinOrder).max() ?? -1) + 1
-        mutate(id) { $0.pinOrder = next }
+        return mutate(id) { $0.pinOrder = next }
     }
 
-    func unpin(_ id: UUID) {
-        mutate(id) { $0.pinOrder = nil }
-        renumberPins()
-        persist()
-    }
+    @discardableResult
+    func unpin(_ id: UUID) -> Bool { mutate(id, renumbering: true) { $0.pinOrder = nil } }
 
     /// Moves a pinned chat up or down by one.
-    func movePin(_ id: UUID, by offset: Int) {
+    @discardableResult
+    func movePin(_ id: UUID, by offset: Int) -> Bool {
         var pins = pinned.map(\.id)
-        guard let index = pins.firstIndex(of: id) else { return }
+        guard let index = pins.firstIndex(of: id) else { return false }
         let target = min(max(0, index + offset), pins.count - 1)
         pins.swapAt(index, target)
+        var next = chats
         for (order, pinID) in pins.enumerated() {
-            if let position = chats.firstIndex(where: { $0.id == pinID }) { chats[position].pinOrder = order }
+            if let position = next.firstIndex(where: { $0.id == pinID }) { next[position].pinOrder = order }
         }
-        persist()
+        return commit(next)
     }
 
-    func archive(_ id: UUID) {
-        mutate(id) {
+    @discardableResult
+    func archive(_ id: UUID) -> Bool {
+        mutate(id, renumbering: true) {
             $0.isArchived = true
             $0.pinOrder = nil
         }
-        renumberPins()
-        persist()
     }
 
-    func unarchive(_ id: UUID) { mutate(id) { $0.isArchived = false } }
+    @discardableResult
+    func unarchive(_ id: UUID) -> Bool { mutate(id) { $0.isArchived = false } }
 
-    /// Moves a chat to Recently Deleted, where it stays for thirty days.
-    func delete(_ id: UUID, now: Date = .now) {
-        mutate(id) {
+    /// Moves a chat to Recently Deleted, where it stays for thirty days, read-only.
+    @discardableResult
+    func delete(_ id: UUID, now: Date = .now) -> Bool {
+        mutate(id, renumbering: true) {
             $0.deletedAt = now
             $0.pinOrder = nil
         }
-        renumberPins()
-        persist()
     }
 
-    func restore(_ id: UUID) { mutate(id) { $0.deletedAt = nil } }
+    @discardableResult
+    func restore(_ id: UUID) -> Bool { mutate(id) { $0.deletedAt = nil } }
 
-    func deletePermanently(_ id: UUID) {
-        chats.removeAll { $0.id == id }
-        persist()
-    }
+    @discardableResult
+    func deletePermanently(_ id: UUID) -> Bool { commit(chats.filter { $0.id != id }) }
 
-    func emptyRecentlyDeleted() {
-        chats.removeAll(where: \.isDeleted)
-        persist()
-    }
+    @discardableResult
+    func emptyRecentlyDeleted() -> Bool { commit(chats.filter { !$0.isDeleted }) }
 
     /// Removes every chat, the deleted ones included.
-    func deleteAll() {
-        chats = []
-        persist()
-    }
+    @discardableResult
+    func deleteAll() -> Bool { commit([]) }
 
     /// A new chat with the messages up to and including `messageID`. It keeps the summary
     /// only when the branch point comes after everything the summary stands for, and starts
@@ -266,44 +282,46 @@ final class ChatStore {
             summary: keepsSummary ? source.summary : nil,
             summarizedMessageCount: keepsSummary ? source.summarizedMessageCount : 0, transcript: nil,
             branchedFrom: source.id)
-        upsert(branch)
-        return persist() ? branch : nil
+        return commit(chats + [branch]) ? branch : nil
     }
 
     /// Applies the retention setting and empties Recently Deleted of chats older than thirty days.
     func purge(retention: ChatRetention, now: Date = .now) {
         let calendar = Calendar.current
-        var changed = false
+        var next = chats
         if let days = retention.days, let cutoff = calendar.date(byAdding: .day, value: -days, to: now) {
-            for index in chats.indices where !chats[index].isDeleted && !chats[index].isPinned && chats[index].updatedAt < cutoff {
-                chats[index].deletedAt = now
-                changed = true
+            for index in next.indices where !next[index].isDeleted && !next[index].isPinned && next[index].updatedAt < cutoff {
+                next[index].deletedAt = now
             }
         }
         if let cutoff = calendar.date(byAdding: .day, value: -Self.recentlyDeletedDays, to: now) {
-            let before = chats.count
-            chats.removeAll { ($0.deletedAt ?? .distantFuture) < cutoff }
-            changed = changed || chats.count != before
+            next.removeAll { ($0.deletedAt ?? .distantFuture) < cutoff }
         }
-        if changed { persist() }
+        if next != chats { commit(next) }
     }
 
     // MARK: Storage
 
-    private func upsert(_ chat: SavedChat) {
-        if let index = chats.firstIndex(where: { $0.id == chat.id }) { chats[index] = chat } else { chats.append(chat) }
+    private func mutate(_ id: UUID, renumbering: Bool = false, _ change: (inout SavedChat) -> Void) -> Bool {
+        var next = chats
+        guard let index = next.firstIndex(where: { $0.id == id }) else { return false }
+        change(&next[index])
+        if renumbering { Self.renumberPins(&next) }
+        return commit(next)
     }
 
-    private func mutate(_ id: UUID, _ change: (inout SavedChat) -> Void) {
-        guard let index = chats.firstIndex(where: { $0.id == id }) else { return }
-        change(&chats[index])
-        persist()
+    private static func renumberPins(_ chats: inout [SavedChat]) {
+        let pinned = chats.indices.filter { chats[$0].isPinned && !chats[$0].isDeleted }
+            .sorted { (chats[$0].pinOrder ?? 0) < (chats[$1].pinOrder ?? 0) }
+        for (order, index) in pinned.enumerated() { chats[index].pinOrder = order }
     }
 
-    private func renumberPins() {
-        for (order, pin) in pinned.enumerated() {
-            if let index = chats.firstIndex(where: { $0.id == pin.id }) { chats[index].pinOrder = order }
-        }
+    /// Writes `next`, then publishes it. Nothing changes when the write fails.
+    @discardableResult
+    private func commit(_ next: [SavedChat]) -> Bool {
+        guard persist(next) else { return false }
+        chats = next
+        return true
     }
 
     private func load() {
@@ -327,10 +345,19 @@ final class ChatStore {
         }
     }
 
-    @discardableResult
-    private func persist() -> Bool {
-        guard let fileURL else { return true }
-        guard !isReadOnly else { return false }
+    private func persist(_ chats: [SavedChat]) -> Bool {
+        guard !isReadOnly else {
+            errorMessage = errorMessage ?? "Saved chats are read-only."
+            return false
+        }
+        if let failure = writeFailureForTesting {
+            errorMessage = "Chats couldn't be saved. \(failure)"
+            return false
+        }
+        guard let fileURL else {
+            errorMessage = nil
+            return true
+        }
         do {
             let encoder = JSONEncoder()
             encoder.dateEncodingStrategy = .iso8601

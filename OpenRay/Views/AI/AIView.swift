@@ -391,7 +391,7 @@ struct ChatMessageView: View {
                         if let branch = actions.branch, !chat.isGenerating {
                             responseButton("Branch", "arrow.triangle.branch") { branch(message) }
                         }
-                        if isLatest {
+                        if isLatest, !chat.isReadOnly {
                             responseButton("Try Again", "arrow.clockwise") { actions.retry() }
                         }
                     }

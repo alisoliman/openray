@@ -306,22 +306,19 @@ struct AgentEditor: View {
             Spacer()
             if let original, !original.isAssistant {
                 Button("Delete", role: .destructive) {
-                    model.aiHub.deleteAgent(original.id)
-                    close()
+                    if model.aiHub.deleteAgent(original.id) {
+                        close()
+                    } else {
+                        problem = model.store.errorMessage ?? "The agent couldn't be deleted."
+                    }
                 }
             }
             Button("Cancel", action: close).keyboardShortcut(.cancelAction)
             Button("Save") {
-                guard model.aiHub.save(agent) else {
+                // The agent and whether it starts new chats save together, or not at all.
+                guard model.aiHub.save(agent, isDefault: isDefault) else {
                     problem = agent.validationMessage ?? model.store.errorMessage ?? "The agent couldn't be saved."
                     return
-                }
-                model.aiHub.updateSettings { settings in
-                    if isDefault {
-                        settings.defaultAgentID = agent.id
-                    } else if settings.defaultAgentID == agent.id {
-                        settings.defaultAgentID = nil
-                    }
                 }
                 close()
             }
