@@ -17,6 +17,9 @@ enum CommandProviders {
         EmojiProvider.registration,
         TranslatorProvider.registration,
         // Slice 4: files, screenshots, applications
+        FilesCommandProvider.registration,
+        ScreenshotsCommandProvider.registration,
+        ApplicationsCommandProvider.registration,
         // Slice 5: system, windows
         SystemCommandProvider.registration,
         WindowCommandProvider.registration,

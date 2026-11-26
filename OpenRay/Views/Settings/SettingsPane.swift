@@ -64,6 +64,8 @@ extension SettingsPane {
         .translator,
         .files,
         // Slice 4: applications
+        .applications,
+        .screenshots,
         .ai,
         // Slice 5: windows, system
         .windows,

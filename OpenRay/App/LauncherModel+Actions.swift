@@ -67,8 +67,7 @@ extension LauncherModel {
             guard allowsSideEffect("opening apps") else { return }
             Task {
                 do {
-                    _ = try await NSWorkspace.shared.openApplication(
-                        at: app.url, configuration: NSWorkspace.OpenConfiguration())
+                    try await openApplication(app)
                     store.recordUse(of: item.id)
                     panel?.dismiss(restoreFocus: false)
                 } catch {
@@ -654,8 +653,8 @@ extension LauncherModel {
     }
 
     private func open(_ url: URL, itemID: String) {
-        guard allowsSideEffect("opening files and links") else { return }
-        if NSWorkspace.shared.open(url) {
+        guard allowsSideEffect("opening files and links"), mayOpenFile(url) else { return }
+        if openFileThroughWorkspace(url) {
             store.recordUse(of: itemID)
             panel?.dismiss(restoreFocus: false)
         } else {
@@ -842,7 +841,7 @@ extension LauncherModel {
                         key: "r", modifiers: [.command, .shift], group: .item
                     ) { [weak self] in
                         guard self?.allowsSideEffect("revealing files in Finder") == true else { return }
-                        NSWorkspace.shared.activateFileViewerSelecting([url])
+                        self?.revealInFinder(url)
                     })
                 entries.append(
                     ActionEntry(
@@ -850,6 +849,7 @@ extension LauncherModel {
                         key: "c", modifiers: [.command, .shift], group: .item
                     ) { [weak self] in self?.copy(url.path, label: Self.shortenedPath(url)) })
             }
+            addFileAndApplicationActions(to: &entries, for: item)
             if item.canEdit {
                 entries.append(
                     ActionEntry(
@@ -959,6 +959,7 @@ extension LauncherModel {
                     })
             }
         }
+        entries += filesAndApplicationsPanelActions()
         entries.append(
             ActionEntry(id: "shortcuts", title: "Show Shortcuts", symbol: "keyboard", shortcut: .command("/"), group: .panel)
             { [weak self] in self?.showShortcuts = true })

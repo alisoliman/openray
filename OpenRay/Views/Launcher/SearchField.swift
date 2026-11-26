@@ -60,7 +60,7 @@ struct SearchFieldBar: View {
             move: model.moveSelection, cancel: model.escape, paste: model.pasteSelected,
             tab: model.handleTab, deleteOnEmpty: model.deleteBackwardOnEmptyField,
             moveHorizontally: { model.arrowsMoveSelection ? model.moveSelectionHorizontally($0) : false },
-            jump: model.jumpSection, tertiary: model.performTertiary,
+            jump: model.jumpSection, backtab: { _ = model.browseEnclosingFolder() }, tertiary: model.performTertiary,
             selectsAllOnFocus: model.selectsQueryOnFocus,
             didSelectAll: { model.selectsQueryOnFocus = false },
             readOnly: model.showsClipboardOptIn, fontSize: OR.scaled(20)
