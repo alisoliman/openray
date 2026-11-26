@@ -89,6 +89,18 @@ enum LibraryArchiveCategory: String, CaseIterable, Codable, Identifiable, Hashab
     }
 }
 
+/// Whether an archived library actually holds a `pomodoro` value.
+private struct PomodoroPresence: Decodable {
+    var isPresent: Bool
+
+    private enum CodingKeys: String, CodingKey { case pomodoro }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        isPresent = container.contains(.pomodoro) && (try? container.decodeNil(forKey: .pomodoro)) == false
+    }
+}
+
 /// Whether an import adds to the library or replaces the chosen parts of it.
 enum LibraryImportMode: String, CaseIterable, Identifiable, Sendable {
     /// Adds what's new; an item with the same identity is replaced by the archive's.
@@ -514,6 +526,11 @@ enum LibraryArchive {
         }
         guard database.schemaVersion <= LibraryDatabase.currentSchemaVersion else {
             throw Failure("This archive comes from a newer version of OpenRay. Update OpenRay to import it.")
+        }
+        // A missing value decodes as defaults, which Replace would apply: an archive that says it
+        // holds Pomodoro must really hold it.
+        if manifest.categories.contains(.pomodoro), !(try JSONDecoder().decode(PomodoroPresence.self, from: library).isPresent) {
+            throw Failure("The archive lists Pomodoro but doesn't contain its data, so it wasn't opened.")
         }
         return Contents(manifest: manifest, database: database, files: files)
     }

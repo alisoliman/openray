@@ -265,4 +265,22 @@ struct LibrarySchemaMainMergeTests {
         _ = try library.store.importArchive(contents, categories: [.pomodoro], mode: .replace)
         #expect(library.store.database.pomodoro == archived.pomodoro)
     }
+
+    @Test func anArchiveThatListsPomodoroWithoutItsDataIsRefused() throws {
+        var object = try #require(
+            JSONSerialization.jsonObject(with: JSONEncoder().encode(LibraryDatabase())) as? [String: Any])
+        object.removeValue(forKey: "pomodoro")
+        let missing = try JSONSerialization.data(withJSONObject: object)
+        let archive = try ArchiveCrafting.archive([(LibraryArchive.libraryFileName, missing)], categories: [.pomodoro])
+        #expect(throws: LibraryArchive.Failure.self) { try LibraryArchive.read(archive) }
+        object["pomodoro"] = NSNull()
+        let null = try JSONSerialization.data(withJSONObject: object)
+        let nullArchive = try ArchiveCrafting.archive([(LibraryArchive.libraryFileName, null)], categories: [.pomodoro])
+        #expect(throws: (any Error).self) { try LibraryArchive.read(nullArchive) }
+        // The same library is fine when the archive doesn't claim Pomodoro.
+        object.removeValue(forKey: "pomodoro")
+        let history = try ArchiveCrafting.archive(
+            [(LibraryArchive.libraryFileName, try JSONSerialization.data(withJSONObject: object))], categories: [.history])
+        #expect(try LibraryArchive.read(history).categories == [.history])
+    }
 }
