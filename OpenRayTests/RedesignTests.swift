@@ -334,7 +334,9 @@ struct RedesignTests {
         model.files.stop()
     }
 
-    @Test func writingCommandsRunFreshOnTheCurrentSelection() async {
+    /// Changed by the main merge review (finding 4): reopening a writing command keeps its
+    /// finished result and offers a different selection, which replaces it only when chosen.
+    @Test func writingCommandsKeepTheirResultAndOfferANewSelection() async {
         let model = model()
         defer { model.stop() }
         var selection = "Their are two things."
@@ -347,6 +349,10 @@ struct RedesignTests {
         model.leaveAI()
         selection = "A different passage."
         model.openAI(.proofread)
+        #expect(model.ai.lastSource == "Their are two things.")
+        #expect(model.ai.messages.count == 2)
+        #expect(model.pendingNewSelection?.text == "A different passage.")
+        model.usePendingSelection()
         #expect(model.ai.attachments.first?.text == "A different passage.")
         #expect(model.ai.messages.isEmpty)
         #expect(model.ai.lastSource == nil)

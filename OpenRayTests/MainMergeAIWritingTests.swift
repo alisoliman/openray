@@ -13,8 +13,11 @@ struct MainMergeAIWritingTests {
             store: LibraryStore(fileURL: nil), ai: AIChatModel(engine: engine), pasteboard: NSPasteboard.withUniqueName())
     }
 
+    /// A captured selection whose place in its field is known, as Replace requires.
     private func selection(_ text: String, source: String = "Source editor") -> SelectedTextContext {
-        SelectedTextContext(text: text, application: nil, sourceName: source, validateForPaste: {})
+        var context = SelectedTextContext(text: text, application: nil, sourceName: source, validateForPaste: {})
+        context.range = NSRange(location: 0, length: (text as NSString).length)
+        return context
     }
 
     /// Opens a writing command on a captured selection and runs it to a result.
@@ -253,8 +256,11 @@ struct MainMergeAIWritingTests {
 
         engine.snapshots = ["Partial", "Partial text"]
         engine.delay = .milliseconds(100)
+        // The finished result is kept; the new selection is offered and taken explicitly.
         model.setCapturedSelection(selection("Teh cat sat."))
         model.openAI(.proofread)
+        #expect(model.pendingNewSelection?.text == "Teh cat sat.")
+        model.usePendingSelection()
         model.submitAI()
         model.ai.cancel()
         await model.ai.waitForResponse()
