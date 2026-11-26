@@ -18,5 +18,6 @@ enum CommandProviders {
         // Slice 8: script commands
         ScriptCommandProvider.registration,
         DeepLinkRouter.registration,
+        LibraryArchiveProvider.registration,
     ]
 }
