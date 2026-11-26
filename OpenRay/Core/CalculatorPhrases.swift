@@ -138,10 +138,12 @@ struct Fraction: Equatable, Sendable {
         self.init(numerator: groups[1] == "-" ? -digits : digits, denominator: denominator)
     }
 
-    /// Exact when a short decimal or a simple fraction (a denominator up to 10,000) matches
-    /// the value to within a few units in the last place, which is all a computed Double can
-    /// promise; otherwise the closest fraction with a denominator up to 10,000, marked
-    /// inexact. Floating point can't tell π from a fraction with a huge denominator.
+    /// Exact when a short decimal or a simple fraction (a denominator up to 10,000) is the
+    /// value: its quotient reproduces the Double exactly, or matches within a few units in the
+    /// last place where those units are far finer than the fraction's own steps. That second
+    /// path forgives float noise (0.1 + 0.2 is 3/10) but never drops a fractional part the
+    /// Double can hold (999999999999999.5 stays a half). Otherwise the closest fraction with a
+    /// denominator up to 10,000, marked inexact.
     init?(approximating value: Double) {
         guard value.isFinite, abs(value) < 1e15 else { return nil }
         if let decimal = Self.decimal(value) {
@@ -164,12 +166,22 @@ struct Fraction: Equatable, Sendable {
         for _ in 0...6 {
             let scaled = value * Double(denominator)
             guard abs(scaled) < 9e15 else { return nil }
-            if abs(scaled - scaled.rounded()) <= 4 * scaled.ulp {
-                return Fraction(numerator: Int64(scaled.rounded()), denominator: denominator)
+            let numerator = scaled.rounded()
+            if accepts(numerator: numerator, denominator: Double(denominator), for: value, tolerance: 4 * value.ulp) {
+                return Fraction(numerator: Int64(numerator), denominator: denominator)
             }
             denominator *= 10
         }
         return nil
+    }
+
+    /// Whether n/d is the value: its quotient is the very same Double, or it's within
+    /// `tolerance` and that tolerance is under a tenth of the gap to the next fraction with
+    /// this denominator, so it can't swallow a representable fractional part.
+    private static func accepts(numerator: Double, denominator: Double, for value: Double, tolerance: Double) -> Bool {
+        let quotient = numerator / denominator
+        if quotient == value { return true }
+        return abs(quotient - value) <= tolerance && tolerance < 0.1 / denominator
     }
 
     private static func gcd(_ a: UInt64, _ b: UInt64) -> UInt64 {
@@ -191,21 +203,28 @@ struct Fraction: Equatable, Sendable {
             let (h2, overflowH) = term.multipliedReportingOverflow(by: h1)
             let (k2, overflowK) = term.multipliedReportingOverflow(by: k1)
             guard !overflowH, !overflowK else { break }
-            let h = h2 + h0
-            let k = k2 + k0
+            let (h, overflowSumH) = h2.addingReportingOverflow(h0)
+            let (k, overflowSumK) = k2.addingReportingOverflow(k0)
+            guard !overflowSumH, !overflowSumK else { break }
             guard k <= maxDenominator else { break }
             (h0, h1) = (h1, h)
             (k0, k1) = (k1, k)
             best = Fraction(numerator: sign * h, denominator: k)
-            if tolerance.isFinite, abs(Double(h) / Double(k) - abs(value)) <= tolerance { return best }
+            if tolerance.isFinite,
+                accepts(numerator: Double(h), denominator: Double(k), for: abs(value), tolerance: tolerance)
+            {
+                return best
+            }
             let remainder = x - a
             guard remainder > 1e-15 else { break }
             x = 1 / remainder
         }
         guard let best else { return nil }
         if tolerance.isInfinite { return best }
-        let error = abs(Double(best.numerator.magnitude) / Double(best.denominator) - abs(value))
-        return error <= tolerance ? best : nil
+        let exact = accepts(
+            numerator: Double(best.numerator.magnitude), denominator: Double(best.denominator), for: abs(value),
+            tolerance: tolerance)
+        return exact ? best : nil
     }
 
     var improper: String { denominator == 1 ? "\(numerator)" : "\(numerator)/\(denominator)" }

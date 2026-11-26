@@ -44,6 +44,28 @@ enum EmojiCategory: String, CaseIterable, Codable, Sendable, Identifiable {
         }
     }
 
+    /// An SF Symbol for the category's browse tile.
+    var systemImage: String {
+        switch self {
+        case .smileysEmotion: "face.smiling"
+        case .peopleBody: "person"
+        case .animalsNature: "pawprint"
+        case .foodDrink: "fork.knife"
+        case .travelPlaces: "airplane"
+        case .activities: "soccerball"
+        case .objects: "lightbulb"
+        case .symbols: "heart"
+        case .flags: "flag"
+        case .arrows: "arrow.right"
+        case .math: "plus.forwardslash.minus"
+        case .currency: "dollarsign"
+        case .punctuation: "textformat"
+        case .letterlike: "c.circle"
+        case .keyboard: "command"
+        case .shapes: "square.on.circle"
+        }
+    }
+
     /// Text symbols rather than emoji.
     var isTextSymbol: Bool {
         switch self {
@@ -136,6 +158,9 @@ struct EmojiUsage: Codable, Equatable, Sendable {
 
     static let halfLife: TimeInterval = 14 * 86_400
     static let maximumRecords = 300
+    /// Counts and scores stop here, so a saved record can never overflow when used again.
+    static let maximumCount = 1_000_000
+    static let maximumScore: Double = 1_000_000
 
     private(set) var records: [String: Record] = [:]
 
@@ -146,7 +171,9 @@ struct EmojiUsage: Codable, Equatable, Sendable {
     mutating func record(_ id: String, at date: Date) {
         let previous = records[id]
         let decayed = previous.map { Self.decay($0.score, from: $0.lastUsed, to: date) } ?? 0
-        records[id] = Record(score: decayed + 1, count: (previous?.count ?? 0) + 1, lastUsed: max(date, previous?.lastUsed ?? date))
+        let count = min(max(previous?.count ?? 0, 0), Self.maximumCount - 1) + 1
+        records[id] = Record(
+            score: min(decayed + 1, Self.maximumScore), count: count, lastUsed: max(date, previous?.lastUsed ?? date))
         if records.count > Self.maximumRecords { prune(keeping: Self.maximumRecords, at: date) }
     }
 
@@ -209,7 +236,10 @@ struct EmojiPreferences: Codable, Equatable, Sendable {
         var usage: [String: EmojiUsage.Record] = [:]
         for record in records {
             if let score = record.score, let lastUsed = record.lastUsed, score.isFinite, score > 0 {
-                usage[record.id] = EmojiUsage.Record(score: score, count: record.count ?? 1, lastUsed: lastUsed)
+                // Saved values may be anything a library file holds; keep them in range.
+                usage[record.id] = EmojiUsage.Record(
+                    score: min(score, EmojiUsage.maximumScore),
+                    count: min(max(record.count ?? 1, 1), EmojiUsage.maximumCount), lastUsed: lastUsed)
             }
             if let keywords = record.keywords, !keywords.isEmpty { customKeywords[record.id] = keywords }
         }

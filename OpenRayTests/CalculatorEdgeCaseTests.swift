@@ -117,10 +117,27 @@ struct CalculatorEdgeCaseTests {
         let marked = try #require(Clock.evaluate("1700000000000 ms to date"))
         #expect(marked.date == Date(timeIntervalSince1970: 1_700_000_000))
         #expect(Clock.evaluate("unix ms 1700000000000")?.date == marked.date)
-        // Too large for seconds, in range for milliseconds.
-        #expect(Clock.evaluate("unix 1700000000000")?.date == marked.date)
+        // Only unmarked input guesses milliseconds from its length.
+        #expect(Clock.evaluate("1700000000000 to date")?.date == marked.date)
+        #expect(issue("unix 1700000000000") == .resultOutOfRange)
+        #expect(Clock.evaluate("unix +86400")?.date == Date(timeIntervalSince1970: 86_400))
         #expect(Clock.evaluate("unix 1700000000.5")?.date == Date(timeIntervalSince1970: 1_700_000_000.5))
         #expect(issue("unix 999999999999999") == .resultOutOfRange)
+    }
+
+    @Test func unixCopiesRoundTripAtTheEdgesAndToTheMillisecond() throws {
+        let far = try #require(Clock.evaluate("9999-01-01T00:00:00Z to unix"))
+        #expect(far.result == "253370764800")
+        #expect(Clock.evaluate("unix \(far.value)")?.date == far.date)
+        let early = try #require(Clock.evaluate("0001-01-01T00:00:00Z to unix"))
+        #expect(Clock.evaluate("unix \(early.value)")?.date == early.date)
+        let precise = try #require(Clock.evaluate("2024-03-15T14:30:00.001Z to unix"))
+        #expect(precise.value == "1710513000.001")
+        let back = try #require(Clock.evaluate("unix \(precise.value)")?.date)
+        #expect(DateMath.unixString(back.timeIntervalSince1970) == precise.value)
+        #expect(DateMath.unixString(-0.5) == "-0.5")
+        #expect(DateMath.unixString(-86_400) == "-86400")
+        #expect(DateMath.unixString(1.25) == "1.25")
     }
 
     @Test func unixRoundTrips() throws {
@@ -191,6 +208,8 @@ struct CalculatorEdgeCaseTests {
         ("1000000000.5 as improper", "2000000001/2"), ("1000000000.25 as fraction", "1000000000 1/4"),
         ("2000000001/2 as improper", "2000000001/2"), ("123456789.75 as improper", "493827159/4"),
         ("0.1 + 0.2 as fraction", "3/10"), ("1/7 as fraction", "1/7"),
+        ("999999999999999.5 + 0 as improper", "1999999999999999/2"),
+        ("999999999999999.25 + 0 as improper", "3999999999999997/4"),
     ])
     func largeHalvesAndQuartersStayExact(input: String, expected: String) {
         #expect(Clock.evaluate(input)?.result == expected, "\(input)")

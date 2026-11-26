@@ -16,16 +16,45 @@ enum DateMath {
         return try parser.query()
     }
 
-    /// Lowercased words, with "+" as its own word except inside ISO 8601 offsets.
+    /// Lowercased words, with "+" as its own word except inside ISO 8601 offsets and in a
+    /// signed number after a unix marker ("unix +86400").
     static func tokenize(_ input: String) -> [String] {
-        input.lowercased()
+        let words = input.lowercased()
             .replacingOccurrences(of: ",", with: " ")
             .replacingOccurrences(of: "?", with: " ")
-            .split(whereSeparator: \.isWhitespace).flatMap { word -> [String] in
-                let word = String(word)
-                guard word.contains("+"), isoDate.groups(in: word) == nil else { return [word] }
-                return word.replacingOccurrences(of: "+", with: " + ").split(separator: " ").map(String.init)
+            .split(whereSeparator: \.isWhitespace).map(String.init)
+        var tokens: [String] = []
+        for word in words {
+            let afterMarker = ["unix", "timestamp", "epoch", "time", "ms", "milliseconds"].contains(tokens.last ?? "")
+            if !word.contains("+") || isoDate.groups(in: word) != nil
+                || afterMarker && signedNumber.groups(in: word) != nil
+            {
+                tokens.append(word)
+            } else {
+                tokens += word.replacingOccurrences(of: "+", with: " + ").split(separator: " ").map(String.init)
             }
+        }
+        return tokens
+    }
+
+    static let signedNumber = CalculatorPattern(#"^[+-]?\d{1,16}(?:\.\d+)?$"#)
+
+    /// Seconds since 1970 that unix phrases accept and produce, in both directions: the years
+    /// 0000 through 9999, as four-digit ISO dates allow.
+    static let unixRange: ClosedRange<Double> = -62_167_219_200...253_402_300_799
+
+    /// Unix seconds as text, to the millisecond, so a copied value converts back to the
+    /// same instant: "1710513000", "1710513000.001", "-86400".
+    static func unixString(_ seconds: TimeInterval) -> String {
+        let milliseconds = (seconds * 1_000).rounded()
+        let sign = milliseconds < 0 ? "-" : ""
+        let magnitude = Int64(abs(milliseconds))
+        let whole = magnitude / 1_000
+        let fraction = magnitude % 1_000
+        guard fraction != 0 else { return "\(sign)\(whole)" }
+        var digits = String(format: "%03lld", fraction)
+        while digits.hasSuffix("0") { digits.removeLast() }
+        return "\(sign)\(whole).\(digits)"
     }
 
     /// Weekdays from the start of `start`'s day up to, not including, `end`'s day.
@@ -353,14 +382,14 @@ private struct DateParser {
             resultLabel: "Unix time", date: context.now)
     }
 
-    /// "unix 0", "unix -86400", "1700000000 to date", "1700000000000 ms to date". A marker
-    /// (unix, timestamp, epoch, to date) accepts any signed number of seconds; "ms" marks
-    /// milliseconds, and a value too large for seconds but in range for milliseconds is read
-    /// as milliseconds.
+    /// "unix 0", "unix +86400", "1700000000 unix", "1700000000000 ms to date". With a unix
+    /// marker (unix, timestamp, epoch) the number is signed seconds unless "ms" says
+    /// milliseconds. Only an unmarked "… to date" guesses: 12 or more digits are milliseconds.
     mutating func unixToDate() throws -> Calculation? {
         let milliseconds: Set<String> = ["ms", "millis", "milliseconds"]
         var number: String?
         var isMilliseconds = false
+        var isMarked = true
         if acceptAny(["unix", "timestamp", "epoch"]) != nil || accept("from", "unix") {
             _ = acceptAny(["time", "timestamp"])
             isMilliseconds = acceptAny(milliseconds) != nil
@@ -368,18 +397,20 @@ private struct DateParser {
             isMilliseconds = acceptAny(milliseconds) != nil || isMilliseconds
         } else if let token = acceptNumber() {
             isMilliseconds = acceptAny(milliseconds) != nil
-            let suffix =
-                accept("unix", "time") || accept("unix", "timestamp") || accept("unix") || accept("timestamp")
-                || accept("to", "date", "time") || accept("to", "date") || accept("as", "date") || accept("in", "date")
-            guard suffix else { return nil }
+            if accept("unix", "time") || accept("unix", "timestamp") || accept("unix") || accept("timestamp") {
+                isMarked = true
+            } else if accept("to", "date", "time") || accept("to", "date") || accept("as", "date") || accept("in", "date") {
+                isMarked = isMilliseconds
+            } else {
+                return nil
+            }
             number = token
         }
         guard let number, atEnd, let value = Double(number) else { return nil }
-        var seconds = isMilliseconds ? value / 1_000 : value
-        if !isMilliseconds, abs(seconds) > Self.maximumUnixSeconds, abs(value) <= Self.maximumUnixSeconds * 1_000 {
-            seconds = value / 1_000
-        }
-        guard abs(seconds) <= Self.maximumUnixSeconds else { throw Issue.resultOutOfRange }
+        let integerDigits = number.drop { $0 == "+" || $0 == "-" }.prefix { $0.isNumber }.count
+        if !isMarked, integerDigits >= 12 { isMilliseconds = true }
+        let seconds = isMilliseconds ? value / 1_000 : value
+        guard DateMath.unixRange.contains(seconds) else { throw Issue.resultOutOfRange }
         let date = Date(timeIntervalSince1970: seconds)
         return Calculation(
             expression: "", result: CalendarFormat.dateTime(date, context: context, seconds: true),
@@ -400,7 +431,8 @@ private struct DateParser {
             _ = accept("time")
         }
         guard let parsed, atEnd else { return nil }
-        let seconds = Calculator.format(parsed.date.timeIntervalSince1970)
+        guard DateMath.unixRange.contains(parsed.date.timeIntervalSince1970) else { throw Issue.resultOutOfRange }
+        let seconds = DateMath.unixString(parsed.date.timeIntervalSince1970)
         return Calculation(
             expression: "", result: seconds, detail: "Unix time · Return to copy", kind: .date,
             resultLabel: "Unix time", date: parsed.date)
@@ -799,17 +831,12 @@ private struct DateParser {
         .weeks: maximumSpan / 604_800, .months: 120_000, .years: 10_000, .workdays: Double(DateMath.maximumWorkdays),
     ]
 
-    /// Seconds since 1970 that a unix phrase may name: about year 5138 either way.
-    static let maximumUnixSeconds: Double = 1e11
-
     /// A signed decimal number, as one token.
     mutating func acceptNumber() -> String? {
-        guard let token = peek(), DateParser.signedNumber.groups(in: token) != nil else { return nil }
+        guard let token = peek(), DateMath.signedNumber.groups(in: token) != nil else { return nil }
         index += 1
         return token
     }
-
-    private static let signedNumber = CalculatorPattern(#"^[+-]?\d{1,16}(?:\.\d+)?$"#)
 
     private static let durationUnits: [String: CountUnit] = [
         "s": .seconds, "sec": .seconds, "secs": .seconds, "second": .seconds, "seconds": .seconds,
