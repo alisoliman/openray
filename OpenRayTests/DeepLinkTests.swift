@@ -489,7 +489,7 @@ extension DeepLinkTests {
         pressReturn(model)
         let session = try #require(controller.session)
         #expect(session.configuration.goal == "Write the report")
-        #expect(session.configuration.duration == 40 * 60)
+        #expect(session.configuration.duration == TimeInterval(2_400))
         #expect(notices.started.count == 1)
         try controller.complete()
 
@@ -500,5 +500,51 @@ extension DeepLinkTests {
         try controller.complete()
         model.store.update { $0.disabledCommandIDs.insert(FocusCommandProvider.startID) }
         #expect(failure(router.handle(url, source: browser, in: model))?.contains("turned off") == true)
+    }
+}
+
+// MARK: - Slice 5's window and system commands
+
+extension DeepLinkTests {
+    @Test("Window and system links reach Slice 5's providers by id; risky ones always ask, and then ask again")
+    func windowAndSystemLinks() async throws {
+        let actions = RecordingSystemActions()
+        let hud = HUDController(
+            presenter: FakeHUDPresenter(), screenFrame: { CGRect(x: 0, y: 0, width: 1_440, height: 900) }, schedule: { _, _ in })
+        let system = SystemCommandProvider(
+            executor: actions, audio: FakeAudioDevices(), menuSearch: MenuItemSearch(source: FakeMenuTree(bars: [:])),
+            hud: hud, foreground: { _ in nil }, dismissal: LauncherDismissal { _, _ in })
+        let (model, router, _, _, _) = harness(extra: [system, WindowCommandProvider()])
+
+        // A window command, by the short form, resolves to Slice 5's window provider.
+        #expect(isAsked(router.handle(try #require(URL(string: "openray://window/leftHalf")), source: browser, in: model)))
+        #expect(router.pending?.commandID == "window.leftHalf")
+        router.cancel(in: model)
+
+        // A system command runs through its provider once the link is approved.
+        #expect(isAsked(router.handle(try #require(URL(string: "openray://system/sleepDisplays")), source: browser, in: model)))
+        pressReturn(model)
+        for _ in 0..<40 where actions.actions.isEmpty { try await Task.sleep(for: .milliseconds(25)) }
+        #expect(actions.actions.count == 1)
+
+        // Shut Down confirms destructively: never trusted from links, and its own question still asks.
+        let shutDown = try #require(model.commandItems.first { $0.id == "system.shutDown" })
+        #expect(!DeepLinkRouter.mayRunWithoutAsking(shutDown, in: model))
+        // Slice 5 asks inside perform, so its provider names the risky ones (LinkRiskAssessing).
+        #expect(system.alwaysAsksFromLinks("system.quitAllApps"))
+        #expect(system.alwaysAsksFromLinks("system.emptyTrash"))
+        #expect(!system.alwaysAsksFromLinks("system.sleepDisplays"))
+        let sleepDisplays = try #require(model.commandItems.first { $0.id == "system.sleepDisplays" })
+        #expect(DeepLinkRouter.mayRunWithoutAsking(sleepDisplays, in: model))
+        #expect(!model.actions(for: shutDown).contains { $0.id == "deeplinkTrust" })
+        LocalApprovalStore.for(model.store).setLinksRunWithoutAsking(true, for: "system.shutDown")
+        #expect(isAsked(router.handle(try #require(URL(string: "openray://commands/system.shutDown")), source: browser, in: model)))
+        pressReturn(model)
+        guard case .provided(let question)? = model.confirmation else {
+            Issue.record("Shut Down should ask its own question")
+            return
+        }
+        #expect(question.isDestructive)
+        #expect(actions.actions.count == 1)
     }
 }

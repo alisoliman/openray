@@ -380,11 +380,17 @@ final class DeepLinkRouter: CommandProvider {
     }
 
     /// Whether a command may ever run from links without asking. Commands that ask before they
-    /// run (destructive ones, scripts with `needsConfirmation`) and commands that take a password
+    /// run (destructive ones, scripts with `needsConfirmation`, and those a provider names through
+    /// `LinkRiskAssessing` because it asks inside `perform`) and commands that take a password
     /// always ask, whatever was granted.
     static func mayRunWithoutAsking(_ item: LauncherItem, in model: LauncherModel) -> Bool {
         guard case .provided(let ref) = item.action else { return true }
         guard let descriptor = model.registry.descriptor(for: ref, in: model) else { return false }
+        if let provider = model.registry.provider(id: ref.provider) as? any LinkRiskAssessing,
+            provider.alwaysAsksFromLinks(ref.id)
+        {
+            return false
+        }
         return descriptor.confirmation == nil && !descriptor.arguments.contains { $0.type == .password }
     }
 
@@ -538,5 +544,23 @@ extension LauncherModel {
                 }
             })
         return entries
+    }
+}
+
+/// A provider whose commands ask their question inside `perform` (built from context, so it
+/// isn't on the descriptor) names the risky ones here. Links never run those without asking,
+/// whatever was granted, and their ⌘K doesn't offer to.
+@MainActor
+protocol LinkRiskAssessing: CommandProvider {
+    func alwaysAsksFromLinks(_ commandID: String) -> Bool
+}
+
+extension SystemCommandProvider: LinkRiskAssessing {
+    /// Every system command with a question in the catalog (Restart, Shut Down, Log Out, Empty
+    /// Trash and the rest), even when the person turned that question off in Settings, and the
+    /// Quit All routes, which ask in Applications' batch flow.
+    func alwaysAsksFromLinks(_ commandID: String) -> Bool {
+        guard let id = SystemCommand.ID(itemID: commandID) else { return false }
+        return SystemCommand.command(id).needsConfirmation || id == .quitAllApps || id == .quitAllAppsExceptFrontmost
     }
 }
