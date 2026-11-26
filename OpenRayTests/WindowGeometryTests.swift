@@ -351,6 +351,16 @@ struct WindowGeometryTests {
         #expect(!WindowFramePlan(current: window, target: moved).changesSize)
     }
 
+    @Test func exactMoveKeepsAWindowLargerThanTheDisplay() throws {
+        let big = CGRect(x: 0, y: 0, width: 2000, height: 1000)
+        let moved = try CustomWindowCommand.move(x: 10, y: 20).frame(in: laptop, current: big)
+        #expect(moved == CGRect(x: 10, y: -144, width: 2000, height: 1000))
+        // A requested size still has to fit.
+        #expect(throws: LibraryValidationError.self) {
+            try CustomWindowCommand.resize(width: 2000, height: 600).frame(in: laptop, current: big)
+        }
+    }
+
     @Test func customCommandValidationRejectsImpossibleValues() throws {
         try CustomWindowCommand(name: "Ok", width: .percent(100), xOffset: .percent(-100)).validate()
         let invalid = [

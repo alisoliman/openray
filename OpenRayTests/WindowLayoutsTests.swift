@@ -315,6 +315,33 @@ struct WindowLayoutsTests {
         }
     }
 
+    @Test func aMoveTheAppIgnoredNeitherCountsNorClearsTheTargetDisplay() async throws {
+        let (manager, system) = makeManager()
+        // Chat sits on the secondary display; its app accepts the write and stays put.
+        system.ignoresFrames = [3]
+        var layout = SavedWindowLayout(name: "Chat here", slots: [slot("com.example.chat", app: "Chat", title: "Team", display: 1)])
+        layout.otherWindows = .close
+        let outcome = try await manager.apply(layout, launcher: FakeApplicationLauncher(), sleep: { _ in })
+        #expect(outcome == WindowLayoutOutcome(requested: 1, placed: 0, failed: ["Chat"]))
+        #expect(!system.events.contains { if case .close = $0 { return true } else { return false } })
+        #expect(!system.events.contains(.focus(3)))
+    }
+
+    @Test func equalFrameWindowsOnDifferentSpacesAreLeftOutOfCaptureAndCleanup() async throws {
+        let shared = CGRect(x: 0, y: 76, width: 1440, height: 800)
+        let here = WindowFixture.window(pid: 500, token: 5, app: "Docs", bundle: "com.example.docs", title: "Here", frame: shared)
+        let elsewhere = WindowFixture.window(
+            pid: 500, token: 6, app: "Docs", bundle: "com.example.docs", title: "Other Space", frame: shared)
+        // Only one of the two is on screen, and nothing says which.
+        let (manager, system) = makeManager(windows: [here, elsewhere], onScreen: [here])
+        #expect(throws: LibraryValidationError.self) { try manager.captureLayout(named: "Unsure") }
+        system.windowList.append(WindowFixture.window(pid: 100, token: 1, app: "Editor", bundle: "com.example.editor"))
+        var layout = SavedWindowLayout(name: "Editor", slots: [slot("com.example.editor", app: "Editor")])
+        layout.otherWindows = .close
+        _ = try await manager.apply(layout, launcher: FakeApplicationLauncher(), sleep: { _ in })
+        #expect(!system.events.contains(.close(5)) && !system.events.contains(.close(6)))
+    }
+
     // MARK: Model
 
     @Test func validationEnforcesNameSlotsAndTheEightWindowLimit() throws {

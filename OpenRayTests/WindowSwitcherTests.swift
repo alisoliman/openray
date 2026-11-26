@@ -60,6 +60,48 @@ struct WindowSwitcherTests {
         #expect(ordered.map(\.isMinimized) == [false, true])
     }
 
+    @Test func sameSizedWindowsOfOneAppMatchOnlyWhenEveryOneIsOnScreen() {
+        let one = WindowFixture.window(pid: 1, token: 1, title: "One", frame: editorFrame)
+        let two = WindowFixture.window(pid: 1, token: 2, title: "Two", frame: editorFrame)
+        // One entry for two candidates: which one is on screen is unknown, so neither counts.
+        let ambiguous = WindowSwitcherOrdering.order([one, two], entries: [entry(7, pid: 1, appKitFrame: editorFrame)], primaryHeight: 900)
+        #expect(ambiguous.allSatisfy { !$0.isOnScreen })
+        // Both on screen: both count.
+        let both = WindowSwitcherOrdering.order(
+            [one, two], entries: [entry(7, pid: 1, appKitFrame: editorFrame), entry(8, pid: 1, appKitFrame: editorFrame)],
+            primaryHeight: 900)
+        #expect(both.allSatisfy { $0.isOnScreen })
+    }
+
+    @Test func theBackgroundReaderOrdersASnapshotAndStopsWhenCancelled() async throws {
+        let windows = [
+            WindowFixture.window(pid: 1, token: 1, title: "Back", frame: notesFrame),
+            WindowFixture.window(pid: 2, token: 2, title: "Front", frame: browserFrame),
+        ]
+        let source = FakeWindowSnapshotSource(
+            windows: windows,
+            entries: [entry(2, pid: 2, appKitFrame: browserFrame), entry(1, pid: 1, appKitFrame: notesFrame)])
+        let reader = WindowSnapshotReader(source: source)
+        let read = try await reader.windows(of: source.applications(), primaryHeight: 900)
+        #expect(read.map(\.title) == ["Front", "Back"])
+
+        let gate = DispatchSemaphore(value: 0)
+        let stuck = FakeWindowSnapshotSource(windows: windows, gate: gate)
+        let pending = Task { try await WindowSnapshotReader(source: stuck).windows(of: stuck.applications(), primaryHeight: 900) }
+        for _ in 0..<400 where !stuck.hasEntered { try await Task.sleep(for: .milliseconds(5)) }
+        pending.cancel()
+        gate.signal()
+        await #expect(throws: CancellationError.self) { try await pending.value }
+        #expect(stuck.wasStoppedEarly)
+    }
+
+    @Test(arguments: [SideEffectGuard.Mode.testHost, .verification])
+    func inertLaunchesGetAnEmptySnapshotSource(_ mode: SideEffectGuard.Mode) {
+        let source = WindowSystemEnvironment.makeSnapshotSource(sideEffects: SideEffectGuard(mode: mode))
+        #expect(source is InertWindowSnapshotSource)
+        #expect(!source.isTrusted && source.applications().isEmpty && source.onScreenWindows().isEmpty)
+    }
+
     @Test func rowsShowTheTitleAndAppAndFallBackToTheAppName() {
         let (switcher, _) = makeSwitcher()
         let listed = switcher.windows()

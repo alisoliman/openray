@@ -69,6 +69,8 @@ final class FakeWindowSystem: WindowSystem {
     var fixedSizeTokens: Set<Int> = []
     /// Apps that accept a resize and then keep their own size.
     var clampedSizes: [Int: CGSize] = [:]
+    /// Windows that accept a frame write and then stay exactly where they were.
+    var ignoresFrames: Set<Int> = []
     /// Windows whose focus or close fails.
     var focusFailures: Set<Int> = []
     var closeFailures: Set<Int> = []
@@ -118,7 +120,7 @@ final class FakeWindowSystem: WindowSystem {
         }
         var applied = frame
         if let clamped = clampedSizes[window.token] { applied.size = clamped }
-        windowList[index].frame = applied
+        if !ignoresFrames.contains(window.token) { windowList[index].frame = applied }
         events.append(.setFrame(window.token, frame))
     }
 
@@ -174,11 +176,70 @@ final class FakeWindowSystem: WindowSystem {
 final class FakeApplicationLauncher: ApplicationLaunching {
     private(set) var launched: [String] = []
     var onLaunch: ((String) -> Void)?
+    /// Holds each launch until `resumeAll()`, like an app that takes a while to open.
+    var suspends = false
+    private var waiting: [CheckedContinuation<Void, Never>] = []
 
     func launch(bundleIdentifier: String) async throws {
         launched.append(bundleIdentifier)
         onLaunch?(bundleIdentifier)
+        if suspends { await withCheckedContinuation { waiting.append($0) } }
     }
+
+    func resumeAll() {
+        let pending = waiting
+        waiting = []
+        for continuation in pending { continuation.resume() }
+    }
+}
+
+/// A Switch Windows snapshot from fixed windows. A gate holds the background read, like an
+/// app that stopped answering Accessibility.
+final class FakeWindowSnapshotSource: WindowSnapshotSource, @unchecked Sendable {
+    let isTrusted: Bool
+    private let lock = NSLock()
+    private let snapshots: [WindowSnapshot]
+    private let entries: [WindowServerEntry]
+    private let gate: DispatchSemaphore?
+    private var entered = false
+    private var stoppedEarly = false
+
+    init(
+        windows: [WindowSnapshot], entries: [WindowServerEntry]? = nil, trusted: Bool = true,
+        gate: DispatchSemaphore? = nil
+    ) {
+        snapshots = windows
+        self.entries = entries ?? WindowFixture.entries(for: windows.filter { !$0.isMinimized })
+        isTrusted = trusted
+        self.gate = gate
+    }
+
+    var hasEntered: Bool { lock.withLock { entered } }
+    var wasStoppedEarly: Bool { lock.withLock { stoppedEarly } }
+
+    @MainActor func applications() -> [WindowAppRecord] {
+        var seen = Set<pid_t>()
+        return snapshots.compactMap { window in
+            guard seen.insert(window.pid).inserted else { return nil }
+            return WindowAppRecord(
+                pid: window.pid, name: window.appName, bundleIdentifier: window.bundleIdentifier, bundleURL: nil)
+        }
+    }
+
+    func windows(
+        of apps: [WindowAppRecord], includeMinimized: Bool, primaryHeight: CGFloat, shouldStop: () -> Bool
+    ) -> [WindowSnapshot] {
+        lock.withLock { entered = true }
+        gate?.wait()
+        if shouldStop() {
+            lock.withLock { stoppedEarly = true }
+            return []
+        }
+        let pids = Set(apps.map(\.pid))
+        return snapshots.filter { pids.contains($0.pid) && (includeMinimized || !$0.isMinimized) }
+    }
+
+    func onScreenWindows() -> [WindowServerEntry] { entries }
 }
 
 @MainActor
@@ -345,6 +406,22 @@ final class FakeMenuTree: MenuTreeSource, @unchecked Sendable {
 
     var hasEntered: Bool { lock.withLock { entered } }
     var pressedTitles: [String] { lock.withLock { pressedTokens.compactMap { infos[$0]?.title } } }
+
+    /// Swaps an app's menus, as an app does when its state changes.
+    func replace(_ pid: pid_t, with bar: MenuSpec) {
+        lock.withLock {
+            var next = (infos.keys.max() ?? 0) + 1
+            func add(_ spec: MenuSpec) -> Int {
+                let token = next
+                next += 1
+                infos[token] = spec.info
+                childTokens[token] = spec.children.map(add)
+                return token
+            }
+            roots[pid] = add(bar)
+            entered = false
+        }
+    }
     /// The most times any single node's attributes or children were read.
     var maxReadsPerNode: Int {
         lock.withLock { max(infoReadCounts.values.max() ?? 0, childReadCounts.values.max() ?? 0) }

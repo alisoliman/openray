@@ -21,8 +21,17 @@ struct SystemWindowProviderTests {
             ]),
     ])
 
+    /// What the providers asked of the launcher and the outside world.
+    @MainActor final class Recorder {
+        var dismissals: [Bool] = []
+        var opened: [URL] = []
+        var foreground: AppIdentity?
+        init(foreground: AppIdentity?) { self.foreground = foreground }
+    }
+
     struct Harness {
         let model: LauncherModel
+        let recorder: Recorder
         let system: FakeWindowSystem
         let windows: WindowCommandProvider
         let systemCommands: SystemCommandProvider
@@ -42,28 +51,37 @@ struct SystemWindowProviderTests {
                 pid: 200, token: 2, app: "Mail", bundle: "com.example.mail", title: "Inbox",
                 frame: CGRect(x: 720, y: 76, width: 720, height: 800)),
         ],
-        foreground: AppIdentity? = notes, store: LibraryStore = LibraryStore(fileURL: nil), hotKey: GlobalHotKey? = nil
+        foreground: AppIdentity? = notes, store: LibraryStore = LibraryStore(fileURL: nil), hotKey: GlobalHotKey? = nil,
+        snapshotSource: FakeWindowSnapshotSource? = nil, menus: FakeMenuTree? = nil,
+        menuLimits: MenuItemCollector.Limits = .init()
     ) -> Harness {
+        let recorder = Recorder(foreground: foreground)
         let system = FakeWindowSystem(displays: [WindowFixture.laptop], windows: windows)
         let listing = FakeWindowServerListing(WindowFixture.entries(for: windows.filter { !$0.isMinimized }))
         let presenter = FakeHUDPresenter()
         let hud = HUDController(presenter: presenter, screenFrame: { WindowFixture.laptop.visibleFrame }, schedule: { _, _ in })
         let launcher = FakeApplicationLauncher()
+        let dismissal = LauncherDismissal { _, restoreFocus in recorder.dismissals.append(restoreFocus) }
+        let opener = ExternalOpener { url in
+            recorder.opened.append(url)
+            return true
+        }
         let windowsProvider = WindowCommandProvider(
             windows: WindowManager(system: system, listing: listing), launcher: launcher, hud: hud,
-            foregroundPID: { _ in foreground?.pid })
+            switchReader: WindowSnapshotReader(source: snapshotSource ?? FakeWindowSnapshotSource(windows: windows)),
+            foregroundPID: { _ in recorder.foreground?.pid }, dismissal: dismissal, opener: opener)
         let actions = RecordingSystemActions()
         let audio = FakeAudioDevices()
-        let menus = FakeMenuTree(bars: [100: Self.menuBar])
+        let menus = menus ?? FakeMenuTree(bars: [100: Self.menuBar])
         let systemProvider = SystemCommandProvider(
             executor: actions, audio: audio, menuSearch: MenuItemSearch(source: menus), hud: hud,
-            foreground: { _ in foreground })
+            foreground: { _ in recorder.foreground }, dismissal: dismissal, menuLimits: menuLimits)
         let model = LauncherModel(
             store: store, ai: AIChatModel(engine: TestAIEngine()), pasteboard: NSPasteboard.withUniqueName(),
             registry: CommandRegistry(providers: [AIWritingCommandProvider(), systemProvider, windowsProvider]),
             hotKey: hotKey)
         return Harness(
-            model: model, system: system, windows: windowsProvider, systemCommands: systemProvider, actions: actions,
+            model: model, recorder: recorder, system: system, windows: windowsProvider, systemCommands: systemProvider, actions: actions,
             presenter: presenter, audio: audio, menus: menus, launcher: launcher)
     }
 
@@ -131,6 +149,8 @@ struct SystemWindowProviderTests {
         #expect(h.system.events == [.setFrame(1, CGRect(x: 0, y: 76, width: 720, height: 800)), .focus(1)])
         #expect(h.model.store.database.usage.first?.id == "window.leftHalf")
         #expect(h.model.feedback == nil)
+        // The panel closes without bringing another app forward: the moved window already is.
+        #expect(h.recorder.dismissals == [false])
         // New commands too, through the same route.
         h.model.perform(try command("window.lastThird", in: h.model))
         #expect(h.system.frames.last == CGRect(x: 960, y: 76, width: 480, height: 800))
@@ -170,6 +190,8 @@ struct SystemWindowProviderTests {
         h.system.isTrusted = false
         h.model.perform(try command("window.center", in: h.model))
         #expect(h.system.trustRequests == 1)
+        // Through the injected opener, which the live default guards.
+        #expect(h.recorder.opened == [ExternalOpener.accessibilitySettings])
         #expect(h.model.feedback?.style == .info)
         #expect(h.system.events.isEmpty)
     }
@@ -244,7 +266,7 @@ struct SystemWindowProviderTests {
         #expect(!h.system.events.dropFirst().contains(.focus(2)))
     }
 
-    @Test func focusNextAppWindowCyclesTheForegroundAppsWindows() throws {
+    @Test func focusNextAppWindowCyclesTheForegroundAppsWindows() async throws {
         let h = harness(windows: [
             WindowFixture.window(pid: 100, token: 1, title: "One", frame: CGRect(x: 0, y: 76, width: 700, height: 800)),
             WindowFixture.window(pid: 100, token: 2, title: "Two", frame: CGRect(x: 740, y: 76, width: 700, height: 800)),
@@ -252,6 +274,7 @@ struct SystemWindowProviderTests {
         defer { h.model.stop() }
         h.system.focusedWindows[100] = WindowHandle(pid: 100, token: 1)
         h.model.perform(try command("window.focusNextAppWindow", in: h.model))
+        await h.windows.pendingTask?.value
         #expect(h.system.events == [.focus(2)])
     }
 
@@ -322,6 +345,8 @@ struct SystemWindowProviderTests {
         await h.systemCommands.pendingTask?.value
         #expect(h.actions.actions == [.volume(.up)])
         #expect(h.hudTexts == ["Volume 56%"])
+        // Back to the app you were using, through the dismissal adapter.
+        #expect(h.recorder.dismissals == [true])
         #expect(h.model.store.database.usage.first?.id == "system.volumeUp")
     }
 
@@ -347,6 +372,7 @@ struct SystemWindowProviderTests {
         // Quit Others names the app it keeps.
         h.model.perform(try command("system.quitAllAppsExceptFrontmost", in: h.model))
         #expect(h.model.confirmation?.question == "Quit every app except Notes?")
+        #expect(h.model.confirmation?.detail.hasPrefix("Keeps Notes (com.example.notes) running.") == true)
     }
 
     @Test func aHotkeyAsksTheSameQuestionBeforeRunning() async throws {
@@ -505,6 +531,250 @@ struct SystemWindowProviderTests {
         #expect(WindowCommandProvider.nextLayoutName(after: []) == "Layout 1")
         let taken = [WindowLayoutRecord(name: "Layout 2")]
         #expect(WindowCommandProvider.nextLayoutName(after: taken) == "Layout 3")
+    }
+
+
+    // MARK: Phase B review fixes
+
+    @Test func inertLaunchesNeverRestoreFocusOrOpenSettings() {
+        let recorder = Recorder(foreground: nil)
+        for mode in [SideEffectGuard.Mode.testHost, .verification] {
+            let sideEffects = SideEffectGuard(mode: mode)
+            #expect(!LauncherDismissal.restoresFocus(true, sideEffects: sideEffects))
+            let opener = ExternalOpener.live(sideEffects: sideEffects) { url in
+                recorder.opened.append(url)
+                return true
+            }
+            #expect(!opener.open(ExternalOpener.automationSettings))
+            #expect(recorder.opened.isEmpty)
+        }
+        #expect(LauncherDismissal.restoresFocus(true, sideEffects: SideEffectGuard(mode: .live)))
+        #expect(!LauncherDismissal.restoresFocus(false, sideEffects: SideEffectGuard(mode: .live)))
+        // The Settings button uses the same guarded opener; in the test host it opens nothing.
+        #expect(!SystemPane.openAutomationSettings())
+        #expect(SystemPane.openAutomationSettings(opener: ExternalOpener { url in
+            recorder.opened.append(url)
+            return true
+        }))
+        #expect(recorder.opened == [ExternalOpener.automationSettings])
+    }
+
+    @Test func choosingAWindowWithTheTargetChipNeverChangesWhichAppQuitOthersKeeps() async throws {
+        // Production wiring: the default foreground reads the launcher's foreground app.
+        let finder = try #require(NSRunningApplication.runningApplications(withBundleIdentifier: "com.apple.finder").first)
+        let dock = try #require(NSRunningApplication.runningApplications(withBundleIdentifier: "com.apple.dock").first)
+        let actions = RecordingSystemActions()
+        let presenter = FakeHUDPresenter()
+        let provider = SystemCommandProvider(
+            executor: actions, audio: FakeAudioDevices(), menuSearch: MenuItemSearch(source: FakeMenuTree(bars: [:])),
+            hud: HUDController(presenter: presenter, screenFrame: { nil }, schedule: { _, _ in }),
+            dismissal: LauncherDismissal { _, _ in })
+        let model = LauncherModel(
+            store: LibraryStore(fileURL: nil), ai: AIChatModel(engine: TestAIEngine()),
+            pasteboard: NSPasteboard.withUniqueName(), registry: CommandRegistry(providers: [provider]))
+        defer { model.stop() }
+        model.previousApplication = finder
+        model.selectTargetWindow(
+            WindowManager.TargetWindow(
+                pid: dock.processIdentifier, appName: "Dock", bundleURL: nil,
+                element: AXUIElementCreateApplication(dock.processIdentifier), title: "Dock"))
+        #expect(model.previousApplication?.processIdentifier == dock.processIdentifier)
+        #expect(model.foregroundApplication?.processIdentifier == finder.processIdentifier)
+        model.perform(try command("system.quitAllAppsExceptFrontmost", in: model))
+        #expect(model.confirmation?.question == "Quit every app except \(finder.localizedName ?? "the app")?")
+        model.performSelected()
+        await provider.pendingTask?.value
+        #expect(actions.actions == [.quitOtherApps(keeping: AppIdentity(finder), excluded: [])])
+    }
+
+    @Test func aQuestionWhoseAppChangedWhileOpenRunsNothing() throws {
+        let h = harness()
+        defer { h.model.stop() }
+        h.model.perform(try command("system.quitAllAppsExceptFrontmost", in: h.model))
+        #expect(h.model.confirmation != nil)
+        // The launcher reopened over another app before ↩.
+        h.recorder.foreground = AppIdentity(pid: 300, bundleIdentifier: "com.example.mail", name: "Mail", launchDate: nil)
+        h.model.performSelected()
+        #expect(h.model.feedback?.style == .warning)
+        #expect(h.actions.actions.isEmpty && h.systemCommands.pendingTask == nil)
+    }
+
+    @Test func twoAppsWithTheSameNameAreToldApartByIdentity() async throws {
+        let personal = AppIdentity(pid: 100, bundleIdentifier: "com.example.notes", name: "Notes", launchDate: nil)
+        let work = AppIdentity(pid: 101, bundleIdentifier: "com.example.work.notes", name: "Notes", launchDate: nil)
+        let h = harness(foreground: work)
+        defer { h.model.stop() }
+        h.model.perform(try command("system.quitAllAppsExceptFrontmost", in: h.model))
+        #expect(h.model.confirmation?.detail.hasPrefix("Keeps Notes (com.example.work.notes) running.") == true)
+        h.model.performSelected()
+        await h.systemCommands.pendingTask?.value
+        #expect(h.actions.actions == [.quitOtherApps(keeping: work, excluded: [])])
+        let running = [
+            RunningAppInfo(pid: 100, bundleIdentifier: personal.bundleIdentifier, name: "Notes", isRegular: true, isHidden: false),
+            RunningAppInfo(pid: 101, bundleIdentifier: work.bundleIdentifier, name: "Notes", isRegular: true, isHidden: false),
+        ]
+        #expect(try AppSelection.quitTargets(running, keeping: work, excluded: [], ownPID: 1).map(\.pid) == [100])
+    }
+
+    @Test func closeOthersLayoutsAskFirstAndCheckTheLayoutAgainOnApproval() async throws {
+        let h = harness()
+        defer { h.model.stop() }
+        let record = WindowLayoutRecord(
+            name: "Focus", slots: [.init(bundleIdentifier: "com.example.notes", appName: "Notes", displayIndex: 0, region: .full)],
+            otherWindows: .close)
+        #expect(h.model.store.update { $0.windowLayouts = [record] })
+        let layout = try command(WindowCommandProvider.layoutPrefix + record.id.uuidString, in: h.model)
+        h.model.perform(layout)
+        #expect(h.model.confirmation?.question == "Close other windows?")
+        #expect(h.system.events.isEmpty)
+        // Edited while the question was open: nothing runs.
+        #expect(h.model.store.update { $0.windowLayouts[0].otherWindows = .minimize })
+        h.model.performSelected()
+        #expect(h.model.feedback?.style == .warning)
+        #expect(h.windows.pendingTask == nil)
+        // Ask again and approve.
+        #expect(h.model.store.update { $0.windowLayouts[0].otherWindows = .close })
+        h.model.perform(try command(layout.id, in: h.model))
+        h.model.performSelected()
+        await h.windows.pendingTask?.value
+        #expect(h.system.events.contains(.close(2)))
+    }
+
+    @Test func aNewerLayoutStopsAnOlderOneBeforeItClosesAnything() async throws {
+        let h = harness()
+        defer { h.model.stop() }
+        h.launcher.suspends = true
+        let older = WindowLayoutRecord(
+            name: "Older",
+            slots: [
+                .init(bundleIdentifier: "com.example.notes", appName: "Notes", displayIndex: 0, region: .full),
+                .init(bundleIdentifier: "com.example.slow", appName: "Slow", displayIndex: 0, region: .full),
+            ], otherWindows: .close)
+        let newer = WindowLayoutRecord(
+            name: "Newer",
+            slots: [.init(bundleIdentifier: "com.example.mail", appName: "Mail", displayIndex: 0, region: .full)])
+        #expect(h.model.store.update { $0.windowLayouts = [older, newer] })
+        h.model.perform(try command(WindowCommandProvider.layoutPrefix + older.id.uuidString, in: h.model))
+        h.model.performSelected()
+        let first = h.windows.pendingTask
+        try await waitUntil { h.launcher.launched == ["com.example.slow"] }
+        h.model.perform(try command(WindowCommandProvider.layoutPrefix + newer.id.uuidString, in: h.model))
+        await h.windows.pendingTask?.value
+        #expect(h.hudTexts.last == "Arranged 1 window")
+        // The slow app finally opens; the older layout must not touch the newer one's windows.
+        h.launcher.resumeAll()
+        await first?.value
+        #expect(!h.system.events.contains { if case .close = $0 { return true } else { return false } })
+        #expect(h.hudTexts == ["Arranged 1 window"])
+    }
+
+    @Test func exactArgumentsRejectHugeOrReplacedValuesWithoutCrashing() throws {
+        let h = harness()
+        defer { h.model.stop() }
+        h.model.navigate(to: .provided(WindowCommandProvider.resizeScope))
+        h.model.query = "1e20 × 800"
+        #expect(h.model.results.isEmpty)
+        h.model.query = "20001 x 10"
+        #expect(h.model.results.isEmpty)
+        // Prefilled values show only until something else is typed.
+        var resize = try command("window.resizeWindow", in: h.model)
+        resize.action = .provided(
+            ProvidedRef(provider: WindowCommandProvider.providerID, id: "window.resizeWindow", arguments: ["width": "900", "height": "600"]))
+        h.model.perform(resize)
+        #expect(h.model.results.first?.title == "Resize to 900 × 600")
+        h.model.query = "abc"
+        #expect(h.model.results.isEmpty)
+        #expect(WindowArgumentParser.format(1200) == "1200" && WindowArgumentParser.format(15.5) == "15.5")
+        #expect(WindowArgumentParser.format(1e20).isEmpty == false)
+    }
+
+    @Test func movingAWindowLargerThanTheDisplayKeepsItsSize() throws {
+        let big = WindowFixture.window(pid: 100, token: 1, frame: CGRect(x: 0, y: 0, width: 2000, height: 1000))
+        let h = harness(windows: [big])
+        defer { h.model.stop() }
+        h.model.navigate(to: .provided(WindowCommandProvider.moveScope))
+        h.model.query = "10, 20"
+        h.model.perform(try #require(h.model.results.first))
+        #expect(h.model.feedback == nil)
+        #expect(h.system.frames == [CGRect(x: 10, y: -144, width: 2000, height: 1000)])
+    }
+
+    @Test func switchWindowsStaysResponsiveWhileAnAppDoesNotAnswer() async throws {
+        let gate = DispatchSemaphore(value: 0)
+        let windows = [WindowFixture.window(pid: 100, token: 1, title: "Stuck")]
+        let source = FakeWindowSnapshotSource(windows: windows, gate: gate)
+        let h = harness(windows: windows, snapshotSource: source)
+        defer { h.model.stop() }
+        h.model.perform(try command("window.switch", in: h.model))
+        try await waitUntil { source.hasEntered }
+        // The main actor is free: leaving the scope works while the read is stuck.
+        h.model.goBack()
+        #expect(h.model.section == .home)
+        gate.signal()
+        try await waitUntil { source.wasStoppedEarly && !h.model.isLoadingProvidedItems }
+        #expect(source.wasStoppedEarly)
+        #expect(!h.model.results.contains { $0.id.hasPrefix("window.switch.") })
+    }
+
+    @Test func reopeningMenuSearchNeverReusesAnEarlierVisitsMenus() async throws {
+        let gate = DispatchSemaphore(value: 0)
+        let menus = FakeMenuTree(bars: [100: Self.menuBar], gate: gate)
+        let h = harness(menus: menus)
+        defer { h.model.stop() }
+        gate.signal()
+        h.model.navigate(to: .provided(SystemCommandProvider.menuScope))
+        try await waitUntil { h.model.results.count == 3 }
+        let oldPrint = try #require(h.model.results.first { $0.title == "Print" })
+        h.model.goBack()
+        // The app's menus change, and the next read is slow; typing starts before it ends.
+        menus.replace(100, with: .bar([.menu("Apple", []), .menu("Edit", [.item("Paste", character: "v")])]))
+        h.model.navigate(to: .provided(SystemCommandProvider.menuScope))
+        try await waitUntil { menus.hasEntered }
+        h.model.query = "p"
+        gate.signal()
+        gate.signal()
+        try await waitUntil { h.model.results.first?.title == "Paste" }
+        #expect(!h.model.results.contains { $0.title == "Print" || $0.title == "PDF" })
+        // A row from the earlier visit can't press anything.
+        h.model.perform(oldPrint)
+        #expect(h.model.feedback?.text == "The menus changed. Search again.")
+        #expect(menus.pressedTitles.isEmpty)
+    }
+
+    @Test func aPartialMenuReadSaysSo() async throws {
+        let h = harness(menuLimits: .init(maxItems: 1))
+        defer { h.model.stop() }
+        h.model.navigate(to: .provided(SystemCommandProvider.menuScope))
+        try await waitUntil { !h.model.results.isEmpty }
+        #expect(h.model.groups.first?.title?.contains("weren't read") == true)
+    }
+
+    @Test func deletingALayoutRemovesItsFavoriteAndUsageInOneSave() throws {
+        let store = LibraryStore(fileURL: nil)
+        let record = WindowLayoutRecord(name: "Desk")
+        let itemID = WindowCommandProvider.layoutPrefix + record.id.uuidString
+        #expect(store.update { $0.windowLayouts = [record] })
+        #expect(store.toggleFavorite(itemID))
+        store.recordUse(of: itemID)
+        #expect(store.saveCommandBinding(CommandBinding(targetID: itemID, alias: "desk")))
+        #expect(WindowLayoutSettingsRow.delete(record.id, in: store))
+        #expect(store.database.windowLayouts.isEmpty)
+        #expect(!store.database.favoriteIDs.contains(itemID))
+        #expect(!store.database.usage.contains { $0.id == itemID })
+        // The binding stays, inactive, as for any command that's missing right now.
+        #expect(store.database.binding(for: itemID)?.alias == "desk")
+    }
+
+    @Test func onlyCatalogCommandsOfferAnAliasOrShortcut() async throws {
+        let h = harness()
+        defer { h.model.stop() }
+        #expect(h.model.actions(for: try command("system.lockScreen", in: h.model)).contains { $0.id == "assign" })
+        h.model.perform(try command("system.soundOutput", in: h.model))
+        let device = try #require(h.model.results.first)
+        #expect(!h.model.actions(for: device).contains { $0.id == "assign" })
+        h.model.navigate(to: .provided(SystemCommandProvider.volumeScope))
+        let level = try #require(h.model.results.first)
+        #expect(!h.model.actions(for: level).contains { $0.id == "assign" })
     }
 
     private static func ref(of item: LauncherItem) -> ProvidedRef? {
