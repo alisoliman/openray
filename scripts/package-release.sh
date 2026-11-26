@@ -109,11 +109,16 @@ plutil -lint "$OPENRAY_APP/Contents/Resources/PrivacyInfo.xcprivacy"
 [[ -f "$OPENRAY_APP/Contents/Resources/AppIcon.icns" ]] || fail 'The archive is missing its app icon.'
 
 OPENRAY_NAME="OpenRay-$OPENRAY_VERSION"
+# The archive is built unsigned, so the hardened-runtime signature below must carry the
+# app's entitlements itself; without them, Automation (Apple Events) is refused at runtime.
+OPENRAY_ENTITLEMENTS="$OPENRAY_ROOT/OpenRay.entitlements"
+plutil -lint "$OPENRAY_ENTITLEMENTS" >/dev/null || fail 'The entitlements file is missing or invalid.'
 if (( OPENRAY_PREVIEW )); then
   OPENRAY_NAME+="-local-preview"
-  codesign --force --sign - --options runtime "$OPENRAY_APP"
+  codesign --force --sign - --options runtime --entitlements "$OPENRAY_ENTITLEMENTS" "$OPENRAY_APP"
 else
-  codesign --force --sign "$OPENRAY_SIGNING_IDENTITY" "${OPENRAY_SIGNING_KEYCHAIN_ARGS[@]}" --options runtime --timestamp "$OPENRAY_APP"
+  codesign --force --sign "$OPENRAY_SIGNING_IDENTITY" "${OPENRAY_SIGNING_KEYCHAIN_ARGS[@]}" --options runtime --timestamp \
+    --entitlements "$OPENRAY_ENTITLEMENTS" "$OPENRAY_APP"
 fi
 codesign --verify --strict --verbose=2 "$OPENRAY_APP" 2>"$OPENRAY_OUTPUT/signature-verification.log"
 codesign -d --verbose=4 "$OPENRAY_APP" 2>"$OPENRAY_OUTPUT/signature-details.txt"
@@ -122,10 +127,14 @@ if (( ! OPENRAY_PREVIEW )); then
   /usr/bin/grep -q '^Authority=Developer ID Application:' "$OPENRAY_OUTPUT/signature-details.txt" || fail 'Unexpected signing authority.'
   /usr/bin/grep -q '^Timestamp=' "$OPENRAY_OUTPUT/signature-details.txt" || fail 'The signature has no secure timestamp.'
 fi
-codesign -d --entitlements - "$OPENRAY_APP" >"$OPENRAY_OUTPUT/entitlements.plist" 2>/dev/null
-# This app requires no code-signing entitlements. Refuse a debugger entitlement if one appears.
-if [[ -s "$OPENRAY_OUTPUT/entitlements.plist" ]] &&
-  [[ "$(/usr/libexec/PlistBuddy -c 'Print :com.apple.security.get-task-allow' "$OPENRAY_OUTPUT/entitlements.plist" 2>/dev/null || true)" == true ]]; then
+codesign -d --entitlements - --xml "$OPENRAY_APP" >"$OPENRAY_OUTPUT/entitlements.plist" 2>/dev/null
+# System commands send Apple events (Automation), which the hardened runtime allows only with
+# this entitlement and a usage description. Refuse a debugger entitlement if one appears.
+[[ "$(/usr/libexec/PlistBuddy -c 'Print :com.apple.security.automation.apple-events' "$OPENRAY_OUTPUT/entitlements.plist" 2>/dev/null || true)" == true ]] ||
+  fail 'The release signature is missing the Automation (Apple Events) entitlement.'
+/usr/libexec/PlistBuddy -c 'Print :NSAppleEventsUsageDescription' "$OPENRAY_APP/Contents/Info.plist" >/dev/null 2>&1 ||
+  fail 'The app is missing NSAppleEventsUsageDescription.'
+if [[ "$(/usr/libexec/PlistBuddy -c 'Print :com.apple.security.get-task-allow' "$OPENRAY_OUTPUT/entitlements.plist" 2>/dev/null || true)" == true ]]; then
   fail 'Release signature unexpectedly permits debugger attachment.'
 fi
 
