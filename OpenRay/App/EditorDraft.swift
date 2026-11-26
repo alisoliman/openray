@@ -197,8 +197,12 @@ final class EditorDraft {
         guard !isEmptyNote else { return true }
         guard isDirty || savedAt == nil else { return true }
         let snapshot = currentValues
-        note.title = name.trimmingCharacters(in: .whitespacesAndNewlines)
-        note.content = content
+        // Start from the note as saved now and write only what changed here, so a pin, Recently
+        // Deleted, or newer words from the Notes window aren't reverted.
+        let stored = store.database.notes.first { $0.id == note.id }
+        if let stored { note = stored }
+        if stored == nil || name != original[0] { note.title = name.trimmingCharacters(in: .whitespacesAndNewlines) }
+        if stored == nil || content != original[2] { note.content = content }
         if store.save(note) {
             // The saved text is the new baseline, so editing back to it saves again.
             original = snapshot

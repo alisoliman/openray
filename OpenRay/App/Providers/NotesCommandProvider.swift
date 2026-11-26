@@ -86,7 +86,10 @@ final class NotesCommandProvider: CommandProvider, MenuBarExtraProviding {
         default:
             // A row in Recently Deleted: restore it and open it in the window.
             guard ref.payload == "deleted", let noteID = UUID(uuidString: ref.id) else { return }
-            notes.restore(noteID)
+            guard notes.restore(noteID) else {
+                model.feedback = .warning(notes.notice?.text ?? "This note couldn't be restored.")
+                return
+            }
             model.panel?.dismiss(restoreFocus: false)
             if !notes.show(noteID: noteID) {
                 model.toast("Restored “\(item.title.truncatedForFeedback)”")
@@ -110,8 +113,12 @@ final class NotesCommandProvider: CommandProvider, MenuBarExtraProviding {
 
     func scopeItems(_ scope: ProvidedScope, query: String, in model: LauncherModel) -> [LauncherItem] {
         guard scope.id == Self.deletedScope.id else { return [] }
-        let now = Date.now
-        return NoteCollection.deleted(model.store.database.notes).map { note in
+        let notes = center.model(for: model.store)
+        let now = notes.now()
+        // Notes past their 60 days are gone, even if the Notes window hasn't opened to purge them.
+        let expired = Set(NoteCollection.expired(model.store.database.notes, now: now).map(\.id))
+        if !expired.isEmpty { Task { @MainActor in notes.purgeExpired() } }
+        return NoteCollection.deleted(model.store.database.notes).filter { !expired.contains($0.id) }.map { note in
             let days = note.expiresAt.map { max(0, Int(ceil($0.timeIntervalSince(now) / 86_400))) } ?? 0
             let deleted = note.deletedAt?.formatted(.relative(presentation: .named)) ?? ""
             return LauncherItem(
@@ -154,8 +161,7 @@ final class NotesCommandProvider: CommandProvider, MenuBarExtraProviding {
         guard ref.payload == "deleted", let noteID = UUID(uuidString: ref.id) else { return nil }
         let notes = center.model(for: model.store)
         return .store { [weak model] in
-            notes.deletePermanently(noteID)
-            let removed = !notes.store.database.notes.contains { $0.id == noteID }
+            let removed = notes.deletePermanently(noteID)
             if !removed { model?.feedback = .error(notes.store.errorMessage ?? "This note couldn't be deleted.") }
             return removed
         }
@@ -186,8 +192,11 @@ final class NotesCommandProvider: CommandProvider, MenuBarExtraProviding {
                     confirmTitle: "Empty", symbol: "trash")
                 model.confirmation = .provided(
                     ProvidedConfirmation(id: "notes.empty", question) { [weak model] in
-                        notes.emptyRecentlyDeleted()
-                        model?.toast("Recently Deleted is empty")
+                        if notes.emptyRecentlyDeleted() {
+                            model?.toast("Recently Deleted is empty")
+                        } else {
+                            model?.feedback = .error(notes.notice?.text ?? "Recently Deleted couldn't be emptied.")
+                        }
                     })
             },
         ]

@@ -105,6 +105,8 @@ final class NotesWindowController: NSObject, NSWindowDelegate, NotesWindowPresen
 
     func hide() {
         panel?.orderOut(nil)
+        // The next show sizes to its note again, even after a manual resize.
+        followsContent = true
     }
 
     /// The launcher is a non-activating panel, so the app it opened over is still frontmost.
@@ -221,8 +223,10 @@ final class NotesWindowController: NSObject, NSWindowDelegate, NotesWindowPresen
         model.flush()
     }
 
-    func windowWillClose(_ notification: Notification) {
-        followsContent = true
+    /// Coming back to the window shows what another editor saved meanwhile, when nothing here
+    /// is waiting to save.
+    func windowDidBecomeKey(_ notification: Notification) {
+        model.reloadIfChangedElsewhere()
     }
 }
 
@@ -295,6 +299,12 @@ private struct NotesHeader: View {
                 model.newNote()
             }
             Menu {
+                if model.saveFailed {
+                    Button("Discard Unsaved Changes", systemImage: "arrow.uturn.backward", role: .destructive) {
+                        model.discardUnsavedChanges()
+                    }
+                    Divider()
+                }
                 Button(model.currentNote?.isPinned == true ? "Unpin Note" : "Pin Note", systemImage: "pin") {
                     model.togglePin()
                 }

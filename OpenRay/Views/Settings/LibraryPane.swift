@@ -43,7 +43,7 @@ struct LibraryPane: View {
             } header: {
                 Text("Data")
             } footer: {
-                Text("library.json and the ClipboardImages folder are readable only by your account, but OpenRay doesn't encrypt them. Export saves library.json only, so back up both together.")
+                Text("library.json and the ClipboardImages and NoteAssets folders are readable only by your account, but OpenRay doesn't encrypt them. Export saves library.json only, so back up all three together.")
                     .font(.system(size: 12)).foregroundStyle(.secondary)
             }
         }

@@ -131,6 +131,11 @@ final class NotesWindowModel {
     private(set) var history = NoteHistory()
     /// Typed text not saved yet.
     private(set) var hasUnsavedText = false
+    /// The last save failed: the words stay here, and the note stays open, until a save works
+    /// or the person discards them.
+    private(set) var saveFailed = false
+    /// The saved words the buffer started from, to notice when another editor changed the note.
+    @ObservationIgnored private(set) var baseContent: String?
     var browser: NotesBrowserState?
     var notice: NotesNotice?
     var slashMenu: NoteSlashMenu?
@@ -230,10 +235,10 @@ final class NotesWindowModel {
         if isWindowKey { hide() } else { show() }
     }
 
+    /// Hides the window. When the open note's words can't be saved, it stays open to say so.
     func hide() {
         closeOverlays()
-        leaveCurrentIfEmpty()
-        flush()
+        guard leaveCurrent() else { return }
         presenter?.hide()
     }
 
@@ -247,7 +252,10 @@ final class NotesWindowModel {
 
     /// Opens a note, recording the one that was open in history.
     func open(_ id: UUID) {
-        guard id != currentID || draft != nil else { return }
+        if id == currentID, draft == nil {
+            reloadIfChangedElsewhere()
+            return
+        }
         guard let note = notes.first(where: { $0.id == id }) else {
             notice = .warning("This note no longer exists.")
             return
@@ -257,26 +265,23 @@ final class NotesWindowModel {
             return
         }
         let previous = currentID
-        leaveCurrentIfEmpty()
-        flush()
+        guard leaveCurrent() else { return }
         history.visit(id, from: previous)
         load(note)
     }
 
     /// ⌘N: a new note. A note left empty is dropped, not saved.
     func newNote() {
-        if draft != nil, text.isEmpty { return }
+        if draft != nil, isBlank(text) { return }
         let previous = currentID
-        leaveCurrentIfEmpty()
-        flush()
+        guard leaveCurrent() else { return }
         startDraft()
         if let previous, let currentID { history.visit(currentID, from: previous) }
     }
 
     /// ⌘[: the note opened before this one.
     func goBack() {
-        leaveCurrentIfEmpty()
-        flush()
+        guard leaveCurrent() else { return }
         guard let id = history.goBack(from: currentID, isAvailable: exists), let note = notes.first(where: { $0.id == id })
         else { return }
         load(note)
@@ -284,8 +289,7 @@ final class NotesWindowModel {
 
     /// ⌘]: the note opened after this one.
     func goForward() {
-        leaveCurrentIfEmpty()
-        flush()
+        guard leaveCurrent() else { return }
         guard let id = history.goForward(from: currentID, isAvailable: exists), let note = notes.first(where: { $0.id == id })
         else { return }
         load(note)
@@ -306,7 +310,9 @@ final class NotesWindowModel {
         draft = nil
         currentID = note.id
         text = note.content
+        baseContent = note.content
         hasUnsavedText = false
+        saveFailed = false
         slashMenu = nil
         textRevision += 1
     }
@@ -316,7 +322,9 @@ final class NotesWindowModel {
         draft = note
         currentID = note.id
         text = ""
+        baseContent = nil
         hasUnsavedText = false
+        saveFailed = false
         slashMenu = nil
         textRevision += 1
     }
@@ -326,14 +334,20 @@ final class NotesWindowModel {
     func reloadIfChangedElsewhere() {
         guard draft == nil, !hasUnsavedText, let currentID else { return }
         guard let note = notes.first(where: { $0.id == currentID }), !note.isDeleted else {
+            // Deleted elsewhere: show the next note rather than words that no longer exist.
+            history.remove(currentID)
             self.currentID = nil
+            openFallbackNote()
             return
         }
+        baseContent = note.content
         if note.content != text {
             text = note.content
             textRevision += 1
         }
     }
+
+    private func isBlank(_ text: String) -> Bool { text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
 
     // MARK: Editing and saving
 
@@ -351,17 +365,17 @@ final class NotesWindowModel {
         }
     }
 
-    /// Saves typed text now. False, with a notice, when it couldn't be saved.
+    /// Saves typed text now. False, with a notice, when it couldn't be saved; the words stay in
+    /// the buffer, and the note stays open.
     @discardableResult
     func flush() -> Bool {
         autosaveTask?.cancel()
         autosaveTask = nil
         guard hasUnsavedText else { return true }
         let content = text
-        let blank = content.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        let blank = isBlank(content)
         guard content.count <= QuickNote.maximumLength else {
-            notice = .error("Notes support up to 100,000 characters.")
-            return false
+            return failSave("Notes support up to 100,000 characters. Shorten this note to save it.")
         }
         if var note = draft {
             // A new note is saved once it has words.
@@ -370,18 +384,21 @@ final class NotesWindowModel {
             note.title = Self.title(for: content)
             note.modifiedAt = now()
             note.formatVersion = QuickNote.markdownFormat
-            guard store.update({ $0.notes.insert(note, at: 0) }) else {
-                notice = .error(store.errorMessage ?? "This note couldn't be saved.")
-                return false
-            }
+            guard store.update({ $0.notes.insert(note, at: 0) }) else { return failSave(nil) }
             draft = nil
             currentID = note.id
-        } else if let id = currentID, let note = notes.first(where: { $0.id == id }) {
-            // An emptied note keeps its last words until you leave it, then it's removed.
-            guard !blank else { return true }
+        } else if let id = currentID, let note = notes.first(where: { $0.id == id }), !note.isDeleted {
+            // A note whose title follows its words keeps its last words while it's empty; leaving
+            // it moves it to Recently Deleted. A note with a title of its own can be empty.
+            guard !blank || !note.titleFollowsContent else { return true }
             guard note.content != content else {
-                hasUnsavedText = false
+                finishSave(content)
                 return true
+            }
+            if let base = baseContent, note.content != base {
+                // Another editor changed this note since the window loaded it. Neither version
+                // overwrites the other: these words become a note of their own.
+                return saveAsNewNote(content, replacing: note)
             }
             var updated = note
             if note.titleFollowsContent { updated.title = Self.title(for: content) }
@@ -392,23 +409,56 @@ final class NotesWindowModel {
                 guard let index = database.notes.firstIndex(where: { $0.id == id }) else { return }
                 database.notes[index] = updated
             }
-            guard saved else {
-                notice = .error(store.errorMessage ?? "This note couldn't be saved.")
-                return false
-            }
+            guard saved else { return failSave(nil) }
         } else {
             // The note was deleted elsewhere while it was open: keep the words as a new note.
             guard !blank else { return true }
             let note = QuickNote(
                 title: Self.title(for: content), content: content, modifiedAt: now(), formatVersion: QuickNote.markdownFormat)
-            guard store.update({ $0.notes.insert(note, at: 0) }) else {
-                notice = .error(store.errorMessage ?? "This note couldn't be saved.")
-                return false
-            }
+            guard store.update({ $0.notes.insert(note, at: 0) }) else { return failSave(nil) }
+            if let currentID { history.remove(currentID) }
             currentID = note.id
         }
-        hasUnsavedText = false
+        finishSave(content)
         return true
+    }
+
+    private func finishSave(_ content: String) {
+        baseContent = content
+        hasUnsavedText = false
+        saveFailed = false
+    }
+
+    private func failSave(_ message: String?) -> Bool {
+        saveFailed = true
+        notice = .error(message ?? store.errorMessage ?? "This note couldn't be saved.")
+        return false
+    }
+
+    private func saveAsNewNote(_ content: String, replacing original: QuickNote) -> Bool {
+        let copy = QuickNote(
+            title: Self.title(for: content), content: content, modifiedAt: now(), formatVersion: QuickNote.markdownFormat)
+        guard store.update({ $0.notes.insert(copy, at: 0) }) else { return failSave(nil) }
+        history.visit(copy.id, from: original.id)
+        currentID = copy.id
+        finishSave(content)
+        notice = .warning("“\(original.title.truncatedForFeedback)” changed in another editor, so these edits are a new note.")
+        return true
+    }
+
+    /// Drops typed words that couldn't be saved and shows the note as saved.
+    func discardUnsavedChanges() {
+        autosaveTask?.cancel()
+        autosaveTask = nil
+        if draft != nil {
+            text = ""
+            hasUnsavedText = false
+            saveFailed = false
+            textRevision += 1
+        } else if let id = currentID, let note = notes.first(where: { $0.id == id }) {
+            load(note)
+        }
+        notice = .info("Changes discarded")
     }
 
     static func title(for content: String) -> String {
@@ -416,29 +466,37 @@ final class NotesWindowModel {
         return title.isEmpty ? "Untitled Note" : title
     }
 
-    /// Leaving a note you emptied removes it, as the inline editor does; a new empty note is dropped.
-    private func leaveCurrentIfEmpty() {
-        guard text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
+    /// Settles the open note before another opens or the window hides. False keeps it open:
+    /// its words couldn't be saved, and a notice says why.
+    private func leaveCurrent() -> Bool {
+        guard isBlank(text) else { return flush() }
+        autosaveTask?.cancel()
+        autosaveTask = nil
         if draft != nil {
+            // A new note left empty was never saved, so there's nothing to keep.
             draft = nil
             if let currentID { history.remove(currentID) }
             currentID = nil
             hasUnsavedText = false
-            return
+            saveFailed = false
+            return true
         }
-        guard let id = currentID, notes.contains(where: { $0.id == id }) else { return }
-        autosaveTask?.cancel()
-        let removed = store.update { database in
-            database.notes.removeAll { $0.id == id }
-            database.favoriteIDs.remove("note.\(id)")
-            database.usage.removeAll { $0.id == "note.\(id)" }
-            NoteCollection.normalizePins(&database.notes)
-        }
-        if removed {
-            history.remove(id)
-            currentID = nil
+        guard let id = currentID, let note = notes.first(where: { $0.id == id }), !note.isDeleted else {
             hasUnsavedText = false
+            return true
         }
+        // A title-only note (OpenRay 0.1 saved those) stays as it is; so does one you emptied
+        // that has a title of its own.
+        guard note.titleFollowsContent, hasUnsavedText else { return flush() }
+        // Emptied: nothing is left of it, so it moves to Recently Deleted with its last saved words.
+        let moved = store.update { NoteCollection.moveToRecentlyDeleted(id, at: self.now(), in: &$0.notes) }
+        guard moved else { return failSave(store.errorMessage ?? "This note couldn't be moved to Recently Deleted.") }
+        history.remove(id)
+        currentID = nil
+        hasUnsavedText = false
+        saveFailed = false
+        notice = .info("Moved the emptied note “\(note.title.truncatedForFeedback)” to Recently Deleted")
+        return true
     }
 
     /// Applies an edit the editor computed (a task toggle, a format command), as if typed.
@@ -491,7 +549,8 @@ final class NotesWindowModel {
             return
         }
         guard let id = currentID, let note = notes.first(where: { $0.id == id }) else { return }
-        flush()
+        // Words that can't be saved aren't thrown away by deleting: the save error shows instead.
+        guard flush() else { return }
         let moved = store.update { database in
             NoteCollection.moveToRecentlyDeleted(id, at: self.now(), in: &database.notes)
         }
@@ -515,64 +574,71 @@ final class NotesWindowModel {
         }
     }
 
-    /// Brings a note back and opens it.
-    func restore(_ id: UUID) {
-        guard store.update({ NoteCollection.restore(id, at: self.now(), in: &$0.notes) }) else {
+    /// Brings a note back and opens it. False, with a notice, when it couldn't be restored,
+    /// including a note past its 60 days.
+    @discardableResult
+    func restore(_ id: UUID) -> Bool {
+        if let note = notes.first(where: { $0.id == id }), NoteCollection.expired([note], now: now()).count == 1 {
+            purgeExpired()
+            notice = .warning("“\(note.title.truncatedForFeedback)” was in Recently Deleted for 60 days and is gone.")
+            return false
+        }
+        guard notes.contains(where: { $0.id == id && $0.isDeleted }),
+            store.update({ NoteCollection.restore(id, at: self.now(), in: &$0.notes) })
+        else {
             notice = .error(store.errorMessage ?? "This note couldn't be restored.")
-            return
+            return false
         }
         if browser?.showsDeleted == true { browser = nil }
         open(id)
-        notice = .success("Restored")
+        if currentID == id { notice = .success("Restored") }
+        return true
     }
 
     /// Removes a note from Recently Deleted for good, with any images only it used.
-    func deletePermanently(_ id: UUID) {
-        let removed = store.update { database in
-            database.notes.removeAll { $0.id == id && $0.isDeleted }
-            database.favoriteIDs.remove("note.\(id)")
-            database.usage.removeAll { $0.id == "note.\(id)" }
-        }
-        guard removed else {
-            notice = .error(store.errorMessage ?? "This note couldn't be deleted.")
-            return
-        }
-        assets.removeUnreferenced(keeping: notes)
+    @discardableResult
+    func deletePermanently(_ id: UUID) -> Bool {
+        removeForGood(notes.filter { $0.id == id && $0.isDeleted }, failure: "This note couldn't be deleted.")
     }
 
     /// Empties Recently Deleted. Asks first, through `confirmsEmptyingDeleted`.
-    func emptyRecentlyDeleted() {
+    @discardableResult
+    func emptyRecentlyDeleted() -> Bool {
         confirmsEmptyingDeleted = false
-        let ids = Set(deletedNotes.map { "note.\($0.id)" })
-        guard !ids.isEmpty else { return }
-        let removed = store.update { database in
-            database.notes.removeAll(where: \.isDeleted)
-            database.favoriteIDs.subtract(ids)
-            database.usage.removeAll { ids.contains($0.id) }
-        }
-        guard removed else {
-            notice = .error(store.errorMessage ?? "Recently Deleted couldn't be emptied.")
-            return
-        }
-        assets.removeUnreferenced(keeping: notes)
+        let deleted = deletedNotes
+        guard !deleted.isEmpty else { return true }
+        guard removeForGood(deleted, failure: "Recently Deleted couldn't be emptied.") else { return false }
         notice = .success("Recently Deleted is empty")
+        return true
     }
 
-    /// Removes notes deleted 60 or more days ago. Runs whenever the window opens.
+    /// Removes notes deleted 60 or more days ago. Runs when the window opens and before the
+    /// launcher lists Recently Deleted.
     @discardableResult
     func purgeExpired() -> Int {
         let expired = NoteCollection.expired(notes, now: now())
         guard !expired.isEmpty, !store.isReadOnly else { return 0 }
-        let ids = Set(expired.map(\.id))
+        return removeForGood(expired, failure: nil) ? expired.count : 0
+    }
+
+    /// Deletes notes from the library, with their favorite and usage records, then the images
+    /// only they used. Images still referenced by any other note, by the words in the editor, or
+    /// by a new note not saved yet, stay.
+    private func removeForGood(_ purged: [QuickNote], failure: String?) -> Bool {
+        guard !purged.isEmpty else { return true }
+        let ids = Set(purged.map(\.id))
         let itemIDs = Set(ids.map { "note.\($0)" })
         let removed = store.update { database in
             database.notes.removeAll { ids.contains($0.id) }
             database.favoriteIDs.subtract(itemIDs)
             database.usage.removeAll { itemIDs.contains($0.id) }
         }
-        guard removed else { return 0 }
-        assets.removeUnreferenced(keeping: notes)
-        return expired.count
+        guard removed else {
+            if let failure { notice = .error(store.errorMessage ?? failure) }
+            return false
+        }
+        assets.removeAssets(referencedBy: purged, keeping: notes, protecting: [text] + (draft.map { [$0.content] } ?? []))
+        return true
     }
 
     // MARK: Browser

@@ -248,20 +248,185 @@ struct NotesWindowTests {
         #expect(store.database.notes.first { $0.content.hasPrefix("Two") }?.title == "Two")
     }
 
-    @Test func leavingANoteYouEmptiedRemovesIt() {
+    @Test func leavingANoteYouEmptiedMovesItToRecentlyDeletedWithItsWords() {
         let harness = NotesHarness()
         defer { harness.cleanUp() }
         harness.model.show()
         harness.write("Keep")
         harness.model.newNote()
-        harness.write("Temporary")
+        harness.write("Temporary words")
         harness.write("")
-        // The emptied note keeps its last words until you leave it…
-        #expect(harness.store.database.notes.count == 2)
+        // The emptied note keeps its last words while it's open…
+        #expect(harness.store.database.notes.first { $0.title == "Temporary words" }?.content == "Temporary words")
         harness.model.goBack()
-        // …then it's gone, not in Recently Deleted.
-        #expect(harness.store.database.notes.map(\.title) == ["Keep"])
+        // …and leaving it moves it to Recently Deleted with them, never deleting it for good.
         #expect(harness.model.currentNote?.title == "Keep")
+        #expect(harness.model.deletedNotes.map(\.content) == ["Temporary words"])
+        #expect(harness.store.database.liveNotes.map(\.title) == ["Keep"])
+    }
+
+    // MARK: Review regressions: data loss
+
+    /// OpenRay 0.1 saved notes with a title and an empty body.
+    private static let titleOnlyNoteJSON = """
+        {"id":"9B5E2C1A-0C3D-4E5F-8A9B-1C2D3E4F5A6B","title":"Call the bank","content":"","modifiedAt":700000000}
+        """
+
+    @Test func openingAndClosingATitleOnlyNoteFromOpenRay01KeepsIt() throws {
+        let legacy = try JSONDecoder().decode(QuickNote.self, from: Data(Self.titleOnlyNoteJSON.utf8))
+        let store = LibraryStore(fileURL: nil)
+        store.update { $0.notes = [legacy, QuickNote(title: "Other", content: "Other")] }
+        let harness = NotesHarness(store: store)
+        defer { harness.cleanUp() }
+        harness.model.show(noteID: legacy.id)
+        #expect(harness.model.displayTitle == "Call the bank")
+        harness.model.hide()
+        harness.model.show(noteID: legacy.id)
+        let other = store.database.notes.first { $0.title == "Other" }!.id
+        harness.model.open(other)
+        harness.model.goBack()
+        harness.model.newNote()
+        #expect(store.database.notes.first { $0.id == legacy.id } == legacy)
+        // Typing into it and clearing it again keeps it too: it has a title of its own.
+        harness.model.open(legacy.id)
+        harness.write("draft")
+        harness.write("")
+        harness.model.hide()
+        let kept = try #require(store.database.notes.first { $0.id == legacy.id })
+        #expect(kept.title == "Call the bank" && kept.content.isEmpty && !kept.isDeleted)
+    }
+
+    @Test func aSaveThatFailsForLengthKeepsTheNoteOpenUntilItSavesOrIsDiscarded() throws {
+        let harness = NotesHarness()
+        defer { harness.cleanUp() }
+        harness.model.show()
+        harness.write("Short")
+        let id = try #require(harness.model.currentID)
+        harness.model.newNote()
+        harness.write("Other")
+        harness.model.open(id)
+        let tooLong = "Short " + String(repeating: "x", count: QuickNote.maximumLength)
+        harness.model.edit(tooLong)
+        #expect(!harness.model.flush())
+        #expect(harness.model.saveFailed)
+        // Every way out keeps the note open, with its words, and says why.
+        harness.model.newNote()
+        harness.model.goBack()
+        harness.model.goForward()
+        harness.model.openPinned(digit: 1)
+        harness.model.deleteCurrentNote()
+        harness.model.hide()
+        #expect(harness.model.currentID == id)
+        #expect(harness.model.text == tooLong)
+        #expect(harness.presenter.isVisible)
+        #expect(harness.model.notice?.text.contains("100,000") == true)
+        #expect(harness.store.database.notes.first { $0.id == id }?.isDeleted == false)
+        // Shortening it saves, and then switching works.
+        harness.write("Short and saved")
+        #expect(!harness.model.saveFailed)
+        harness.model.newNote()
+        #expect(harness.model.isDraft)
+        #expect(harness.store.database.notes.first { $0.id == id }?.content == "Short and saved")
+    }
+
+    @Test func aFailedWriteKeepsTheWordsAndDiscardRestoresTheSavedNote() throws {
+        // An unreadable library opens read-only, so every save fails, as a full disk would.
+        let directory = FileManager.default.temporaryDirectory.appending(path: "OpenRayReadOnly-\(UUID())")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let url = directory.appending(path: "library.json")
+        try Data("not json".utf8).write(to: url)
+        let store = LibraryStore(fileURL: url)
+        #expect(store.isReadOnly)
+        let harness = NotesHarness(store: store)
+        defer { harness.cleanUp() }
+        harness.model.show()
+        harness.model.edit("Words I typed")
+        #expect(!harness.model.flush())
+        harness.model.newNote()
+        harness.model.hide()
+        #expect(harness.model.text == "Words I typed")
+        #expect(harness.presenter.isVisible)
+        harness.model.discardUnsavedChanges()
+        #expect(harness.model.text.isEmpty && !harness.model.saveFailed)
+        harness.model.hide()
+        #expect(!harness.presenter.isVisible)
+    }
+
+    @Test func theWindowShowsEditsSavedElsewhereAndNeverOverwritesThem() throws {
+        let harness = NotesHarness()
+        defer { harness.cleanUp() }
+        harness.model.show()
+        harness.write("Plan\nfirst")
+        let id = try #require(harness.model.currentID)
+        // The inline editor saves the same note while the window is idle…
+        harness.store.update { database in
+            let index = database.notes.firstIndex { $0.id == id }!
+            database.notes[index].content = "Plan\nfrom the launcher"
+        }
+        // …and coming back to the window shows it.
+        harness.model.reloadIfChangedElsewhere()
+        #expect(harness.model.text == "Plan\nfrom the launcher")
+        // A buffer edited before the other save doesn't overwrite it: its words become a new note.
+        harness.model.edit("Plan\nwindow edit")
+        harness.store.update { database in
+            let index = database.notes.firstIndex { $0.id == id }!
+            database.notes[index].content = "Plan\nlauncher again"
+        }
+        #expect(harness.model.flush())
+        #expect(harness.store.database.notes.first { $0.id == id }?.content == "Plan\nlauncher again")
+        #expect(harness.store.database.notes.contains { $0.id != id && $0.content == "Plan\nwindow edit" })
+        #expect(harness.model.currentID != id)
+        #expect(harness.model.notice?.tone == .warning)
+        // Opening the note that's already open picks up what was saved elsewhere.
+        harness.model.open(id)
+        #expect(harness.model.text == "Plan\nlauncher again")
+    }
+
+    @Test func theInlineEditorWritesOnlyWhatItChanged() throws {
+        let store = LibraryStore(fileURL: nil)
+        let original = QuickNote(title: "Trip", content: "Old body")
+        store.update { $0.notes = [original] }
+        let draft = EditorDraft(editor: .note(original), store: store)
+        // Meanwhile the Notes window writes a newer body and pins the note.
+        store.update { database in
+            database.notes[0].content = "Newer body from the window"
+            try NoteCollection.togglePin(original.id, in: &database.notes)
+        }
+        draft.name = "Trip to Lisbon"
+        #expect(draft.saveNote())
+        let saved = try #require(store.database.notes.first)
+        #expect(saved.title == "Trip to Lisbon")
+        #expect(saved.content == "Newer body from the window")
+        #expect(saved.pinnedIndex == 0)
+        // A body edited there is written, and the pin still stays.
+        draft.content = "Body from the inline editor"
+        #expect(draft.saveNote())
+        #expect(store.database.notes.first?.content == "Body from the inline editor")
+        #expect(store.database.notes.first?.pinnedIndex == 0)
+    }
+
+    @Test func purgingOneNoteNeverDeletesAnotherNotesPendingImage() throws {
+        let harness = NotesHarness()
+        defer { harness.cleanUp() }
+        harness.model.show()
+        harness.write("Old note")
+        harness.model.deleteCurrentNote()
+        let trashed = try #require(harness.model.deletedNotes.first)
+        harness.model.newNote()
+        harness.write("Near the limit")
+        // An image pasted into a note that can't save yet (it's over the limit).
+        let reference = try #require(harness.model.storeImage(Data([1, 2, 3]), fileExtension: "png"))
+        harness.model.edit(String(repeating: "x", count: QuickNote.maximumLength) + "\n![Image](\(reference))")
+        #expect(!harness.model.flush())
+        #expect(harness.model.deletePermanently(trashed.id))
+        let file = try #require(harness.model.assets.url(for: reference))
+        #expect(FileManager.default.fileExists(atPath: file.path))
+        // Only images the purged notes referenced are candidates, and only when nothing keeps them.
+        let shared = QuickNote(title: "a", content: "![Image](NoteAssets/S.png) ![Image](NoteAssets/T.png)")
+        let keeper = QuickNote(title: "b", content: "![Image](NoteAssets/S.png)")
+        #expect(NoteAssetStore.orphans(of: [shared], keeping: [keeper]) == ["T.png"])
+        #expect(NoteAssetStore.orphans(of: [shared], keeping: [], protecting: ["![x](NoteAssets/T.png)"]) == ["S.png"])
     }
 
     @Test func backAndForwardFollowTheNotesYouOpened() {
@@ -466,9 +631,14 @@ struct NotesWindowTests {
         }
 
         let other = try assets.save(Data([1]), fileExtension: "jpg")
-        let removed = assets.removeUnreferenced(keeping: [QuickNote(title: "x", content: "![Image](\(reference))")])
+        let unrelated = try assets.save(Data([2]), fileExtension: "png")
+        let purged = QuickNote(title: "gone", content: "![Image](\(reference)) ![Image](\(other))")
+        let removed = assets.removeAssets(
+            referencedBy: [purged], keeping: [QuickNote(title: "x", content: "![Image](\(reference))")])
         #expect(removed == [String(other.dropFirst("NoteAssets/".count))])
         #expect(assets.url(for: reference).map { FileManager.default.fileExists(atPath: $0.path) } == true)
+        // A file no purged note referenced is never swept.
+        #expect(assets.url(for: unrelated).map { FileManager.default.fileExists(atPath: $0.path) } == true)
     }
 
     @Test func pastedImagesBecomeAReferenceOnTheirOwnLine() throws {
@@ -581,6 +751,23 @@ struct NotesLauncherTests {
         let goneRow = try #require(model.results.first { $0.title == "Gone" })
         #expect(model.delete(goneRow))
         #expect(!model.store.database.notes.contains { $0.id == gone.id })
+    }
+
+    @Test func recentlyDeletedNeverListsOrRestoresNotesPastSixtyDays() throws {
+        let presenter = FakeNotesPresenter()
+        let model = makeModel(center: fakeCenter(presenter))
+        let expired = QuickNote(title: "Ancient", content: "x", deletedAt: .now.addingTimeInterval(-61 * 86_400))
+        let recent = QuickNote(title: "Recent", content: "y", deletedAt: .now)
+        model.store.update { $0.notes = [expired, recent] }
+        model.navigate(to: .provided(NotesCommandProvider.deletedScope))
+        #expect(model.results.map(\.title) == ["Recent"])
+        // A row for an expired note (an old result, say) can't bring it back, and says so.
+        let row = LauncherItem(
+            id: "notes.deleted.\(expired.id)", title: "Ancient", subtitle: "", symbol: "note.text", badge: "Deleted",
+            action: .provided(ProvidedRef(provider: "notes", id: expired.id.uuidString, payload: "deleted", traits: [.delete])))
+        model.perform(row)
+        #expect(model.feedback?.style == .warning)
+        #expect(!model.store.database.notes.contains { $0.id == expired.id })
     }
 
     @Test func settingsListsTheSliceSixPanesInOrder() {

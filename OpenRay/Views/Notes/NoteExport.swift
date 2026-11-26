@@ -374,28 +374,38 @@ struct NoteAssetStore: Sendable, Equatable {
 
     /// Every asset file name the notes reference.
     static func referencedNames(in notes: [QuickNote]) -> Set<String> {
+        referencedNames(inTexts: notes.map(\.content))
+    }
+
+    /// Every asset file name these Markdown texts reference.
+    static func referencedNames(inTexts texts: [String]) -> Set<String> {
         var names = Set<String>()
         let pattern = try! NSRegularExpression(pattern: #"!\[[^\]\n]*\]\(([^)\s]+)\)"#)
-        for note in notes where note.content.contains(folderName + "/") {
-            let string = note.content as NSString
-            for match in pattern.matches(in: note.content, range: NSRange(location: 0, length: string.length)) {
+        for text in texts where text.contains(folderName + "/") {
+            let string = text as NSString
+            for match in pattern.matches(in: text, range: NSRange(location: 0, length: string.length)) {
                 if let name = fileName(in: string.substring(with: match.range(at: 1))) { names.insert(name) }
             }
         }
         return names
     }
 
-    /// Deletes image files no note references any more, after notes leave Recently Deleted for
-    /// good. Only files in this folder with an image extension are considered.
+    /// The images to delete when `purged` notes leave the library for good: the ones they
+    /// referenced that no retained note and no protected text (the editor's words, a new note
+    /// not saved yet) still references. Nothing else in the folder is a candidate, so a pasted
+    /// image whose note hasn't saved yet is never swept.
+    static func orphans(of purged: [QuickNote], keeping retained: [QuickNote], protecting texts: [String] = []) -> Set<String> {
+        referencedNames(in: purged).subtracting(referencedNames(in: retained)).subtracting(referencedNames(inTexts: texts))
+    }
+
+    /// Deletes `orphans(of:keeping:protecting:)` and returns the names removed.
     @discardableResult
-    func removeUnreferenced(keeping notes: [QuickNote]) -> [String] {
-        let keep = Self.referencedNames(in: notes)
-        guard let names = try? FileManager.default.contentsOfDirectory(atPath: directory.path) else { return [] }
-        var removed: [String] = []
-        for name in names where !keep.contains(name) && Self.imageExtensions.contains((name as NSString).pathExtension.lowercased()) {
-            if (try? FileManager.default.removeItem(at: directory.appending(path: name))) != nil { removed.append(name) }
+    func removeAssets(referencedBy purged: [QuickNote], keeping retained: [QuickNote], protecting texts: [String] = [])
+        -> [String]
+    {
+        Self.orphans(of: purged, keeping: retained, protecting: texts).sorted().filter { name in
+            (try? FileManager.default.removeItem(at: directory.appending(path: name))) != nil
         }
-        return removed
     }
 
     /// PNG or JPEG data from a pasteboard: the file's own bytes when it holds an image file,
