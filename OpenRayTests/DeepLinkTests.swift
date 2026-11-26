@@ -138,7 +138,8 @@ struct DeepLinkTests {
 
     @Test("Every root command has Copy Deeplink; content rows don't")
     func copyDeeplink() throws {
-        let (model, _, _, pasteboard, _) = harness()
+        // Window commands come from their provider (Slice 5), inert in the test host.
+        let (model, _, _, pasteboard, _) = harness(extra: [WindowCommandProvider()])
         for id in ["section.files", "ai.chat", "settings", "window.leftHalf", "linktest.plain", "linktest.greet"] {
             let item = try #require(model.commandItems.first { $0.id == id }, "\(id)")
             let entries = model.actions(for: item).map(\.id)
