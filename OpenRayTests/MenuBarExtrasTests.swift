@@ -137,6 +137,27 @@ struct MenuBarExtrasTests {
         #expect(snapshot(CalendarCommandProvider.menuBarID, in: harness.model)?.content.title == "Lunch · in 30 min")
     }
 
+    @Test func aHiddenCountdownWakesWhenTheNextMeetingEntersItsLeadTime() throws {
+        // 11:09, with a 60-minute lead: the countdown starts at 10:09. It's 10:07 and nothing
+        // else in the menu bar runs a timer.
+        let review = CalendarFixture.event("Review", from: (11, 9), to: (11, 30), location: "https://zoom.us/j/7")
+        let harness = make(events: [review])
+        MenuBarExtras.setShown(true, commandID: CalendarCommandProvider.menuBarID, in: harness.model.store)
+        var state = MenuBarExtrasModel.state(in: harness.model)
+        #expect(state.snapshots.isEmpty)
+        #expect(state.nextRefresh == .seconds(120))
+        harness.clock.now = CalendarFixture.date(10, 9)
+        state = MenuBarExtrasModel.state(in: harness.model)
+        #expect(state.snapshots.first?.content.title == "Review · in 1 h")
+        #expect(state.nextRefresh == .seconds(30))
+        // With nothing coming up, it still looks again every five minutes for new events.
+        harness.clock.now = CalendarFixture.date(12, 0)
+        #expect(MenuBarExtrasModel.state(in: harness.model).nextRefresh == .seconds(300))
+        // Turned off, it doesn't wake anything.
+        MenuBarExtras.setShown(false, commandID: CalendarCommandProvider.menuBarID, in: harness.model.store)
+        #expect(MenuBarExtrasModel.state(in: harness.model).nextRefresh == nil)
+    }
+
     @Test func noCalendarAccessMeansNoEventItem() {
         let harness = make(calendarAccess: .denied)
         MenuBarExtras.setShown(true, commandID: CalendarCommandProvider.menuBarID, in: harness.model.store)

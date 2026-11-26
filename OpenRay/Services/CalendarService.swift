@@ -33,14 +33,14 @@ struct CalendarEvent: Identifiable, Hashable, Sendable {
     var calendarColor: UInt32?
     var attendees: [CalendarAttendee] = []
     var organizer: String?
-    /// False for events marked Free, which never count against availability.
-    var isBusy = true
+    /// How the calendar marks the event's time.
+    var availability: EventAvailability = .unspecified
 
     init(
         id: String? = nil, eventIdentifier: String = UUID().uuidString, externalIdentifier: String? = nil,
         title: String, start: Date, end: Date, isAllDay: Bool = false, location: String? = nil, notes: String? = nil,
         url: URL? = nil, calendarID: String = "", calendarTitle: String = "", calendarColor: UInt32? = nil,
-        attendees: [CalendarAttendee] = [], organizer: String? = nil, isBusy: Bool = true
+        attendees: [CalendarAttendee] = [], organizer: String? = nil, availability: EventAvailability = .unspecified
     ) {
         self.id = id ?? "\(eventIdentifier)@\(Int(start.timeIntervalSince1970))"
         self.eventIdentifier = eventIdentifier
@@ -57,10 +57,19 @@ struct CalendarEvent: Identifiable, Hashable, Sendable {
         self.calendarColor = calendarColor
         self.attendees = attendees
         self.organizer = organizer
-        self.isBusy = isBusy
+        self.availability = availability
     }
 
     var meetingLink: MeetingLink? { MeetingLink.detect(url: url, location: location, notes: notes) }
+
+    /// Whether the event takes its time, for availability and Block Time. A timed event does
+    /// unless it's marked Free. An all-day event does only when marked Busy or Unavailable, since
+    /// most all-day entries (holidays, birthdays, reminders) don't hold the day.
+    var blocksTime: Bool {
+        isAllDay ? availability == .busy || availability == .unavailable : availability != .free
+    }
+
+    func overlaps(_ interval: DateInterval) -> Bool { start < interval.end && end > interval.start }
 
     /// The person's own answer, when they're invited rather than organizing.
     var myStatus: CalendarAttendee.Status? { attendees.first(where: \.isCurrentUser)?.status }
@@ -72,6 +81,13 @@ struct CalendarEvent: Identifiable, Hashable, Sendable {
 
     func isOngoing(at now: Date) -> Bool { start <= now && now < end }
     func hasEnded(at now: Date) -> Bool { end <= now }
+}
+
+/// How an event's time is marked, as EventKit reports it.
+enum EventAvailability: String, Hashable, Sendable {
+    case busy, free, tentative, unavailable
+    /// The calendar doesn't say, such as a subscribed holiday calendar.
+    case unspecified
 }
 
 /// A calendar the person can include or leave out of My Schedule.
@@ -115,7 +131,9 @@ struct MeetingLink: Hashable, Sendable {
         (.zoom, #"zoommtg://[^\s<>"']+"#),
         (.zoom, #"https?://(?:[\w-]+\.)*zoom(?:gov)?\.(?:us|com)/(?:j|my|w|s|wc/join)/"# + tail),
         (.googleMeet, #"https?://meet\.google\.com/[a-z]{3,4}-[a-z]{4}-[a-z]{3}"# + tail),
-        (.teams, #"https?://teams\.microsoft\.com/l/meetup-join/"# + tail),
+        // Work and school links, long (meetup-join) and short (meet/<id>?p=<passcode>), including
+        // the government clouds, then personal ones. The query, with its passcode, is kept.
+        (.teams, #"https?://(?:[\w-]+\.)*teams\.microsoft\.(?:com|us)/(?:l/meetup-join/|meet/)"# + tail),
         (.teams, #"https?://teams\.live\.com/meet/"# + tail),
         (.webex, #"https?://(?:[\w-]+\.)*webex\.com/(?:meet|join|[\w-]+/j\.php|wbxmjs|webappng)"# + tail),
     ].map { provider, pattern in (provider, try! NSRegularExpression(pattern: pattern, options: [.caseInsensitive])) }
@@ -177,11 +195,11 @@ enum Availability {
     static func freeSlots(
         events: [CalendarEvent], from now: Date, options: Options, calendar: Calendar
     ) -> [(day: Date, slots: [DateInterval])] {
-        let busy = events.filter { $0.isBusy && !$0.isAllDay }.map { DateInterval(start: $0.start, end: max($0.start, $0.end)) }
+        let busy = events.filter(\.blocksTime).map { DateInterval(start: $0.start, end: max($0.start, $0.end)) }
             .sorted { $0.start < $1.start }
         return days(from: now, options: options, calendar: calendar).map { day in
-            guard let open = calendar.date(byAdding: .minute, value: options.dayStart, to: day),
-                let close = calendar.date(byAdding: .minute, value: options.dayEnd, to: day), close > open
+            guard let open = wallClock(options.dayStart, on: day, calendar: calendar),
+                let close = wallClock(options.dayEnd, on: day, calendar: calendar), close > open
             else { return (day, []) }
             var cursor = max(open, roundedUp(now, toMinutes: 15, calendar: calendar))
             var slots: [DateInterval] = []
@@ -207,6 +225,18 @@ enum Availability {
             if let slot = slots.first { return DateInterval(start: slot.start, duration: duration) }
         }
         return nil
+    }
+
+    /// `minutes` after midnight as a local wall-clock time on `day`, so the working day keeps its
+    /// hours across a daylight-saving change. 24:00 is the next midnight.
+    static func wallClock(_ minutes: Int, on day: Date, calendar: Calendar) -> Date? {
+        guard minutes < 1_440 else { return calendar.date(byAdding: .day, value: 1, to: calendar.startOfDay(for: day)) }
+        return calendar.date(bySettingHour: minutes / 60, minute: minutes % 60, second: 0, of: day)
+    }
+
+    /// True when no event that takes its time overlaps `interval`.
+    static func isFree(_ interval: DateInterval, events: [CalendarEvent]) -> Bool {
+        !events.contains { $0.blocksTime && $0.overlaps(interval) }
     }
 
     static func roundedUp(_ date: Date, toMinutes step: Int, calendar: Calendar) -> Date {
@@ -443,13 +473,23 @@ final class EventKitCalendarSource: CalendarEventSource {
             start: event.startDate, end: event.endDate, isAllDay: event.isAllDay, location: event.location,
             notes: event.notes, url: event.url, calendarID: event.calendar?.calendarIdentifier ?? "",
             calendarTitle: event.calendar?.title ?? "", calendarColor: event.calendar.flatMap { hex($0.color) },
-            attendees: attendees, organizer: event.organizer?.name, isBusy: event.availability != .free)
+            attendees: attendees, organizer: event.organizer?.name, availability: availability(event.availability))
     }
 
     private static func email(from url: URL) -> String? {
         let string = url.absoluteString
         guard string.lowercased().hasPrefix("mailto:") else { return nil }
         return String(string.dropFirst("mailto:".count)).removingPercentEncoding
+    }
+
+    private static func availability(_ availability: EKEventAvailability) -> EventAvailability {
+        switch availability {
+        case .busy: .busy
+        case .free: .free
+        case .tentative: .tentative
+        case .unavailable: .unavailable
+        default: .unspecified
+        }
     }
 
     private static func status(_ status: EKParticipantStatus) -> CalendarAttendee.Status {
@@ -638,12 +678,17 @@ final class CalendarService {
         return Availability.formatted(days, calendar: calendar)
     }
 
-    /// The first free stretch of `duration`, for Block Time.
-    func nextFreeSlot(lasting duration: TimeInterval, options: Availability.Options, hidden: Set<String> = []) -> DateInterval {
+    /// The first free stretch of `duration` in working hours over the next working days, for
+    /// Block Time. Nil when there's none; Block Time never offers a time that's taken.
+    func nextFreeSlot(lasting duration: TimeInterval, options: Availability.Options, hidden: Set<String> = []) -> DateInterval? {
         let now = now()
-        let events = upcoming(after: now, hidden: hidden)
-        return Availability.firstSlot(lasting: duration, events: events, from: now, options: options, calendar: calendar)
-            ?? DateInterval(start: Availability.roundedUp(now, toMinutes: 15, calendar: calendar), duration: duration)
+        return Availability.firstSlot(
+            lasting: duration, events: upcoming(after: now, hidden: hidden), from: now, options: options, calendar: calendar)
+    }
+
+    /// Whether `interval` is still free in the cache, for checking a proposed slot again.
+    func isFree(_ interval: DateInterval, hidden: Set<String> = []) -> Bool {
+        Availability.isFree(interval, events: events.filter { !hidden.contains($0.calendarID) })
     }
 
     // MARK: Text

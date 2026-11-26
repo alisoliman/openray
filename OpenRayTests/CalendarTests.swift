@@ -66,12 +66,13 @@ enum CalendarFixture {
 
     static func event(
         _ title: String, day: Int = 26, from start: (Int, Int), to end: (Int, Int), location: String? = nil, notes: String? = nil,
-        url: URL? = nil, attendees: [CalendarAttendee] = [], calendarID: String = "work", isBusy: Bool = true
+        url: URL? = nil, attendees: [CalendarAttendee] = [], calendarID: String = "work",
+        availability: EventAvailability = .busy
     ) -> CalendarEvent {
         CalendarEvent(
             eventIdentifier: "\(title)-id", title: title, start: date(day: day, start.0, start.1), end: date(day: day, end.0, end.1),
             location: location, notes: notes, url: url, calendarID: calendarID, calendarTitle: "Work", attendees: attendees,
-            isBusy: isBusy)
+            availability: availability)
     }
 }
 
@@ -91,6 +92,14 @@ struct MeetingLinkTests {
         #expect(MeetingLink.detect(in: "Microsoft Teams meeting\n<\(teams)>")?.url.absoluteString == teams)
         #expect(MeetingLink.detect(in: "https://acme.webex.com/meet/jdoe")?.provider == .webex)
         #expect(MeetingLink.detect(in: "https://acme.webex.com/acme/j.php?MTID=m123")?.provider == .webex)
+        // Work and school short links keep their passcode; government clouds and personal links count.
+        let short = "https://teams.microsoft.com/meet/2345678901234?p=AbCdEfGhIjKlMn"
+        #expect(MeetingLink.detect(in: "Join: \(short)")?.url.absoluteString == short)
+        #expect(MeetingLink.detect(in: short)?.provider == .teams)
+        let gov = "https://gov.teams.microsoft.us/l/meetup-join/19%3ameeting_X%40thread.v2/0?context=%7b%7d"
+        #expect(MeetingLink.detect(in: gov)?.url.absoluteString == gov)
+        #expect(MeetingLink.detect(in: "https://teams.live.com/meet/9387653?p=Q1w2E3")?.url.query == "p=Q1w2E3")
+        #expect(MeetingLink.detect(in: "https://teams.microsoft.com/v2/") == nil)
         #expect(MeetingLink.detect(in: "See https://example.com/agenda") == nil)
         #expect(MeetingLink.detect(in: nil) == nil)
     }
@@ -113,7 +122,7 @@ struct AvailabilityTests {
     private let events = [
         CalendarFixture.event("Sync", from: (10, 30), to: (11, 0)),
         CalendarFixture.event("Lunch", from: (13, 0), to: (14, 0)),
-        CalendarFixture.event("Optional", from: (15, 0), to: (16, 0), isBusy: false),
+        CalendarFixture.event("Optional", from: (15, 0), to: (16, 0), availability: .free),
         CalendarEvent(
             title: "Holiday", start: CalendarFixture.date(day: 27, 0), end: CalendarFixture.date(day: 28, 0), isAllDay: true),
     ]
@@ -155,6 +164,38 @@ struct AvailabilityTests {
         #expect(formatted.hasPrefix("My availability ("))
         #expect(formatted.contains("Thu, Nov 26: no free time"))
         #expect(formatted.contains("Fri, Nov 27: 9:00"))
+    }
+
+    @Test func onlyEventsThatTakeTheirTimeCountAsBusy() {
+        let day = CalendarFixture.date(day: 27, 0)
+        let nextDay = CalendarFixture.date(day: 28, 0)
+        let allDayBusy = CalendarEvent(title: "Offsite", start: day, end: nextDay, isAllDay: true, availability: .busy)
+        let allDayUnmarked = CalendarEvent(title: "Holiday", start: day, end: nextDay, isAllDay: true)
+        let timedFree = CalendarFixture.event("Optional", day: 27, from: (9, 0), to: (10, 0), availability: .free)
+        let timedTentative = CalendarFixture.event("Maybe", day: 27, from: (10, 0), to: (11, 0), availability: .tentative)
+        let timedUnmarked = CalendarFixture.event("Unmarked", day: 27, from: (11, 0), to: (12, 0), availability: .unspecified)
+        #expect(allDayBusy.blocksTime && !allDayUnmarked.blocksTime && !timedFree.blocksTime)
+        #expect(timedTentative.blocksTime && timedUnmarked.blocksTime)
+        var options = Availability.Options()
+        options.days = 2
+        let blocked = Availability.freeSlots(events: [allDayBusy], from: CalendarFixture.date(10, 7), options: options, calendar: calendar)
+        #expect(blocked[1].slots.isEmpty)
+        let open = Availability.freeSlots(
+            events: [allDayUnmarked, timedFree, timedTentative, timedUnmarked], from: CalendarFixture.date(10, 7), options: options,
+            calendar: calendar)
+        #expect(open[1].slots.map { "\(hhmm($0.start))-\(hhmm($0.end))" } == ["09:00-10:00", "12:00-17:00"])
+    }
+
+    @Test func workingHoursKeepTheirWallClockTimeAcrossDaylightSaving() throws {
+        var newYork = Calendar(identifier: .gregorian)
+        newYork.timeZone = try #require(TimeZone(identifier: "America/New_York"))
+        // Clocks jump from 2:00 to 3:00 on Sunday, March 8, 2026.
+        let sunday = try #require(newYork.date(from: DateComponents(year: 2026, month: 3, day: 8)))
+        let start = try #require(Availability.wallClock(9 * 60, on: sunday, calendar: newYork))
+        let end = try #require(Availability.wallClock(17 * 60, on: sunday, calendar: newYork))
+        #expect(newYork.component(.hour, from: start) == 9)
+        #expect(newYork.component(.hour, from: end) == 17)
+        #expect(Availability.wallClock(1_440, on: sunday, calendar: newYork) == newYork.date(byAdding: .day, value: 1, to: sunday))
     }
 
     @Test func slotsStartOnTheNextQuarterHour() {
@@ -379,6 +420,39 @@ struct CalendarProviderTests {
         #expect(source.created.first?.start == CalendarFixture.date(11, 0))
         #expect(source.created.first?.end == CalendarFixture.date(12, 0))
         #expect(model.feedback?.text.hasPrefix("Blocked today") == true)
+    }
+
+    @Test func blockTimeSaysSoWhenNothingIsFree() throws {
+        // Every working hour of the next week is taken.
+        let busy = (0..<14).map { offset -> CalendarEvent in
+            let day = CalendarFixture.calendar.date(byAdding: .day, value: offset, to: CalendarFixture.date(0))!
+            return CalendarEvent(
+                title: "Busy \(offset)", start: day, end: day.addingTimeInterval(86_400), isAllDay: true, availability: .busy)
+        }
+        let (model, service, source, _) = make(events: busy)
+        service.refresh()
+        let command = try #require(model.commandItems.first { $0.id == CalendarCommandProvider.blockTimeID })
+        model.perform(command)
+        #expect(model.confirmation == nil)
+        #expect(model.feedback?.text.hasPrefix("There's no free 1 h") == true)
+        #expect(source.created.isEmpty)
+    }
+
+    @Test func blockTimeChecksTheSlotAgainWhenConfirmed() throws {
+        let (model, service, source, _) = make(events: [CalendarFixture.event("Sync", from: (10, 30), to: (11, 0))])
+        service.refresh()
+        let command = try #require(model.commandItems.first { $0.id == CalendarCommandProvider.blockTimeID })
+        model.perform(command)
+        let first = try #require(model.confirmation)
+        // While the question is up, someone books 11:00.
+        source.stored.append(CalendarFixture.event("Booked", from: (11, 0), to: (11, 30)))
+        model.confirm(first)
+        #expect(source.created.isEmpty)
+        let second = try #require(model.confirmation)
+        #expect(second.question.hasPrefix("That time was just taken. Block 1 h today"))
+        model.confirm(second)
+        #expect(source.created.first?.start == CalendarFixture.date(11, 30))
+        #expect(source.created.first?.end == CalendarFixture.date(12, 30))
     }
 
     @Test func copyAvailabilityCopiesAndSaysSo() throws {

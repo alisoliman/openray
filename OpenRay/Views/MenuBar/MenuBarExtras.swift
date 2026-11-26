@@ -79,10 +79,16 @@ protocol MenuBarExtraProviding: CommandProvider {
     func menuBarExtra(for command: CommandDescriptor, in model: LauncherModel) -> MenuBarExtraContent?
     /// Whether the extra shows before the person chooses. Default false.
     func menuBarExtraIsShownByDefault(_ command: CommandDescriptor) -> Bool
+    /// For an extra that's turned on but has nothing to show right now: how soon it might, such
+    /// as when the next meeting enters its countdown. Nil (the default) waits for a change the
+    /// content reads through Observation. Time passing isn't such a change, so anything that
+    /// appears with time needs this.
+    func menuBarExtraIdleRefresh(for command: CommandDescriptor, in model: LauncherModel) -> Duration?
 }
 
 extension MenuBarExtraProviding {
     func menuBarExtraIsShownByDefault(_ command: CommandDescriptor) -> Bool { false }
+    func menuBarExtraIdleRefresh(for command: CommandDescriptor, in model: LauncherModel) -> Duration? { nil }
 }
 
 /// The person's choices about the menu bar, kept in `commandPreferences["pref.menuBar"]`.
@@ -152,21 +158,29 @@ struct MenuBarExtraSnapshot: Identifiable {
 /// without touching the real menu bar.
 @MainActor
 enum MenuBarExtrasModel {
-    static func snapshots(in model: LauncherModel) -> [MenuBarExtraSnapshot] {
+    /// The extras to draw now, and how soon to look again: the soonest `refresh` of a visible
+    /// extra or `menuBarExtraIdleRefresh` of one that's turned on but empty.
+    static func state(in model: LauncherModel) -> (snapshots: [MenuBarExtraSnapshot], nextRefresh: Duration?) {
         let database = model.store.database
         var result: [MenuBarExtraSnapshot] = []
+        var idle: [Duration] = []
         for provider in model.registry.providers {
             guard let extras = provider as? any MenuBarExtraProviding else { continue }
             for command in provider.commands(in: model) where command.mode == .menuBar {
                 guard !database.disabledCommandIDs.contains(command.id),
-                    MenuBarExtras.isShown(command.id, default: extras.menuBarExtraIsShownByDefault(command), in: database),
-                    let content = extras.menuBarExtra(for: command, in: model)
+                    MenuBarExtras.isShown(command.id, default: extras.menuBarExtraIsShownByDefault(command), in: database)
                 else { continue }
-                result.append(MenuBarExtraSnapshot(id: command.id, content: content))
+                if let content = extras.menuBarExtra(for: command, in: model) {
+                    result.append(MenuBarExtraSnapshot(id: command.id, content: content))
+                } else if let wait = extras.menuBarExtraIdleRefresh(for: command, in: model) {
+                    idle.append(wait)
+                }
             }
         }
-        return result
+        return (result, (result.compactMap(\.content.refresh) + idle).min())
     }
+
+    static func snapshots(in model: LauncherModel) -> [MenuBarExtraSnapshot] { state(in: model).snapshots }
 
     /// The soonest any shown extra asks to be recomputed.
     static func nextRefresh(_ snapshots: [MenuBarExtraSnapshot]) -> Duration? {
@@ -218,8 +232,8 @@ final class MenuBarExtrasController: NSObject, NSMenuDelegate {
 
     func update() {
         guard let model else { return }
-        let snapshots = withObservationTracking {
-            MenuBarExtrasModel.snapshots(in: model)
+        let (snapshots, nextRefresh) = withObservationTracking {
+            MenuBarExtrasModel.state(in: model)
         } onChange: { [weak self] in
             Task { @MainActor in self?.scheduleUpdate() }
         }
@@ -236,7 +250,7 @@ final class MenuBarExtrasController: NSObject, NSMenuDelegate {
             contents[id] = nil
         }
         refreshTask?.cancel()
-        if let interval = MenuBarExtrasModel.nextRefresh(snapshots) {
+        if let interval = nextRefresh {
             refreshTask = Task { @MainActor [weak self] in
                 try? await Task.sleep(for: interval)
                 guard !Task.isCancelled else { return }
@@ -278,6 +292,8 @@ final class MenuBarExtrasController: NSObject, NSMenuDelegate {
             button.action = nil
             if item.menu == nil {
                 let menu = NSMenu()
+                // Items carry their own enabled state; AppKit's automatic validation would override it.
+                menu.autoenablesItems = false
                 menu.delegate = self
                 menu.identifier = NSUserInterfaceItemIdentifier(id)
                 item.menu = menu
@@ -309,6 +325,7 @@ final class MenuBarExtrasController: NSObject, NSMenuDelegate {
             item.state = entry.isChecked ? .on : .off
             if !entry.children.isEmpty {
                 let submenu = NSMenu(title: entry.title)
+                submenu.autoenablesItems = false
                 for child in entry.children { submenu.addItem(menuItem(for: child)) }
                 item.submenu = submenu
             } else if entry.role == .action, let perform = entry.perform {

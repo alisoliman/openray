@@ -417,25 +417,42 @@ final class CalendarCommandProvider: CommandProvider, MenuBarExtraProviding {
         join(event, in: model)
     }
 
-    /// Asks, then adds an event in the next free slot of the length chosen.
+    /// Asks, then adds an event in the next free slot of the length chosen. Nothing is offered
+    /// when no working-hours slot is free, and the slot is checked again when the person confirms.
     func blockTime(in model: LauncherModel, title: String?, minutes: Int?) {
         guard service.access == .fullAccess else {
             model.feedback = .warning("Open My Schedule to allow calendar access first.")
             return
         }
-        service.refreshIfStale()
-        let preferences = preferences(model)
-        let minutes = minutes ?? 60
         let name = title?.trimmingCharacters(in: .whitespaces).isEmpty == false ? title! : "Focus Time"
-        let slot = service.nextFreeSlot(
-            lasting: TimeInterval(minutes * 60), options: preferences.availability, hidden: preferences.hiddenCalendarIDs)
+        proposeBlock(minutes: minutes ?? 60, name: name, in: model, retry: false)
+    }
+
+    private func proposeBlock(minutes: Int, name: String, in model: LauncherModel, retry: Bool) {
+        // Always from fresh events: what was cached can be minutes old.
+        service.refresh()
+        let preferences = preferences(model)
+        let length = FocusFormat.duration(minutes: minutes)
+        guard
+            let slot = service.nextFreeSlot(
+                lasting: TimeInterval(minutes * 60), options: preferences.availability, hidden: preferences.hiddenCalendarIDs)
+        else {
+            model.feedback = .info("There's no free \(length) in your working hours over the next 7 working days.")
+            return
+        }
         let when = Self.describe(slot, now: service.now(), calendar: service.calendar)
         let question = CommandConfirmation(
-            question: "Block \(FocusFormat.duration(minutes: minutes)) \(when)?",
+            question: retry ? "That time was just taken. Block \(length) \(when) instead?" : "Block \(length) \(when)?",
             detail: "Adds “\(name)” to your default calendar.", confirmTitle: "Block Time", symbol: "calendar.badge.plus")
         model.confirmation = .provided(
             ProvidedConfirmation(id: "calendar.blockTime.confirm", question) { [weak self, weak model] in
                 guard let self, let model else { return }
+                // The calendar can change while the question is up.
+                self.service.refresh()
+                guard self.service.isFree(slot, hidden: preferences.hiddenCalendarIDs) else {
+                    self.proposeBlock(minutes: minutes, name: name, in: model, retry: true)
+                    return
+                }
                 do {
                     _ = try self.service.createEvent(title: name, interval: slot)
                     model.toast("Blocked \(when)")
@@ -476,6 +493,20 @@ final class CalendarCommandProvider: CommandProvider, MenuBarExtraProviding {
     }
 
     // MARK: Menu bar
+
+    /// While nothing is soon enough to show, wake when the next meeting enters its countdown, and
+    /// at least every five minutes for new events.
+    func menuBarExtraIdleRefresh(for command: CommandDescriptor, in model: LauncherModel) -> Duration? {
+        guard command.id == Self.menuBarID, service.access.canRead else { return nil }
+        let preferences = preferences(model)
+        let now = service.now()
+        let lead = TimeInterval(preferences.menuBarLeadMinutes * 60)
+        let next = service.upcoming(after: now, hidden: preferences.hiddenCalendarIDs).first { event in
+            !event.isAllDay && (!preferences.menuBarOnlyMeetings || event.meetingLink != nil)
+        }
+        let wait = next.map { max(1, $0.start.timeIntervalSince(now) - lead) } ?? 300
+        return .seconds(min(wait, 300).rounded(.up))
+    }
 
     func menuBarExtra(for command: CommandDescriptor, in model: LauncherModel) -> MenuBarExtraContent? {
         guard command.id == Self.menuBarID, service.access.canRead else { return nil }
