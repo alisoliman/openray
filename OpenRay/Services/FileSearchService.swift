@@ -75,7 +75,12 @@ final class FileSearchService: NSObject {
         var scope: FileSearchScope
         var recent: Bool
         var contentTerms: [String] = []
+        /// Whether contents match too (Files) or names only (root search).
+        var matchingContent = false
     }
+
+    /// The text the current listing was last asked for.
+    @ObservationIgnored private var listingText: String?
 
     init(
         home: URL = FileManager.default.homeDirectoryForCurrentUser, folders: any FolderReading = LiveFolderReader(),
@@ -107,9 +112,22 @@ final class FileSearchService: NSObject {
         // keystroke. Rows from another folder, or from a name search shown as the
         // recent listing, would mislead, so those clear.
         // Rows found by other contents would sit under the new search's heading, so they clear too.
-        let listing = Listing(scope: scope, recent: text.isEmpty, contentTerms: FileQuery.parse(text).contentTerms)
-        if listing != self.listing, !results.isEmpty { results = [] }
+        let parsed = FileQuery.parse(text)
+        let listing = Listing(
+            scope: scope, recent: text.isEmpty, contentTerms: parsed.contentTerms, matchingContent: showRecent)
+        if listing != self.listing {
+            if !results.isEmpty { results = [] }
+        } else if text != listingText, !results.isEmpty {
+            // A row the old search found by its contents says nothing about the new one, and only a
+            // plain name search can match the rest afresh, so nothing stale can be opened meanwhile.
+            if parsed.hasFilters || parsed.nameText.isEmpty {
+                results = []
+            } else if results.contains(where: \.matchedContent) {
+                results.removeAll(where: \.matchedContent)
+            }
+        }
         self.listing = listing
+        listingText = text
         isSearching = true
         let request = UUID()
         generation = request
