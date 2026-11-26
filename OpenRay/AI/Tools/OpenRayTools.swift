@@ -290,7 +290,7 @@ enum AIToolCatalog {
     }
 
     /// Titles and extra mention words, by extension id. Order is the order Settings lists them.
-    static let extensionOrder = ["clipboard", "notes", "snippets", "quicklinks", "files", "calculator"]
+    static let extensionOrder = ["clipboard", "notes", "snippets", "quicklinks", "files", "calculator", "calendar", "system", "windows"]
     static let extensionInfo: [String: ExtensionInfo] = [
         "clipboard": ExtensionInfo(title: "Clipboard History", symbol: "list.clipboard", aliases: []),
         "notes": ExtensionInfo(title: "Notes", symbol: "note.text", aliases: ["note"]),
@@ -298,11 +298,18 @@ enum AIToolCatalog {
         "quicklinks": ExtensionInfo(title: "Quicklinks", symbol: "link", aliases: ["quicklink", "links"]),
         "files": ExtensionInfo(title: "Files", symbol: "doc.text.magnifyingglass", aliases: ["finder", "file-search", "file"]),
         "calculator": ExtensionInfo(title: "Calculator", symbol: "function", aliases: ["math", "calc", "date"]),
+        "calendar": ExtensionInfo(title: "Calendar", symbol: "calendar", aliases: ["schedule", "events", "meetings"]),
+        "system": ExtensionInfo(title: "System Commands", symbol: "gearshape.2", aliases: ["mac"]),
+        "windows": ExtensionInfo(title: "Windows", symbol: "macwindow", aliases: ["window"]),
     ]
 
+    /// The tools over OpenRay's services. Calendar and commands join when their services exist.
     @MainActor
-    static func standard(store: LibraryStore, files: any AIFileSearching) -> [any AIToolExecutor] {
-        [
+    static func standard(
+        store: LibraryStore, files: any AIFileSearching, calendar: (any AICalendarReading)? = nil,
+        commands: (any AICommandRunning)? = nil
+    ) -> [any AIToolExecutor] {
+        var tools: [any AIToolExecutor] = [
             ClipboardSearchTool(store: store),
             NotesSearchTool(store: store), CreateNoteTool(store: store),
             SnippetsSearchTool(store: store), CreateSnippetTool(store: store),
@@ -310,6 +317,12 @@ enum AIToolCatalog {
             FileSearchTool(searcher: files),
             CalculatorTool(),
         ]
+        if let calendar { tools.append(CalendarReadTool(reader: calendar)) }
+        if let commands {
+            tools.append(RunCommandTool.system(runner: commands))
+            tools.append(RunCommandTool.windows(runner: commands))
+        }
+        return tools
     }
 
     /// Groups tools into mentionable extensions, in `extensionOrder`, then any others by id.
