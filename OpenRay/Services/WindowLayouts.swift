@@ -867,8 +867,13 @@ struct WindowLayoutOutcome: Equatable, Sendable {
     var failed: [String] = []
     /// Other windows that couldn't be minimized or closed.
     var cleanupFailures: Int = 0
+    /// Set when the layout asked to minimize or close other windows and they were left alone,
+    /// because not every window it moved could be confirmed in place.
+    var otherWindowsLeft: SavedWindowLayout.OtherWindows? = nil
+    /// Apps whose window moved but wasn't confirmed where the layout put it, by name.
+    var unconfirmed: [String] = []
 
-    var isComplete: Bool { placed == requested && cleanupFailures == 0 }
+    var isComplete: Bool { placed == requested && cleanupFailures == 0 && otherWindowsLeft == nil }
 
     var message: String {
         if isComplete { return placed == 1 ? "Arranged 1 window" : "Arranged \(placed) windows" }
@@ -878,6 +883,13 @@ struct WindowLayoutOutcome: Equatable, Sendable {
         if cleanupFailures > 0 {
             parts.append(
                 cleanupFailures == 1 ? "1 other window stayed open." : "\(cleanupFailures) other windows stayed open.")
+        }
+        if let left = otherWindowsLeft {
+            let verb = left == .close ? "closed" : "minimized"
+            parts.append(
+                unconfirmed.isEmpty
+                    ? "Other windows weren't \(verb)."
+                    : "Other windows weren't \(verb): \(unconfirmed.joined(separator: ", ")) couldn't be confirmed in place.")
         }
         return parts.joined(separator: " ")
     }

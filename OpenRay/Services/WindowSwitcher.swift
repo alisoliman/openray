@@ -75,31 +75,117 @@ struct SwitchableWindow: Identifiable, Equatable, Sendable {
     }
 }
 
+/// How Accessibility windows pair with the window server's on-screen entries. A window and an
+/// entry fit when they belong to the same process and their bounds agree within two points.
+struct WindowServerJoin: Equatable, Sendable {
+    struct Pairing: Equatable, Sendable {
+        /// The entry's place in the window server's list, front to back.
+        var rank: Int
+        var number: UInt32
+    }
+
+    /// Windows certainly on screen in the current Space, by index, with their entry.
+    var onScreen: [Int: Pairing] = [:]
+    /// Windows paired one to one: exactly one entry fits the window, and that entry fits no
+    /// other window. Only these can stand for "this window is on screen here" when a wrong
+    /// guess would act on another window.
+    var unambiguous: Set<Int> = []
+
+    static let tolerance: CGFloat = 2
+
+    /// Windows and entries that fit each other form groups. Every on-screen entry is some
+    /// window's, so a group with as many windows as entries, which pair up completely, is on
+    /// screen as a whole. A group with more windows than entries holds one somewhere else (two
+    /// same-sized windows of an app on different Spaces) and nothing says which: all of its
+    /// windows are left out. Counting nearby entries can't overstate a group, because a group
+    /// only grows through entries that fit one of its windows.
+    init(_ windows: [WindowSnapshot], entries: [WindowServerEntry], primaryHeight: CGFloat) {
+        let normal = entries.filter { $0.layer == 0 }
+        let flipped = windows.map { window -> CGRect? in
+            guard !window.isMinimized, let frame = window.frame else { return nil }
+            return ScreenCoordinates.flip(frame, primaryHeight: primaryHeight)
+        }
+        func distance(_ window: Int, _ entry: Int) -> CGFloat {
+            guard let frame = flipped[window] else { return .infinity }
+            let bounds = normal[entry].bounds
+            let origin: CGFloat = abs(frame.minX - bounds.minX) + abs(frame.minY - bounds.minY)
+            let size: CGFloat = abs(frame.width - bounds.width) + abs(frame.height - bounds.height)
+            return origin + size
+        }
+        var windowEdges = [[Int]](repeating: [], count: windows.count)
+        var entryEdges = [[Int]](repeating: [], count: normal.count)
+        for window in windows.indices {
+            guard let frame = flipped[window] else { continue }
+            for entry in normal.indices where normal[entry].pid == windows[window].pid
+                && WindowGeometry.approximatelyEqual(frame, normal[entry].bounds, tolerance: Self.tolerance)
+            {
+                windowEdges[window].append(entry)
+                entryEdges[entry].append(window)
+            }
+        }
+        // Each entry tries its closest window first, so near neighbors keep their own entries.
+        for entry in normal.indices {
+            entryEdges[entry].sort { lhs, rhs in
+                let left = distance(lhs, entry)
+                let right = distance(rhs, entry)
+                return left != right ? left < right : lhs < rhs
+            }
+        }
+
+        var seenWindows = Set<Int>()
+        var seenEntries = Set<Int>()
+        for start in windows.indices where !windowEdges[start].isEmpty && seenWindows.insert(start).inserted {
+            var groupWindows: [Int] = []
+            var groupEntries: [Int] = []
+            var stack: [(isWindow: Bool, index: Int)] = [(true, start)]
+            while let next = stack.popLast() {
+                let (isWindow, index) = next
+                if isWindow {
+                    groupWindows.append(index)
+                    for entry in windowEdges[index] where seenEntries.insert(entry).inserted { stack.append((false, entry)) }
+                } else {
+                    groupEntries.append(index)
+                    for window in entryEdges[index] where seenWindows.insert(window).inserted { stack.append((true, window)) }
+                }
+            }
+            guard groupWindows.count == groupEntries.count,
+                let pairs = Self.pair(entries: groupEntries.sorted(), edges: entryEdges)
+            else { continue }
+            for (window, entry) in pairs { onScreen[window] = Pairing(rank: entry, number: normal[entry].number) }
+            if groupWindows.count == 1 { unambiguous.insert(groupWindows[0]) }
+        }
+    }
+
+    /// A complete pairing of `entries` with distinct windows, or nil when there's none.
+    private static func pair(entries: [Int], edges: [[Int]]) -> [Int: Int]? {
+        var owner: [Int: Int] = [:]  // window → entry
+        func claim(_ entry: Int, _ visited: inout Set<Int>) -> Bool {
+            for window in edges[entry] where visited.insert(window).inserted {
+                if let other = owner[window], !claim(other, &visited) { continue }
+                owner[window] = entry
+                return true
+            }
+            return false
+        }
+        for entry in entries {
+            var visited = Set<Int>()
+            guard claim(entry, &visited) else { return nil }
+        }
+        return owner
+    }
+}
+
 enum WindowSwitcherOrdering {
     /// On-screen windows first, front to back as the window server stacks them;
     /// then windows in other Spaces; then minimized ones. Ties keep their order.
     static func order(
         _ windows: [WindowSnapshot], entries: [WindowServerEntry], primaryHeight: CGFloat
     ) -> [SwitchableWindow] {
-        func matches(_ window: WindowSnapshot, _ entry: WindowServerEntry) -> Bool {
-            guard window.pid == entry.pid, !window.isMinimized, let frame = window.frame else { return false }
-            return WindowGeometry.approximatelyEqual(
-                ScreenCoordinates.flip(frame, primaryHeight: primaryHeight), entry.bounds, tolerance: 2)
+        let join = WindowServerJoin(windows, entries: entries, primaryHeight: primaryHeight)
+        let onScreen = join.onScreen.sorted { $0.value.rank < $1.value.rank }.map { paired in
+            SwitchableWindow(snapshot: windows[paired.key], windowNumber: paired.value.number)
         }
-        let normal = entries.filter { $0.layer == 0 }
-        var remaining = windows
-        var onScreen: [SwitchableWindow] = []
-        for entry in normal {
-            let candidates = remaining.indices.filter { matches(remaining[$0], entry) }
-            guard let index = candidates.first else { continue }
-            // Two same-sized windows of one app can sit on different Spaces. Only when every
-            // candidate has its own on-screen entry is the match certain; otherwise skip them all.
-            let sameBounds = normal.filter { other in
-                other.pid == entry.pid && WindowGeometry.approximatelyEqual(other.bounds, entry.bounds, tolerance: 2)
-            }
-            guard candidates.count <= sameBounds.count else { continue }
-            onScreen.append(SwitchableWindow(snapshot: remaining.remove(at: index), windowNumber: entry.number))
-        }
+        let remaining = windows.indices.filter { join.onScreen[$0] == nil }.map { windows[$0] }
         let elsewhere = remaining.filter { !$0.isMinimized }.map { SwitchableWindow(snapshot: $0) }
         let minimized = remaining.filter(\.isMinimized).map { SwitchableWindow(snapshot: $0) }
         return onScreen + elsewhere + minimized

@@ -281,7 +281,7 @@ final class WindowCommandProvider: CommandProvider {
                 id: ref.id,
                 CommandConfirmation(
                     question: "Close other windows?",
-                    detail: "“\(record.displayName)” closes the windows it doesn't place on its displays.",
+                    detail: "“\(record.displayName)” closes the windows it doesn't place on its displays, once every window it moves is confirmed in place.",
                     confirmTitle: "Apply Layout", isDestructive: true)
             ) { [weak self, weak model] in
                 guard let self, let model else { return }

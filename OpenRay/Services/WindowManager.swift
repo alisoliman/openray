@@ -641,8 +641,10 @@ final class WindowManager {
     /// Places every window a layout lists, launching apps that have no window yet
     /// and waiting up to `launchTimeout` for their windows. Cancellation stops it
     /// before the next launch, wait or move. Other windows are minimized or closed
-    /// only on displays where a window was placed, and only when the window
-    /// server confirms they are on screen.
+    /// only once every window the layout moved is confirmed at its requested frame as
+    /// one on-screen window in this Space; then only on displays where a window was
+    /// placed, and only when the window server confirms they are on screen. Otherwise
+    /// they are left alone, and the outcome says so.
     func apply(
         _ layout: SavedWindowLayout, launcher: any ApplicationLaunching,
         launchTimeout: Duration = .seconds(6), pollInterval: Duration = .milliseconds(250),
@@ -694,7 +696,18 @@ final class WindowManager {
             }
         }
         var cleanupFailures = 0
-        if layout.otherWindows != .leave && !placed.isEmpty {
+        var cleanupSkipped = false
+        var unconfirmed: [UUID] = []
+        if layout.otherWindows != .leave {
+            // Other windows are minimized or closed only once the layout is in place: every
+            // window it moved is where it was asked to go, and each is one window the window
+            // server shows in this Space. Anything less leaves them all alone, and says so.
+            if !placed.isEmpty && failedSlots.isEmpty {
+                unconfirmed = try await unconfirmedPlacements(placed, sleep: sleep)
+            }
+            cleanupSkipped = placed.isEmpty || !failedSlots.isEmpty || !unconfirmed.isEmpty
+        }
+        if layout.otherWindows != .leave && !cleanupSkipped {
             // A superseded or cancelled apply must never touch windows another layout placed.
             try Task.checkCancellation()
             let targets = WindowLayoutPlanner.cleanupTargets(
@@ -716,11 +729,44 @@ final class WindowManager {
         // The first slot is the frontmost, so raise the rest first.
         for move in placed.reversed() { try? system.focus(move.window) }
         let unmatched = Set(plan.unmatchedSlots)
+        let unconfirmedSlots = Set(unconfirmed)
         return WindowLayoutOutcome(
             requested: layout.slots.count, placed: placed.count,
             missing: Self.uniqueNames(layout.slots.filter { unmatched.contains($0.id) }),
             failed: Self.uniqueNames(layout.slots.filter { failedSlots.contains($0.id) }),
-            cleanupFailures: cleanupFailures)
+            cleanupFailures: cleanupFailures,
+            otherWindowsLeft: cleanupSkipped ? layout.otherWindows : nil,
+            unconfirmed: Self.uniqueNames(layout.slots.filter { unconfirmedSlots.contains($0.id) }))
+    }
+
+    /// How close a placed window must be to the frame it was asked to take.
+    static let placementTolerance: CGFloat = 2
+    /// How often, and how far apart, placements are checked before cleanup gives up on them:
+    /// the window server can trail Accessibility by a moment.
+    static let placementChecks = 3
+    static let placementCheckInterval: Duration = .milliseconds(100)
+
+    /// The slots whose window isn't confirmed in place: at the frame its move asked for, and
+    /// paired one to one with an on-screen window in this Space.
+    private func unconfirmedPlacements(
+        _ placed: [WindowLayoutPlan.Move], sleep: @Sendable (Duration) async throws -> Void
+    ) async throws -> [UUID] {
+        var unconfirmed: [UUID] = []
+        for attempt in 0..<Self.placementChecks {
+            try Task.checkCancellation()
+            if attempt > 0 { try await sleep(Self.placementCheckInterval) }
+            let windows = system.windows(includeMinimized: false, readFrames: true)
+            let join = WindowServerJoin(
+                windows, entries: listing.onScreenWindows(), primaryHeight: system.displays().first?.frame.maxY ?? 0)
+            unconfirmed = placed.filter { move in
+                guard let index = windows.firstIndex(where: { $0.handle == move.window }),
+                    join.unambiguous.contains(index), let frame = windows[index].frame
+                else { return true }
+                return !WindowGeometry.approximatelyEqual(frame, move.frame, tolerance: Self.placementTolerance)
+            }.map(\.slotID)
+            if unconfirmed.isEmpty { break }
+        }
+        return unconfirmed
     }
 
     private func currentPlan(for layout: SavedWindowLayout) -> WindowLayoutPlan {
