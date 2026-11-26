@@ -319,7 +319,7 @@ extension LauncherModel {
             let typed = prompt.map { $0.displayText ?? $0.text } ?? ""
             title = QuickNote.derivedTitle(from: typed.isEmpty ? "AI response" : typed)
         } else {
-            title = ai.action.title
+            title = ai.title
         }
         editor = .note(QuickNote(title: title, content: message.text))
         draft?.saveNote()
@@ -1060,6 +1060,7 @@ extension LauncherModel {
                     self.focusRequest += 1
                 })
         }
+        entries += slice7AIActions()
         if !ai.isGenerating {
             entries.append(
                 ActionEntry(

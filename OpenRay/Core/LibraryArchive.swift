@@ -129,9 +129,6 @@ enum LibraryArchive {
     /// adds the read rule its store applies (see `sideFileIsReadable` and `noteAssetIsReadable`)
     /// to export and import, so only files the committed rows will read travel.
     ///
-    /// Slice 7: saved AI chats will need the same treatment once their store lands: register its
-    /// folder under `.ai` (or `.otherData`), match its file names exactly, export only the chats
-    /// the library refers to, and validate them on import by the chat store's own read rule.
     static let portableStores: [PortableStore] = [
         PortableStore(folder: "ClipboardImages", category: .clipboard) { name in
             let stem = (name as NSString).deletingPathExtension
@@ -140,6 +137,9 @@ enum LibraryArchive {
         },
         // Slice 6: images pasted into notes, which notes reference as `NoteAssets/<name>`.
         PortableStore(folder: NoteAssetStore.folderName, category: .notes) { isNoteAssetName($0) },
+        // Slice 7: saved AI chats, one file. Exported and imported only when the chat store
+        // can read it (`ChatStore.isReadable`); Merge combines chats by id.
+        PortableStore(folder: ChatStore.folderName, category: .otherData) { $0 == ChatStore.fileName },
     ]
 
     /// A note image's file name exactly as `NoteAssetStore.save` writes it: an uppercase UUID
@@ -364,6 +364,11 @@ enum LibraryArchive {
                 if missing > 0 {
                     omissions.append("\(missing) image\(missing == 1 ? "" : "s") in notes \(missing == 1 ? "was" : "were") missing or unreadable and left out.")
                 }
+            }
+            if let chats = byPath[ChatStore.archivePath], !ChatStore.isReadable(chats) {
+                // Slice 7: a chats file this build can't read isn't passed on.
+                byPath[ChatStore.archivePath] = nil
+                omissions.append("Saved chats couldn't be read, so they were left out.")
             }
             for (path, data) in byPath.sorted(by: { $0.key < $1.key }) {
                 files.append((FileEntry(path: path, size: data.count, sha256: digest(data), category: category(forFile: path)), data))
@@ -1258,6 +1263,17 @@ extension LibraryStore {
             }
             if missing > 0 {
                 notes.append("\(missing) image\(missing == 1 ? "" : "s") in notes \(missing == 1 ? "wasn't" : "weren't") in the archive, so \(missing == 1 ? "it" : "they") won't show.")
+            }
+        }
+        if chosen.contains(.otherData), let incoming = contents.files[ChatStore.archivePath] {
+            // Slice 7: saved chats, checked by the chat store's read rule. Replace takes the
+            // archive's chats; Merge adds them to the ones here, by chat id.
+            let existing = directory.flatMap { LibraryArchive.existingFile(ChatStore.archivePath, in: $0) }
+            if let combined = ChatStore.combined(existing: existing, incoming: incoming, merging: mode == .merge) {
+                files[ChatStore.archivePath] = combined
+                overwriting.insert(ChatStore.archivePath)
+            } else {
+                notes.append("The archive's chats couldn't be read, so they weren't imported.")
             }
         }
         do { try merged.validate() } catch { throw LibraryArchive.Failure(error.localizedDescription) }

@@ -12,7 +12,7 @@ struct AIView: View {
             header
             Hairline()
             Group {
-                if !model.ai.availability.isAvailable {
+                if !model.ai.isReady {
                     AIUnavailableView(model: model)
                 } else if model.ai.action == .chat {
                     ChatBody(model: model)
@@ -57,7 +57,7 @@ struct AIView: View {
     @ViewBuilder private var header: some View {
         HStack(spacing: 10) {
             ScopeToken(
-                kind: .ai, symbol: model.ai.action.kindSymbol, title: model.ai.action.title,
+                kind: .ai, symbol: model.ai.symbol, title: model.ai.title,
                 onRemove: { model.leaveAI() })
             if model.ai.action != .chat, model.ai.availability.isAvailable, let attachment = model.ai.attachments.first {
                 LauncherSearchInput(
@@ -85,6 +85,9 @@ struct AIView: View {
             } else {
                 Spacer(minLength: 0)
                 if model.ai.availability.isAvailable {
+                    if model.ai.action == .chat, model.ai.command == nil {
+                        AgentMenu(chat: model.ai, agents: model.aiHub.agents) { model.focusRequest += 1 }
+                    }
                     HStack(spacing: 6) {
                         Circle().fill(OR.Color.success).frame(width: 6, height: 6)
                         Text("On this Mac")
@@ -176,7 +179,7 @@ struct AIView: View {
     }
 
     @ViewBuilder private var context: some View {
-        if !model.ai.availability.isAvailable {
+        if !model.ai.isReady {
             Image(systemName: "info.circle").font(.system(size: 12)).accessibilityHidden(true)
             Text("Everything else in OpenRay works without AI")
         } else if model.ai.action != .chat, model.ai.latestResponse != nil {
@@ -190,7 +193,7 @@ struct AIView: View {
     }
 
     @ViewBuilder private var actions: some View {
-        if !model.ai.availability.isAvailable {
+        if !model.ai.isReady {
             ActionBarButton(title: "Back", keys: ["esc"], style: .ghost) { model.goBack() }
         } else if model.ai.isGenerating {
             ActionBarButton(title: "Stop", keys: ["⌘", "."]) { model.ai.cancel() }
@@ -218,7 +221,7 @@ struct AIView: View {
             }
         } else {
             ActionBarButton(
-                title: model.ai.action.runTitle, keys: model.ai.attachments.isEmpty ? ["⌘", "↩"] : ["↩"], style: .accent
+                title: model.ai.runTitle, keys: model.ai.attachments.isEmpty ? ["⌘", "↩"] : ["↩"], style: .accent
             ) { model.ai.send() }
             .disabled(!model.ai.canSend)
         }
@@ -227,37 +230,50 @@ struct AIView: View {
 
 // MARK: - Chat
 
+/// What a conversation's reply buttons do, so the panel and the chat window share the views.
+struct ChatMessageActions {
+    var copy: (ChatMessage) -> Void
+    /// The paste button's title for a reply (the latest one when the flag is set), or nil for none.
+    var pasteTitle: (ChatMessage, Bool) -> String?
+    var paste: (ChatMessage, Bool) -> Void
+    var saveNote: (ChatMessage) -> Void
+    var retry: () -> Void
+    /// Continues from a reply in a new chat. Only saved chats can branch.
+    var branch: ((ChatMessage) -> Void)? = nil
+}
+
 private struct ChatBody: View {
     @Bindable var model: LauncherModel
 
     var body: some View {
         VStack(spacing: 0) {
-            ScrollViewReader { proxy in
-                ScrollView {
-                    if model.ai.messages.isEmpty {
-                        emptyChat
-                    } else {
-                        LazyVStack(alignment: .leading, spacing: 16) {
-                            ForEach(model.ai.messages) { message in
-                                ChatMessageView(model: model, message: message, isLatest: message.id == model.ai.messages.last?.id)
-                            }
-                            Color.clear.frame(height: 1).id("conversation.end")
-                        }
-                        .padding(.horizontal, 24).padding(.top, 18).padding(.bottom, 8)
-                    }
-                }
-                .onChange(of: model.ai.messages.last?.text) { proxy.scrollTo("conversation.end", anchor: .bottom) }
-                .onChange(of: model.ai.messages.count) { proxy.scrollTo("conversation.end", anchor: .bottom) }
+            ChatTranscript(chat: model.ai, actions: actions) { emptyChat }
+            ChatSuggestions(chat: model.ai, agents: model.aiHub.agents, extensions: model.aiHub.toolExtensions) {
+                model.focusRequest += 1
             }
             ChatComposer(model: model)
         }
+    }
+
+    private var actions: ChatMessageActions {
+        ChatMessageActions(
+            copy: { model.copy($0.text) },
+            pasteTitle: { _, isLatest in
+                if isLatest { return model.aiResultIsUnchanged ? nil : model.aiPasteTitle }
+                // Earlier replies paste as they are; nothing about them replaces a selection.
+                return model.canPasteDirectly || !model.clipboard.usesGeneralPasteboard
+                    ? "Paste to \(model.targetAppName)" : "Copy · ⌘V in \(model.targetAppName)"
+            },
+            paste: { message, isLatest in if isLatest { model.pasteAIResponse() } else { model.paste(message.text) } },
+            saveNote: { model.saveResponseAsNote($0) },
+            retry: { model.ai.retry() })
     }
 
     private var emptyChat: some View {
         VStack(spacing: 0) {
             EmptyStateView(
                 kind: .ai, title: "Ask anything",
-                detail: "Brainstorm, draft or work through a question. Apple's on-device model answers here, and nothing is saved unless you ask."
+                detail: "Brainstorm, draft or work through a question. Apple's on-device model answers here. Type @ to use your notes, clipboard or files, or / to pick an agent."
             ) {
                 ForEach(
                     [
@@ -278,10 +294,54 @@ private struct ChatBody: View {
     }
 }
 
-private struct ChatMessageView: View {
-    let model: LauncherModel
+/// A conversation's messages, with its notices, tool activity and approval cards, kept
+/// scrolled to the end. The panel and the chat window both draw it.
+struct ChatTranscript<Empty: View>: View {
+    let chat: AIChatModel
+    let actions: ChatMessageActions
+    @ViewBuilder var empty: Empty
+
+    var body: some View {
+        ScrollViewReader { proxy in
+            ScrollView {
+                if chat.messages.isEmpty, chat.environment.toolBroker?.pendingApprovals.isEmpty != false {
+                    empty
+                } else {
+                    LazyVStack(alignment: .leading, spacing: 16) {
+                        if chat.summarizedMessageCount > 0 {
+                            Label("Earlier messages are summarized to fit the on-device model.", systemImage: "text.badge.minus")
+                                .labelStyle(TightLabelStyle()).font(OR.Font.caption).foregroundStyle(OR.Color.text2)
+                        }
+                        ForEach(chat.messages) { message in
+                            ChatMessageView(
+                                chat: chat, message: message, isLatest: message.id == chat.messages.last?.id, actions: actions)
+                        }
+                        if let broker = chat.environment.toolBroker {
+                            ToolActivityList(broker: broker)
+                            ToolApprovalCards(broker: broker)
+                        }
+                        if let notice = chat.condensationNotice {
+                            InlineNotice(.info, symbol: "text.badge.minus", title: notice)
+                        }
+                        Color.clear.frame(height: 1).id("conversation.end")
+                    }
+                    .padding(.horizontal, 24).padding(.top, 18).padding(.bottom, 8)
+                }
+            }
+            .onChange(of: chat.messages.last?.text) { proxy.scrollTo("conversation.end", anchor: .bottom) }
+            .onChange(of: chat.messages.count) { proxy.scrollTo("conversation.end", anchor: .bottom) }
+            .onChange(of: chat.environment.toolBroker?.pendingApprovals.count) {
+                proxy.scrollTo("conversation.end", anchor: .bottom)
+            }
+        }
+    }
+}
+
+struct ChatMessageView: View {
+    let chat: AIChatModel
     let message: ChatMessage
     var isLatest: Bool
+    let actions: ChatMessageActions
 
     var body: some View {
         if message.role == .user {
@@ -307,7 +367,7 @@ private struct ChatMessageView: View {
             .accessibilityLabel("You: \(message.displayText ?? message.text)")
         } else {
             VStack(alignment: .leading, spacing: 6) {
-                if message.text.isEmpty && model.ai.isGenerating {
+                if message.text.isEmpty && chat.isGenerating {
                     // Marks where the reply will appear. The action bar says “Writing on this Mac…”.
                     Spinner(size: 14, lineWidth: 1.75).frame(height: 20)
                 } else {
@@ -316,24 +376,23 @@ private struct ChatMessageView: View {
                         .textSelection(.enabled)
                         .frame(maxWidth: .infinity, alignment: .leading)
                 }
-                if message.isPartial && !model.ai.isGenerating {
+                if message.isPartial && !chat.isGenerating {
                     Label("Stopped", systemImage: "stop.circle").labelStyle(TightLabelStyle())
                         .font(OR.Font.caption).foregroundStyle(OR.Color.text2)
                 }
                 // Every finished reply keeps its actions. ⌘K and ⌘↩ stay bound to the latest one.
-                if !message.text.isEmpty, !(isLatest && model.ai.isGenerating) {
+                if !message.text.isEmpty, !(isLatest && chat.isGenerating) {
                     HStack(spacing: 4) {
-                        responseButton("Copy", "doc.on.doc", emphasized: true) { model.copy(message.text) }
-                        if isLatest {
-                            if !model.aiResultIsUnchanged {
-                                responseButton(model.aiPasteTitle, "arrow.down.doc") { model.pasteAIResponse() }
-                            }
-                        } else {
-                            responseButton(pasteTitle, "arrow.down.doc") { model.paste(message.text) }
+                        responseButton("Copy", "doc.on.doc", emphasized: true) { actions.copy(message) }
+                        if let title = actions.pasteTitle(message, isLatest) {
+                            responseButton(title, "arrow.down.doc") { actions.paste(message, isLatest) }
                         }
-                        responseButton("Save as Note", "note.text.badge.plus") { model.saveResponseAsNote(message) }
-                        if isLatest {
-                            responseButton("Try Again", "arrow.clockwise") { model.ai.retry() }
+                        responseButton("Save as Note", "note.text.badge.plus") { actions.saveNote(message) }
+                        if let branch = actions.branch, !chat.isGenerating {
+                            responseButton("Branch", "arrow.triangle.branch") { branch(message) }
+                        }
+                        if isLatest, !chat.isReadOnly {
+                            responseButton("Try Again", "arrow.clockwise") { actions.retry() }
                         }
                     }
                     .padding(.top, 2)
@@ -342,12 +401,6 @@ private struct ChatMessageView: View {
             .frame(maxWidth: 640, alignment: .leading)
             .accessibilityElement(children: .contain)
         }
-    }
-
-    /// Earlier replies paste as they are; nothing about them replaces a selection.
-    private var pasteTitle: String {
-        model.canPasteDirectly || !model.clipboard.usesGeneralPasteboard
-            ? "Paste to \(model.targetAppName)" : "Copy · ⌘V in \(model.targetAppName)"
     }
 
     private func responseButton(_ title: String, _ symbol: String, emphasized: Bool = false, action: @escaping () -> Void)
@@ -411,7 +464,16 @@ private struct ChatComposer: View {
                         model.focusRequest += 1
                     }
                 }
+                if model.aiHub.settings.screenContextEnabled, !model.ai.attachments.contains(where: { $0.source == .screen }) {
+                    addButton("Window", "macwindow") {
+                        let pid = model.previousApplication?.processIdentifier
+                        Task { await model.aiHub.attachScreen(.focusedWindow(processID: pid), to: model.ai) }
+                    }
+                }
                 Spacer(minLength: 8)
+                if model.aiHub.settings.dictationEnabled {
+                    DictationButton(dictation: model.aiHub.dictation, chat: model.ai)
+                }
                 if model.ai.pendingCharacterCount > AIChatModel.inputLimit * 8 / 10 {
                     Text("\(model.ai.pendingCharacterCount.formatted()) / \(AIChatModel.inputLimit.formatted())")
                         .font(OR.Font.caption).monospacedDigit()
@@ -535,7 +597,7 @@ private struct TransformBody: View {
                 } else {
                     Text("Press").foregroundStyle(OR.Color.text2)
                     KeyCaps(["↩"], size: .small)
-                    Text("to \(model.ai.action.title.lowercased()).").foregroundStyle(OR.Color.text2)
+                    Text("to \(model.ai.title.lowercased()).").foregroundStyle(OR.Color.text2)
                     Spacer(minLength: 8)
                     if count > limit * 8 / 10 {
                         Text("\(count.formatted()) / \(limit.formatted())")
@@ -550,10 +612,10 @@ private struct TransformBody: View {
 
     private var pasteInput: some View {
         VStack(alignment: .leading, spacing: 10) {
-            Text(model.ai.action.subtitle).font(OR.Font.body).foregroundStyle(OR.Color.text2)
+            Text(model.ai.subtitle).font(OR.Font.body).foregroundStyle(OR.Color.text2)
             ZStack(alignment: .topLeading) {
                 if model.ai.draft.isEmpty {
-                    Text("Paste or type the text to \(model.ai.action.runTitle.lowercased())")
+                    Text("Paste or type the text to \(model.ai.runTitle.lowercased())")
                         .font(OR.Font.reading).foregroundStyle(OR.Color.text3).padding(.top, 2)
                         .allowsHitTesting(false).accessibilityHidden(true)
                 }
@@ -590,7 +652,7 @@ private struct TransformBody: View {
         VStack(alignment: .leading, spacing: 14) {
             if response.isPartial && !model.ai.isGenerating {
                 stopped(response)
-            } else if model.ai.action.showsDiff {
+            } else if model.ai.showsDiff {
                 if let diff = model.ai.lastDiff, !model.ai.isGenerating {
                     if model.ai.action == .proofread && diff.isUnchanged {
                         unchanged(source)
@@ -609,7 +671,7 @@ private struct TransformBody: View {
             } else if model.ai.action == .actionItems {
                 ActionItemsList(message: response)
             } else {
-                Text("Summary").font(OR.Font.headline).foregroundStyle(OR.Color.text)
+                Text(model.ai.command?.title ?? "Summary").font(OR.Font.headline).foregroundStyle(OR.Color.text)
                 ScrollView {
                     AIMessageText(message: response).font(OR.Font.reading).lineSpacing(8).foregroundStyle(OR.Color.text)
                         .frame(maxWidth: .infinity, alignment: .topLeading)

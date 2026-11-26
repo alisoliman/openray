@@ -117,17 +117,32 @@ struct LibraryArchiveTests {
     @Test("An archive of everything round-trips: the library and its clipboard pictures, nothing of this Mac's")
     func roundTrip() throws {
         let source = try populated()
+        // Slice 7: saved AI chats travel under Other Data.
+        let chats = ChatStore(fileURL: ChatStore.url(nextTo: source.folder.appending(path: "library.json")))
+        let chat = try #require(
+            chats.save(
+                AIConversationState(
+                    messages: [ChatMessage(role: .user, text: "Plan the trip"), ChatMessage(role: .assistant, text: "Day one…")],
+                    summary: nil, summarizedMessageCount: 0, agentID: nil, transcript: nil),
+                id: nil))
         let archive = try make(source)
         #expect(try !LibraryArchive.isEncrypted(archive))
         let contents = try LibraryArchive.read(archive)
         #expect(contents.categories == Set(LibraryArchiveCategory.allCases))
         let imageID = try #require(source.store.database.clipboard.compactMap(\.image).first?.id)
-        // Only portable store files travel: not chats.json (no store owns it), never this Mac's own files.
-        #expect(Set(contents.files.keys) == ["ClipboardImages/\(imageID).png"])
+        // Only portable store files travel: not a stray chats.json beside the library (no store
+        // owns it), never this Mac's own files.
+        #expect(Set(contents.files.keys) == ["ClipboardImages/\(imageID).png", ChatStore.archivePath])
 
         let target = try TemporaryLibrary()
         let report = try target.store.importArchive(contents, categories: contents.categories, mode: .replace)
-        #expect(report.filesWritten == 1)
+        #expect(report.filesWritten == 2)
+        let importedChats = ChatStore(fileURL: ChatStore.url(nextTo: target.folder.appending(path: "library.json")))
+        // Compared as stored (dates keep whole seconds on disk).
+        let sourceChats = ChatStore(fileURL: ChatStore.url(nextTo: source.folder.appending(path: "library.json")))
+        #expect(importedChats.chats == sourceChats.chats)
+        #expect(importedChats.chats.map(\.id) == chats.chats.map(\.id))
+        #expect(importedChats.chat(id: chat.id)?.messages.map(\.text) == ["Plan the trip", "Day one…"])
         let before = source.store.database
         let after = target.store.database
         #expect(after.snippets == before.snippets)
@@ -292,7 +307,8 @@ struct LibraryArchiveTests {
         #expect(preview.map(\.category) == [.snippets])
         #expect(preview[0].archived == 1)
         #expect(preview[0].current == 1)
-        #expect(!LibraryArchive.exportableCategories.contains(.otherData))
+        // Other Data is offered once a store files under it: Slice 7's saved chats.
+        #expect(LibraryArchive.exportableCategories.contains(.otherData))
     }
 
     @Test("An export leaves out entries whose pictures are missing, and says so")

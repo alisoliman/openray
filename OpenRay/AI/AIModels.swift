@@ -220,6 +220,35 @@ protocol AIEngine: AnyObject {
         _ prompt: String, action: AIAction, instruction: String,
         onSnapshot: @escaping @MainActor (AIResponseSnapshot) -> Void
     ) async throws
+
+    // Slice 7. Every requirement below has a default (`AIRequest.swift`), so an engine that
+    // only streams actions keeps working: requests fall back to its action stream.
+
+    /// What the active model supports: vision, reasoning, tool calling.
+    var capabilities: AIModelCapabilities { get }
+    /// The model's context window, in tokens.
+    func contextSize() async -> Int
+    /// How many tokens `text` takes.
+    func tokenCount(_ text: String) async -> Int
+    /// How many tokens these tools' definitions take.
+    func toolTokenCount(_ tools: [AIToolSpec]) async -> Int
+    /// Streams a configured request: chat with an agent, tools or images, or an AI Command.
+    func stream(_ request: AIRequest, onSnapshot: @escaping @MainActor (AIResponseSnapshot) -> Void) async throws
+    /// Summarizes on a fresh session, never the conversation's.
+    func summarize(_ text: String, focus: String) async throws -> String
+    /// Replaces the conversation's session with one built from a condensed context.
+    func rebuild(_ context: AIConversationContext)
+    /// The conversation's FoundationModels transcript as JSON, for saved chats.
+    func exportTranscript() -> Data?
+    /// Resumes a conversation from `exportTranscript()` data, under `context`'s current
+    /// instructions. False when it can't.
+    func restoreTranscript(_ data: Data, context: AIConversationContext) -> Bool
+    /// The model future sessions use. Private Cloud Compute is used only while it can answer.
+    func setModelChoice(_ choice: AIModelChoice)
+    /// Private Cloud Compute's availability and quota, or nil when the SDK has no such model.
+    var privateCloudStatus: AIPrivateCloudStatus? { get }
+    /// A new engine of the same kind, for a second conversation such as the chat window.
+    func makeSibling() -> any AIEngine
 }
 
 extension AIEngine {

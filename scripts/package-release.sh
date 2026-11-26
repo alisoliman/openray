@@ -137,6 +137,14 @@ codesign -d --entitlements - --xml "$OPENRAY_APP" >"$OPENRAY_OUTPUT/entitlements
   fail 'The release signature is missing the Calendars entitlement.'
 /usr/libexec/PlistBuddy -c 'Print :NSAppleEventsUsageDescription' "$OPENRAY_APP/Contents/Info.plist" >/dev/null 2>&1 ||
   fail 'The app is missing NSAppleEventsUsageDescription.'
+# Dictation (AI chat, opt-in) captures the microphone, which the hardened runtime allows only
+# with this entitlement, plus the microphone and speech usage descriptions.
+[[ "$(/usr/libexec/PlistBuddy -c 'Print :com.apple.security.device.audio-input' "$OPENRAY_OUTPUT/entitlements.plist" 2>/dev/null || true)" == true ]] ||
+  fail 'The release signature is missing the Audio Input entitlement.'
+for key in NSMicrophoneUsageDescription NSSpeechRecognitionUsageDescription; do
+  /usr/libexec/PlistBuddy -c "Print :$key" "$OPENRAY_APP/Contents/Info.plist" >/dev/null 2>&1 ||
+    fail "The app is missing $key."
+done
 if [[ "$(/usr/libexec/PlistBuddy -c 'Print :com.apple.security.get-task-allow' "$OPENRAY_OUTPUT/entitlements.plist" 2>/dev/null || true)" == true ]]; then
   fail 'Release signature unexpectedly permits debugger attachment.'
 fi

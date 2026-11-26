@@ -29,6 +29,7 @@ enum CommandProviders {
         FocusCommandProvider.registration,
         MenuBarCommandProvider.registration,
         // Slice 7: AI commands, agents
+        AICommandProvider.registration,
         // Slice 8: script commands
         ScriptCommandProvider.registration,
         DeepLinkRouter.registration,
