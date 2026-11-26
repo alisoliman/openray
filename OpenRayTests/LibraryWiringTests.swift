@@ -373,6 +373,21 @@ struct LauncherLibraryWiringTests {
         #expect(model.results.contains { $0.id.hasPrefix("clipboard.") })
     }
 
+    @Test func tagsAreSearchable() {
+        let (model, _) = makeModel()
+        var snippet = Snippet(name: "Signature", keyword: "", content: "Ann")
+        snippet.tags = ["quarterly"]
+        var link = Quicklink(name: "Dashboard", template: "https://example.com", keyword: "")
+        link.tags = ["quarterly"]
+        model.store.update {
+            $0.snippets = [snippet]
+            $0.quicklinks = [link]
+        }
+        model.query = "quarterly"
+        let ids = model.results.map(\.id)
+        #expect(ids.contains("snippet.\(snippet.id)") && ids.contains("quicklink.\(link.id)"))
+    }
+
     @Test func returnCopiesAndCommandReturnPastesByDefault() {
         let (model, _) = makeModel()
         #expect(model.contentPrimaryAction == .copy)
