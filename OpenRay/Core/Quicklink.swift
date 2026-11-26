@@ -5,12 +5,31 @@ struct Quicklink: Codable, Identifiable, Equatable, Sendable {
     var name: String
     var template: String
     var keyword: String
+    /// The app the link opens in. Nil uses the default browser or app.
+    var openWith: QuicklinkApplication? = nil
+    /// Labels for search and filtering. Missing in libraries from before tags.
+    var tags: [String]? = nil
 
-    var needsQuery: Bool { template.contains("{query}") }
+    var linkTemplate: QuicklinkTemplate { QuicklinkTemplate(template) }
+    var tagList: [String] { tags ?? [] }
 
-    /// The arguments this link asks for: today only `{query}`. Its value goes through
-    /// `resolvedURL(query:)`, which is still the path the launcher uses.
-    var argumentSpecs: [ArgumentSpec] { needsQuery ? [.query] : [] }
+    /// The arguments the link asks for, in order: `{argument …}` placeholders, plus
+    /// the legacy `{query}` and `{Name}` forms.
+    var placeholderArguments: [PlaceholderArgument] { linkTemplate.arguments }
+
+    /// True when the link takes at least one typed value.
+    var needsQuery: Bool { !placeholderArguments.isEmpty }
+
+    /// One spec per argument, named by `PlaceholderArgument.ID.specName`. A `{query}`
+    /// link keeps `[ArgumentSpec.query]`.
+    var argumentSpecs: [ArgumentSpec] { placeholderArguments.map(\.argumentSpec) }
+
+    /// The argument a single typed term fills: the first one.
+    var primaryArgument: PlaceholderArgument? { placeholderArguments.first }
+
+    /// More than one argument needs a value, so the one-term path can't open it on
+    /// its own; it needs every field (`resolution(arguments:values:)`).
+    var needsSeveralValues: Bool { placeholderArguments.filter(\.isRequired).count > 1 }
 
     func argument(in input: String) -> String? {
         guard !keyword.isEmpty else { return nil }
@@ -20,31 +39,25 @@ struct Quicklink: Codable, Identifiable, Equatable, Sendable {
         return parts.count == 2 ? String(parts[1]).trimmingCharacters(in: .whitespacesAndNewlines) : ""
     }
 
+    /// The URL for one typed term, which fills the first argument; other arguments
+    /// use their defaults. Placeholders that read the clipboard or selection render empty.
     func resolvedURL(query: String = "") throws -> URL {
-        let trimmed = template.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { throw LibraryValidationError("Enter a URL or an absolute file path.") }
-        if needsQuery && query.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-            throw LibraryValidationError("Enter a search term for this quicklink.")
+        try resolution(query: query, values: PlaceholderValues()).url
+    }
+
+    /// One typed term for the first argument, with the rest of the values from `values`.
+    func resolution(query: String, values: PlaceholderValues) throws -> QuicklinkResolution {
+        guard let primary = primaryArgument else { return try resolution(arguments: [:], values: values) }
+        return try resolution(arguments: [primary.id.specName: query], values: values)
+    }
+
+    /// Values by `ArgumentSpec.name`, as `ProvidedRef.arguments` carries them.
+    func resolution(arguments: [String: String], values: PlaceholderValues) throws -> QuicklinkResolution {
+        var values = values
+        for argument in placeholderArguments {
+            if let value = arguments[argument.id.specName] { values.arguments[argument.id] = value }
         }
-        if trimmed.hasPrefix("/") || trimmed.hasPrefix("~/") {
-            guard !needsQuery else {
-                throw LibraryValidationError("Query placeholders are only supported in web links.")
-            }
-            return URL(fileURLWithPath: (trimmed as NSString).expandingTildeInPath)
-        }
-        // Only RFC 3986 unreserved characters may remain unescaped inside a query.
-        let unreserved = CharacterSet(
-            charactersIn: "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-._~")
-        let encoded = query.addingPercentEncoding(withAllowedCharacters: unreserved) ?? ""
-        let substituted = trimmed.replacingOccurrences(of: "{query}", with: encoded)
-        guard let url = URL(string: substituted),
-            let scheme = url.scheme?.lowercased(),
-            ["https", "http", "file", "mailto"].contains(scheme),
-            !["http", "https"].contains(scheme) || url.host?.isEmpty == false
-        else {
-            throw LibraryValidationError("Use an http(s) URL, a mailto link or an absolute file path.")
-        }
-        return url
+        return try linkTemplate.resolve(using: values)
     }
 
     func validate() throws {
@@ -54,11 +67,8 @@ struct Quicklink: Codable, Identifiable, Equatable, Sendable {
         guard keyword.count <= 32, !keyword.contains(where: \.isWhitespace) else {
             throw LibraryValidationError("Use a quicklink keyword of up to 32 characters without spaces.")
         }
-        _ = try resolvedURL(query: needsQuery ? "test" : "")
-        let withoutPlaceholder = template.replacingOccurrences(of: "{query}", with: "")
-        guard !withoutPlaceholder.contains("{") && !withoutPlaceholder.contains("}") else {
-            throw LibraryValidationError("The supported placeholder is {query}.")
-        }
+        try linkTemplate.validate()
+        try LibraryTags.validate(tags)
     }
 
     static let defaults = [

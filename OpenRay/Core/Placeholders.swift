@@ -629,3 +629,43 @@ struct PlaceholderArgumentCollector {
         return true
     }
 }
+
+// MARK: - Command arguments
+
+extension PlaceholderArgument.ID {
+    /// The `ArgumentSpec.name` for this argument, unique within a template and
+    /// reversible: a name as written (a leading `#` is doubled, so it can't look
+    /// like the others), `#1` for the template's first unnamed argument, and
+    /// `#Signature#1` for the first unnamed argument inside the snippet "Signature".
+    var specName: String {
+        switch self {
+        case .named(let name): name.hasPrefix("#") ? "#" + name : name
+        case .unnamed(let index): "#\(index)"
+        case .snippetUnnamed(let snippet, let index): "#\(snippet)#\(index)"
+        }
+    }
+}
+
+extension PlaceholderArgument {
+    /// The field a command shows for this argument. A plain `{query}` keeps
+    /// `ArgumentSpec.query`, so the single-argument path and stored specs don't change.
+    var argumentSpec: ArgumentSpec {
+        if id == .named("query"), defaultValue == nil, options.isEmpty { return .query }
+        let placeholder: String =
+            switch id {
+            case .named(let name): name
+            case .unnamed(let index): "Argument \(index)"
+            case .snippetUnnamed(let snippet, let index): "\(snippet) \(index)"
+            }
+        var type = ArgumentSpec.InputType.text
+        if !options.isEmpty {
+            var choices = options
+            // A default outside the options would never validate; offer it too.
+            if let defaultValue, !choices.contains(defaultValue) { choices.insert(defaultValue, at: 0) }
+            type = .dropdown(choices.map { ArgumentSpec.Option(title: $0, value: $0) })
+        }
+        return ArgumentSpec(
+            name: id.specName, placeholder: placeholder, type: type, isOptional: !isRequired,
+            defaultValue: defaultValue)
+    }
+}

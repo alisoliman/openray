@@ -68,12 +68,25 @@ enum SnippetKeywordRules {
         }
     }
 
-    /// A keyword of 1–32 characters without whitespace, quotes, backticks,
-    /// brackets or control characters. Letters, digits and other punctuation,
-    /// math and currency symbols are fine, so imported keywords such as `@@` work.
+    /// A keyword of 1–32 characters made of letters, digits, punctuation, and math,
+    /// currency or modifier symbols, so imported keywords such as `@@`, `!email` or
+    /// `€x` work. Whitespace, quotes, backticks, brackets, emoji and other symbols
+    /// and control characters can't appear.
     static func isValid(_ keyword: String) -> Bool {
         (1...maximumLength).contains(keyword.count)
-            && keyword.allSatisfy { !isWordBoundary($0) && !isControl($0) }
+            && keyword.allSatisfy { character in
+                !isWordBoundary(character) && !isControl(character)
+                    && character.unicodeScalars.allSatisfy { scalar in
+                        switch scalar.properties.generalCategory {
+                        case .uppercaseLetter, .lowercaseLetter, .titlecaseLetter, .modifierLetter, .otherLetter,
+                            .nonspacingMark, .spacingMark, .enclosingMark, .decimalNumber, .letterNumber, .otherNumber,
+                            .connectorPunctuation, .dashPunctuation, .otherPunctuation, .mathSymbol, .currencySymbol,
+                            .modifierSymbol:
+                            true
+                        default: false
+                        }
+                    }
+            }
     }
 }
 
@@ -461,10 +474,14 @@ final class SnippetExpander {
     private var matcher = SnippetMatcher()
     private var previousPID: pid_t?
 
-    /// Expansion options; the library doesn't store them yet, so this defaults to
-    /// OpenRay's original behavior.
-    var settings = SnippetExpansionSettings() {
+    /// Overrides the saved expansion options; nil uses `AppPreferences.snippetExpansion`,
+    /// which defaults to OpenRay's original behavior.
+    var settings: SnippetExpansionSettings? {
         didSet { matcher.reset() }
+    }
+
+    private var effectiveSettings: SnippetExpansionSettings {
+        settings ?? store.database.preferences.snippetExpansion ?? SnippetExpansionSettings()
     }
 
     /// Defaults come from `sideEffects`: inert executors in the test host and in
@@ -559,7 +576,11 @@ final class SnippetExpander {
             matcher.reset()
             return nil
         }
-        matcher.settings = settings
+        let settings = effectiveSettings
+        if matcher.settings != settings {
+            matcher.settings = settings
+            matcher.reset()
+        }
         guard let trigger = matcher.trigger(for: text, snippets: database.snippets.filter(\.expandsAsYouType))
         else { return nil }
         // Arguments can't be asked for mid-typing: optional ones take their
