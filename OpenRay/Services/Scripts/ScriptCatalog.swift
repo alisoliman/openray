@@ -45,6 +45,9 @@ struct ScriptScan: Equatable, Sendable {
     var issues: [ScriptIssue] = []
     /// Folders that couldn't be read, by record id, with the reason.
     var unreadable: [UUID: String] = [:]
+    /// Turned-on folders that this Mac hasn't allowed, or that changed since: moved, replaced
+    /// or pointed elsewhere. Their scripts aren't read until the person allows them again.
+    var unapproved: Set<UUID> = []
 }
 
 /// Reads script folders. Pure file reading, safe off the main actor.
@@ -59,12 +62,19 @@ enum ScriptScanner {
 
     /// Scans each enabled folder's top level in name order. Hidden files, files whose name
     /// contains `.template.` (the format's marker for scripts that need editing first) and files
-    /// without any header lines are skipped quietly.
-    static func scan(_ directories: [ScriptDirectoryRecord]) -> ScriptScan {
+    /// without any header lines are skipped quietly. With `approvals`, a folder is read only when
+    /// it's still the folder this Mac allowed; nil skips that check (tests of the format only).
+    static func scan(_ directories: [ScriptDirectoryRecord], approvals: [UUID: FolderIdentity]? = nil) -> ScriptScan {
         var result = ScriptScan()
         var seen = Set<String>()
         for directory in directories where directory.isEnabled {
             guard let folder = directory.url else { continue }
+            if let approvals {
+                guard let approved = approvals[directory.id], FolderIdentity.current(of: folder) == approved else {
+                    result.unapproved.insert(directory.id)
+                    continue
+                }
+            }
             let entries: [URL]
             do {
                 entries = try FileManager.default.contentsOfDirectory(
@@ -199,7 +209,11 @@ final class FSEventsDirectoryWatcher: DirectoryWatching {
 final class ScriptCatalog {
     private(set) var scan = ScriptScan()
     private(set) var directories: [ScriptDirectoryRecord] = []
+    private(set) var approvals: [UUID: FolderIdentity] = [:]
     private(set) var isScanning = false
+    /// True once the first scan has finished, so links to scripts can wait for it.
+    private(set) var hasLoaded = false
+    @ObservationIgnored private var loadWaiters: [@MainActor () -> Void] = []
     /// Called after a scan changes the commands, so the launcher re-registers hotkeys.
     @ObservationIgnored var didChange: (@MainActor () -> Void)?
     @ObservationIgnored private let watcher: (any DirectoryWatching)?
@@ -215,12 +229,32 @@ final class ScriptCatalog {
 
     func command(withID id: String) -> ScriptCommand? { scan.commands.first { $0.id == id } }
 
-    /// Points the catalog at these folders. A change rescans and rewatches; the same list does nothing.
-    func setDirectories(_ records: [ScriptDirectoryRecord], synchronously: Bool = false) {
-        guard records != directories else { return }
+    /// Points the catalog at these folders and this Mac's approvals. A change rescans and
+    /// rewatches; the same lists do nothing.
+    func setDirectories(
+        _ records: [ScriptDirectoryRecord], approvals: [UUID: FolderIdentity], synchronously: Bool = false
+    ) {
+        guard records != directories || approvals != self.approvals else {
+            if !hasLoaded, records.isEmpty { finishLoading() }
+            return
+        }
         directories = records
-        watcher?.watch(records.filter(\.isEnabled).compactMap(\.url)) { [weak self] in self?.reload() }
+        self.approvals = approvals
+        let watched = records.filter { $0.isEnabled && approvals[$0.id] != nil }.compactMap(\.url)
+        watcher?.watch(watched) { [weak self] in self?.reload() }
         if synchronously { reloadNow() } else { reload() }
+    }
+
+    /// Runs `action` once the first scan has finished: now, if it has.
+    func whenLoaded(_ action: @escaping @MainActor () -> Void) {
+        if hasLoaded { action() } else { loadWaiters.append(action) }
+    }
+
+    private func finishLoading() {
+        hasLoaded = true
+        let waiters = loadWaiters
+        loadWaiters = []
+        for waiter in waiters { waiter() }
     }
 
     /// Rescans off the main actor. A later reload supersedes an earlier one still running.
@@ -228,9 +262,10 @@ final class ScriptCatalog {
         generation += 1
         let generation = generation
         let directories = directories
+        let approvals = approvals
         isScanning = true
         Task.detached(priority: .utility) { [weak self] in
-            let result = ScriptScanner.scan(directories)
+            let result = ScriptScanner.scan(directories, approvals: approvals)
             await self?.apply(result, generation: generation)
         }
     }
@@ -239,16 +274,18 @@ final class ScriptCatalog {
     func reloadNow() {
         generation += 1
         isScanning = true
-        apply(ScriptScanner.scan(directories), generation: generation)
+        apply(ScriptScanner.scan(directories, approvals: approvals), generation: generation)
     }
 
     private func apply(_ result: ScriptScan, generation: Int) {
         guard generation == self.generation else { return }
         isScanning = false
-        guard result != scan else { return }
-        let commandsChanged = result.commands != scan.commands
-        scan = result
-        if commandsChanged { didChange?() }
+        if result != scan {
+            let commandsChanged = result.commands != scan.commands
+            scan = result
+            if commandsChanged { didChange?() }
+        }
+        if !hasLoaded { finishLoading() }
     }
 }
 
@@ -376,10 +413,11 @@ enum ScriptTemplate {
     }
 
     /// Writes a new executable script into `folder`. Never replaces a file: a taken name gets a number.
-    static func create(_ draft: Draft, in folder: URL) throws -> URL {
+    static func create(_ draft: Draft, in folder: URL, sideEffects: SideEffectGuard = .current) throws -> URL {
         guard !draft.title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             throw LibraryValidationError("Give the script a title.")
         }
+        try InertWrites.check(folder, sideEffects: sideEffects, what: "creating scripts")
         let base = fileName(for: draft.title, language: draft.language)
         let stem = (base as NSString).deletingPathExtension
         var url = folder.appending(path: base)

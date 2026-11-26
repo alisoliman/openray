@@ -34,6 +34,15 @@ final class ScriptFolder {
 
     var record: ScriptDirectoryRecord { ScriptDirectoryRecord(path: url.path) }
 
+    /// A fixed environment for fixture processes: system paths only, home in the fixture folder,
+    /// nothing inherited from the developer's shell (no BASH_ENV, no personal PATH entries).
+    var environment: [String: String] {
+        ScriptEnvironment.make(base: ["PATH": "/usr/bin:/bin:/usr/sbin:/sbin", "HOME": url.path, "LANG": "en_US.UTF-8"])
+    }
+
+    /// This folder's identity now, as an approval records it.
+    var identity: FolderIdentity? { FolderIdentity.current(of: url) }
+
     deinit { try? FileManager.default.removeItem(at: url) }
 }
 
@@ -392,7 +401,8 @@ struct ScriptCatalogTests {
         let catalog = ScriptCatalog()
         var changes = 0
         catalog.didChange = { changes += 1 }
-        catalog.setDirectories([folder.record], synchronously: true)
+        let record = folder.record
+        catalog.setDirectories([record], approvals: [record.id: try #require(folder.identity)], synchronously: true)
         #expect(catalog.commands.map(\.title) == ["One"])
         #expect(changes == 1)
         try folder.script("two.sh", title: "Two", body: "echo 2")
@@ -455,9 +465,10 @@ struct ScriptRunnerTests {
     func invocation(_ url: URL, _ arguments: [String] = [], timeout: Duration = .seconds(10), in folder: URL? = nil)
         -> ScriptInvocation
     {
-        ScriptInvocation(
+        let home = url.deletingLastPathComponent().path
+        return ScriptInvocation(
             scriptURL: url, argv: [url.path] + arguments, workingDirectory: folder ?? url.deletingLastPathComponent(),
-            environment: ScriptEnvironment.make(), timeout: timeout)
+            environment: ScriptEnvironment.make(base: ["PATH": "/usr/bin:/bin", "HOME": home]), timeout: timeout)
     }
 
     @Test("Output, arguments, working directory and PATH")
@@ -468,12 +479,15 @@ struct ScriptRunnerTests {
         let launcher = POSIXScriptLauncher(allowedRoots: [folder.url])
         let result = await launcher.run(invocation(script, ["one", "two words"])) { _ in }
         #expect(result.termination == .exited(0))
-        let lines = result.output.split(separator: "\n").map(String.init)
+        let lines = try #require(result.standardOutput).split(separator: "\n").map(String.init)
+        #expect(lines.count == 3)
         #expect(lines[0] == "args:one|two words")
         #expect(URL(fileURLWithPath: lines[1]).resolvingSymlinksInPath() == folder.url.resolvingSymlinksInPath())
         #expect(lines[2].split(separator: ":").contains("/usr/local/bin"))
         #expect(lines[2].split(separator: ":").contains("/opt/homebrew/bin"))
-        #expect(lines.last == "oops")
+        // Standard error is in the full output, never in standard output.
+        #expect(result.output.contains("oops"))
+        #expect(result.lastLine == lines[2])
     }
 
     @Test("A non-zero exit is a failure whose message is the last line")
@@ -489,7 +503,7 @@ struct ScriptRunnerTests {
     @Test("A timeout stops the script and everything it started")
     func timeout() async throws {
         let folder = try ScriptFolder()
-        let script = try folder.write("slow.sh", "#!/bin/bash\nsleep 30 &\necho \"child $!\"\nwait\n")
+        let script = try folder.write("slow.sh", "#!/bin/bash\n/bin/sleep 30 &\necho \"child $!\"\nwait\n")
         var launcher = POSIXScriptLauncher(allowedRoots: [folder.url])
         launcher.killGrace = .milliseconds(200)
         launcher.drainGrace = .milliseconds(200)
@@ -512,7 +526,7 @@ struct ScriptRunnerTests {
     @Test("Cancelling the task stops the script")
     func cancel() async throws {
         let folder = try ScriptFolder()
-        let script = try folder.write("wait.sh", "#!/bin/bash\necho ready\nsleep 30\n")
+        let script = try folder.write("wait.sh", "#!/bin/bash\necho ready\n/bin/sleep 30\n")
         var launcher = POSIXScriptLauncher(allowedRoots: [folder.url])
         launcher.killGrace = .milliseconds(200)
         let (stream, continuation) = AsyncStream.makeStream(of: String.self)
@@ -528,7 +542,7 @@ struct ScriptRunnerTests {
     @Test("Output streams before the script ends")
     func streaming() async throws {
         let folder = try ScriptFolder()
-        let script = try folder.write("stream.sh", "#!/bin/bash\necho first\nsleep 0.3\necho second\n")
+        let script = try folder.write("stream.sh", "#!/bin/bash\necho first\n/bin/sleep 0.3\necho second\n")
         let (stream, continuation) = AsyncStream.makeStream(of: String.self)
         let run = Task {
             await POSIXScriptLauncher(allowedRoots: [folder.url]).run(invocation(script)) { continuation.yield($0) }
@@ -635,7 +649,8 @@ struct ScriptCommandLauncherTests {
         let presenter = RecordingScriptPresenter()
         let provider = ScriptCommandProvider(
             catalog: ScriptCatalog(),
-            runner: ScriptRunner(launcher: launcher ?? POSIXScriptLauncher(allowedRoots: [folder.url])),
+            runner: ScriptRunner(
+                launcher: launcher ?? POSIXScriptLauncher(allowedRoots: [folder.url]), environment: folder.environment),
             presenter: presenter, refreshesAutomatically: false)
         let model = LauncherModel(
             store: LibraryStore(fileURL: nil), ai: AIChatModel(engine: TestAIEngine()),
@@ -643,9 +658,14 @@ struct ScriptCommandLauncherTests {
         return Harness(folder: folder, model: model, provider: provider, presenter: presenter)
     }
 
-    func load(_ harness: Harness) {
-        harness.model.store.update { $0.scriptDirectories = [harness.folder.record] }
+    /// Lists the fixture folder and allows it on "this Mac", as Add Script Folder does.
+    @discardableResult
+    func load(_ harness: Harness) -> ScriptDirectoryRecord {
+        let record = harness.folder.record
+        harness.model.store.update { $0.scriptDirectories = [record] }
+        LocalApprovalStore.for(harness.model.store).approve(record)
         harness.provider.synchronize(with: harness.model, synchronously: true)
+        return record
     }
 
     func row(_ title: String, in harness: Harness) throws -> LauncherItem {
@@ -833,7 +853,7 @@ struct ScriptCommandLauncherTests {
     @Test("A running script shows as running and can be stopped from ⌘K")
     func runningRow() async throws {
         let h = try harness()
-        try h.folder.script("long.sh", title: "Long", body: "echo started\nsleep 30")
+        try h.folder.script("long.sh", title: "Long", body: "echo started\n/bin/sleep 30")
         load(h)
         h.model.perform(try row("Long", in: h))
         let running = try row("Long", in: h)
@@ -868,5 +888,150 @@ struct ScriptCommandLauncherTests {
         h.model.perform(try row("Canned", in: h))
         try await finish(h, "Canned")
         #expect(h.model.feedback?.text == "canned")
+    }
+}
+
+// MARK: - Authorization (review fixes)
+
+extension ScriptCommandLauncherTests {
+    @Test("A folder's scripts run only once it's allowed on this Mac, and again only after a change")
+    func folderApproval() throws {
+        let h = try harness()
+        try h.folder.script("one.sh", title: "One", body: "echo 1")
+        let record = h.folder.record
+        h.model.store.update { $0.scriptDirectories = [record] }
+        h.provider.synchronize(with: h.model, synchronously: true)
+        // Listed and on, as an import would leave it, but never allowed here.
+        #expect(h.provider.catalog.commands.isEmpty)
+        #expect(h.provider.catalog.scan.unapproved == [record.id])
+        #expect(!h.provider.isActive(record, in: h.model))
+
+        #expect(h.provider.setDirectory(record.id, enabled: true, in: h.model))
+        h.provider.catalog.reloadNow()
+        #expect(h.provider.catalog.commands.map(\.title) == ["One"])
+
+        // The folder is replaced by another at the same path: it needs allowing again.
+        let aside = h.folder.url.deletingLastPathComponent().appending(path: "aside-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: aside) }
+        try FileManager.default.moveItem(at: h.folder.url, to: aside)
+        try FileManager.default.createDirectory(at: h.folder.url, withIntermediateDirectories: true)
+        try h.folder.script("one.sh", title: "One", body: "echo 1")
+        h.provider.catalog.reloadNow()
+        #expect(h.provider.catalog.commands.isEmpty)
+        #expect(!h.provider.isActive(record, in: h.model))
+
+        // Allowed again, then pointed elsewhere through a link: refused again.
+        #expect(h.provider.setDirectory(record.id, enabled: true, in: h.model))
+        h.provider.catalog.reloadNow()
+        #expect(h.provider.catalog.commands.count == 1)
+        try FileManager.default.removeItem(at: h.folder.url)
+        try FileManager.default.createSymbolicLink(at: h.folder.url, withDestinationURL: aside)
+        h.provider.catalog.reloadNow()
+        #expect(h.provider.catalog.commands.isEmpty)
+
+        // Turning it off forgets the approval.
+        #expect(h.provider.setDirectory(record.id, enabled: false, in: h.model))
+        #expect(LocalApprovalStore.for(h.model.store).approvals.scriptFolders[record.id] == nil)
+    }
+
+    @Test("Inline scripts that ask first, or whose command is off, never refresh on their own")
+    func inlineAuthorization() async throws {
+        let h = try harness()
+        try h.folder.script("ask.sh", title: "Ask", mode: "inline", extra: ["refreshTime 10s", "needsConfirmation true"], body: "echo a")
+        try h.folder.script("off.sh", title: "Off", mode: "inline", extra: ["refreshTime 10s"], body: "echo o")
+        try h.folder.script("on.sh", title: "On", mode: "inline", extra: ["refreshTime 10s"], body: "echo on")
+        load(h)
+        let off = try #require(h.provider.catalog.commands.first { $0.title == "Off" })
+        h.model.store.update { $0.disabledCommandIDs.insert(off.id) }
+        h.provider.refreshDueInlineScripts(in: h.model)
+        #expect(h.provider.runner.jobs.map(\.command.title) == ["On"])
+        try await finish(h, "On")
+        // ↩ on the one that asks still asks.
+        h.model.perform(try row("Ask", in: h))
+        #expect(h.model.confirmation != nil)
+        #expect(h.provider.runner.jobs.count == 1)
+    }
+
+    @Test("Run Again goes through the command's current checks")
+    func runAgainChecks() async throws {
+        let h = try harness()
+        try h.folder.script("ask.sh", title: "Ask", mode: "fullOutput", extra: ["needsConfirmation true"], body: "echo asked")
+        let record = load(h)
+        h.model.perform(try row("Ask", in: h))
+        h.model.confirm(try #require(h.model.confirmation))
+        try await finish(h, "Ask")
+        let job = try #require(h.provider.runner.jobs.first)
+        let again = try #require(h.model.actions(for: try #require(h.model.results.first)).first { $0.id == "script.runAgain" })
+        again.perform()
+        #expect(h.model.confirmation != nil, "The confirmation is asked again")
+        #expect(h.provider.runner.jobs.count == 1)
+        h.model.confirmation = nil
+
+        h.model.store.update { $0.disabledCommandIDs.insert(job.command.id) }
+        h.provider.runAgain(job, in: h.model)
+        #expect(h.provider.runner.jobs.count == 1)
+        h.model.store.update { $0.disabledCommandIDs = [] }
+
+        h.provider.setDirectory(record.id, enabled: false, in: h.model)
+        h.provider.catalog.reloadNow()
+        h.provider.runAgain(job, in: h.model)
+        #expect(h.model.feedback?.text.contains("no longer available") == true)
+        #expect(h.provider.runner.jobs.count == 1)
+    }
+
+    @Test("Results come from standard output; diagnostics stay in the full output and failures")
+    func standardOutputSummaries() async throws {
+        let h = try harness()
+        try h.folder.script("warn.sh", title: "Warn", body: "echo result\necho 'warning: slow disk' >&2")
+        try h.folder.script("log.sh", title: "Log", body: "echo 'logged only' >&2")
+        try h.folder.script("bad.sh", title: "Bad", body: "echo partial\necho 'error: bad input' >&2\nexit 1")
+        load(h)
+        h.model.perform(try row("Warn", in: h))
+        try await finish(h, "Warn")
+        #expect(h.model.feedback?.text == "result")
+        h.model.perform(try row("Log", in: h))
+        try await finish(h, "Log")
+        #expect(h.model.feedback?.text == "logged only")
+        h.model.perform(try row("Bad", in: h))
+        try await finish(h, "Bad")
+        #expect(h.model.feedback?.style == .error)
+        #expect(h.model.feedback?.text == "error: bad input")
+    }
+
+    @Test("Arguments containing NUL never reach the script")
+    func nulArguments() async throws {
+        let h = try harness()
+        try h.folder.script(
+            "args.sh", title: "Args", extra: [#"argument1 { "type": "text", "placeholder": "Value" }"#], body: "echo \"$1\"")
+        load(h)
+        let script = try #require(h.provider.catalog.commands.first)
+        #expect(h.provider.run(script, values: ["argument1": "a\u{0}b"], in: h.model) == nil)
+        #expect(h.model.feedback?.style == .error)
+        #expect(h.provider.runner.jobs.isEmpty)
+        let result = await POSIXScriptLauncher(allowedRoots: [h.folder.url]).run(
+            h.provider.runner.invocation(for: script, arguments: ["a\u{0}b"], timeout: .seconds(5))) { _ in }
+        #expect(result.termination == .failedToLaunch("An argument contains a NUL character."))
+    }
+}
+
+extension ScriptRunnerTests {
+    @Test("While inert, only the script itself or a system interpreter runs, in an allowed folder")
+    func inertLaunchRules() throws {
+        let folder = try ScriptFolder()
+        let script = try folder.write("ok.sh", "#!/bin/bash\necho ok\n")
+        let launcher = POSIXScriptLauncher(allowedRoots: [folder.url])
+        var allowed = invocation(script)
+        try launcher.checkAllowed(allowed)
+        allowed.argv = ["/bin/bash", script.path]
+        try launcher.checkAllowed(allowed)
+        var otherProgram = invocation(script)
+        otherProgram.argv = ["/usr/local/bin/python3", script.path]
+        #expect(throws: SideEffectGuard.Blocked.self) { try launcher.checkAllowed(otherProgram) }
+        var otherFolder = invocation(script)
+        otherFolder.workingDirectory = FileManager.default.homeDirectoryForCurrentUser
+        #expect(throws: SideEffectGuard.Blocked.self) { try launcher.checkAllowed(otherFolder) }
+        // An injected live rule can't make the test host run anything outside the fixtures.
+        let live = POSIXScriptLauncher(sideEffects: SideEffectGuard(mode: .live), allowedRoots: [])
+        #expect(throws: SideEffectGuard.Blocked.self) { try live.checkAllowed(invocation(script)) }
     }
 }

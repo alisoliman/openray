@@ -13,6 +13,14 @@ extension SettingsPane {
 struct ScriptsPane: View {
     let model: LauncherModel
     @State private var showsCreate = false
+    /// The folder waiting for the person's approval before its scripts can run.
+    @State private var approving: FolderApproval?
+
+    struct FolderApproval: Identifiable {
+        var record: ScriptDirectoryRecord
+        var resolvedPath: String
+        var id: UUID { record.id }
+    }
 
     private var provider: ScriptCommandProvider? {
         model.registry.provider(id: ScriptCommandProvider.registration.id) as? ScriptCommandProvider
@@ -35,6 +43,17 @@ struct ScriptsPane: View {
                 CreateScriptSheet(model: model, provider: provider) { showsCreate = false }
             }
         }
+        .alert(item: $approving) { approval in
+            Alert(
+                title: Text("Allow scripts in “\(approval.record.url?.lastPathComponent ?? "this folder")” to run?"),
+                message: Text(
+                    "OpenRay will run scripts from \(approval.resolvedPath) when you use them, and inline scripts there refresh on their own. Allow only folders you trust. If the folder is moved or replaced, OpenRay asks again."
+                ),
+                primaryButton: .default(Text("Allow")) {
+                    provider?.setDirectory(approval.record.id, enabled: true, in: model)
+                },
+                secondaryButton: .cancel())
+        }
     }
 
     @ViewBuilder private func foldersSection(_ provider: ScriptCommandProvider) -> some View {
@@ -42,14 +61,29 @@ struct ScriptsPane: View {
         Section {
             ForEach(directories) { record in
                 let count = provider.catalog.commands.filter { $0.directoryID == record.id }.count
-                let problem = provider.catalog.scan.unreadable[record.id]
+                let active = provider.isActive(record, in: model)
+                let problem =
+                    provider.catalog.scan.unreadable[record.id].map { "Can't read this folder. \($0)" }
+                    ?? (record.isEnabled && !active
+                        ? "Not allowed on this Mac yet: it came from an archive, or the folder changed. Turn it on to allow it."
+                        : nil)
                 LabeledContent {
                     HStack(spacing: 8) {
                         Toggle(
                             "Use \(record.url?.lastPathComponent ?? "folder")",
                             isOn: Binding(
-                                get: { record.isEnabled },
-                                set: { provider.setDirectory(record.id, enabled: $0, in: model) })
+                                get: { active },
+                                set: { enabled in
+                                    if enabled {
+                                        guard let url = record.url, let identity = FolderIdentity.current(of: url) else {
+                                            model.feedback = .error("That folder isn't there anymore.")
+                                            return
+                                        }
+                                        approving = FolderApproval(record: record, resolvedPath: identity.resolvedPath)
+                                    } else {
+                                        provider.setDirectory(record.id, enabled: false, in: model)
+                                    }
+                                })
                         )
                         .labelsHidden().toggleStyle(.switch).settingsSwitch()
                         Button("Reveal") { reveal(record.url) }.disabled(record.url == nil)
@@ -58,8 +92,8 @@ struct ScriptsPane: View {
                 } label: {
                     SettingRowLabel(
                         title: record.url?.lastPathComponent ?? "Folder without a path",
-                        detail: problem.map { "Can't read this folder. \($0)" }
-                            ?? "\(record.url.map(LauncherModel.shortenedPath) ?? "") · \(count) \(count == 1 ? "command" : "commands")")
+                        detail: problem
+                            ?? "\(record.url.map(LauncherModel.shortenedPath) ?? "") · \(active ? "\(count) \(count == 1 ? "command" : "commands")" : "Off")")
                 }
             }
             HStack {

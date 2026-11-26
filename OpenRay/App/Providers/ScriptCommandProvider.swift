@@ -107,12 +107,20 @@ final class ScriptCommandProvider: CommandProvider {
                 self.startSchedulerIfNeeded(model)
             }
         }
-        catalog.setDirectories(model.store.database.scriptDirectories, synchronously: synchronously)
+        catalog.setDirectories(
+            model.store.database.scriptDirectories, approvals: approvals(for: model).approvals.scriptFolders,
+            synchronously: synchronously)
         startSchedulerIfNeeded(model)
     }
 
+    /// This Mac's approvals for the launcher's library.
+    func approvals(for model: LauncherModel) -> LocalApprovalStore { LocalApprovalStore.for(model.store) }
+
     private func scheduleSynchronization(_ model: LauncherModel) {
-        guard !pendingDirectorySync, model.store.database.scriptDirectories != catalog.directories else { return }
+        guard !pendingDirectorySync,
+            model.store.database.scriptDirectories != catalog.directories
+                || approvals(for: model).approvals.scriptFolders != catalog.approvals
+        else { return }
         pendingDirectorySync = true
         DispatchQueue.main.async { [weak self, weak model] in
             guard let self, let model else { return }
@@ -271,6 +279,14 @@ final class ScriptCommandProvider: CommandProvider {
     /// Runs a script in its output mode. A script that's already running isn't started twice.
     @discardableResult
     func run(_ script: ScriptCommand, values: [String: String], in model: LauncherModel) -> ScriptJob? {
+        guard !model.store.database.disabledCommandIDs.contains(script.id) else {
+            model.feedback = .warning("“\(script.title.truncatedForFeedback)” is turned off.")
+            return nil
+        }
+        guard !values.values.contains(where: { $0.contains("\0") }) else {
+            model.feedback = .error("An argument contains a NUL character, so the script wasn't run.")
+            return nil
+        }
         if let running = runner.runningJob(for: script.id) {
             if script.mode == .fullOutput {
                 present(running, in: model)
@@ -341,17 +357,26 @@ final class ScriptCommandProvider: CommandProvider {
         }
     }
 
-    /// Runs every auto-refreshing inline script that's due.
+    /// Runs every auto-refreshing inline script that's due. Scripts that ask for confirmation,
+    /// or whose command is turned off, never run on their own; ↩ runs them through the usual checks.
     func refreshDueInlineScripts(in model: LauncherModel, now: Date = .now) {
         let running = Set(runner.runningJobs.map(\.command.id))
-        for script in ScriptInlineSchedule.due(catalog.commands, lastRun: inline.lastRun, running: running, now: now) {
+        let eligible = Self.automaticallyRefreshable(catalog.commands, disabled: model.store.database.disabledCommandIDs)
+        for script in ScriptInlineSchedule.due(eligible, lastRun: inline.lastRun, running: running, now: now) {
             runInline(script, in: model, reportsFailure: false, now: now)
         }
     }
 
+    /// The scripts the timer may run without anyone asking.
+    nonisolated static func automaticallyRefreshable(_ commands: [ScriptCommand], disabled: Set<String>) -> [ScriptCommand] {
+        commands.filter { !$0.metadata.needsConfirmation && !disabled.contains($0.id) }
+    }
+
     private func startSchedulerIfNeeded(_ model: LauncherModel) {
         guard refreshesAutomatically, schedulerTask == nil,
-            !ScriptInlineSchedule.autoRefreshing(catalog.commands).isEmpty
+            !ScriptInlineSchedule.autoRefreshing(
+                Self.automaticallyRefreshable(catalog.commands, disabled: model.store.database.disabledCommandIDs)
+            ).isEmpty
         else { return }
         schedulerTask = Task { [weak self, weak model] in
             while !Task.isCancelled {
@@ -471,8 +496,7 @@ final class ScriptCommandProvider: CommandProvider {
                     key: "r", modifiers: .command, group: .item
                 ) { [weak self, weak model] in
                     guard let self, let model else { return }
-                    let script = self.catalog.command(withID: job.command.id) ?? job.command
-                    self.run(script, values: job.values, in: model)
+                    self.runAgain(job, in: model)
                 })
         }
         if let last = job.execution?.lastLine {
@@ -483,6 +507,22 @@ final class ScriptCommandProvider: CommandProvider {
         }
         entries += fileActions(for: job.command, in: model)
         return entries
+    }
+
+    /// Runs a finished run's script again, as ↩ on its row would: through the registry, with
+    /// the current command, so a removed or turned-off script, a confirmation and the arguments'
+    /// checks all apply again.
+    func runAgain(_ job: ScriptJob, in model: LauncherModel) {
+        guard var item = model.commandItems.first(where: { $0.id == job.command.id }),
+            case .provided(var ref) = item.action, catalog.command(withID: job.command.id) != nil
+        else {
+            model.feedback = .error("“\(job.command.title.truncatedForFeedback)” is no longer available.")
+            return
+        }
+        ref.arguments = job.values
+        item.action = .provided(ref)
+        model.selectedID = item.id
+        model.perform(item)
     }
 
     private func stopEntry(for job: ScriptJob) -> ActionEntry {
@@ -546,9 +586,10 @@ final class ScriptCommandProvider: CommandProvider {
             model.feedback = .info("That folder is already in the list.")
             return false
         }
-        let saved = model.store.update { database in
-            database.scriptDirectories.append(ScriptDirectoryRecord(path: path, addedAt: .now))
-        }
+        let record = ScriptDirectoryRecord(path: path, addedAt: .now)
+        let saved = model.store.update { database in database.scriptDirectories.append(record) }
+        // Chosen here, on this Mac, so it's allowed as it is now.
+        if saved { approvals(for: model).approve(record) }
         if saved { synchronize(with: model) }
         return saved
     }
@@ -556,17 +597,34 @@ final class ScriptCommandProvider: CommandProvider {
     @discardableResult
     func removeDirectory(_ id: UUID, in model: LauncherModel) -> Bool {
         let saved = model.store.update { $0.scriptDirectories.removeAll { $0.id == id } }
+        if saved { approvals(for: model).revoke(id) }
         if saved { synchronize(with: model) }
         return saved
     }
 
+    /// Whether a folder's scripts run: turned on, and allowed on this Mac as the folder is now.
+    func isActive(_ record: ScriptDirectoryRecord, in model: LauncherModel) -> Bool {
+        record.isEnabled && approvals(for: model).isApproved(record)
+    }
+
+    /// Turns a folder on or off. Turning it on is the person's approval, on this Mac, of the
+    /// folder as it is now (Settings asks first, showing its resolved path); off forgets it.
     @discardableResult
     func setDirectory(_ id: UUID, enabled: Bool, in model: LauncherModel) -> Bool {
+        guard let record = model.store.database.scriptDirectories.first(where: { $0.id == id }) else { return false }
+        if enabled {
+            guard approvals(for: model).approve(record) else {
+                model.feedback = .error("That folder isn't there anymore.")
+                return false
+            }
+        } else {
+            approvals(for: model).revoke(id)
+        }
         let saved = model.store.update { database in
             guard let index = database.scriptDirectories.firstIndex(where: { $0.id == id }) else { return }
             database.scriptDirectories[index].isEnabled = enabled
         }
-        if saved { synchronize(with: model) }
+        synchronize(with: model)
         return saved
     }
 

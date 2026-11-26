@@ -30,31 +30,44 @@ enum ScriptTermination: Hashable, Sendable {
 /// What a finished run printed and how it ended.
 struct ScriptExecution: Hashable, Sendable {
     var termination: ScriptTermination
-    /// Standard output and standard error, interleaved as they were written.
+    /// Standard output and standard error, interleaved as they were read. Full Output shows this.
     var output: String
+    /// Standard output alone. Nil when it wasn't kept apart (canned results), which reads `output`.
+    var standardOutput: String? = nil
     var duration: Duration
     /// True when older output was dropped to stay within the limit.
     var isTruncated = false
 
     var succeeded: Bool { termination == .exited(0) }
 
-    /// The output's lines with ANSI codes removed, blank lines dropped.
-    var plainLines: [String] {
-        ANSIText.strip(output).split(whereSeparator: \.isNewline)
+    static func lines(_ text: String) -> [String] {
+        ANSIText.strip(text).split(whereSeparator: \.isNewline)
             .map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty }
     }
 
-    var firstLine: String? { plainLines.first }
-    var lastLine: String? { plainLines.last }
+    /// Every line, both streams, with ANSI codes removed and blank lines dropped.
+    var plainLines: [String] { Self.lines(output) }
 
-    /// A sentence for a failure toast: the last line, else how it ended.
+    /// The lines a result is read from: standard output's, so a warning on standard error never
+    /// stands in for the answer. A script that printed only to standard error (AppleScript's
+    /// `log` does) is read from everything.
+    var resultLines: [String] {
+        let standard = standardOutput.map(Self.lines) ?? []
+        return standard.isEmpty ? plainLines : standard
+    }
+
+    var firstLine: String? { resultLines.first }
+    var lastLine: String? { resultLines.last }
+
+    /// A sentence for a failure toast: the last line of everything printed, which includes the
+    /// diagnostics on standard error, else how it ended.
     func failureMessage(title: String) -> String {
         switch termination {
         case .timedOut: return "“\(title.truncatedForFeedback)” took too long and was stopped."
         case .cancelled: return "“\(title.truncatedForFeedback)” was stopped."
         case .failedToLaunch(let reason): return "“\(title.truncatedForFeedback)” couldn't run. \(reason)"
-        case .signaled(let signal): return lastLine ?? "“\(title.truncatedForFeedback)” ended with signal \(signal)."
-        case .exited(let code): return lastLine ?? "“\(title.truncatedForFeedback)” failed with exit code \(code)."
+        case .signaled(let signal): return plainLines.last ?? "“\(title.truncatedForFeedback)” ended with signal \(signal)."
+        case .exited(let code): return plainLines.last ?? "“\(title.truncatedForFeedback)” failed with exit code \(code)."
         }
     }
 }
@@ -84,9 +97,10 @@ enum ScriptEnvironment {
 }
 
 /// Spawns scripts with `posix_spawn` in a new process group, standard input from /dev/null and
-/// one pipe for standard output and error. A timeout or cancel sends SIGTERM to the group, then
-/// SIGKILL a second later. While OpenRay is inert (tests, verification), it refuses every script
-/// outside `allowedRoots`.
+/// one pipe each for standard output and standard error. A timeout or cancel sends SIGTERM to the
+/// group, then SIGKILL a second later. While OpenRay is inert (tests, verification), it refuses
+/// every script outside `allowedRoots`, any program other than the script itself or a system
+/// interpreter, and any working directory outside `allowedRoots`.
 struct POSIXScriptLauncher: ScriptProcessLaunching {
     var sideEffects: SideEffectGuard = .current
     /// Folders whose scripts may run while inert: tests pass the temporary folder they wrote.
@@ -94,6 +108,9 @@ struct POSIXScriptLauncher: ScriptProcessLaunching {
     /// How long to keep reading after the script exits, for output its children still write.
     var drainGrace: Duration = .seconds(1)
     var killGrace: Duration = .seconds(1)
+
+    /// Where interpreters may live while inert.
+    static let systemInterpreterFolders = ["/bin/", "/usr/bin/"]
 
     func run(_ invocation: ScriptInvocation, onOutput: @escaping @Sendable (String) -> Void) async -> ScriptExecution {
         let start = ContinuousClock.now
@@ -105,33 +122,45 @@ struct POSIXScriptLauncher: ScriptProcessLaunching {
             return ScriptExecution(termination: .cancelled, output: "", duration: ContinuousClock.now - start)
         }
         guard let program = invocation.argv.first else { return failure("There's nothing to run.") }
+        // C strings end at NUL, so a value containing one would reach the script cut short.
+        guard !invocation.argv.contains(where: { $0.contains("\0") }) else {
+            return failure("An argument contains a NUL character.")
+        }
 
-        var fds: [Int32] = [-1, -1]
-        guard pipe(&fds) == 0 else { return failure(String(cString: strerror(errno))) }
-        let readFD = fds[0]
-        let writeFD = fds[1]
-        _ = fcntl(readFD, F_SETFD, FD_CLOEXEC)
+        var outputPipe: [Int32] = [-1, -1]
+        var errorPipe: [Int32] = [-1, -1]
+        guard pipe(&outputPipe) == 0 else { return failure(String(cString: strerror(errno))) }
+        guard pipe(&errorPipe) == 0 else {
+            close(outputPipe[0])
+            close(outputPipe[1])
+            return failure(String(cString: strerror(errno)))
+        }
+        _ = fcntl(outputPipe[0], F_SETFD, FD_CLOEXEC)
+        _ = fcntl(errorPipe[0], F_SETFD, FD_CLOEXEC)
 
         var pid: pid_t = 0
         let spawnError = Self.spawn(
             program: program, argv: invocation.argv, environment: invocation.environment,
-            workingDirectory: invocation.workingDirectory.path, output: writeFD, pid: &pid)
-        close(writeFD)
+            workingDirectory: invocation.workingDirectory.path, output: outputPipe[1], error: errorPipe[1], pid: &pid)
+        close(outputPipe[1])
+        close(errorPipe[1])
         if spawnError != 0 {
-            close(readFD)
+            close(outputPipe[0])
+            close(errorPipe[0])
             return failure(Self.launchFailure(spawnError, program: program))
         }
 
-        let process = SpawnedScript(pid: pid, readFD: readFD, limit: invocation.outputLimit, onOutput: onOutput)
+        let process = SpawnedScript(
+            pid: pid, outputFD: outputPipe[0], errorFD: errorPipe[0], limit: invocation.outputLimit, onOutput: onOutput)
         let killGrace = killGrace
         let drainGrace = drainGrace
         return await withTaskCancellationHandler {
             await withCheckedContinuation { (continuation: CheckedContinuation<ScriptExecution, Never>) in
-                process.start(timeout: invocation.timeout, killGrace: killGrace, drainGrace: drainGrace) { termination, output, truncated in
+                process.start(timeout: invocation.timeout, killGrace: killGrace, drainGrace: drainGrace) { result in
                     continuation.resume(
                         returning: ScriptExecution(
-                            termination: termination, output: output, duration: ContinuousClock.now - start,
-                            isTruncated: truncated))
+                            termination: result.termination, output: result.output, standardOutput: result.standardOutput,
+                            duration: ContinuousClock.now - start, isTruncated: result.truncated))
                 }
             }
         } onCancel: {
@@ -140,13 +169,23 @@ struct POSIXScriptLauncher: ScriptProcessLaunching {
     }
 
     func checkAllowed(_ invocation: ScriptInvocation) throws {
-        guard sideEffects.isInert else { return }
-        let script = invocation.scriptURL.standardizedFileURL.resolvingSymlinksInPath().path
-        let allowed = allowedRoots.contains { root in
-            let root = root.standardizedFileURL.resolvingSymlinksInPath().path
-            return script.hasPrefix(root.hasSuffix("/") ? root : root + "/")
+        guard sideEffects.isEffectivelyInert else { return }
+        func resolved(_ url: URL) -> String { url.standardizedFileURL.resolvingSymlinksInPath().path }
+        func isInsideRoots(_ path: String) -> Bool {
+            allowedRoots.contains { root in
+                let root = resolved(root)
+                return path == root || path.hasPrefix(root.hasSuffix("/") ? root : root + "/")
+            }
         }
-        if !allowed { try sideEffects.check("running script commands") }
+        let script = resolved(invocation.scriptURL)
+        let program = invocation.argv.first.map { resolved(URL(fileURLWithPath: $0)) } ?? ""
+        let programIsAllowed =
+            program == script || Self.systemInterpreterFolders.contains { program.hasPrefix($0) }
+        guard isInsideRoots(script), programIsAllowed, isInsideRoots(resolved(invocation.workingDirectory)) else {
+            try sideEffects.check("running script commands")
+            try SideEffectGuard.check("running script commands")
+            return
+        }
     }
 
     private static func launchFailure(_ code: Int32, program: String) -> String {
@@ -163,7 +202,7 @@ struct POSIXScriptLauncher: ScriptProcessLaunching {
     /// Returns 0 or an errno.
     private static func spawn(
         program: String, argv: [String], environment: [String: String], workingDirectory: String, output: Int32,
-        pid: inout pid_t
+        error: Int32, pid: inout pid_t
     ) -> Int32 {
         var attributes: posix_spawnattr_t?
         posix_spawnattr_init(&attributes)
@@ -187,7 +226,7 @@ struct POSIXScriptLauncher: ScriptProcessLaunching {
         defer { posix_spawn_file_actions_destroy(&actions) }
         posix_spawn_file_actions_addopen(&actions, 0, "/dev/null", O_RDONLY, 0)
         posix_spawn_file_actions_adddup2(&actions, output, 1)
-        posix_spawn_file_actions_adddup2(&actions, output, 2)
+        posix_spawn_file_actions_adddup2(&actions, error, 2)
         posix_spawn_file_actions_addchdir(&actions, workingDirectory)
 
         let cArguments = argv.map { strdup($0) } + [nil]
@@ -200,30 +239,41 @@ struct POSIXScriptLauncher: ScriptProcessLaunching {
     }
 }
 
-/// A spawned script: reads its pipe, reaps it, and stops it on request. Its state is guarded by a lock.
+/// A spawned script: reads its two pipes, reaps it, and stops it on request. Its state is guarded by a lock.
 private final class SpawnedScript: @unchecked Sendable {
+    struct Result: Sendable {
+        var termination: ScriptTermination
+        var output: String
+        var standardOutput: String
+        var truncated: Bool
+    }
+
     let pid: pid_t
-    private let readFD: Int32
+    private let outputFD: Int32
+    private let errorFD: Int32
     private let limit: Int
     private let onOutput: @Sendable (String) -> Void
     private let lock = NSLock()
     private var reason: ScriptTermination?
     private var exited = false
     private var stopReading = false
-    private var buffer = Data()
+    private var waitStatus: Int32 = 0
+    /// Both streams, interleaved in the order they were read.
+    private var combined = Data()
+    private var standardOutput = Data()
     private var truncated = false
-    private var pending = Data()
+    private var pending: [Int32: Data] = [:]
 
-    init(pid: pid_t, readFD: Int32, limit: Int, onOutput: @escaping @Sendable (String) -> Void) {
+    init(pid: pid_t, outputFD: Int32, errorFD: Int32, limit: Int, onOutput: @escaping @Sendable (String) -> Void) {
         self.pid = pid
-        self.readFD = readFD
+        self.outputFD = outputFD
+        self.errorFD = errorFD
         self.limit = max(1_024, limit)
         self.onOutput = onOutput
     }
 
     func start(
-        timeout: Duration, killGrace: Duration, drainGrace: Duration,
-        completion: @escaping @Sendable (ScriptTermination, String, Bool) -> Void
+        timeout: Duration, killGrace: Duration, drainGrace: Duration, completion: @escaping @Sendable (Result) -> Void
     ) {
         let group = DispatchGroup()
         group.enter()
@@ -240,7 +290,7 @@ private final class SpawnedScript: @unchecked Sendable {
                 exited = true
                 waitStatus = finalStatus
             }
-            // Children that outlive the script may hold the pipe open; stop reading soon after.
+            // Children that outlive the script may hold the pipes open; stop reading soon after.
             DispatchQueue.global().asyncAfter(deadline: .now() + drainGrace.timeInterval) { [self] in
                 lock.withLock { stopReading = true }
             }
@@ -250,18 +300,20 @@ private final class SpawnedScript: @unchecked Sendable {
             terminate(.timedOut, killGrace: killGrace)
         }
         group.notify(queue: .global()) { [self] in
-            close(readFD)
-            let (termination, output, truncated) = lock.withLock { () -> (ScriptTermination, String, Bool) in
-                let output = String(decoding: buffer, as: UTF8.self)
-                if let reason { return (reason, output, self.truncated) }
+            close(outputFD)
+            close(errorFD)
+            let result = lock.withLock { () -> Result in
+                let output = String(decoding: combined, as: UTF8.self)
+                let standard = String(decoding: standardOutput, as: UTF8.self)
+                if let reason { return Result(termination: reason, output: output, standardOutput: standard, truncated: truncated) }
                 let code = waitStatus & 0x7F
-                return (code == 0 ? .exited((waitStatus >> 8) & 0xFF) : .signaled(code), output, self.truncated)
+                return Result(
+                    termination: code == 0 ? .exited((waitStatus >> 8) & 0xFF) : .signaled(code), output: output,
+                    standardOutput: standard, truncated: truncated)
             }
-            completion(termination, output, truncated)
+            completion(result)
         }
     }
-
-    private var waitStatus: Int32 = 0
 
     /// Stops the group: SIGTERM now, SIGKILL after the grace period if it's still running. The
     /// first reason wins; a script that already exited is left alone.
@@ -283,49 +335,63 @@ private final class SpawnedScript: @unchecked Sendable {
 
     private func readLoop() {
         var chunk = [UInt8](repeating: 0, count: 65_536)
-        while true {
+        var open: [Int32] = [outputFD, errorFD]
+        while !open.isEmpty {
             if lock.withLock({ stopReading }) { break }
-            var descriptor = pollfd(fd: readFD, events: Int16(POLLIN), revents: 0)
-            let ready = poll(&descriptor, 1, 100)
+            var descriptors = open.map { pollfd(fd: $0, events: Int16(POLLIN), revents: 0) }
+            let ready = poll(&descriptors, nfds_t(descriptors.count), 100)
             if ready < 0 {
                 if errno == EINTR { continue }
                 break
             }
             guard ready > 0 else { continue }
-            let count = read(readFD, &chunk, chunk.count)
-            if count < 0, errno == EINTR { continue }
-            guard count > 0 else { break }
-            append(Data(chunk[0..<count]))
+            for descriptor in descriptors where descriptor.revents != 0 {
+                let count = read(descriptor.fd, &chunk, chunk.count)
+                if count < 0, errno == EINTR { continue }
+                if count <= 0 {
+                    open.removeAll { $0 == descriptor.fd }
+                    continue
+                }
+                append(Data(chunk[0..<count]), from: descriptor.fd)
+            }
         }
-        flushPending()
+        for fd in [outputFD, errorFD] { flushPending(fd) }
     }
 
-    private func append(_ data: Data) {
+    private func keepTail(_ buffer: inout Data) {
+        guard buffer.count > limit else { return }
+        // Keep the tail, starting after a newline when there's one near the cut.
+        var cut = buffer.count - limit
+        if let newline = buffer[buffer.startIndex + cut..<buffer.endIndex].firstIndex(of: 0x0A),
+            newline - buffer.startIndex - cut < 4_096
+        {
+            cut = newline - buffer.startIndex + 1
+        }
+        buffer = Data(buffer.dropFirst(cut))
+        truncated = true
+    }
+
+    private func append(_ data: Data, from fd: Int32) {
         let text = lock.withLock { () -> String in
-            buffer.append(data)
-            if buffer.count > limit {
-                // Keep the tail, starting after a newline when there's one near the cut.
-                var cut = buffer.count - limit
-                if let newline = buffer[buffer.startIndex + cut..<buffer.endIndex].firstIndex(of: 0x0A),
-                    newline - buffer.startIndex - cut < 4_096
-                {
-                    cut = newline - buffer.startIndex + 1
-                }
-                buffer = Data(buffer.dropFirst(cut))
-                truncated = true
+            combined.append(data)
+            keepTail(&combined)
+            if fd == outputFD {
+                standardOutput.append(data)
+                keepTail(&standardOutput)
             }
-            pending.append(data)
-            let (complete, rest) = ANSIText.splitCompleteUTF8(pending)
-            pending = rest
+            var waiting = pending[fd] ?? Data()
+            waiting.append(data)
+            let (complete, rest) = ANSIText.splitCompleteUTF8(waiting)
+            pending[fd] = rest
             return String(decoding: complete, as: UTF8.self)
         }
         if !text.isEmpty { onOutput(text) }
     }
 
-    private func flushPending() {
+    private func flushPending(_ fd: Int32) {
         let text = lock.withLock { () -> String in
-            defer { pending = Data() }
-            return String(decoding: pending, as: UTF8.self)
+            defer { pending[fd] = Data() }
+            return String(decoding: pending[fd] ?? Data(), as: UTF8.self)
         }
         if !text.isEmpty { onOutput(text) }
     }
