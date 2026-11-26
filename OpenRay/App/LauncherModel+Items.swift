@@ -143,19 +143,12 @@ extension LauncherModel {
         return nil
     }
 
+    /// The Windows grid: WindowCommandProvider's rows for the original twelve layouts, in the
+    /// design system's order. The provider is the one route for every `window.` command.
     var windowItems: [LauncherItem] {
-        // The design system's grid order: halves, quarters, then the rest.
-        let layouts: [WindowLayout] = [
-            .leftHalf, .rightHalf, .topHalf, .bottomHalf, .topLeft, .topRight, .bottomLeft, .bottomRight,
-            .maximize, .center, .nextDisplay, .restore,
-        ]
-        return layouts.map { layout in
-            LauncherItem(
-                id: "window.\(layout.id)", title: layout.title,
-                subtitle: accessibilityAllowed ? "Window layout" : "Needs Accessibility. Press ↩ to enable",
-                symbol: layout.symbol, kind: .window, badge: "Window", keywords: "window resize move tile",
-                action: .window(layout))
-        }
+        let rows = Dictionary(
+            registry.commandItems(in: self).map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
+        return WindowCommandProvider.gridLayouts.compactMap { rows[WindowCommandProvider.commandID($0.command)] }
     }
 
     var commandItems: [LauncherItem] {
@@ -171,8 +164,8 @@ extension LauncherModel {
                 symbol: section.tileSymbol, kind: section.kind, badge: "Command",
                 keywords: "search " + section.title, action: .section(section))
         }
-        // The writing commands come from AIWritingCommandProvider, through the registry below.
-        commands += windowItems
+        // The writing commands come from AIWritingCommandProvider, and the window commands from
+        // WindowCommandProvider, through the registry below.
         commands.append(
             LauncherItem(
                 id: "settings", title: "Settings", subtitle: "Shortcuts, clipboard, permissions and more",

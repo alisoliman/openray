@@ -464,7 +464,7 @@ struct WindowTile: View {
             model.perform(item)
         } label: {
             VStack(spacing: 7) {
-                if case .window(let layout) = item.action {
+                if let layout = WindowCommandProvider.gridLayout(for: item) {
                     MiniScreen(layout: layout).opacity(model.accessibilityAllowed ? 1 : 0.5)
                 }
                 Text(item.title).font(OR.Font.calloutEmphasis)
