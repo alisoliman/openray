@@ -20,6 +20,9 @@ struct ActionBar<Context: View, Actions: View>: View {
     /// False for a bar drawn over another one, so VoiceOver hears each toast once.
     var announces = true
     @Environment(\.actionBarIsCovered) private var isCovered
+    /// The prompt instance drawn at full opacity. A new or uncovered prompt fades in from nothing,
+    /// and only once that has finished does the bar report it shown.
+    @State private var drawnPrompt: String?
 
     var body: some View {
         HStack(spacing: 6) {
@@ -31,11 +34,13 @@ struct ActionBar<Context: View, Actions: View>: View {
                         Text("\(Text(confirmation.question).font(OR.Font.calloutEmphasis).foregroundStyle(OR.Color.text)) \(Text(confirmation.detail).foregroundStyle(OR.Color.text2))")
                             .lineLimit(1)
                     }
+                    .opacity(drawnPrompt == (confirmationInstance ?? confirmation.id) ? 1 : 0)
                     .transition(.opacity)
-                    // A covered bar reports nothing until it's uncovered. The report starts the
-                    // prompt's exposure; the model waits out its fade-in and the panel's reveal.
-                    .onAppear { reportShown(confirmation) }
-                    .onChange(of: "\(confirmationInstance ?? confirmation.id)/\(isCovered)") { reportShown(confirmation) }
+                    // A covered bar reports nothing until it's uncovered. The report comes after the
+                    // fade-in has finished, so the prompt has really been drawn; the model also
+                    // waits for the panel's reveal to finish.
+                    .onAppear { revealPrompt(confirmation) }
+                    .onChange(of: "\(confirmationInstance ?? confirmation.id)/\(isCovered)") { revealPrompt(confirmation) }
                 } else if let feedback {
                     ToastLabel(feedback: feedback).transition(.opacity)
                 } else {
@@ -79,9 +84,20 @@ struct ActionBar<Context: View, Actions: View>: View {
 }
 
 extension ActionBar {
-    fileprivate func reportShown(_ confirmation: ActionConfirmation) {
-        guard !isCovered else { return }
-        onConfirmationShown?(confirmationInstance ?? confirmation.id)
+    /// Fades the prompt in from nothing, then reports it shown once the fade has finished.
+    fileprivate func revealPrompt(_ confirmation: ActionConfirmation) {
+        let instance = confirmationInstance ?? confirmation.id
+        guard !isCovered else {
+            drawnPrompt = nil
+            return
+        }
+        drawnPrompt = nil
+        let report = onConfirmationShown
+        withAnimation(OR.Motion.quick, completionCriteria: .logicallyComplete) {
+            drawnPrompt = instance
+        } completion: {
+            report?(instance)
+        }
     }
 }
 

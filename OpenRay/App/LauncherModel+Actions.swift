@@ -27,9 +27,10 @@ extension LauncherModel {
 
     func performSelected() {
         if confirmation != nil {
-            // Return itself is answered by the panel before any field sees it. Anything else that
-            // submits (insertNewline: from a key binding, an accessibility action) goes through
-            // the same fresh-key and visibility checks.
+            // Return itself is answered by the panel, from its own key event, before any field
+            // sees it. A field's submit (insertNewline: from a key binding, an accessibility
+            // action) carries no key evidence, so it answers nothing; tests stand in for the
+            // panel's fresh press with `currentKeyPressIsFresh`.
             _ = confirmFromReturn(isRepeat: !currentKeyPressIsFresh())
             return
         }
@@ -417,18 +418,26 @@ extension LauncherModel {
         confirmation.map { "\($0.id)#\(confirmationToken.uuidString)" }
     }
 
-    /// How long a prompt that loses something must have been on screen, uncovered, in a fully
-    /// revealed panel, before it can be approved. Longer than the panel's reveal and the prompt's
-    /// fade-in, so a press or click aimed at what was there before can't answer it.
-    static let minimumPromptExposure: TimeInterval = 0.45
+    /// How long after its presentation completed (the panel's reveal finished and the prompt drawn
+    /// at full opacity) a prompt that loses something can first be approved: about a reaction
+    /// time, so a press or click aimed at what was there before can't answer it.
+    static let minimumPromptExposure: TimeInterval = 0.3
 
     /// A key press while a question is pending. Only a fresh press approves it: a held Return's
     /// autorepeat, or a submission without a key behind it, is consumed, so the press that asked
-    /// can't also answer. Returns whether the key was handled, which is whenever a question is pending.
-    func confirmFromReturn(isRepeat: Bool) -> Bool {
+    /// can't also answer. `pressedAt` is when the key went down: the panel passes its event's own
+    /// time, so a press made before the prompt was on screen never answers it, however late it's
+    /// handled. Nil means now, for tests. Returns whether the key was handled, which is whenever a
+    /// question is pending.
+    func confirmFromReturn(isRepeat: Bool, pressedAt: Date? = nil) -> Bool {
         guard let confirmation else { return false }
-        if !isRepeat, canApprove(confirmation) { confirm(confirmation) }
+        if !isRepeat, canApprove(confirmation, at: pressedAt ?? promptClock()) { confirm(confirmation) }
         return true
+    }
+
+    /// A key event's timestamp (seconds since startup, as `NSEvent.timestamp`) on the prompt clock.
+    func promptDate(forEventTimestamp timestamp: TimeInterval) -> Date {
+        promptClock().addingTimeInterval(timestamp - ProcessInfo.processInfo.systemUptime)
     }
 
     /// The approve button: it answers only the prompt instance it showed, so a click landing as a
@@ -448,11 +457,21 @@ extension LauncherModel {
     /// Whether the pending prompt can be approved now. One that loses something must have been
     /// shown as this very instance, on a surface that is visible and key, for long enough.
     func canApprove(_ confirmation: ActionConfirmation) -> Bool {
+        canApprove(confirmation, at: promptClock())
+    }
+
+    /// Whether an approval made at `time` (a key press's own time) counts. For a prompt that loses
+    /// something, presentation is complete once the panel's reveal has finished and the bar has
+    /// drawn this instance at full opacity; the approval must come `minimumPromptExposure` after
+    /// that, and the prompt must still be on screen now.
+    func canApprove(_ confirmation: ActionConfirmation, at time: Date) -> Bool {
         guard confirmation.requiresVisibleApproval else { return true }
         guard let shown = confirmationShown, shown.instance == confirmationInstanceID,
             let visibleSince = confirmationVisibleSince
         else { return false }
-        return promptClock().timeIntervalSince(max(shown.at, visibleSince)) >= Self.minimumPromptExposure
+        let presented = max(shown.at, visibleSince)
+        // A millisecond's grace for clock arithmetic, far below anything a person can press in.
+        return time.timeIntervalSince(presented) >= Self.minimumPromptExposure - 0.001
     }
 
     /// Since when prompts have been on screen: the panel visible, revealed, opaque and key, with

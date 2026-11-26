@@ -131,9 +131,15 @@ extension LauncherModel {
     /// A provided row that stands for a registered command keeps that identity in snapshots (⌘K,
     /// argument fields), so it's refused rather than run unconfirmed if the command goes away.
     func markingCommandIdentity(_ item: LauncherItem) -> LauncherItem {
-        guard case .provided(var ref) = item.action, !ref.has(.descriptor),
-            registry.descriptor(for: ref, in: self) != nil
-        else { return item }
+        markingCommandIdentity(item, provider: nil, commandIDs: [])
+    }
+
+    /// Also marks a row of `provider` whose ref names one of `commandIDs`: the provider's commands
+    /// when the row was asked for, so a command withdrawn since still marks it.
+    func markingCommandIdentity(_ item: LauncherItem, provider: String?, commandIDs: Set<String>) -> LauncherItem {
+        guard case .provided(var ref) = item.action, !ref.has(.descriptor) else { return item }
+        let wasCommand = ref.provider == provider && commandIDs.contains(ref.id)
+        guard wasCommand || registry.descriptor(for: ref, in: self) != nil else { return item }
         ref.traits.insert(.descriptor)
         var marked = item
         marked.action = .provided(ref)
