@@ -16,7 +16,18 @@ struct NoteEditorBody: View {
                 .focused($focus, equals: .title)
                 .onSubmit { focus = .body }
                 .accessibilityLabel("Note title").accessibilityIdentifier("editor.name")
-            Text(meta).font(OR.Font.callout).foregroundStyle(OR.Color.text2)
+            HStack(spacing: 8) {
+                Text(meta).font(OR.Font.callout).foregroundStyle(OR.Color.text2)
+                Spacer(minLength: 8)
+                // The floating window has Markdown, pins and history; ⌘O moves the note there.
+                Button(action: openInNotesWindow) {
+                    Label("Open in Notes Window", systemImage: "macwindow").labelStyle(TightLabelStyle())
+                }
+                .buttonStyle(.orGhost)
+                .keyboardShortcut("o")
+                .help("Open in Notes Window (⌘O)")
+                .accessibilityIdentifier("editor.openInNotesWindow")
+            }
             TextEditor(text: $draft.content)
                 .font(OR.Font.reading).lineSpacing(6)
                 .scrollContentBackground(.hidden)
@@ -29,6 +40,14 @@ struct NoteEditorBody: View {
         .onAppear {
             DispatchQueue.main.async { focus = draft.name.isEmpty && draft.content.isEmpty ? .title : .body }
         }
+    }
+
+    /// Saves the note, closes this editor and shows the note in the floating Notes window.
+    private func openInNotesWindow() {
+        guard case .note(let note) = draft.editor, !draft.isEmptyNote, draft.saveNote(),
+            let store = NotesCenter.shared.launcher?.store
+        else { return }
+        NotesCenter.shared.openInWindow(noteID: note.id, store: store)
     }
 
     private var meta: String {

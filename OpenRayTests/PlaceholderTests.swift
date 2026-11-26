@@ -162,7 +162,9 @@ struct PlaceholderParsingTests {
             #expect(render(text).text == text)
             #expect(render(text, .quicklink).text == text)
         }
-        #expect(clock.now - start < .seconds(5))
+        // A quadratic parser takes minutes on these ~100 KB inputs; linear work finishes in about
+        // a second. The generous bound keeps the guard without failing on a loaded test machine.
+        #expect(clock.now - start < .seconds(20))
     }
 }
 

@@ -117,6 +117,8 @@ struct LauncherRootView: View {
     @ViewBuilder private func searchBody(groups: [LauncherResultGroup], selected: LauncherItem?) -> some View {
         if showsClipboardOptIn {
             ClipboardOptInView(model: model)
+        } else if let detail = model.providedDetail {
+            DetailView(model: model, content: detail)
         } else if groups.allSatisfy({ $0.items.isEmpty && !$0.isLoading }), !hasNotices {
             ScopeEmptyState(model: model).reportsContentHeight()
                 .frame(maxHeight: .infinity, alignment: .top)

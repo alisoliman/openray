@@ -133,7 +133,7 @@ extension LauncherModel {
     }
 
     var noteItems: [LauncherItem] {
-        store.database.notes.sorted { $0.modifiedAt > $1.modifiedAt }.map { note in
+        store.database.liveNotes.sorted { $0.modifiedAt > $1.modifiedAt }.map { note in
             let body = note.content.split(whereSeparator: \.isNewline)
                 .first { $0.trimmingCharacters(in: .whitespaces) != note.title }
                 .map { String($0.prefix(90)) }

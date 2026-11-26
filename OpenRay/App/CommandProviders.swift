@@ -24,7 +24,14 @@ enum CommandProviders {
         SystemCommandProvider.registration,
         WindowCommandProvider.registration,
         // Slice 6: notes, calendar, focus
+        NotesCommandProvider.registration,
+        CalendarCommandProvider.registration,
+        FocusCommandProvider.registration,
+        MenuBarCommandProvider.registration,
         // Slice 7: AI commands, agents
         // Slice 8: script commands
+        ScriptCommandProvider.registration,
+        DeepLinkRouter.registration,
+        LibraryArchiveProvider.registration,
     ]
 }

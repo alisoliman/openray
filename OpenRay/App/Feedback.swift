@@ -56,6 +56,8 @@ enum ActionConfirmation: Identifiable {
 
     var detail: String {
         switch self {
+        // Notes move to Recently Deleted, where they stay 60 days.
+        case .delete(let item) where item.id.hasPrefix("note."): "It moves to Recently Deleted for 60 days."
         case .delete: "You can't undo this."
         case .discardChanges: "Your edits haven't been saved."
         case .clearClipboardHistory(let pinned) where pinned > 0:

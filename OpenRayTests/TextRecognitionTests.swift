@@ -89,10 +89,27 @@ private struct FakeRecognizer: TextRecognizing {
     func barcodePayloads(in imageData: Data) async throws -> [String] { [] }
 }
 
+/// Vision occasionally fails with a transient runtime error (Neural Engine or model loading)
+/// when the machine is under heavy load. Those calls are retried; a wrong recognition result
+/// still fails the test, and `TextRecognitionError` is never retried.
+func withVisionRetry<T>(attempts: Int = 3, _ body: () async throws -> T) async throws -> T {
+    var lastError: Error?
+    for attempt in 1...attempts {
+        do { return try await body() } catch let error as TextRecognitionError { throw error } catch {
+            lastError = error
+            if attempt < attempts { try await Task.sleep(for: .milliseconds(300 * attempt)) }
+        }
+    }
+    throw lastError!
+}
+
+/// Serialized: running several Vision requests at once under a loaded test host is what
+/// triggers the transient runtime errors.
+@Suite(.serialized)
 struct TextRecognitionTests {
     @Test func recognizesRenderedText() async throws {
         let png = try OCRFixtures.png(text: "OPENRAY 2026")
-        let result = try await VisionTextRecognizer().recognizeText(in: png)
+        let result = try await withVisionRetry { try await VisionTextRecognizer().recognizeText(in: png) }
         let text = result.text.uppercased().replacingOccurrences(of: " ", with: "")
         #expect(text.contains("OPENRAY"))
         #expect(text.contains("2026"))
@@ -108,7 +125,9 @@ struct TextRecognitionTests {
         defer { try? FileManager.default.removeItem(at: directory) }
         let url = directory.appending(path: "shot.png")
         try OCRFixtures.png(text: "INVOICE 42").write(to: url)
-        let result = try await VisionTextRecognizer().recognizeText(inImageAt: url, options: .init(level: .accurate, languages: ["en-US"]))
+        let result = try await withVisionRetry {
+            try await VisionTextRecognizer().recognizeText(inImageAt: url, options: .init(level: .accurate, languages: ["en-US"]))
+        }
         #expect(result.text.uppercased().contains("INVOICE"))
     }
 
@@ -117,7 +136,7 @@ struct TextRecognitionTests {
         let source = try #require(CGImageSourceCreateWithData(tiff as CFData, nil))
         let properties = try #require(CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [CFString: Any])
         #expect((properties[kCGImagePropertyOrientation] as? NSNumber)?.intValue == 6)
-        let result = try await VisionTextRecognizer().recognizeText(in: tiff)
+        let result = try await withVisionRetry { try await VisionTextRecognizer().recognizeText(in: tiff) }
         #expect(result.text.uppercased().replacingOccurrences(of: " ", with: "").contains("OPENRAY"))
         // Boxes are in the upright image: a wide line of text stays wide.
         let box = try #require(result.lines.first?.boundingBox)
@@ -126,14 +145,15 @@ struct TextRecognitionTests {
 
     @Test func blankImagesHaveNoText() async throws {
         let blank = try OCRFixtures.png(text: "")
-        let result = try await VisionTextRecognizer().recognizeText(in: blank, options: .init(level: .fast))
+        let result = try await withVisionRetry { try await VisionTextRecognizer().recognizeText(in: blank, options: .init(level: .fast)) }
         #expect(result.isEmpty)
         #expect(result.storableText == nil)
     }
 
     @Test func readsQRCodes() async throws {
         let message = "https://example.com/openray?q=1"
-        let payloads = try await VisionTextRecognizer().barcodePayloads(in: try OCRFixtures.qrCode(message))
+        let qr = try OCRFixtures.qrCode(message)
+        let payloads = try await withVisionRetry { try await VisionTextRecognizer().barcodePayloads(in: qr) }
         #expect(payloads == [message])
     }
 

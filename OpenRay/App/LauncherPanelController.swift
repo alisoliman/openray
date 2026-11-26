@@ -10,8 +10,10 @@ final class LauncherPanel: NSPanel {
     var panelRect: (() -> CGRect)?
     var onClickOutside: (() -> Void)?
     /// Return confirms a pending action-bar confirmation, even from a text editor. It gets
-    /// whether the key is an autorepeat, which never confirms, and returns whether it handled the key.
-    var confirmAction: ((_ isRepeat: Bool) -> Bool)?
+    /// whether the key is an autorepeat, which never confirms, and the key event's own timestamp
+    /// (seconds since startup), so a press made before the prompt was on screen never answers it,
+    /// however late it's handled. Returns whether it handled the key.
+    var confirmAction: ((_ isRepeat: Bool, _ timestamp: TimeInterval) -> Bool)?
     /// The file Quick Look previews. Quick Look finds its controller through the
     /// responder chain, which ends at this window, so the panel controls it.
     var quickLook: QuickLookPreview? {
@@ -50,7 +52,7 @@ final class LauncherPanel: NSPanel {
         }
         if event.type == .keyDown, [36, 76].contains(event.keyCode),
             event.modifierFlags.intersection([.command, .control, .option, .shift]).isEmpty,
-            !((firstResponder as? NSTextView)?.hasMarkedText() ?? false), confirmAction?(event.isARepeat) == true
+            !((firstResponder as? NSTextView)?.hasMarkedText() ?? false), confirmAction?(event.isARepeat, event.timestamp) == true
         {
             return
         }
@@ -172,10 +174,13 @@ final class LauncherPanelController: NSObject, NSWindowDelegate {
         return window.isVisible && window.alphaValue >= 1 && window.isKeyWindow && window.occlusionState.contains(.visible)
     }
 
-    /// When the panel last started revealing itself or took key, while it's visible and key; nil
-    /// otherwise. Prompt approval counts its exposure from here, so the reveal itself never counts.
+    /// When the panel's reveal animation finished, or it last took key back, while it's visible
+    /// and key; nil otherwise, including during the reveal. Prompt approval counts from here.
     var surfaceVisibleSince: Date? { isSurfaceVisible ? revealedAt : nil }
     private var revealedAt: Date?
+    /// Changes on every show and hide, so a reveal that finishes after the panel hid, or after
+    /// it showed again, never counts.
+    private var revealGeneration = 0
 
     func toggle() {
         if window?.isVisible == true { dismiss() } else { show() }
@@ -218,11 +223,20 @@ final class LauncherPanelController: NSObject, NSWindowDelegate {
         model.focusRequest += 1
         if !wasVisible {
             revealedAt = nil
+            revealGeneration += 1
+            let generation = revealGeneration
             DispatchQueue.main.async { [weak self, model] in
                 window.alphaValue = 1
-                self?.revealedAt = Date()
                 let reduceMotion = NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
-                withAnimation(OR.Motion.resolve(OR.Motion.panel, reduceMotion: reduceMotion)) { model.isPresented = true }
+                withAnimation(
+                    OR.Motion.resolve(OR.Motion.panel, reduceMotion: reduceMotion), completionCriteria: .logicallyComplete
+                ) {
+                    model.isPresented = true
+                } completion: { [weak self] in
+                    // Only once the reveal has finished does the panel count as showing prompts.
+                    guard let self, self.revealGeneration == generation, window.isVisible else { return }
+                    self.revealedAt = Date()
+                }
             }
         }
     }
@@ -230,6 +244,7 @@ final class LauncherPanelController: NSObject, NSWindowDelegate {
     func dismiss(restoreFocus: Bool = true) {
         guard let window, window.isVisible else { return }
         revealedAt = nil
+        revealGeneration += 1
         model.panelDidHide()
         window.orderOut(nil)
         if isQuickLookVisible { QLPreviewPanel.shared().orderOut(nil) }
@@ -419,8 +434,9 @@ final class LauncherPanelController: NSObject, NSWindowDelegate {
         // The margin belongs to whatever is behind it, so focus goes back to that app.
         panel.onClickOutside = { [weak self] in self?.dismiss() }
         panel.onQuickLookEnd = { [weak self] in self?.quickLookDidEnd() }
-        panel.confirmAction = { [weak model] isRepeat in
-            model?.confirmFromReturn(isRepeat: isRepeat) ?? false
+        panel.confirmAction = { [weak model] isRepeat, timestamp in
+            guard let model else { return false }
+            return model.confirmFromReturn(isRepeat: isRepeat, pressedAt: model.promptDate(forEventTimestamp: timestamp))
         }
         let host = NSHostingView(rootView: LauncherRootView(model: model))
         host.sizingOptions = []
@@ -460,10 +476,18 @@ final class OpenRayDelegate: NSObject, NSApplicationDelegate {
             self, selector: #selector(activeApplicationChanged(_:)),
             name: NSWorkspace.didActivateApplicationNotification, object: nil)
         panel.show()
+        // Slice 6: the Notes window reaches the launcher, and menu bar extras start drawing.
+        NotesCenter.shared.launcher = model
+        MenuBarExtrasController.shared.start(model: model)
         Task { await model.start() }
         if let pane = RuntimeMode.settingsPane(arguments: ProcessInfo.processInfo.arguments) {
             model.openSettings(pane)
         }
+    }
+
+    /// openray:// links. The deeplink router asks before running anything.
+    func application(_ application: NSApplication, open urls: [URL]) {
+        DeepLinkRouter.open(urls, source: .currentAppleEventSender(), in: model)
     }
 
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
@@ -473,6 +497,8 @@ final class OpenRayDelegate: NSObject, NSApplicationDelegate {
 
     func applicationWillTerminate(_ notification: Notification) {
         NSWorkspace.shared.notificationCenter.removeObserver(self)
+        NotesCenter.shared.prepareForTermination()
+        MenuBarExtrasController.shared.stop()
         model.stop()
     }
 

@@ -71,7 +71,12 @@ extension SettingsPane {
         .windows,
         .system,
         // Slice 6: notes, calendar, focus
+        .notes,
+        .calendar,
+        .focus,
+        .menuBar,
         // Slice 8: scripts
+        .scripts,
     ]
 
     static let secondary: [SettingsPane] = [.permissions, .library, .about]
