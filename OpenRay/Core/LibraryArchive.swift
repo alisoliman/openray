@@ -286,7 +286,10 @@ enum LibraryArchive {
             let full = url.standardizedFileURL.resolvingSymlinksInPath().path
             guard full.hasPrefix(root.path + "/") else { continue }
             let path = String(full.dropFirst(root.path.count + 1))
-            guard !machineLocalFiles.contains(path), !path.hasSuffix(".tmp"), (try? validate(path)) != nil else { continue }
+            // A backup folder inside the library's folder mustn't fold old backups into new ones.
+            guard !machineLocalFiles.contains(path), !path.hasSuffix(".tmp"),
+                url.pathExtension != fileExtension, (try? validate(path)) != nil
+            else { continue }
             files.append((path, url))
         }
         return files.sorted { $0.0 < $1.0 }

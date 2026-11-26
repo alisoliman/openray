@@ -69,12 +69,28 @@ struct LibraryArchiveSections: View {
             LabeledContent {
                 HStack {
                     Button("Export Archive…") { showsExport = true }
-                    Button("Import Archive…") { chooseImport() }.disabled(model.store.isReadOnly)
+                        .sheet(isPresented: $showsExport) {
+                            ExportArchiveSheet(model: model) { result in
+                                showsExport = false
+                                if let result { alert = result }
+                            }
+                        }
+                    Button("Import Archive…") { chooseImport() }
+                        .disabled(model.store.isReadOnly)
+                        .sheet(item: $pendingImport) { pending in
+                            ImportArchiveSheet(model: model, pending: pending) { result in
+                                pendingImport = nil
+                                if let result { alert = result }
+                            }
+                        }
                 }
             } label: {
                 SettingRowLabel(
                     title: "Archive",
                     detail: "One file with your library, clipboard images and other OpenRay data. Choose what goes in, and optionally encrypt it with a passphrase.")
+            }
+            .alert(item: $alert) { alert in
+                Alert(title: Text(alert.title), message: Text(alert.message), dismissButton: .default(Text("OK")))
             }
         } header: {
             Text("Export and Import")
@@ -85,22 +101,6 @@ struct LibraryArchiveSections: View {
         if let scheduler {
             BackupSection(model: model, scheduler: scheduler, settings: scheduler.settings) { alert = $0 }
         }
-        EmptyView()
-            .sheet(isPresented: $showsExport) {
-                ExportArchiveSheet(model: model) { result in
-                    showsExport = false
-                    if let result { alert = result }
-                }
-            }
-            .sheet(item: $pendingImport) { pending in
-                ImportArchiveSheet(model: model, pending: pending) { result in
-                    pendingImport = nil
-                    if let result { alert = result }
-                }
-            }
-            .alert(item: $alert) { alert in
-                Alert(title: Text(alert.title), message: Text(alert.message), dismissButton: .default(Text("OK")))
-            }
     }
 
     private func chooseImport() {

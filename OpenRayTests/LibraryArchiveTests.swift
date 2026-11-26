@@ -271,6 +271,15 @@ struct LibraryArchiveTests {
         #expect(!target.store.replaceLibrary(with: incoming))
     }
 
+    @Test("Backups kept inside the library's folder never end up in new archives")
+    func nestedBackups() throws {
+        let library = try TemporaryLibrary()
+        try library.write("Backups/OpenRay Backup 2026-01-01 0000 00.\(LibraryArchive.fileExtension)", "old archive")
+        try library.write("Backups/readme.txt", "kept")
+        let paths = try LibraryArchive.storeFiles(in: library.folder).map(\.0)
+        #expect(paths == ["Backups/readme.txt"])
+    }
+
     // MARK: Paths
 
     @Test("Archive paths can't leave the library's folder")
