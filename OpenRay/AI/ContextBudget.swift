@@ -168,7 +168,20 @@ struct AttachmentCondenser {
             }
         }
         if !current.isEmpty { parts.append(current) }
-        return parts
+        // A "word" with no breaks (a URL, minified code) can still be too long: halve it.
+        var bounded: [String] = []
+        for part in parts { bounded += await fitting(part, maximumTokens: maximumTokens) }
+        return bounded
+    }
+
+    /// `text` in pieces that each fit, split at character midpoints. Bounded depth, so a
+    /// counter that never says yes can't recurse forever.
+    private func fitting(_ text: String, maximumTokens: Int, depth: Int = 0) async -> [String] {
+        guard text.count > 1, depth < 24, await counter.tokenCount(text) > maximumTokens else { return [text] }
+        let middle = text.index(text.startIndex, offsetBy: text.count / 2)
+        let first = await fitting(String(text[..<middle]), maximumTokens: maximumTokens, depth: depth + 1)
+        let second = await fitting(String(text[middle...]), maximumTokens: maximumTokens, depth: depth + 1)
+        return first + second
     }
 }
 
@@ -208,8 +221,17 @@ struct ChatCondenser {
             let folded = turns.dropLast(keep)
             var source = summary.map { "Summary so far:\n\($0)\n\n" } ?? ""
             source += folded.map { "Person: \($0.prompt)\nAssistant: \($0.response)" }.joined(separator: "\n\n")
-            let newSummary = try await summarizer.summarize(
-                source, focus: "Keep names, decisions, facts and open questions from this conversation.")
+            let focus = "Keep names, decisions, facts and open questions from this conversation."
+            let newSummary: String
+            // One summary request must fit the window with its instructions; a longer history is
+            // summarized in bounded parts first.
+            if await counter.tokenCount(source) + 64 > budget.available {
+                let reduced = try await AttachmentCondenser(counter: counter, summarizer: summarizer)
+                    .fit(source, within: budget.summaryReserve, chunkBudget: budget.chunkBudget, focus: focus)
+                newSummary = reduced.text
+            } else {
+                newSummary = try await summarizer.summarize(source, focus: focus)
+            }
             let rebuilt = AIConversationContext(profile: profile, summary: newSummary, turns: Array(turns.suffix(keep)))
             return Outcome(summary: newSummary, foldedTurns: folded.count, rebuilt: rebuilt)
         }

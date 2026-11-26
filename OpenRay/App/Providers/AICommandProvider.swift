@@ -25,7 +25,8 @@ final class AICommandProvider: CommandProvider {
     var id: String { Self.registration.id }
     var title: String { "AI" }
 
-    /// Argument fields per prompt, so building rows on every keystroke doesn't re-parse.
+    /// Argument fields per prompt, so building rows on every keystroke doesn't re-parse. Prompts
+    /// that reference snippets aren't cached: their fields follow the snippets.
     private var argumentCache: [String: [ArgumentSpec]] = [:]
 
     init() {}
@@ -35,7 +36,7 @@ final class AICommandProvider: CommandProvider {
     func commands(in model: LauncherModel) -> [CommandDescriptor] {
         let hub = model.aiHub
         let available = model.ai.availability.isAvailable
-        var commands = hub.aiCommands.map { command in descriptor(for: command, available: available) }
+        var commands = hub.aiCommands.map { command in descriptor(for: command, available: available, in: model) }
         commands += [
             CommandDescriptor(
                 id: Self.chatID, title: "AI Chat", subtitle: "Saved chats in their own window", kind: .ai,
@@ -64,19 +65,25 @@ final class AICommandProvider: CommandProvider {
         return commands
     }
 
-    private func descriptor(for command: AICommand, available: Bool) -> CommandDescriptor {
+    private func descriptor(for command: AICommand, available: Bool, in model: LauncherModel) -> CommandDescriptor {
         let usable = available || command.performer != .model
         return CommandDescriptor(
             id: command.id, title: command.name,
             subtitle: usable ? LauncherModel.aiCommandSubtitle : "Not available yet", kind: .ai, symbol: command.symbol,
-            keywords: ["AI", "command", command.subtitle].filter { !$0.isEmpty }, arguments: arguments(for: command),
+            keywords: ["AI", "command", command.subtitle].filter { !$0.isEmpty }, arguments: arguments(for: command, in: model),
             mode: .ai, badge: "AI command", detail: usable && !command.subtitle.isEmpty ? command.subtitle : nil,
             isUnavailable: !usable)
     }
 
-    private func arguments(for command: AICommand) -> [ArgumentSpec] {
+    /// The fields a command asks for, planned with the same snippet lookup it runs with, so
+    /// arguments inside referenced snippets get fields too.
+    func arguments(for command: AICommand, in model: LauncherModel) -> [ArgumentSpec] {
+        let template = command.template
+        if template.placeholders.contains(where: { $0.kind == .snippet }) {
+            return template.plan(snippets: PlaceholderValues.snippetLookup(model.store.database)).argumentSpecs
+        }
         if let cached = argumentCache[command.prompt] { return cached }
-        let specs = command.template.plan(snippets: { _ in nil }).argumentSpecs
+        let specs = template.plan(snippets: { _ in nil }).argumentSpecs
         if argumentCache.count > 200 { argumentCache.removeAll() }
         argumentCache[command.prompt] = specs
         return specs
@@ -99,7 +106,13 @@ final class AICommandProvider: CommandProvider {
             hub.openChatWindow()
         case Self.quickFixID:
             model.store.recordUse(of: item.id)
-            run(commandID: hub.settings.quickFixCommandID, arguments: [:], in: model, startsWritingCommands: true)
+            let target = hub.settings.quickFixCommandID
+            // A target that needs a value opens its fields first, then runs on the selection.
+            if let targetItem = model.bindableCommands.first(where: { $0.id == target }), model.needsArguments(targetItem) {
+                model.beginArguments(for: targetItem)
+                return
+            }
+            run(commandID: target, arguments: [:], in: model, startsWritingCommands: true)
         case Self.createID:
             model.store.recordUse(of: item.id)
             hub.requestEditor(.newCommand)
@@ -107,8 +120,10 @@ final class AICommandProvider: CommandProvider {
             model.store.recordUse(of: item.id)
             hub.requestEditor(.newAgent)
         default:
+            // Rows in Search AI Commands carry the command's own id, so the registry fills
+            // their arguments through the same fields as a root search does.
             let commandID = ref.payload ?? ref.id
-            if ref.id == commandID { model.store.recordUse(of: item.id) }
+            model.store.recordUse(of: commandID)
             run(commandID: commandID, arguments: ref.arguments, in: model, startsWritingCommands: false)
         }
     }
@@ -149,16 +164,17 @@ final class AICommandProvider: CommandProvider {
         guard scope.id == Self.scope.id else { return [] }
         let hub = model.aiHub
         let originals = AIWritingCommandProvider.writingActions.map(AICommand.writingTemplate)
+        // Each row is its command: the same id for favorites, usage, bindings and argument fields.
         return (originals + hub.aiCommands).map { command in
             LauncherItem(
-                id: "aicommand.row.\(command.id)", title: command.name,
+                id: command.id, title: command.name,
                 subtitle: command.isBuiltIn ? "Built-in · \(command.subtitle)" : command.output.title,
                 symbol: command.symbol, kind: .ai, badge: command.isBuiltIn ? "Built-in" : "Custom",
                 keywords: command.subtitle,
                 action: .provided(
                     ProvidedRef(
-                        provider: id, id: "row.\(command.id)", payload: command.id, primaryTitle: "Run Command",
-                        traits: command.isBuiltIn ? [] : [.edit, .delete])))
+                        provider: id, id: command.id, payload: command.id, primaryTitle: "Run Command",
+                        traits: command.isBuiltIn ? [.favorite] : [.favorite, .edit, .delete])))
         }
     }
 
@@ -246,6 +262,8 @@ final class AICommandProvider: CommandProvider {
             guard let model else { return false }
             let saved = model.store.update { database in
                 database.aiCommands.removeAll { $0.id == recordID }
+                // Its alias and hotkey go with it.
+                database.commandBindings.removeAll { $0.targetID == command.id }
                 var settings = AISettings(database: database)
                 if settings.quickFixCommandID == command.id { settings.quickFixCommandID = "ai.proofread" }
                 settings.write(into: &database)
@@ -287,9 +305,9 @@ enum AICommandFiles {
         panel.allowedContentTypes = [.json]
         guard panel.runModal() == .OK, let url = panel.url else { return }
         do {
-            let count = try model.aiHub.importCommands(from: Data(contentsOf: url))
+            let result = try model.aiHub.importCommands(from: Data(contentsOf: url))
             model.panel?.show()
-            model.toast("Imported \(count) AI Command\(count == 1 ? "" : "s")")
+            model.toast(result.summary)
         } catch {
             model.panel?.show()
             model.feedback = .error(error.localizedDescription)

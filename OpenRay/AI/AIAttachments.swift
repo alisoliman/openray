@@ -114,9 +114,11 @@ protocol AIScreenCapturing {
 }
 
 enum AIScreenCaptureError: LocalizedError, Equatable {
-    case noPermission, nothingToCapture, failed(String)
+    case noPermission, nothingToCapture, unknownWindow, failed(String)
     var errorDescription: String? {
         switch self {
+        case .unknownWindow:
+            "OpenRay couldn't tell which window to attach. Open OpenRay over that window, then try again."
         case .noPermission:
             "OpenRay needs Screen Recording permission to attach the screen. Allow it in System Settings › Privacy & Security › Screen & System Audio Recording, then try again."
         case .nothingToCapture: "There's no window to capture."
@@ -130,7 +132,10 @@ enum AIScreenCaptureError: LocalizedError, Equatable {
 struct LiveScreenCapture: AIScreenCapturing {
     var sideEffects: SideEffectGuard = .current
 
-    var hasPermission: Bool { !sideEffects.isInert && CGPreflightScreenCaptureAccess() }
+    /// Inert where either this adapter's rule or the process's is (tests, verification).
+    private var isInert: Bool { sideEffects.isInert || SideEffectGuard.isInert }
+
+    var hasPermission: Bool { !isInert && CGPreflightScreenCaptureAccess() }
 
     func requestPermission() -> Bool {
         guard (try? sideEffects.check("asking for Screen Recording permission")) != nil else { return false }
@@ -147,11 +152,11 @@ struct LiveScreenCapture: AIScreenCapturing {
         let title: String
         switch target {
         case .focusedWindow(let pid):
-            let candidates = content.windows.filter {
-                $0.windowLayer == 0 && $0.isOnScreen && $0.owningApplication?.processID != ownPID
-                    && (pid == nil || $0.owningApplication?.processID == pid)
-            }
-            guard let window = candidates.first else { throw AIScreenCaptureError.nothingToCapture }
+            // Only the app OpenRay opened over, and its frontmost window in on-screen order.
+            guard let pid, pid != ownPID else { throw AIScreenCaptureError.unknownWindow }
+            guard let frontID = Self.frontmostWindowID(of: pid),
+                let window = content.windows.first(where: { $0.windowID == frontID })
+            else { throw AIScreenCaptureError.nothingToCapture }
             filter = SCContentFilter(desktopIndependentWindow: window)
             configuration.width = Int(window.frame.width * 2)
             configuration.height = Int(window.frame.height * 2)
@@ -170,6 +175,19 @@ struct LiveScreenCapture: AIScreenCapturing {
             throw AIScreenCaptureError.failed("The capture couldn't be encoded.")
         }
         return (png, title.isEmpty ? "Window" : title)
+    }
+}
+
+extension LiveScreenCapture {
+    /// The frontmost normal window of an app, from the window server's front-to-back order.
+    static func frontmostWindowID(of pid: pid_t) -> CGWindowID? {
+        guard let list = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID)
+            as? [[String: Any]]
+        else { return nil }
+        let entry = list.first { info in
+            (info[kCGWindowOwnerPID as String] as? pid_t) == pid && (info[kCGWindowLayer as String] as? Int) == 0
+        }
+        return (entry?[kCGWindowNumber as String] as? NSNumber).map { CGWindowID($0.uint32Value) }
     }
 }
 

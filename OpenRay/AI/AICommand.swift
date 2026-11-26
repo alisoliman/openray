@@ -84,9 +84,16 @@ struct AICommand: Identifiable, Hashable, Sendable {
             duplicatedFrom: duplicatedFrom, createdAt: createdAt)
     }
 
-    /// A custom copy that can be edited.
+    /// A custom copy that can be edited. Custom commands run on the model, so a copy of
+    /// Translate gets an explicit translation prompt with the same language choices.
     func duplicate(named name: String? = nil) -> AICommandRecord {
-        AICommandRecord(
+        let prompt: String =
+            switch performer {
+            case .model: self.prompt
+            case .translation(let argument):
+                "Translate the following text into {argument name=\"\(argument)\" options=\"\(TranslationLanguages.all.map(\.name).joined(separator: ", "))\" default=\"English\" | raw}. Keep its meaning, tone and formatting. Return only the translation.\n\n{selection}"
+            }
+        return AICommandRecord(
             id: UUID(), name: name ?? "\(self.name) Copy", symbol: symbol, prompt: prompt, creativity: creativity.rawValue,
             reasoning: reasoning?.rawValue, guardrail: guardrail.rawValue, output: output.rawValue,
             duplicatedFrom: duplicatedFrom ?? id, createdAt: .now)
@@ -253,8 +260,21 @@ enum AICommandRenderer {
 /// Exported files use the same keys, sorted.
 enum AICommandTransfer {
     static let maximumBytes = 2_000_000
+    static let maximumPromptCharacters = 8_000
 
-    static func importCommands(from data: Data) throws -> [AICommandRecord] {
+    /// What an import adds, and how many rows it left out (no name or prompt, or a prompt
+    /// longer than `maximumPromptCharacters`). Nothing is cut short.
+    struct ImportResult: Equatable {
+        var records: [AICommandRecord]
+        var skipped: Int
+
+        var summary: String {
+            let added = "Imported \(records.count) AI Command\(records.count == 1 ? "" : "s")"
+            return skipped == 0 ? added : added + "; skipped \(skipped) without a name or prompt, or with a prompt over 8,000 characters"
+        }
+    }
+
+    static func importCommands(from data: Data) throws -> ImportResult {
         guard data.count <= maximumBytes else { throw LibraryValidationError("That file is too large to import.") }
         let object = try? JSONSerialization.jsonObject(with: data)
         let items: [[String: Any]]
@@ -267,21 +287,24 @@ enum AICommandTransfer {
         }
         let records = items.compactMap { item -> AICommandRecord? in
             let name = (item["name"] as? String) ?? (item["title"] as? String)
-            guard let name, !name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
-                let prompt = item["prompt"] as? String, !prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            guard let name, !name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty, name.count <= 120,
+                let prompt = item["prompt"] as? String, !prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+                prompt.count <= maximumPromptCharacters
             else { return nil }
             func value<T: RawRepresentable>(_ key: String, as type: T.Type) -> String? where T.RawValue == String {
                 (item[key] as? String).map { $0.lowercased() }.flatMap(T.init(rawValue:))?.rawValue
             }
             let icon = (item["icon"] as? String).flatMap { $0.allSatisfy { $0.isLetter || $0.isNumber || $0 == "." } ? $0 : nil }
             return AICommandRecord(
-                id: UUID(), name: String(name.prefix(120)), symbol: icon, prompt: String(prompt.prefix(8_000)),
+                id: UUID(), name: name, symbol: icon, prompt: prompt,
                 creativity: value("creativity", as: AICreativity.self), reasoning: value("reasoning", as: AIReasoningLevel.self),
                 guardrail: value("guardrail", as: AIGuardrail.self), output: value("output", as: AICommandOutput.self),
                 createdAt: .now)
         }
-        guard !records.isEmpty else { throw LibraryValidationError("The file has no AI Commands with a name and a prompt.") }
-        return records
+        guard !records.isEmpty else {
+            throw LibraryValidationError("The file has no AI Commands with a name and a prompt of up to 8,000 characters.")
+        }
+        return ImportResult(records: records, skipped: items.count - records.count)
     }
 
     static func export(_ commands: [AICommand]) throws -> Data {

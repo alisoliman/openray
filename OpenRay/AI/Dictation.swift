@@ -35,13 +35,16 @@ final class SpeechDictation: AIDictating {
     private var task: SFSpeechRecognitionTask?
     private(set) var isListening = false
     private let sideEffects: SideEffectGuard
+    /// Changes on every start and stop, so a start whose authorization arrives after Stop
+    /// never turns the microphone on.
+    private var attempt = UUID()
 
     init(sideEffects: SideEffectGuard = .current) {
         self.sideEffects = sideEffects
     }
 
     var unavailableReason: String? {
-        if sideEffects.isInert { return "Dictation is off here." }
+        if sideEffects.isInert || SideEffectGuard.isInert { return "Dictation is off here." }
         let info = Bundle.main.infoDictionary ?? [:]
         guard info["NSMicrophoneUsageDescription"] != nil, info["NSSpeechRecognitionUsageDescription"] != nil else {
             return "This build of OpenRay can't use the microphone yet."
@@ -55,13 +58,17 @@ final class SpeechDictation: AIDictating {
     func start(onText: @escaping @MainActor (String) -> Void) async throws {
         try sideEffects.check("listening to the microphone")
         if let reason = unavailableReason { throw AIServiceError.failed(reason) }
+        stop()
+        let attempt = UUID()
+        self.attempt = attempt
         let status = await withCheckedContinuation { continuation in
             SFSpeechRecognizer.requestAuthorization { continuation.resume(returning: $0) }
         }
+        // Stopped, or started again, while macOS was asking: this start is over.
+        guard self.attempt == attempt, !Task.isCancelled else { return }
         guard status == .authorized, let recognizer = SFSpeechRecognizer() else {
             throw AIServiceError.failed("Allow Speech Recognition for OpenRay in System Settings › Privacy & Security.")
         }
-        stop()
         let request = SFSpeechAudioBufferRecognitionRequest()
         request.requiresOnDeviceRecognition = true
         request.shouldReportPartialResults = true
@@ -99,6 +106,7 @@ final class SpeechDictation: AIDictating {
     }
 
     func stop() {
+        attempt = UUID()
         guard isListening || task != nil else { return }
         audio.stop()
         audio.inputNode.removeTap(onBus: 0)

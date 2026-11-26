@@ -54,11 +54,13 @@ struct AIPane: View {
             AIToolsSettingsSection(model: model)
             Section("Privacy") {
                 IconRow(
-                    model.aiHub.settings.model == .privateCloud
-                        ? "Runs on this Mac. When the larger model is on, requests go to Apple's Private Cloud Compute, which keeps nothing."
+                    model.aiHub.effectiveModel == .privateCloud
+                        ? "When the larger model is on, requests, attachments and tool results go to Apple's Private Cloud Compute, which keeps nothing."
                         : "Runs on Apple's on-device model. Nothing is sent to a server, and there's no cloud fallback.",
                     symbol: "lock.fill")
-                IconRow("Clipboard, files, notes and the screen reach the model only when you attach or @-mention them.", symbol: "paperclip")
+                IconRow(
+                    "Clipboard, files, notes and the screen reach the model when you attach or @-mention them. An agent you give tools can also read your notes, clipboard history, snippets, quicklinks and file names without a mention.",
+                    symbol: "paperclip")
                 IconRow("Chats in the launcher are kept in memory. Chats in the AI Chat window are saved on this Mac.", symbol: "note.text")
             }
         }
@@ -73,6 +75,21 @@ private struct AIModelSection: View {
         let hub = model.aiHub
         let status = hub.privateCloudStatus
         Section {
+            if !AIModelSelection.isBuildEnabled {
+                LabeledContent {
+                    Text("On this Mac").foregroundStyle(.secondary)
+                } label: {
+                    SettingRowLabel(title: "Model", detail: AIModelSelection.buildUnavailableReason)
+                }
+            } else {
+                privateCloudRows(hub: hub, status: status)
+            }
+        } header: {
+            Text("Model")
+        }
+    }
+
+    @ViewBuilder private func privateCloudRows(hub: AIHub, status: AIPrivateCloudStatus?) -> some View {
             Toggle(isOn: Binding(
                 get: { hub.settings.model == .privateCloud },
                 set: { on in hub.updateSettings { $0.model = on ? .privateCloud : .onDevice } })
@@ -91,9 +108,6 @@ private struct AIModelSection: View {
                 }
                 LabeledContent("Requests use") { Text(hub.effectiveModel.title).foregroundStyle(.secondary) }
             }
-        } header: {
-            Text("Model")
-        }
     }
 }
 
@@ -211,16 +225,24 @@ private struct AIToolsSettingsSection: View {
         Section {
             ForEach(hub.toolExtensions) { item in
                 ForEach(item.tools) { tool in
-                    Picker(
-                        selection: Binding(
-                            get: { hub.settings.toolPermissions[tool.id] ?? .auto },
-                            set: { value in hub.updateSettings { $0.toolPermissions[tool.id] = value } })
-                    ) {
-                        ForEach(AIToolPermission.allCases) { Text($0.title).tag($0) }
-                    } label: {
-                        SettingRowLabel(title: "\(tool.title)  ·  @\(item.id)", detail: tool.isAction ? "Changes your library" : nil)
+                    if tool.isAction {
+                        LabeledContent {
+                            Text("Asks every time").foregroundStyle(.secondary)
+                        } label: {
+                            SettingRowLabel(title: "\(tool.title)  ·  @\(item.id)", detail: "Changes your library, so each call needs your OK")
+                        }
+                    } else {
+                        Picker(
+                            selection: Binding(
+                                get: { hub.settings.toolPermissions[tool.id] ?? .auto },
+                                set: { value in hub.updateSettings { $0.toolPermissions[tool.id] = value } })
+                        ) {
+                            ForEach(AIToolPermission.choices(for: tool)) { Text($0.title).tag($0) }
+                        } label: {
+                            SettingRowLabel(title: "\(tool.title)  ·  @\(item.id)", detail: nil)
+                        }
+                        .neutralMenus()
                     }
-                    .neutralMenus()
                 }
             }
             Toggle(isOn: Binding(get: { hub.settings.screenContextEnabled }, set: { on in hub.updateSettings { $0.screenContextEnabled = on } })) {
@@ -237,7 +259,7 @@ private struct AIToolsSettingsSection: View {
         } header: {
             Text("Tools and context")
         } footer: {
-            Text("Ask: always ask first. Auto: read without asking, ask before changing anything. Always: never ask. Type @ and a name in chat to use a tool.")
+            Text("For tools that only read: Ask asks first, Auto and Always read without asking. Tools that change anything ask every time and show what they'll write. Type @ and a name in chat to use a tool; an agent's tools can read without a mention.")
                 .font(.system(size: 11.5)).foregroundStyle(.secondary)
         }
     }
