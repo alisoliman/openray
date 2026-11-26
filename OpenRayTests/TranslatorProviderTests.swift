@@ -114,9 +114,9 @@ struct TranslatorProviderTests {
         #expect(model.section.providedScope?.arguments == ["target": "fr"])
         #expect(model.query == "good night")
         try await waitUntil { model.results.contains { $0.id == "translation.result" } }
-        let row = try #require(model.results.first { $0.id == "translation.result" })
         #expect(model.groups.first?.items.first?.id == "translation.result")
-        model.selectedID = row.id
+        model.synchronizeSelection()
+        #expect(model.selectedItem?.id == "translation.result")
         model.performSelected()
         #expect(model.feedback?.text.contains("GOOD NIGHT") == true)
         #expect(model.store.database.commandPreferences["translate"]?["lastSource"] == "en-US")
@@ -179,38 +179,85 @@ struct TranslatorProviderTests {
 
     // MARK: Downloads
 
-    @Test func consentBelongsToOnePairAndOneRequest() async throws {
+    @Test func consentBelongsToOneSearchAndRepeatsAreIdempotent() async throws {
         let downloads = TranslationDownloads(sideEffects: SideEffectGuard(mode: .live))
         let (provider, model, _) = setUp(.needsDownload, downloads: downloads)
         defer { model.stop() }
-        provider.open(text: "hello", arguments: ["target": "ja"], in: model)
-        try await waitUntil { model.results.contains { $0.id == "translation.download" } }
-        #expect(downloads.request == nil)
-        model.selectedID = "translation.download"
-        model.performSelected()
         let japanese = TranslationDownloads.pairKey(source: "en-US", target: "ja")
         let french = TranslationDownloads.pairKey(source: "en-US", target: "fr")
-        let declined = try #require(downloads.requestID(for: japanese))
-        #expect(downloads.configuration(for: japanese) != nil)
-        #expect(downloads.configuration(for: french) == nil)
-        downloads.finish(id: declined, succeeded: false, message: "Declined")
-        #expect(downloads.request == nil)
-        #expect(downloads.status(for: japanese) == "Declined")
-
-        // Another pair's preview never reopens the declined request.
-        provider.open(text: "hello", arguments: ["target": "fr"], in: model)
+        provider.open(text: "hello", arguments: ["target": "ja"], in: model)
         try await waitUntil { model.results.contains { $0.id == "translation.download" } }
-        #expect(downloads.configuration(for: french) == nil)
+        let first = TranslatorProvider.downloadContext(of: model)
         model.selectedID = "translation.download"
         model.performSelected()
-        let current = try #require(downloads.requestID(for: french))
-        // A late answer for the old request changes nothing.
-        downloads.finish(id: declined, succeeded: true, message: "Late")
-        #expect(downloads.requestID(for: french) == current)
-        #expect(downloads.status(for: japanese) == "Declined")
-        // Typing other text cancels the request.
-        type(model, "good night")
+        let id = try #require(downloads.requestID(for: japanese, context: first))
+        #expect(downloads.configuration(for: japanese, context: first) != nil)
+        #expect(downloads.configuration(for: french, context: first) == nil)
+        // Pressing ↩ again keeps the request the running task belongs to.
+        model.performSelected()
+        #expect(downloads.requestID(for: japanese, context: first) == id)
+        #expect(downloads.isCurrent(id))
+
+        // A new search ends it: the preview can't reattach and a late answer changes nothing.
+        model.query = "hello there"
+        model.files.stop()
+        let second = TranslatorProvider.downloadContext(of: model)
+        #expect(downloads.configuration(for: japanese, context: second) == nil)
         try await waitUntil { downloads.request == nil }
+        downloads.finish(id: id, succeeded: true, message: "Late")
+        #expect(provider.downloadRefreshes == 0)
+        #expect(downloads.status(for: japanese) != "Late")
+    }
+
+    @Test func aDownloadOnlyRefreshesTheSearchItBelongsTo() async throws {
+        let downloads = TranslationDownloads(sideEffects: SideEffectGuard(mode: .live))
+        let (provider, model, _) = setUp(.needsDownload, downloads: downloads)
+        defer { model.stop() }
+        let pair = TranslationDownloads.pairKey(source: "en-US", target: "fr")
+        provider.open(text: "hello", arguments: ["target": "fr"], in: model)
+        try await waitUntil { model.results.contains { $0.id == "translation.download" } }
+        model.selectedID = "translation.download"
+        model.performSelected()
+        let id = try #require(downloads.requestID(for: pair, context: TranslatorProvider.downloadContext(of: model)))
+        downloads.finish(id: id, succeeded: true, message: "Done")
+        #expect(provider.downloadRefreshes == 1)
+        // The refreshed search still needs the language (the fake never installs it).
+        try await waitUntil { model.results.contains { $0.id == "translation.download" } }
+
+        // Started, then the scope ends before macOS answers: no refresh of a hidden search.
+        model.selectedID = "translation.download"
+        model.performSelected()
+        let again = try #require(downloads.requestID(for: pair, context: TranslatorProvider.downloadContext(of: model)))
+        model.navigate(to: .home)
+        downloads.finish(id: again, succeeded: true, message: "Done")
+        #expect(provider.downloadRefreshes == 1)
+    }
+
+    @Test func theTranslationTakesTheSelectionFromTheLanguageRows() async throws {
+        let (provider, model, engine) = setUp()
+        defer { model.stop() }
+        await engine.gate.hold("bonjour")
+        provider.open(text: "bonjour", arguments: ["target": "de"], in: model)
+        model.files.stop()
+        model.synchronizeSelection()
+        #expect(model.selectedItem?.id == "translation.target")
+        await engine.gate.release("bonjour")
+        try await waitUntil { model.results.contains { $0.id == "translation.result" } }
+        model.synchronizeSelection()
+        #expect(model.selectedItem?.id == "translation.result")
+        #expect(model.secondaryTitle(for: try #require(model.selectedItem)) != nil)
+
+        // A language row the person chose keeps the selection.
+        await engine.gate.hold("hallo")
+        model.query = "hallo"
+        model.files.stop()
+        model.synchronizeSelection()
+        model.moveSelection(1)
+        #expect(model.selectedID == "translation.source")
+        await engine.gate.release("hallo")
+        try await waitUntil { model.results.contains { $0.title == "HALLO" } }
+        model.synchronizeSelection()
+        #expect(model.selectedID == "translation.source")
     }
 
     @Test func aRootDownloadRowKeepsTheExplicitSource() async throws {

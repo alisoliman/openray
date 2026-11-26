@@ -45,6 +45,15 @@ final class TranslatorProvider: CommandProvider {
     /// Asks macOS to download a language, from a view in the scope's preview pane.
     let downloads: TranslationDownloads
     private var restoredSource = false
+    /// How many finished downloads refreshed the translation they belonged to.
+    private(set) var downloadRefreshes = 0
+
+    /// The search a download belongs to: it ends when the search, the scope or the panel's
+    /// showing ends.
+    static func downloadContext(of model: LauncherModel) -> TranslationDownloads.Context {
+        TranslationDownloads.Context(
+            search: model.searchGeneration, presentation: model.presentation, scope: model.section.rawValue)
+    }
 
     /// The app's provider: Apple Translation in a normal launch, an inert engine and no
     /// download prompts in the test host and verification mode.
@@ -205,11 +214,12 @@ final class TranslatorProvider: CommandProvider {
 
     func liveItems(for query: String, scope: ProvidedScope?, in model: LauncherModel) async -> [LauncherItem] {
         restoreLastSource(in: model)
+        // Any new search ends a download request from an earlier one.
+        downloads.cancel(unless: Self.downloadContext(of: model))
         let request: TranslationRequest
         let choices: [String: String]
         if let scope {
             guard scope.id == Self.scope.id else { return [] }
-            downloads.cancel(unlessText: query)
             guard !query.isEmpty, query.count <= TranslationParser.maximumLength else { return [] }
             let target = Self.language(scope.arguments["target"]) ?? defaultTarget(in: model)
             let source = Self.language(scope.arguments["source"])
@@ -306,7 +316,9 @@ final class TranslatorProvider: CommandProvider {
             guard let source = ref.arguments["pairSource"], let target = ref.arguments["pairTarget"] else { return nil }
             return ProvidedPreview(
                 content: AnyView(
-                    TranslationDownloadHost(downloads: downloads, pairKey: TranslationDownloads.pairKey(source: source, target: target))))
+                    TranslationDownloadHost(
+                        downloads: downloads, pairKey: TranslationDownloads.pairKey(source: source, target: target),
+                        context: Self.downloadContext(of: model))))
         case "translation":
             return ProvidedPreview(
                 content: AnyView(
@@ -353,9 +365,12 @@ final class TranslatorProvider: CommandProvider {
             open(text: ref.payload ?? "", arguments: ref.arguments, in: model)
             return
         }
-        downloads.start(source: source, target: target, text: ref.payload ?? "") { [weak model] succeeded in
-            guard let model else { return }
-            if succeeded { model.refreshProvidedLiveItems() }
+        let context = Self.downloadContext(of: model)
+        downloads.start(source: source, target: target, context: context) { [weak self, weak model] succeeded in
+            // Refresh only the search the download belongs to, if it's still on screen.
+            guard succeeded, let self, let model, Self.downloadContext(of: model) == context else { return }
+            self.downloadRefreshes += 1
+            model.refreshProvidedLiveItems()
         }
     }
 
@@ -456,17 +471,27 @@ final class TranslatorProvider: CommandProvider {
 
 /// One pending language download, asked of macOS by `TranslationDownloadHost`.
 ///
-/// A request belongs to one language pair and one search. Only the preview for that pair
-/// attaches its configuration, so another pair's preview can't reopen it; navigating or
-/// typing other text cancels it; and a completion for anything but the current request is
-/// ignored. Inert in the test host and verification mode.
+/// A request belongs to one language pair and one `Context`: the search, the panel's showing
+/// and the scope it started in. Only a preview for that pair in that context attaches its
+/// configuration, so another pair, a later search, a new showing of the panel or another scope
+/// can't reopen it. Starting the same pair again in the same context does nothing, so the task
+/// already asking keeps its request. The host checks the request is still current before asking
+/// macOS, a completion for anything but the current request is ignored, and the provider only
+/// refreshes a translation whose context is still on screen. Inert in the test host and
+/// verification mode.
 @MainActor
 @Observable
 final class TranslationDownloads {
+    struct Context: Equatable, Sendable {
+        var search: Int
+        var presentation: Int
+        var scope: String
+    }
+
     struct Request: Equatable {
         let id: UUID
         let pairKey: String
-        let text: String
+        let context: Context
     }
 
     private(set) var request: Request?
@@ -481,27 +506,32 @@ final class TranslationDownloads {
 
     nonisolated static func pairKey(source: String, target: String) -> String { "\(source)>\(target)" }
 
-    func start(source: String, target: String, text: String, onFinished: @escaping @MainActor (Bool) -> Void) {
+    func start(source: String, target: String, context: Context, onFinished: @escaping @MainActor (Bool) -> Void) {
         let key = Self.pairKey(source: source, target: target)
         guard !sideEffects.isInert else {
             statuses[key] = "Language downloads are off in this mode."
             return
         }
-        request = Request(id: UUID(), pairKey: key, text: text)
+        // Already asking for this pair in this search: keep the running request.
+        if let request, request.pairKey == key, request.context == context { return }
+        request = Request(id: UUID(), pairKey: key, context: context)
         configuration = TranslationSession.Configuration(
             source: Locale.Language(identifier: source), target: Locale.Language(identifier: target))
         statuses[key] = "Waiting for macOS to download the language…"
         self.onFinished = onFinished
     }
 
-    /// The configuration to attach for a pair: the current request's, or nil.
-    func configuration(for pairKey: String) -> TranslationSession.Configuration? {
-        request?.pairKey == pairKey ? configuration : nil
+    /// The configuration to attach for a pair in a context: the current request's, or nil.
+    func configuration(for pairKey: String, context: Context) -> TranslationSession.Configuration? {
+        request?.pairKey == pairKey && request?.context == context ? configuration : nil
     }
 
-    func requestID(for pairKey: String) -> UUID? {
-        request?.pairKey == pairKey ? request?.id : nil
+    func requestID(for pairKey: String, context: Context) -> UUID? {
+        request?.pairKey == pairKey && request?.context == context ? request?.id : nil
     }
+
+    /// Whether `id` is still the request to act on.
+    func isCurrent(_ id: UUID) -> Bool { request?.id == id }
 
     func status(for pairKey: String) -> String? { statuses[pairKey] }
 
@@ -522,20 +552,21 @@ final class TranslationDownloads {
         onFinished = nil
     }
 
-    /// Cancels the request when the search moved on to other text.
-    func cancel(unlessText text: String) {
-        if let request, request.text != text { cancel() }
+    /// Cancels a request that belongs to another search, scope or showing of the panel.
+    func cancel(unless context: Context) {
+        if let request, request.context != context { cancel() }
     }
 }
 
-/// Lives in the Translate scope's preview pane for one download row. It attaches the
-/// pending request only when it's for this row's language pair.
+/// Lives in the Translate scope's preview pane for one download row. It attaches the pending
+/// request only when it's for this row's language pair in this search.
 struct TranslationDownloadHost: View {
     let downloads: TranslationDownloads
     let pairKey: String
+    let context: TranslationDownloads.Context
 
     var body: some View {
-        let requestID = downloads.requestID(for: pairKey)
+        let requestID = downloads.requestID(for: pairKey, context: context)
         VStack(alignment: .leading, spacing: OR.Space.s2) {
             Label("Translation languages", systemImage: "arrow.down.circle")
                 .font(OR.Font.headline).foregroundStyle(OR.Color.text)
@@ -546,9 +577,9 @@ struct TranslationDownloadHost: View {
             .font(OR.Font.body).foregroundStyle(OR.Color.text2)
             .fixedSize(horizontal: false, vertical: true)
         }
-        .translationTask(downloads.configuration(for: pairKey)) { @Sendable [downloads] session in
+        .translationTask(downloads.configuration(for: pairKey, context: context)) { @Sendable [downloads] session in
             // Off the main actor, so the framework's session never crosses isolation.
-            guard let requestID else { return }
+            guard let requestID, await downloads.isCurrent(requestID) else { return }
             do {
                 try await session.prepareTranslation()
                 await downloads.finish(id: requestID, succeeded: true, message: "Downloaded. Translating…")
