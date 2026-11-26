@@ -3,7 +3,15 @@ import Testing
 
 @testable import OpenRay
 
+/// One token per character.
 @MainActor
+private struct CharacterCounter: AITokenCounting {
+    func tokenCount(_ text: String) async -> Int { text.count }
+    func contextSize() async -> Int { 1_000 }
+}
+
+@MainActor
+@Suite(.timeLimit(.minutes(2)))
 struct AIContextBudgetTests {
     @Test func theBudgetFitsThenCondensesThenRefuses() {
         let budget = ContextBudget(contextSize: 1_000, responseReserve: 200)
@@ -36,16 +44,37 @@ struct AIContextBudgetTests {
         #expect(rebuilt.turns == Array(turns.suffix(4 - outcome.foldedTurns)))
         #expect(outcome.summary == rebuilt.summary)
         // The earlier summary is carried into the new one, with the folded turns, oldest first.
-        #expect(summarizer.calls.count == 1)
+        // This tiny window can't take them in one request, so they're summarized in parts.
+        #expect(summarizer.calls.count >= 1)
         #expect(summarizer.calls[0].hasPrefix("Summary so far:\nEarlier facts"))
-        #expect(summarizer.calls[0].contains("Person: Question 1"))
+        #expect(summarizer.calls.joined().contains("Person: Question 1"))
+        #expect(summarizer.calls.allSatisfy { $0.split(whereSeparator: \.isWhitespace).count <= 53 })
         #expect(rebuilt.instructions.contains("<summary>"))
         #expect(rebuilt.instructions.hasPrefix("Be brief."))
 
+        let calls = summarizer.calls.count
         let small = try await condenser.prepare(
             profile: profile, summary: nil, turns: [.init(prompt: "Hi", response: "Hello")], prompt: "Again", toolTokens: 0)
         #expect(small.rebuilt == nil)
+        #expect(summarizer.calls.count == calls)
+    }
+
+    @Test func aRoomyWindowFoldsHistoryInOneSummary() async throws {
+        let summarizer = FirstWordsSummarizer()
+        let condenser = ChatCondenser(counter: WordCounter(window: 2_000), summarizer: summarizer)
+        let profile = AIRequestProfile(id: "chat", instructions: "Be brief.", maximumResponseTokens: 100)
+        let turns = (1...50).map { AIConversationContext.Turn(prompt: "Q\($0) " + String(repeating: "w ", count: 40), response: "A") }
+        let outcome = try await condenser.prepare(profile: profile, summary: nil, turns: turns, prompt: "Next", toolTokens: 0)
+        #expect(outcome.rebuilt != nil)
         #expect(summarizer.calls.count == 1)
+    }
+
+    @Test func unbrokenTextIsSplitByCharactersToo() async {
+        let condenser = AttachmentCondenser(counter: CharacterCounter(), summarizer: FirstWordsSummarizer())
+        let chunks = await condenser.split(String(repeating: "x", count: 100), maximumTokens: 30)
+        #expect(chunks.count >= 4)
+        #expect(chunks.allSatisfy { $0.count <= 30 })
+        #expect(chunks.joined() == String(repeating: "x", count: 100))
     }
 
     @Test func aPromptTooLargeForTheWindowIsRefused() async {

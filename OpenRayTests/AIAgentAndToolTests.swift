@@ -5,6 +5,7 @@ import Testing
 @testable import OpenRay
 
 @MainActor
+@Suite(.timeLimit(.minutes(2)))
 struct AIAgentTests {
     private let writer = Agent(name: "Writer", symbol: "pencil", instructions: "You edit prose. Be terse.", temperature: 0.9)
     private let coder = Agent(name: "Code Review", instructions: "You review code.", reasoning: .deep)
@@ -135,6 +136,7 @@ struct AIAgentTests {
 }
 
 @MainActor
+@Suite(.timeLimit(.minutes(2)))
 struct AIToolTests {
     private let extensions = [
         AIToolExtension(id: "notes", title: "Notes", symbol: "note", aliases: ["note"], tools: [
@@ -192,54 +194,79 @@ struct AIToolTests {
         #expect(AIToolRouter.plan(text: "@notes", extensions: extensions, agentToolIDs: []).prompt == "@notes")
     }
 
-    @Test func readsRunAndActionsWaitForApproval() async throws {
+    @Test func readsRunButEveryWriteNeedsItsOwnApproval() async throws {
         let read = FakeToolExecutor("searchNotes", extensionID: "notes")
         let write = FakeToolExecutor("createNote", extensionID: "notes", effect: .library)
-        let permissions = InMemoryToolPermissions()
+        // A standing "Always" stored for a write, say by an older build, counts as Ask.
+        let permissions = InMemoryToolPermissions(["createNote": .always])
         let broker = AIToolBroker(executors: [read, write], permissions: permissions)
+        #expect(broker.permission(for: write.spec) == .ask)
+        #expect(AIToolPermission.choices(for: write.spec).isEmpty)
+        #expect(AIToolPermission.choices(for: read.spec) == AIToolPermission.allCases)
         #expect(await broker.invoke(toolID: "searchNotes", arguments: AIToolArguments(["query": "x"])) == "done")
         #expect(read.runs.count == 1)
         #expect(broker.pendingApprovals.isEmpty)
 
-        let pending = Task { await broker.invoke(toolID: "createNote", arguments: AIToolArguments()) }
-        await waitFor { !broker.pendingApprovals.isEmpty }
-        let card = try #require(broker.pendingApprovals.first)
-        #expect(card.isAction)
-        #expect(card.detail == "Run createNote")
-        #expect(write.runs.isEmpty)
-        broker.resolve(card.id, .allow)
-        #expect(await pending.value == "done")
-        #expect(write.runs.count == 1)
+        for decision in [AIToolDecision.allow, .alwaysAllow, .allow] {
+            let call = Task {
+                await broker.invoke(toolID: "createNote", arguments: AIToolArguments(["query": "Milk, eggs", "ignored": "x"]))
+            }
+            await waitFor { !broker.pendingApprovals.isEmpty }
+            let card = try #require(broker.pendingApprovals.first)
+            #expect(card.isAction)
+            #expect(!card.offersAlways)
+            #expect(card.detail == "Run createNote")
+            // The card shows the values it would write.
+            #expect(card.fields == [AIToolApproval.Field(label: "Query", value: "Milk, eggs")])
+            broker.resolve(card.id, decision)
+            #expect(await call.value == "done")
+        }
+        // Always Allow on a write approved that call only.
+        #expect(write.runs.count == 3)
+        #expect(permissions.values["createNote"] == .always)  // left as stored, still read as Ask
 
         let denied = Task { await broker.invoke(toolID: "createNote", arguments: AIToolArguments()) }
         await waitFor { !broker.pendingApprovals.isEmpty }
-        broker.resolve(broker.pendingApprovals[0].id, .deny)
+        broker.resolve(try #require(broker.pendingApprovals.first).id, .deny)
         #expect(await denied.value.contains("declined"))
-        #expect(write.runs.count == 1)
+        #expect(write.runs.count == 3)
         #expect(broker.activity.last?.outcome == .declined)
 
-        let always = Task { await broker.invoke(toolID: "createNote", arguments: AIToolArguments()) }
+        // A read may be allowed for good.
+        permissions.values["searchNotes"] = .ask
+        let ask = Task { await broker.invoke(toolID: "searchNotes", arguments: AIToolArguments()) }
         await waitFor { !broker.pendingApprovals.isEmpty }
-        broker.resolve(broker.pendingApprovals[0].id, .alwaysAllow)
-        _ = await always.value
-        #expect(permissions.values["createNote"] == .always)
-        // Always: no card next time.
-        #expect(await broker.invoke(toolID: "createNote", arguments: AIToolArguments()) == "done")
-        #expect(write.runs.count == 3)
+        let readCard = try #require(broker.pendingApprovals.first)
+        #expect(readCard.offersAlways)
+        broker.resolve(readCard.id, .alwaysAllow)
+        _ = await ask.value
+        #expect(permissions.values["searchNotes"] == .always)
+        #expect(await broker.invoke(toolID: "searchNotes", arguments: AIToolArguments()) == "done")
+        #expect(read.runs.count == 3)
         #expect(await broker.invoke(toolID: "nope", arguments: AIToolArguments()).contains("no tool"))
     }
 
-    @Test func askAsksEvenForReadsAndStopDeclines() async {
+    @Test func snippetCardsShowTheExpansionKeyword() {
+        let spec = CreateSnippetTool(store: LibraryStore(fileURL: nil)).spec
+        let fields = AIToolBroker.fields(
+            for: spec, arguments: AIToolArguments(["name": "Sign-off", "text": "Best, Kim", "keyword": ";bk"]))
+        #expect(fields.map(\.label) == ["Name", "Text", "Keyword"])
+        #expect(fields.map(\.value) == ["Sign-off", "Best, Kim", ";bk"])
+    }
+
+    @Test func askAsksEvenForReadsAndStopDeclines() async throws {
         let read = FakeToolExecutor("searchClipboard", extensionID: "clipboard")
         let broker = AIToolBroker(executors: [read], permissions: InMemoryToolPermissions(["searchClipboard": .ask]))
         let call = Task { await broker.invoke(toolID: "searchClipboard", arguments: AIToolArguments()) }
         await waitFor { !broker.pendingApprovals.isEmpty }
+        try #require(!broker.pendingApprovals.isEmpty)
         broker.declineAll()
         #expect(await call.value.contains("declined"))
         #expect(read.runs.isEmpty)
 
         let cancelled = Task { await broker.invoke(toolID: "searchClipboard", arguments: AIToolArguments()) }
         await waitFor { !broker.pendingApprovals.isEmpty }
+        try #require(!broker.pendingApprovals.isEmpty)
         cancelled.cancel()
         #expect(await cancelled.value.contains("declined"))
         await waitFor { broker.pendingApprovals.isEmpty }
@@ -251,9 +278,12 @@ struct AIToolTests {
         let broker = AIToolBroker(
             executors: [system], permissions: InMemoryToolPermissions(["createEvent": .always]),
             sideEffects: SideEffectGuard(mode: .testHost))
+        // Refused before any card: stored Always counts as Ask for an action, but no one is
+        // asked about something this launch can't do.
         let output = await broker.invoke(toolID: "createEvent", arguments: AIToolArguments())
         #expect(output.contains("while tests run"))
         #expect(system.runs.isEmpty)
+        #expect(broker.pendingApprovals.isEmpty)
         guard case .blocked? = broker.activity.last?.outcome else {
             Issue.record("Expected a blocked call")
             return
@@ -270,6 +300,7 @@ struct AIToolTests {
         model.ai.send()
         let broker = try #require(model.ai.environment.toolBroker)
         await waitFor { !broker.pendingApprovals.isEmpty }
+        try #require(!broker.pendingApprovals.isEmpty)
         let request = try #require(engine.requests.last)
         #expect(request.tools.map(\.id) == ["searchNotes", "createNote"])
         #expect(request.toolMode == .required)
@@ -336,35 +367,41 @@ private struct StubFiles: AIFileSearching {
 }
 
 @MainActor
+@Suite(.timeLimit(.minutes(2)))
 struct AIModelChoiceTests {
-    @Test func theLargerModelIsOptInAndOnlyUsedWhileItCanAnswer() {
+    @Test func thisBuildIsOnDeviceOnly() {
+        // Private Cloud Compute needs a managed entitlement Developer ID builds can't carry.
+        #expect(!AIModelSelection.isBuildEnabled)
         #expect(AISettings().model == .onDevice)
-        #expect(AIModelSelection.resolve(preference: .onDevice, privateCloud: .available(approachingLimit: false)) == .onDevice)
-        #expect(AIModelSelection.resolve(preference: .privateCloud, privateCloud: .available(approachingLimit: true)) == .privateCloud)
-        #expect(AIModelSelection.resolve(preference: .privateCloud, privateCloud: .limitReached(resetDate: nil)) == .onDevice)
-        #expect(AIModelSelection.resolve(preference: .privateCloud, privateCloud: .unavailable("Not ready")) == .onDevice)
-        #expect(AIModelSelection.resolve(preference: .privateCloud, privateCloud: nil) == .onDevice)
+        #expect(AIModelSelection.resolve(preference: .privateCloud, privateCloud: .available(approachingLimit: false)) == .onDevice)
+        #expect(FoundationModelEngine().privateCloudStatus == nil)
+        #expect(AIModelSelection.buildUnavailableReason.contains("App Store"))
     }
 
-    @Test func optingInReachesBothEnginesAndShowsTheQuota() {
+    @Test func inABuildThatMayUseItTheLargerModelIsOptInAndOnlyUsedWhileItCanAnswer() {
+        func resolve(_ preference: AIModelChoice, _ status: AIPrivateCloudStatus?) -> AIModelChoice {
+            AIModelSelection.resolve(preference: preference, privateCloud: status, buildAllows: true)
+        }
+        #expect(resolve(.onDevice, .available(approachingLimit: false)) == .onDevice)
+        #expect(resolve(.privateCloud, .available(approachingLimit: true)) == .privateCloud)
+        #expect(resolve(.privateCloud, .limitReached(resetDate: nil)) == .onDevice)
+        #expect(resolve(.privateCloud, .unavailable("Not ready")) == .onDevice)
+        #expect(resolve(.privateCloud, nil) == .onDevice)
+    }
+
+    @Test func aStoredOptInStaysOnDeviceInThisBuild() {
         let engine = RecordingAIEngine()
-        engine.cloudStatus = .limitReached(resetDate: nil)
+        engine.cloudStatus = .available(approachingLimit: false)
         let model = Slice7Fixtures.launcher(engine: engine)
         defer { model.stop() }
         let hub = model.aiHub
         let window = hub.windowChat.engine as? RecordingAIEngine
-        #expect(hub.settings.model == .onDevice)
         #expect(model.store.database.commandPreferences["ai"] == nil)
         #expect(hub.updateSettings { $0.model = .privateCloud })
-        #expect(engine.modelChoice == .privateCloud)
-        #expect(window?.modelChoice == .privateCloud)
         #expect(model.store.database.commandPreferences["ai"]?["model"] == "privateCloud")
-        #expect(hub.privateCloudStatus?.summary == "Limit reached")
-        #expect(hub.effectiveModel == .onDevice)
-        engine.cloudStatus = .available(approachingLimit: false)
-        #expect(hub.effectiveModel == .privateCloud)
-        hub.updateSettings { $0.model = .onDevice }
         #expect(engine.modelChoice == .onDevice)
+        #expect(window?.modelChoice == .onDevice)
+        #expect(hub.effectiveModel == .onDevice)
     }
 
     @Test func settingsRoundTripAndIgnoreUnknownValues() {
@@ -388,6 +425,7 @@ struct AIModelChoiceTests {
 }
 
 @MainActor
+@Suite(.timeLimit(.minutes(2)))
 struct AIAttachmentTests {
     private struct FakeRecognizer: TextRecognizing {
         var text: String

@@ -4,6 +4,7 @@ import Testing
 @testable import OpenRay
 
 @MainActor
+@Suite(.timeLimit(.minutes(2)))
 struct AIChatStoreTests {
     private func state(_ pairs: [(String, String)], agentID: UUID? = nil, transcript: Data? = nil) -> AIConversationState {
         var messages: [ChatMessage] = []

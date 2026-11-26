@@ -26,7 +26,7 @@ final class RecordingAIEngine: AIEngine {
     var toolCalls: [(String, [String: String])] = []
     var toolOutputs: [String] = []
 
-    func prepare(for action: AIAction) {}
+    func prepare(for action: AIAction) { prepared.append(action) }
     func reset() { resetCount += 1 }
 
     func stream(_ prompt: String, action: AIAction, onSnapshot: @escaping @MainActor (String) -> Void) async throws {
@@ -58,8 +58,11 @@ final class RecordingAIEngine: AIEngine {
 
     func rebuild(_ context: AIConversationContext) { rebuilds.append(context) }
     func exportTranscript() -> Data? { transcript }
-    func restoreTranscript(_ data: Data, profile: AIRequestProfile) -> Bool {
+    var restoredContexts: [AIConversationContext] = []
+    var prepared: [AIAction] = []
+    func restoreTranscript(_ data: Data, context: AIConversationContext) -> Bool {
         restored.append(data)
+        restoredContexts.append(context)
         return true
     }
     func setModelChoice(_ choice: AIModelChoice) { modelChoice = choice }

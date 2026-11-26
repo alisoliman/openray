@@ -121,8 +121,9 @@ struct LauncherTests {
         let clipboardID = "clipboard.\(model.store.database.clipboard[0].id)"
         model.store.toggleFavorite(clipboardID)
         model.store.toggleFavorite("file./Users/example/Documents/note.txt")
-        #expect(model.results.contains { $0.id == clipboardID })
-        #expect(model.results.contains { $0.id == "file./Users/example/Documents/note.txt" })
+        // An empty Home shows its groups (favorites, recents), not the capped search list.
+        #expect(model.orderedResults.contains { $0.id == clipboardID })
+        #expect(model.orderedResults.contains { $0.id == "file./Users/example/Documents/note.txt" })
         #expect(Set(model.results.map(\.id)).count == model.results.count)
         model.query = "zzzzzzzzzzzzzzzzz"
         #expect(model.results.isEmpty)

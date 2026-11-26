@@ -5,6 +5,7 @@ import Testing
 @testable import OpenRay
 
 @MainActor
+@Suite(.timeLimit(.minutes(2)))
 struct AICommandTests {
     private func run(
         _ command: AICommand, selection: String?, typed: [String: String] = [:], capabilities: AIModelCapabilities = []
@@ -251,7 +252,9 @@ struct AICommandTests {
              {"name": "Bad", "prompt": "   "},
              {"name": "Shout", "prompt": "Uppercase {selection}", "output": "replace", "icon": "<script>"}]
             """
-        let records = try AICommandTransfer.importCommands(from: Data(json.utf8))
+        let result = try AICommandTransfer.importCommands(from: Data(json.utf8))
+        let records = result.records
+        #expect(result.skipped == 1)
         #expect(records.map(\.name) == ["Emojify", "Shout"])
         #expect(records[0].creativity == "high")
         #expect(records[0].symbol == "face.smiling")
@@ -261,12 +264,12 @@ struct AICommandTests {
 
         let model = Slice7Fixtures.launcher()
         defer { model.stop() }
-        #expect(try model.aiHub.importCommands(from: Data(json.utf8)) == 2)
+        #expect(try model.aiHub.importCommands(from: Data(json.utf8)).records.count == 2)
         let exported = try model.aiHub.exportCommands()
         let objects = try #require(try JSONSerialization.jsonObject(with: exported) as? [[String: String]])
         #expect(objects.map { $0["name"] } == ["Emojify", "Shout"])
         #expect(objects[1]["output"] == "replace")
-        #expect(try AICommandTransfer.importCommands(from: exported).map(\.prompt) == records.map(\.prompt))
+        #expect(try AICommandTransfer.importCommands(from: exported).records.map(\.prompt) == records.map(\.prompt))
     }
 
     @Test func aiCommandRecordsSurviveALibraryRoundTrip() throws {
