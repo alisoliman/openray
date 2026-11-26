@@ -41,25 +41,27 @@ struct SystemCommandSettings: Equatable, Sendable {
     /// moved into `LibraryDatabase.keepRunningBundleIDs` on the next write; never written.
     static let legacyExclusionsKey = "quitExclusions"
 
-    /// Empty Trash asks first. On by default.
-    var confirmsEmptyingTrash = true
-    /// Hide Others asks first. On by default. (Quit All and Quit Others always ask: they name
-    /// the exact apps they'll quit.) Stored under the key the earlier quit toggle used.
+    /// Commands that can't be undone. They always ask, whatever is saved: no setting turns their
+    /// question off. (Force Quit, in Applications, always asks too.) Earlier builds saved
+    /// `confirmEmptyTrash` and `confirmQuitApps`; both are ignored and dropped on the next write.
+    static let alwaysConfirmed: Set<SystemCommand.ID> = [
+        .emptyTrash, .shutDown, .restart, .logOut, .quitAllApps, .quitAllAppsExceptFrontmost,
+    ]
+
+    /// Hide Others asks first. On by default. Hiding is undone by Unhide All Apps, so this one
+    /// question may be turned off. It has its own key, so no earlier quit setting turns it off.
     var confirmsHidingOtherApps = true
 
-    init(confirmsEmptyingTrash: Bool = true, confirmsHidingOtherApps: Bool = true) {
-        self.confirmsEmptyingTrash = confirmsEmptyingTrash
+    init(confirmsHidingOtherApps: Bool = true) {
         self.confirmsHidingOtherApps = confirmsHidingOtherApps
     }
 
     init(_ values: [String: String]?) {
-        let values = values ?? [:]
-        confirmsEmptyingTrash = values["confirmEmptyTrash"] != "false"
-        confirmsHidingOtherApps = values["confirmQuitApps"] != "false"
+        confirmsHidingOtherApps = values?["confirmHideOthers"] != "false"
     }
 
     var values: [String: String] {
-        ["confirmEmptyTrash": String(confirmsEmptyingTrash), "confirmQuitApps": String(confirmsHidingOtherApps)]
+        ["confirmHideOthers": String(confirmsHidingOtherApps)]
     }
 
     /// Exclusions an earlier build saved here, in order, without duplicates.
@@ -72,11 +74,11 @@ struct SystemCommandSettings: Equatable, Sendable {
         return ids.filter { !$0.isEmpty && seen.insert($0).inserted }
     }
 
-    /// Restart, Shut Down and Log Out always ask; Empty Trash and Hide Others follow the settings.
-    /// Quit All and Quit Others ask in Applications' batch flow, which names the apps.
+    /// Every command that can't be undone asks; Hide Others follows its setting. Quit All and Quit
+    /// Others ask in Applications' batch flow, which names the apps.
     func asksFirst(_ id: SystemCommand.ID) -> Bool {
-        switch id {
-        case .emptyTrash: confirmsEmptyingTrash
+        if Self.alwaysConfirmed.contains(id) { return true }
+        return switch id {
         case .hideOtherApps: confirmsHidingOtherApps
         default: SystemCommand.command(id).needsConfirmation
         }

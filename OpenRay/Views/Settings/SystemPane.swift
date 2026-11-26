@@ -7,7 +7,7 @@ extension SettingsPane {
         subtitle: "Confirmations, Quit All Apps and permissions for system commands.",
         kind: .system, symbol: "power",
         keywords:
-            "system commands quit all apps exclusions keep running confirm empty trash restart shut down log out automation apple events sound"
+            "system commands quit all apps keep running confirm hide others empty trash restart shut down log out automation apple events sound"
     ) { model, navigation in AnyView(SystemPane(model: model, navigation: navigation)) }
 }
 
@@ -20,10 +20,6 @@ struct SystemPane: View {
     var body: some View {
         SettingsPaneScaffold(pane: .system) {
             Section {
-                Toggle(isOn: binding(\.confirmsEmptyingTrash)) {
-                    SettingRowLabel(title: "Confirm before emptying the Trash", detail: "Empty Trash asks in the action bar first.")
-                }
-                .settingsSwitch()
                 Toggle(isOn: binding(\.confirmsHidingOtherApps)) {
                     SettingRowLabel(title: "Confirm before hiding other apps", detail: "Hide Others asks in the action bar first.")
                 }
@@ -31,7 +27,7 @@ struct SystemPane: View {
             } header: {
                 Text("Confirmations")
             } footer: {
-                Text("Restart, Shut Down and Log Out always ask. Quit All and Quit Others always name the apps they'll quit and ask.")
+                Text("Commands that can't be undone always ask: Empty Trash, Restart, Shut Down and Log Out, and Quit All, Quit Others and Force Quit, which name the apps they'll quit.")
                     .font(.system(size: 12)).foregroundStyle(.secondary)
             }
             Section {

@@ -124,10 +124,8 @@ final class SystemCommandProvider: CommandProvider {
             switch id {
             case .restart, .shutDown, .logOut: "Open apps can ask to save their documents first."
             case .emptyTrash: "This can't be undone."
-            case .quitAllApps: "Apps can ask to save first. Apps excluded in Settings › System keep running."
-            case .quitAllAppsExceptFrontmost:
-                (kept ?? "") + "Apps can ask to save first. Apps excluded in Settings › System keep running."
             case .hideOtherApps: (kept ?? "") + "Unhide All Apps brings the others back."
+            // Quit All and Quit Others ask in Applications' batch flow, which lists the apps.
             default: ""
             }
         // Every system question loses something or affects every app: danger-styled, approved
@@ -162,7 +160,11 @@ final class SystemCommandProvider: CommandProvider {
                         return
                     }
                     model.store.recordUse(of: item.id)
-                    model.askToBatch(quitting: true, sparing: spared)
+                    if let spared {
+                        askToQuitOthers(sparing: spared, command: command, in: model)
+                    } else {
+                        model.askToBatch(quitting: true)
+                    }
                     return
                 }
             } catch {
@@ -170,10 +172,14 @@ final class SystemCommandProvider: CommandProvider {
                 model.feedback = .warning(error.localizedDescription)
                 return
             }
-            guard model.store.database.systemCommandSettings.asksFirst(id), let text = command.confirmation(for: context)
-            else {
+            guard model.store.database.systemCommandSettings.asksFirst(id) else {
                 model.store.recordUse(of: item.id)
                 run(action, reporting: command, in: model)
+                return
+            }
+            // A command that asks never runs without its question.
+            guard let text = command.confirmation(for: context) else {
+                model.feedback = .error("\(command.title) couldn't ask first, so nothing ran.")
                 return
             }
             // The question names this app and these exclusions. Approval runs exactly this
@@ -203,6 +209,27 @@ final class SystemCommandProvider: CommandProvider {
             pressMenuItem(ref.payload, in: model)
         default:
             break
+        }
+    }
+
+    /// Quit Others asks to quit every app but `spared`. On approval, `spared` must still be the
+    /// app OpenRay opened over, the same process. If it quit or was replaced while the question
+    /// was open, nothing is quit: the question is asked again for the app OpenRay is over now,
+    /// or, with none, the panel says so.
+    private func askToQuitOthers(sparing spared: AppIdentity, command: SystemCommand, in model: LauncherModel) {
+        model.askToBatch(quitting: true, sparing: spared) { [weak self, weak model] in
+            guard let self, let model else { return false }
+            let now = self.context(in: model).foregroundApplication
+            if now == spared { return true }
+            if let now {
+                model.feedback = .warning(
+                    "\(spared.name) changed while the question was open, so nothing was quit. Asking again, keeping \(now.name).")
+                self.askToQuitOthers(sparing: now, command: command, in: model)
+            } else {
+                model.feedback = .warning(
+                    "\(spared.name) quit while the question was open, so nothing was quit. Run \(command.title) again from the app you want to keep.")
+            }
+            return false
         }
     }
 
