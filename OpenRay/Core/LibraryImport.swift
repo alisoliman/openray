@@ -41,18 +41,27 @@ struct ImportedQuicklink: Codable, Equatable, Sendable {
     var name: String
     var link: String
     var iconName: String?
+    /// An app name, as other launchers write it.
     var openWith: String?
+    /// OpenRay's addition, so its own round trip keeps the exact app. Others ignore it.
+    var openWithBundleIdentifier: String?
 
-    init(name: String, link: String, iconName: String? = nil, openWith: String? = nil) {
+    init(
+        name: String, link: String, iconName: String? = nil, openWith: String? = nil, openWithBundleIdentifier: String? = nil
+    ) {
         self.name = name
         self.link = link
         self.iconName = iconName?.isEmpty == true ? nil : iconName
         self.openWith = openWith?.isEmpty == true ? nil : openWith
+        self.openWithBundleIdentifier = openWithBundleIdentifier?.isEmpty == true ? nil : openWithBundleIdentifier
     }
 
-    /// Exports write `{argument name="query"}` rather than OpenRay's older `{query}`.
-    init(_ quicklink: Quicklink, openWith: String? = nil) {
-        self.init(name: quicklink.name, link: QuicklinkTemplate(quicklink.template).modernizedLink, openWith: openWith)
+    /// Exports write `{argument name="query"}` rather than OpenRay's older `{query}`,
+    /// and the Open With app by name and bundle identifier.
+    init(_ quicklink: Quicklink) {
+        self.init(
+            name: quicklink.name, link: QuicklinkTemplate(quicklink.template).modernizedLink,
+            openWith: quicklink.openWith?.name, openWithBundleIdentifier: quicklink.openWith?.bundleIdentifier)
     }
 }
 
@@ -123,7 +132,9 @@ enum LibraryImport {
                 !phrase.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
             else { return nil }
             let shortcut = string(object["shortcut"])
-            return ImportedSnippet(name: Self.name(for: phrase), text: phrase, keyword: shortcut)
+            // Text Replacements have no placeholders: escape anything that looks like one.
+            let text = PlaceholderParser.escaping(phrase, context: .snippet) { _ in false }
+            return ImportedSnippet(name: Self.name(for: phrase), text: text, keyword: shortcut)
         }
     }
 
@@ -149,7 +160,8 @@ enum LibraryImport {
         return try parse(objects: jsonObjects(data)) { object in
             guard let name = string(object["name"]), let link = string(object["link"]) else { return nil }
             return ImportedQuicklink(
-                name: name, link: link, iconName: string(object["iconName"]), openWith: string(object["openWith"]))
+                name: name, link: link, iconName: string(object["iconName"]), openWith: string(object["openWith"]),
+                openWithBundleIdentifier: string(object["openWithBundleIdentifier"]))
         }
     }
 
@@ -284,13 +296,15 @@ extension LibraryImport {
         isValidKeyword: (String) -> Bool = SnippetKeywordRules.isValid
     ) -> SnippetImportPlan {
         var plan = SnippetImportPlan()
-        func same(_ a: ImportedSnippet, _ b: ImportedSnippet) -> Bool {
-            a.name == b.name && a.text == b.text && (a.keyword ?? "") == (b.keyword ?? "")
+        // Hashed, so a 10,000-row file is planned in linear time.
+        func key(_ snippet: ImportedSnippet) -> String {
+            [snippet.name, snippet.text, snippet.keyword ?? ""].joined(separator: "\u{0}")
         }
-        let library = existing.map(ImportedSnippet.init)
-        func isDuplicate(_ candidate: ImportedSnippet) -> Bool {
-            library.contains { same($0, candidate) } || plan.additions.contains { same($0, candidate) }
-                || plan.replacements.contains { same($0.snippet, candidate) }
+        var known = Set(existing.map { key(ImportedSnippet($0)) })
+        func isDuplicate(_ candidate: ImportedSnippet) -> Bool { known.contains(key(candidate)) }
+        func add(_ snippet: ImportedSnippet) {
+            plan.additions.append(snippet)
+            known.insert(key(snippet))
         }
         var holders: [String: UUID] = [:]
         for snippet in existing where !snippet.keyword.isEmpty {
@@ -300,8 +314,9 @@ extension LibraryImport {
         var claimed: [String: Int] = [:]
 
         for item in incoming {
-            guard !item.name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
-                !item.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty, item.text.count <= maximumTextLength
+            // The same rules a save applies, so the plan never promises a row the save rejects.
+            guard item.text.count <= maximumTextLength,
+                (try? Snippet(name: item.name, keyword: "", content: item.text).validate(against: [])) != nil
             else {
                 plan.invalid.append(item)
                 continue
@@ -311,7 +326,7 @@ extension LibraryImport {
                 continue
             }
             guard let keyword = item.keyword else {
-                plan.additions.append(item)
+                add(item)
                 continue
             }
             let withoutKeyword = ImportedSnippet(name: item.name, text: item.text)
@@ -320,7 +335,7 @@ extension LibraryImport {
                     plan.duplicates.append(item)
                 } else {
                     plan.keywordsDropped.append(item)
-                    plan.additions.append(withoutKeyword)
+                    add(withoutKeyword)
                 }
                 continue
             }
@@ -328,7 +343,7 @@ extension LibraryImport {
             let earlier = claimed[keyword]
             guard holder != nil || earlier != nil else {
                 claimed[keyword] = plan.additions.count
-                plan.additions.append(item)
+                add(item)
                 continue
             }
             switch policy {
@@ -338,7 +353,7 @@ extension LibraryImport {
                 } else {
                     plan.keywordConflicts.append(item)
                     plan.keywordsDropped.append(item)
-                    plan.additions.append(withoutKeyword)
+                    add(withoutKeyword)
                 }
             case .skip:
                 plan.keywordConflicts.append(item)
@@ -351,6 +366,7 @@ extension LibraryImport {
                 } else if let earlier {
                     plan.additions[earlier] = item
                 }
+                known.insert(key(item))
             }
         }
         return plan

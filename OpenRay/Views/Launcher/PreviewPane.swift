@@ -189,7 +189,7 @@ struct PreviewPane: View {
 
     private func expiry(_ entry: ClipboardEntry) -> String {
         if entry.isPinned { return "Never · Pinned" }
-        let days = model.store.database.preferences.clipboardRetentionDays
+        guard let days = model.store.database.preferences.clipboardRetentionDaysOrUnlimited else { return "Never" }
         let date = entry.copiedAt.addingTimeInterval(Double(days) * 86_400)
         let remaining = date.timeIntervalSinceNow
         if remaining < 3_600 { return "Within the hour" }

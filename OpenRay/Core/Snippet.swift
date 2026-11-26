@@ -9,14 +9,26 @@ struct Snippet: Codable, Identifiable, Equatable, Sendable {
     var expandsKeyword: Bool? = nil
     /// Labels for search and filtering. Missing in libraries from before tags.
     var tags: [String]? = nil
+    /// The placeholder syntax `content` is written in. Snippets saved before dynamic
+    /// placeholders had none; decoding migrates them (see `init(from:)`).
+    var placeholderVersion = Snippet.currentPlaceholderVersion
 
     /// The longest snippet text, as in the public reference.
     static let maximumLength = 65_000
+    /// Version 2: the dynamic placeholder engine.
+    static let currentPlaceholderVersion = 2
 
     var expandsAsYouType: Bool { expandsKeyword ?? true }
     var tagList: [String] { tags ?? [] }
 
     var template: PlaceholderTemplate { PlaceholderTemplate(content, context: .snippet) }
+
+    /// Content written for OpenRay before 2.x filled in only exact `{date}` and `{time}`.
+    /// Every other placeholder in it is escaped, so it still shows as written, and
+    /// a library with, say, four literal `{argument}` tokens still loads.
+    static func migratingLegacyContent(_ content: String) -> String {
+        PlaceholderParser.escaping(content, context: .snippet) { $0.source == "{date}" || $0.source == "{time}" }
+    }
 
     /// The text with what needs nothing from the library filled in: dates, times,
     /// UUIDs and argument defaults. `{clipboard}` and other inputs render empty;
@@ -70,5 +82,26 @@ enum LibraryTags {
         else {
             throw LibraryValidationError("Use up to 16 tags of up to 32 characters each.")
         }
+    }
+}
+
+extension Snippet {
+    private enum CodingKeys: String, CodingKey {
+        case id, name, keyword, content, expandsKeyword, tags, placeholderVersion
+    }
+
+    /// Snippets without a placeholder version were written before dynamic placeholders.
+    /// Their content is migrated once, in memory, and saved as version 2 with the next save.
+    init(from decoder: any Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        id = try container.decode(UUID.self, forKey: .id)
+        name = try container.decode(String.self, forKey: .name)
+        keyword = try container.decode(String.self, forKey: .keyword)
+        let content = try container.decode(String.self, forKey: .content)
+        expandsKeyword = try container.decodeIfPresent(Bool.self, forKey: .expandsKeyword)
+        tags = try container.decodeIfPresent([String].self, forKey: .tags)
+        let version = try container.decodeIfPresent(Int.self, forKey: .placeholderVersion) ?? 1
+        self.content = version < Self.currentPlaceholderVersion ? Self.migratingLegacyContent(content) : content
+        placeholderVersion = max(version, Self.currentPlaceholderVersion)
     }
 }

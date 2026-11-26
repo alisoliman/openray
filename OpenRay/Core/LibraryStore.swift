@@ -33,14 +33,24 @@ final class LibraryStore {
                 "Your library could not be loaded. The original file is untouched. \(error.localizedDescription)"
             return
         }
-        // Formatting and recognized text are kept beside the images.
+        // Formatting and recognized text are kept beside the images. Values still inline
+        // (their side file was never written) move there now, and stay inline until they do.
         for index in database.clipboard.indices {
             let entry = database.clipboard[index]
-            if entry.richText == nil, case .text = entry.content {
-                database.clipboard[index].richText = images.richText(for: entry.id)
+            if let digest = entry.richTextDigest {
+                database.clipboard[index].richText = images.richText(digest: digest)
+                if database.clipboard[index].richText == nil { database.clipboard[index].richTextDigest = nil }
+            } else if let richText = entry.richText {
+                database.clipboard[index].richTextDigest = try? images.saveRichText(richText)
             }
-            if entry.recognizedText == nil, let image = entry.image {
-                database.clipboard[index].recognizedText = images.recognizedText(forImage: image.id)
+            if let image = entry.image {
+                if let text = entry.recognizedText {
+                    database.clipboard[index].recognizedTextIsStored =
+                        (try? images.saveRecognizedText(text, forImage: image.id)) != nil
+                } else if let text = images.recognizedText(forImage: image.id) {
+                    database.clipboard[index].recognizedText = text
+                    database.clipboard[index].recognizedTextIsStored = true
+                }
             }
         }
         // An interrupted image capture can leave a PNG that no saved entry owns.
@@ -253,6 +263,8 @@ final class LibraryStore {
         guard database.preferences.clipboardEnabled, entry.isValid else { return false }
         if case .image = entry.content, !database.preferences.capturesClipboardImages { return false }
         if case .files = entry.content, !database.preferences.capturesClipboardFiles { return false }
+        var entry = entry
+        entry.richTextDigest = nil
         let insert = { (database: inout LibraryDatabase) in
             var entry = entry
             if let existing = database.clipboard.first(where: { $0.content == entry.content }) {
@@ -273,17 +285,12 @@ final class LibraryStore {
                 "The last copy wasn't saved: pinned entries fill the \(budget) clipboard budget. Unpin some to keep new copies."
             return false
         }
-        guard update(insert) else { return false }
-        // Formatting is optional: if its file can't be written, the copy is still saved.
-        if case .text = entry.content, let stored = database.clipboard.first(where: { $0.content == entry.content }) {
-            if let richText = stored.richText {
-                try? images.saveRichText(richText, for: stored.id)
-            } else {
-                // A recopy without formatting mustn't bring back an earlier copy's.
-                images.removeRichText(for: stored.id)
-            }
+        // Formatting goes to its own content-named file before the row that refers to
+        // it. If that fails the row carries it inline; an unsaved row's file is cleaned up.
+        if case .text = entry.content, let richText = entry.richText {
+            entry.richTextDigest = try? images.saveRichText(richText)
         }
-        return true
+        return update(insert)
     }
 
     /// Saves text recognized in a captured image beside it, and makes the entries
@@ -291,10 +298,12 @@ final class LibraryStore {
     @discardableResult
     func setRecognizedText(_ text: String, forImage imageID: String) -> Bool {
         guard !isReadOnly, database.clipboard.contains(where: { $0.image?.id == imageID }) else { return false }
-        do { try images.saveRecognizedText(text, forImage: imageID) } catch { return false }
+        // Saved inline if the side file can't be written, so the text is never lost.
+        let stored = (try? images.saveRecognizedText(text, forImage: imageID)) != nil
         return update { database in
             for index in database.clipboard.indices where database.clipboard[index].image?.id == imageID {
                 database.clipboard[index].recognizedText = text
+                database.clipboard[index].recognizedTextIsStored = stored
             }
         }
     }

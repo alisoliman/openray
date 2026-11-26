@@ -87,11 +87,17 @@ struct ClipboardEntry: Codable, Identifiable, Equatable, Sendable {
     /// Pinned entries are exempt from retention and the entry limit, not from the byte budget.
     var isPinned = false
     /// The formatted versions of copied text, when the source app offered them.
-    /// Kept in memory; `LibraryStore` persists it beside the images, not in `library.json`.
+    /// `LibraryStore` keeps it in a side file; `library.json` holds only `richTextDigest`.
     var richText: ClipboardRichText?
+    /// The digest of the side file that holds `richText`. A side file is used only when
+    /// it matches, so formatting from an earlier copy can never come back. Nil while
+    /// the formatting has no side file yet; it's then saved inline instead.
+    var richTextDigest: String?
     /// Text found in an image by on-device recognition, so image entries are searchable.
-    /// Kept in memory; `LibraryStore` persists it beside the images, not in `library.json`.
+    /// `LibraryStore` keeps it in a side file named by the image.
     var recognizedText: String?
+    /// True once `recognizedText` is in its side file. Until then it's saved inline.
+    var recognizedTextIsStored = false
 
     init(id: UUID = UUID(), text: String, copiedAt: Date = .now, sourceName: String, sourceBundleID: String? = nil) {
         self.init(
@@ -130,6 +136,7 @@ struct ClipboardEntry: Codable, Identifiable, Equatable, Sendable {
         guard case .text = content else { return }
         content = .text(text)
         richText = nil
+        richTextDigest = nil
     }
 
     /// What copied text looks like: a link, an email address, a color or plain text.
@@ -214,7 +221,7 @@ struct ClipboardEntry: Codable, Identifiable, Equatable, Sendable {
     }
 
     private enum CodingKeys: String, CodingKey {
-        case id, kind, text, image, files, copiedAt, sourceName, sourceBundleID, pinned, rich, recognizedText
+        case id, kind, text, image, files, copiedAt, sourceName, sourceBundleID, pinned, rich, richDigest, recognizedText
     }
 
     init(from decoder: any Decoder) throws {
@@ -224,9 +231,10 @@ struct ClipboardEntry: Codable, Identifiable, Equatable, Sendable {
         sourceName = try container.decode(String.self, forKey: .sourceName)
         sourceBundleID = try container.decodeIfPresent(String.self, forKey: .sourceBundleID)
         isPinned = try container.decodeIfPresent(Bool.self, forKey: .pinned) ?? false
-        // Formatting and recognized text live in side files. Early test builds wrote them
-        // inline, so they're still read here if present.
+        // Formatting and recognized text live in side files. Inline values are a fallback
+        // until their side file is written; `LibraryStore` migrates them when it loads.
         richText = try container.decodeIfPresent(ClipboardRichText.self, forKey: .rich)
+        richTextDigest = try container.decodeIfPresent(String.self, forKey: .richDigest)
         recognizedText = try container.decodeIfPresent(String.self, forKey: .recognizedText)
         // Version 1 entries contained only a `text` field, without a kind tag.
         switch try container.decodeIfPresent(String.self, forKey: .kind) ?? "text" {
@@ -246,6 +254,13 @@ struct ClipboardEntry: Codable, Identifiable, Equatable, Sendable {
         try container.encode(sourceName, forKey: .sourceName)
         try container.encodeIfPresent(sourceBundleID, forKey: .sourceBundleID)
         if isPinned { try container.encode(true, forKey: .pinned) }
+        // A side file holds formatting and recognized text; inline only until it's written.
+        if let richTextDigest {
+            try container.encode(richTextDigest, forKey: .richDigest)
+        } else if let richText, !richText.isEmpty {
+            try container.encode(richText, forKey: .rich)
+        }
+        if let recognizedText, !recognizedTextIsStored { try container.encode(recognizedText, forKey: .recognizedText) }
         switch content {
         case .text(let text):
             try container.encode("text", forKey: .kind)
@@ -616,8 +631,7 @@ struct ClipboardRetentionPolicy: Equatable, Sendable {
     /// The policy saved preferences describe. An explicit choice wins over the day
     /// count older builds store, which stays the default (7 days).
     init(preferences: AppPreferences) {
-        let days = preferences.clipboardRetention.map(\.days) ?? preferences.clipboardRetentionDays
-        self.init(retentionDays: days, maximumItems: min(500, preferences.clipboardLimit))
+        self.init(retentionDays: preferences.clipboardRetentionDaysOrUnlimited, maximumItems: min(500, preferences.clipboardLimit))
     }
 
     /// Entries copied at or before this moment have expired. Nil when they never do.
@@ -647,5 +661,32 @@ struct ClipboardRetentionPolicy: Equatable, Sendable {
             }
         }
         return candidates.filter { kept.contains($0.id) }
+    }
+}
+
+extension AppPreferences {
+    /// Days clipboard history is kept, or nil for no limit: the explicit choice, else
+    /// the day count earlier builds store (7 by default).
+    var clipboardRetentionDaysOrUnlimited: Int? {
+        clipboardRetention.map(\.days) ?? clipboardRetentionDays
+    }
+
+    /// The retention choice to show: the explicit one, else the saved day count rounded up.
+    var effectiveClipboardRetention: ClipboardRetention {
+        clipboardRetention ?? ClipboardRetention(days: clipboardRetentionDays)
+    }
+
+    /// The one way to change retention, from Settings or the opt-in screen. It sets the
+    /// explicit choice and keeps the day count earlier builds read in step.
+    mutating func setClipboardRetention(_ retention: ClipboardRetention) {
+        clipboardRetention = retention
+        clipboardRetentionDays = retention.days ?? 365
+    }
+
+    /// For a day count, such as the opt-in screen's: exact days, kept as they are.
+    mutating func setClipboardRetention(days: Int) {
+        let days = min(365, max(1, days))
+        clipboardRetention = ClipboardRetention.allCases.first { $0.days == days }
+        clipboardRetentionDays = days
     }
 }

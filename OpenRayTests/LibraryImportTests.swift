@@ -113,9 +113,11 @@ struct LibraryImportTests {
     }
 
     @Test func quicklinkExportModernizesLegacyQueries() throws {
-        let link = Quicklink(name: "Search", template: "https://duckduckgo.com/?q={query}", keyword: "d")
-        let exported = ImportedQuicklink(link, openWith: "Safari")
+        var link = Quicklink(name: "Search", template: "https://duckduckgo.com/?q={query}", keyword: "d")
+        link.openWith = QuicklinkApplication(bundleIdentifier: "com.apple.Safari", name: "Safari")
+        let exported = ImportedQuicklink(link)
         #expect(exported.link == #"https://duckduckgo.com/?q={argument name="query"}"#)
+        #expect(exported.openWith == "Safari" && exported.openWithBundleIdentifier == "com.apple.Safari")
         let data = try LibraryImport.exportQuicklinks([exported])
         #expect(try LibraryImport.quicklinks(from: data).items == [exported])
         #expect(String(decoding: data, as: UTF8.self).contains("https://duckduckgo.com"))

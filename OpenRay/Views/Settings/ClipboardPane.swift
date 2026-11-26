@@ -112,17 +112,9 @@ struct ClipboardPane: View {
     /// builds read the day count, so it's kept in step: unlimited saves the longest it allows.
     private var retentionBinding: Binding<ClipboardRetention> {
         Binding(
-            get: {
-                let preferences = model.store.database.preferences
-                return preferences.clipboardRetention ?? ClipboardRetention(days: preferences.clipboardRetentionDays)
-            },
+            get: { model.store.database.preferences.effectiveClipboardRetention },
             set: { retention in
-                if model.store.update({
-                    $0.preferences.clipboardRetention = retention
-                    $0.preferences.clipboardRetentionDays = retention.days ?? 365
-                }) {
-                    model.applyPreferences()
-                }
+                if model.store.update({ $0.preferences.setClipboardRetention(retention) }) { model.applyPreferences() }
             })
     }
 

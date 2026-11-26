@@ -233,14 +233,20 @@ struct ClipboardRichTextTests {
 
     // MARK: Storage
 
-    @Test func formattingAndRecognizedTextStayOutOfTheLibraryJSON() throws {
+    @Test func formattingIsReferencedByDigestAndInlineOnlyUntilStored() throws {
         var entry = ClipboardEntry(text: "Bold", copiedAt: Date(timeIntervalSince1970: 100), sourceName: "Fixture")
         entry.richText = ClipboardRichText(rtf: sampleRTF, html: sampleHTML)
-        entry.recognizedText = "ignored"
+        // Without a side file yet, the formatting is saved inline, so it's never lost.
+        let inline = try JSONDecoder().decode(ClipboardEntry.self, from: JSONEncoder().encode(entry))
+        #expect(inline.richText == entry.richText && inline.richTextDigest == nil)
+        // With one, only its digest is saved.
+        entry.richTextDigest = String(repeating: "a", count: 64)
         let json = String(decoding: try JSONEncoder().encode(entry), as: UTF8.self)
-        #expect(!json.contains("rich") && !json.contains("recognizedText"))
+        #expect(json.contains("richDigest") && !json.contains("\"rich\""))
         let decoded = try JSONDecoder().decode(ClipboardEntry.self, from: Data(json.utf8))
-        #expect(decoded.richText == nil && decoded.recognizedText == nil && decoded.plainText == "Bold")
+        #expect(decoded.richText == nil && decoded.richTextDigest == entry.richTextDigest)
+        entry.replaceText("Edited")
+        #expect(entry.richText == nil && entry.richTextDigest == nil)
 
         let old = Data(#"{"id":"\#(UUID().uuidString)","kind":"text","text":"Old","copiedAt":0,"sourceName":"App"}"#.utf8)
         let older = try JSONDecoder().decode(ClipboardEntry.self, from: old)

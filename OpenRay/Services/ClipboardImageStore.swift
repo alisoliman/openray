@@ -6,7 +6,7 @@ import Foundation
 final class ClipboardImageStore {
     let directory: URL?
     private var memory: [String: Data] = [:]
-    private var memoryRichText: [UUID: ClipboardRichText] = [:]
+    private var memoryRichText: [String: ClipboardRichText] = [:]
     private var memoryRecognizedText: [String: String] = [:]
 
     init(libraryURL: URL?) {
@@ -92,40 +92,40 @@ final class ClipboardImageStore {
 
 /// Formatting and recognized text, kept beside the images rather than in
 /// `library.json`, so ordinary saves never rewrite them:
-/// - `<entry UUID>.rich`: a binary property list with an entry's RTF and HTML.
+/// - `<digest>.rich`: a binary property list with RTF and HTML, named by its own
+///   SHA-256 digest, which the entry stores. A file is only ever read for the digest
+///   it has, so it can't be overwritten for another row or come back stale.
 /// - `<image digest>.txt`: UTF-8 text recognized in that image.
 ///
-/// They're written when captured or recognized, read once when the library loads,
-/// and removed by `reconcileSideData` when their entry or image is gone. A missing
-/// or damaged file only costs that entry its formatting or searchable text.
+/// They're written before the row that refers to them is saved, read when the
+/// library loads, and removed by `reconcileSideData` once nothing refers to them.
+/// A missing or damaged file only costs that entry its formatting or searchable text.
 extension ClipboardImageStore {
-    func saveRichText(_ richText: ClipboardRichText, for entryID: UUID) throws {
+    /// Writes formatting to a file named by its digest, and returns the digest for the
+    /// entry to store. Never touches another digest's file.
+    func saveRichText(_ richText: ClipboardRichText) throws -> String {
         guard !richText.isEmpty, richText.byteCount <= ClipboardLimits.richTextBytes else {
             throw LibraryValidationError("Invalid clipboard formatting.")
         }
-        guard let url = try sideFileURL(entryID.uuidString + ".rich") else {
-            memoryRichText[entryID] = richText
-            return
-        }
         let encoder = PropertyListEncoder()
         encoder.outputFormat = .binary
-        try write(try encoder.encode(richText), to: url)
+        let data = try encoder.encode(richText)
+        let digest = ClipboardImageCodec.digest(data)
+        guard let url = try sideFileURL(digest + ".rich") else {
+            memoryRichText[digest] = richText
+            return digest
+        }
+        if readSideFile(url, limit: ClipboardLimits.richTextBytes + 4_096) != data { try write(data, to: url) }
+        return digest
     }
 
-    func removeRichText(for entryID: UUID) {
-        memoryRichText[entryID] = nil
-        guard let directory else { return }
-        let url = directory.appending(path: entryID.uuidString + ".rich")
-        guard let values = try? url.resourceValues(forKeys: [.isRegularFileKey, .isSymbolicLinkKey]),
-            values.isRegularFile == true, values.isSymbolicLink != true
-        else { return }
-        try? FileManager.default.removeItem(at: url)
-    }
-
-    func richText(for entryID: UUID) -> ClipboardRichText? {
-        guard let directory else { return memoryRichText[entryID] }
-        guard let data = readSideFile(directory.appending(path: entryID.uuidString + ".rich"),
+    /// The formatting with `digest`, only if its file still has that digest.
+    func richText(digest: String) -> ClipboardRichText? {
+        guard ClipboardImageStore.isDigest(digest) else { return nil }
+        guard let directory else { return memoryRichText[digest] }
+        guard let data = readSideFile(directory.appending(path: digest + ".rich"),
             limit: ClipboardLimits.richTextBytes + 4_096),
+            ClipboardImageCodec.digest(data) == digest,
             let richText = try? PropertyListDecoder().decode(ClipboardRichText.self, from: data),
             !richText.isEmpty, richText.byteCount <= ClipboardLimits.richTextBytes
         else { return nil }
@@ -151,11 +151,12 @@ extension ClipboardImageStore {
         return String(data: data, encoding: .utf8)
     }
 
-    /// Removes formatting of entries and text of images no longer in `entries`.
+    /// Removes formatting no entry refers to (gone, or replaced by a copy without
+    /// formatting) and text of images no longer in `entries`.
     func reconcileSideData(keeping entries: [ClipboardEntry]) throws {
-        let entryIDs = Set(entries.map(\.id.uuidString))
+        let richDigests = Set(entries.compactMap(\.richTextDigest))
         let imageIDs = Set(entries.compactMap(\.image?.id))
-        memoryRichText = memoryRichText.filter { entryIDs.contains($0.key.uuidString) }
+        memoryRichText = memoryRichText.filter { richDigests.contains($0.key) }
         memoryRecognizedText = memoryRecognizedText.filter { imageIDs.contains($0.key) }
         guard let directory, FileManager.default.fileExists(atPath: directory.path) else { return }
         guard (try? directory.resourceValues(forKeys: [.isSymbolicLinkKey]).isSymbolicLink) != true else {
@@ -165,7 +166,7 @@ extension ClipboardImageStore {
             let name = url.deletingPathExtension().lastPathComponent
             let orphaned: Bool
             switch url.pathExtension {
-            case "rich": orphaned = UUID(uuidString: name) != nil && !entryIDs.contains(name)
+            case "rich": orphaned = ClipboardImageStore.isDigest(name) && !richDigests.contains(name)
             case "txt": orphaned = ClipboardImageStore.isDigest(name) && !imageIDs.contains(name)
             default: continue
             }
