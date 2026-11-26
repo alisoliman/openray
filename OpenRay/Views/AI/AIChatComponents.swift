@@ -102,10 +102,27 @@ struct ToolApprovalCards: View {
                 }
                 Text(approval.detail).font(OR.Font.body).foregroundStyle(OR.Color.text)
                     .fixedSize(horizontal: false, vertical: true)
-                Text("\(approval.title) · runs on this Mac").font(OR.Font.caption).foregroundStyle(OR.Color.text2)
+                if !approval.fields.isEmpty {
+                    VStack(alignment: .leading, spacing: 6) {
+                        ForEach(Array(approval.fields.enumerated()), id: \.offset) { _, field in
+                            VStack(alignment: .leading, spacing: 1) {
+                                Text(field.label).font(OR.Font.caption).foregroundStyle(OR.Color.text2)
+                                Text(field.value).font(.system(size: 12.5)).foregroundStyle(OR.Color.text)
+                                    .textSelection(.enabled).lineLimit(8).fixedSize(horizontal: false, vertical: true)
+                            }
+                        }
+                    }
+                    .padding(10)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .background(OR.Color.fill2, in: .rect(cornerRadius: OR.Radius.chip, style: .continuous))
+                }
+                Text(approval.isAction ? "\(approval.title) · asks every time" : "\(approval.title) · runs on this Mac")
+                    .font(OR.Font.caption).foregroundStyle(OR.Color.text2)
                 HStack(spacing: 8) {
                     Button("Allow") { broker.resolve(approval.id, .allow) }.buttonStyle(.orPrimary)
-                    Button("Always Allow") { broker.resolve(approval.id, .alwaysAllow) }.buttonStyle(.orSecondary)
+                    if approval.offersAlways {
+                        Button("Always Allow") { broker.resolve(approval.id, .alwaysAllow) }.buttonStyle(.orSecondary)
+                    }
                     Spacer(minLength: 0)
                     Button("Don't Allow") { broker.resolve(approval.id, .deny) }.buttonStyle(.orGhost)
                 }

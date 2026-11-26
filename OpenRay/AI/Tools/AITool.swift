@@ -52,13 +52,14 @@ struct AIToolExtension: Identifiable, Hashable, Sendable {
     var mention: String { "@" + id }
 }
 
-/// When a tool may run without asking.
+/// When a read-only tool may run without asking. Tools that change something always ask,
+/// every call, whatever is stored: a stored `.always` for one of them counts as `.ask`.
 enum AIToolPermission: String, CaseIterable, Identifiable, Sendable {
     /// Ask before every call, reads included.
     case ask
     /// Run reads; ask before anything that changes something. The default.
     case auto
-    /// Never ask.
+    /// Run reads without asking. Never applies to tools that change something.
     case always
 
     var id: String { rawValue }
@@ -71,12 +72,13 @@ enum AIToolPermission: String, CaseIterable, Identifiable, Sendable {
     }
 
     func needsApproval(for spec: AIToolSpec) -> Bool {
-        switch self {
-        case .ask: true
-        case .auto: spec.isAction
-        case .always: false
-        }
+        // Writes and actions need a fresh yes each time.
+        if spec.isAction { return true }
+        return self == .ask
     }
+
+    /// The choices Settings offers for a tool: writes only ever ask.
+    static func choices(for spec: AIToolSpec) -> [AIToolPermission] { spec.isAction ? [] : allCases }
 }
 
 /// The values the model filled in.
@@ -139,6 +141,10 @@ final class InMemoryToolPermissions: AIToolPermissionStoring {
 
 /// A call waiting for the person, drawn as a card in the conversation.
 struct AIToolApproval: Identifiable, Equatable, Sendable {
+    struct Field: Equatable, Sendable {
+        var label: String
+        var value: String
+    }
     var id = UUID()
     var toolID: String
     var title: String
@@ -146,6 +152,10 @@ struct AIToolApproval: Identifiable, Equatable, Sendable {
     /// What will happen, in one line.
     var detail: String
     var isAction: Bool
+    /// Every value the call would use, so a write is approved knowing exactly what it writes.
+    var fields: [Field] = []
+    /// Always Allow is offered only for read-only tools.
+    var offersAlways: Bool { !isAction }
 }
 
 enum AIToolDecision: Sendable {
@@ -190,30 +200,52 @@ final class AIToolBroker: AIToolInvoking {
 
     var specs: [AIToolSpec] { executors.values.map(\.spec).sorted { $0.id < $1.id } }
 
-    func permission(for spec: AIToolSpec) -> AIToolPermission { permissions.permission(for: spec.id) ?? .auto }
+    /// The stored permission, with a stored `.always` for a write read as `.ask`.
+    func permission(for spec: AIToolSpec) -> AIToolPermission {
+        let stored = permissions.permission(for: spec.id) ?? .auto
+        return spec.isAction && stored == .always ? .ask : stored
+    }
+
+    /// The values a call would use, labeled by parameter, longest values shortened.
+    static func fields(for spec: AIToolSpec, arguments: AIToolArguments) -> [AIToolApproval.Field] {
+        spec.parameters.compactMap { parameter in
+            guard let value = arguments[parameter.name] else { return nil }
+            let shown = value.count > 600 ? String(value.prefix(600)) + "…" : value
+            return AIToolApproval.Field(label: parameter.name.capitalized, value: shown)
+        }
+    }
 
     func invoke(toolID: String, arguments: AIToolArguments) async -> String {
         guard let executor = executors[toolID] else { return AIToolError.unknownTool(toolID).localizedDescription }
         let spec = executor.spec
         let detail = executor.describe(arguments)
-        if permission(for: spec).needsApproval(for: spec) {
-            let decision = await requestApproval(
-                AIToolApproval(toolID: spec.id, title: spec.title, symbol: spec.symbol, detail: detail, isAction: spec.isAction))
-            switch decision {
-            case .deny:
-                log(spec, detail, .declined)
-                return "The person declined this request, so nothing was done. Tell them it wasn't done."
-            case .alwaysAllow:
-                permissions.setPermission(.always, for: spec.id)
-            case .allow:
-                break
-            }
-        }
+        // An action this launch may not perform is refused before anyone is asked about it.
         if spec.effect == .system {
             do { try sideEffects.check(spec.title.lowercased()) } catch {
                 log(spec, detail, .blocked(error.localizedDescription))
                 return error.localizedDescription
             }
+        }
+        if permission(for: spec).needsApproval(for: spec) {
+            let decision = await requestApproval(
+                AIToolApproval(
+                    toolID: spec.id, title: spec.title, symbol: spec.symbol, detail: detail, isAction: spec.isAction,
+                    fields: Self.fields(for: spec, arguments: arguments)))
+            switch decision {
+            case .deny:
+                log(spec, detail, .declined)
+                return "The person declined this request, so nothing was done. Tell them it wasn't done."
+            case .alwaysAllow:
+                // Standing permission is for reads only; a write was approved this once.
+                if !spec.isAction { permissions.setPermission(.always, for: spec.id) }
+            case .allow:
+                break
+            }
+        }
+        // Stop, or a closed conversation, between the yes and the run cancels the call.
+        if Task.isCancelled {
+            log(spec, detail, .declined)
+            return "The request was stopped, so nothing was done."
         }
         do {
             let output = try await executor.run(arguments)

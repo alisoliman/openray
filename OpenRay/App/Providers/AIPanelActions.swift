@@ -12,10 +12,12 @@ extension LauncherModel {
                 ActionEntry(id: "tool.allow", title: "Allow \(approval.title)", symbol: "checkmark.circle", group: .item) {
                     broker?.resolve(approval.id, .allow)
                 })
-            entries.append(
-                ActionEntry(id: "tool.always", title: "Always Allow \(approval.title)", symbol: "checkmark.seal", group: .item) {
-                    broker?.resolve(approval.id, .alwaysAllow)
-                })
+            if approval.offersAlways {
+                entries.append(
+                    ActionEntry(id: "tool.always", title: "Always Allow \(approval.title)", symbol: "checkmark.seal", group: .item) {
+                        broker?.resolve(approval.id, .alwaysAllow)
+                    })
+            }
             entries.append(
                 ActionEntry(id: "tool.deny", title: "Don't Allow", symbol: "xmark.circle", group: .item, isDestructive: true) {
                     broker?.resolve(approval.id, .deny)
@@ -29,7 +31,8 @@ extension LauncherModel {
                     symbol: "macwindow.on.rectangle", shortcut: .command("J"), key: "j", modifiers: .command, group: .organize
                 ) { [weak self] in
                     guard let self else { return }
-                    if !(hasReply && self.aiHub.continueInChat()) { self.aiHub.openChatWindow() }
+                    // A conversation that couldn't be saved stays here, with the reason shown.
+                    if hasReply { self.aiHub.continueInChat() } else { self.aiHub.openChatWindow() }
                 })
         }
         if ai.action == .chat, ai.command == nil, !ai.isGenerating {
