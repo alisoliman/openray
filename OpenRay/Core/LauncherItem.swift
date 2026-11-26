@@ -147,6 +147,10 @@ struct LauncherResultGroup: Identifiable {
     /// How a `.grid` group draws its tiles. Nil draws window layout tiles, as Window Management does.
     var tile: GridTileRenderer? = nil
 
+    /// An untitled group still loading with nothing in it shows a “Searching…” header instead of
+    /// nothing, so it never looks empty.
+    var showsLoadingHeader: Bool { title == nil && isLoading && items.isEmpty }
+
     init(
         id: String? = nil, title: String?, trailing: String? = nil, isLoading: Bool = false, style: Style = .list,
         items: [LauncherItem], columns: Int? = nil, tile: GridTileRenderer? = nil

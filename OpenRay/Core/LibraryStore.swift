@@ -12,9 +12,12 @@ final class LibraryStore {
     @ObservationIgnored var commandBindingsDidChange: (() -> Void)?
     @ObservationIgnored private let images: ClipboardImageStore
     /// Rows deleted from another store whose favorite and usage records a failed save left
-    /// behind. Every later save removes them first, until one succeeds. They're also written to
-    /// `pendingCleanupURL`, so quitting before that save doesn't lose them.
+    /// behind. Every later save removes them first, until one succeeds.
     @ObservationIgnored private(set) var pendingForgottenIDs: Set<String> = []
+    /// Deletions from other stores, recorded before they happen (item id → provider id) in
+    /// `pendingCleanupURL`, so a failed save or a quit at any point can't lose the cleanup. Entries
+    /// loaded at launch wait for `reconcileJournaledCleanup`, which checks the row is really gone.
+    @ObservationIgnored private(set) var journaledCleanup: [String: String] = [:]
 
     init(fileURL: URL? = LibraryStore.defaultURL) {
         self.fileURL = fileURL
@@ -27,7 +30,7 @@ final class LibraryStore {
             try decoded.validate()
             decoded.schemaVersion = LibraryDatabase.currentSchemaVersion
             database = decoded
-            pendingForgottenIDs = Self.readPendingCleanup(at: pendingCleanupURL)
+            journaledCleanup = Self.readJournal(at: pendingCleanupURL)
         } catch {
             // Do not overwrite an unreadable or newer library with empty defaults.
             isReadOnly = true
@@ -43,8 +46,6 @@ final class LibraryStore {
             errorMessage =
                 "Your library was loaded, but some unused clipboard images could not be removed: \(error.localizedDescription)"
         }
-        // Favorites and recents of rows deleted elsewhere in an earlier session, if that save failed.
-        reconcilePendingCleanup()
     }
 
     /// Where cleanup that couldn't be saved waits for the next launch, beside the library.
@@ -52,21 +53,60 @@ final class LibraryStore {
         fileURL?.deletingLastPathComponent().appending(path: "library-pending-cleanup.json")
     }
 
-    private static func readPendingCleanup(at url: URL?) -> Set<String> {
+    private static func readJournal(at url: URL?) -> [String: String] {
         guard let url, let data = try? Data(contentsOf: url),
-            let ids = try? JSONDecoder().decode(Set<String>.self, from: data)
-        else { return [] }
-        return ids
+            let entries = try? JSONDecoder().decode([String: String].self, from: data)
+        else { return [:] }
+        return entries
     }
 
-    private func writePendingCleanup() {
+    /// Writes the journal, or removes it when empty. Throws when it can't be written.
+    private func writeJournal(_ entries: [String: String]) throws {
         guard let url = pendingCleanupURL else { return }
-        if pendingForgottenIDs.isEmpty {
-            try? FileManager.default.removeItem(at: url)
-        } else if let data = try? JSONEncoder().encode(pendingForgottenIDs) {
-            try? data.write(to: url, options: [.atomic])
-            try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: url.path)
+        if entries.isEmpty {
+            if FileManager.default.fileExists(atPath: url.path) { try FileManager.default.removeItem(at: url) }
+        } else {
+            try FileManager.default.createDirectory(
+                at: url.deletingLastPathComponent(), withIntermediateDirectories: true,
+                attributes: [.posixPermissions: 0o700])
+            try JSONEncoder().encode(entries).write(to: url, options: [.atomic])
+            try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: url.path)
         }
+    }
+
+    /// Records, before a provider deletes a row from its own store, that the row's favorite and
+    /// usage must go. Throws when it can't be recorded, and then the deletion mustn't happen.
+    func journalCleanup(of itemID: String, provider: String) throws {
+        guard !isReadOnly else { throw LibraryValidationError("The library is read-only.") }
+        var entries = journaledCleanup
+        entries[itemID] = provider
+        try writeJournal(entries)
+        journaledCleanup = entries
+    }
+
+    /// Withdraws a recorded cleanup whose deletion didn't happen.
+    func unjournalCleanup(of itemID: String) {
+        guard journaledCleanup[itemID] != nil else { return }
+        var entries = journaledCleanup
+        entries.removeValue(forKey: itemID)
+        if (try? writeJournal(entries)) != nil { journaledCleanup = entries }
+    }
+
+    /// Settles cleanup recorded in an earlier session. `isGone` says whether the row was really
+    /// deleted: true cleans its records, false drops the entry (the deletion never happened), and
+    /// nil keeps it for later (its provider isn't here to ask).
+    func reconcileJournaledCleanup(isGone: (_ itemID: String, _ provider: String) -> Bool?) {
+        guard !journaledCleanup.isEmpty, !isReadOnly else { return }
+        var entries = journaledCleanup
+        for (id, provider) in journaledCleanup {
+            switch isGone(id, provider) {
+            case true?: pendingForgottenIDs.insert(id)
+            case false?: entries.removeValue(forKey: id)
+            case nil: break
+            }
+        }
+        if entries != journaledCleanup, (try? writeJournal(entries)) != nil { journaledCleanup = entries }
+        if !pendingForgottenIDs.isEmpty { update { _ in } }
     }
 
     static var defaultURL: URL {
@@ -118,8 +158,10 @@ final class LibraryStore {
             let bindingsChanged = database.commandBindings != next.commandBindings
             database = next
             if !pendingForgottenIDs.isEmpty {
+                // Saved: the journal no longer needs these.
+                let settled = journaledCleanup.filter { !pendingForgottenIDs.contains($0.key) }
+                if settled != journaledCleanup, (try? writeJournal(settled)) != nil { journaledCleanup = settled }
                 pendingForgottenIDs = []
-                writePendingCleanup()
             }
             if bindingsChanged { commandBindingsDidChange?() }
             if !removedImages.isEmpty {
@@ -144,18 +186,12 @@ final class LibraryStore {
         let referenced = itemIDs.filter { id in
             database.favoriteIDs.contains(id) || database.usage.contains { $0.id == id }
         }
-        guard !referenced.isEmpty else { return true }
+        guard !referenced.isEmpty else {
+            for id in itemIDs { unjournalCleanup(of: id) }
+            return true
+        }
         pendingForgottenIDs.formUnion(referenced)
-        if update({ _ in }) { return true }
-        if !isReadOnly { writePendingCleanup() }
-        return false
-    }
-
-    /// Applies cleanup left by an earlier session. Call once the app is running; a library that
-    /// still can't be saved keeps it for later.
-    func reconcilePendingCleanup() {
-        guard !pendingForgottenIDs.isEmpty else { return }
-        update { _ in }
+        return update { _ in }
     }
 
     @discardableResult

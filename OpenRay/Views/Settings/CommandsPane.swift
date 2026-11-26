@@ -170,7 +170,7 @@ struct FallbacksSection: View {
                 .disabled(available.isEmpty)
                 .fixedSize()
                 Spacer()
-                if model.store.database.preferences.usesCustomFallbacks {
+                if model.usesCustomFallbacks {
                     Button("Restore Defaults") { model.resetFallbacks() }
                 }
             }

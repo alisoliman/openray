@@ -188,7 +188,7 @@ struct LauncherCoreTests {
         #expect(model.fallbackCandidates.map(\.id).contains("fallback.files"))
         // Adding one makes the order the person's own.
         #expect(model.setFallback("fallback.files", enabled: true))
-        #expect(model.store.database.preferences.usesCustomFallbacks)
+        #expect(model.usesCustomFallbacks)
         #expect(model.store.database.fallbackOrder == ["fallback.ai", "fallback.web", "fallback.files"])
         #expect(model.moveFallback("fallback.files", by: -2))
         #expect(model.groups.last?.items.map(\.id) == ["fallback.files", "fallback.ai", "fallback.web"])
@@ -479,7 +479,7 @@ struct LauncherCoreTests {
         #expect(preferences.size == .standard)
         #expect(!preferences.primaryActionPastes)
         #expect(preferences.launcherHotKeyShortcut == LauncherHotKey.optionSpace.shortcut)
-        #expect(!preferences.usesCustomFallbacks)
+        #expect(preferences.customFallbacks == nil)
         #expect(!preferences.hyper.isEnabled)
         var legacy = AppPreferences()
         legacy.rememberLastQuery = false

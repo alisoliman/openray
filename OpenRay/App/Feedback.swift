@@ -41,7 +41,7 @@ enum ActionConfirmation: Identifiable {
         case .delete(let item): "delete.\(item.id)"
         case .discardChanges: "discard"
         case .clearClipboardHistory: "clear"
-        case .provided(let confirmation): "provided.\(confirmation.id)"
+        case .provided(let confirmation): "provided.\(confirmation.id).\(confirmation.token.uuidString)"
         }
     }
 
@@ -82,6 +82,14 @@ enum ActionConfirmation: Identifiable {
         case .delete, .discardChanges, .clearClipboardHistory: true
         case .provided(let confirmation): confirmation.isDestructive
         }
+    }
+
+    /// A provider's destructive question (Shut Down, Empty Trash) can be approved only after this
+    /// very prompt was shown on a visible surface, and never by a repeated or unfocused Return.
+    /// The built-in prompts are always asked from the visible panel, by a key pressed in it.
+    var requiresVisibleApproval: Bool {
+        if case .provided(let confirmation) = self { return confirmation.isDestructive }
+        return false
     }
 
     var symbol: String {

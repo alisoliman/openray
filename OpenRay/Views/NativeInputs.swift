@@ -30,6 +30,8 @@ struct LauncherSearchInput: NSViewRepresentable {
     var autoFocus = true
     /// Masks the text, for password arguments.
     var secure = false
+    /// Called when the field becomes first responder, as when it's clicked.
+    var onFocus: (() -> Void)? = nil
     /// Keeps keyboard focus for Return and Esc, but takes no text and shows no caret.
     var readOnly = false
     var fontSize: CGFloat = 20
@@ -60,6 +62,7 @@ struct LauncherSearchInput: NSViewRepresentable {
     func updateNSView(_ field: FocusedSearchField, context: Context) {
         context.coordinator.parent = self
         field.takesFocusAutomatically = autoFocus
+        field.onBecomeFirstResponder = onFocus
         if field.isReadOnly != readOnly {
             field.isReadOnly = readOnly
             (field.currentEditor() as? NSTextView).map(field.configure)
@@ -92,7 +95,8 @@ struct LauncherSearchInput: NSViewRepresentable {
         }
         if field.focusRequest != focusRequest {
             field.focusRequest = focusRequest
-            field.focusIfNeeded()
+            // Only a field that should hold the keyboard takes it; a field losing focus never does.
+            if autoFocus { field.focusIfNeeded() }
             if selectsAllOnFocus, field.currentEditor() != nil {
                 field.currentEditor()?.selectAll(nil)
                 DispatchQueue.main.async { didSelectAll() }
@@ -203,6 +207,7 @@ struct LauncherSearchInput: NSViewRepresentable {
 
 class FocusedSearchField: NSTextField {
     var focusRequest = -1
+    var onBecomeFirstResponder: (() -> Void)?
     /// Whether the field takes the keyboard when it appears or its window becomes key.
     var takesFocusAutomatically = true
     /// Keeps first responder, so Return, Esc and ⌫ still reach the delegate, but the
@@ -229,6 +234,8 @@ class FocusedSearchField: NSTextField {
     override func becomeFirstResponder() -> Bool {
         let became = super.becomeFirstResponder()
         if became, let editor = currentEditor() as? NSTextView { configure(editor) }
+        // Reported a turn later: focus can change during a view update, which mustn't mutate state.
+        if became, let report = onBecomeFirstResponder { DispatchQueue.main.async { report() } }
         return became
     }
 

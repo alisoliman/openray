@@ -76,7 +76,7 @@ enum InterfaceSize: String, Codable, CaseIterable, Identifiable, Sendable {
         }
     }
 
-    /// Scale for sizes the launcher computes itself. Design tokens stay fixed.
+    /// The design tokens' scale (`OR.interfaceScale`): fonts and the launcher's lengths.
     var scale: CGFloat {
         switch self {
         case .compact: 0.92
@@ -95,20 +95,28 @@ enum PrimaryAction: String, Codable, CaseIterable, Identifiable, Sendable {
     var title: String { self == .copy ? "Copy to Clipboard" : "Paste to Active App" }
 }
 
-/// What a lone press of the Hyper key does.
-enum HyperKeyQuickPress: String, Codable, CaseIterable, Identifiable, Sendable {
-    case nothing, toggleCapsLock
-
-    var id: String { rawValue }
-    var title: String { self == .nothing ? "Nothing" : "Toggle Caps Lock" }
-}
-
-/// Caps Lock as ⌃⌥⌘ (and optionally ⇧). Off unless turned on.
+/// A right-side modifier as ⌃⌥⌘ (and optionally ⇧) while it's held. Off unless turned on.
+/// Every field decodes with a default, so settings saved by another build always load.
 struct HyperKeySettings: Codable, Equatable, Sendable {
     var isEnabled = false
     var includesShift = true
-    var quickPress: HyperKeyQuickPress = .toggleCapsLock
+    var trigger: HyperKeyTrigger = .rightCommand
 
     /// The modifiers the Hyper key holds down.
     var modifiers: ShortcutModifiers { includesShift ? .all : [.command, .control, .option] }
+
+    init(isEnabled: Bool = false, includesShift: Bool = true, trigger: HyperKeyTrigger = .rightCommand) {
+        self.isEnabled = isEnabled
+        self.includesShift = includesShift
+        self.trigger = trigger
+    }
+
+    private enum CodingKeys: String, CodingKey { case isEnabled, includesShift, trigger }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        isEnabled = (try? container.decodeIfPresent(Bool.self, forKey: .isEnabled)) ?? false
+        includesShift = (try? container.decodeIfPresent(Bool.self, forKey: .includesShift)) ?? true
+        trigger = (try? container.decodeIfPresent(HyperKeyTrigger.self, forKey: .trigger)) ?? .rightCommand
+    }
 }

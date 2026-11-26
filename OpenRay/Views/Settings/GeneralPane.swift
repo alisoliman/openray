@@ -6,7 +6,7 @@ extension SettingsPane {
         id: "general", title: "General",
         subtitle: "How OpenRay looks and opens.",
         kind: .system, symbol: "slider.horizontal.3",
-        keywords: "appearance light dark theme bar mode compact remember last query search applications index refresh pop root screen display monitor return copy paste primary action history ranking reset"
+        keywords: "appearance light dark theme bar mode compact remember last query search applications index refresh pop root screen display monitor return copy paste primary action history ranking reset interface size text larger smaller"
     ) { model, _ in AnyView(GeneralPane(model: model)) }
 }
 
@@ -30,6 +30,14 @@ struct GeneralPane: View {
                     SegmentedPicker(
                         options: AppAppearance.allCases.map { ($0, $0.title) }, selection: model.preference(\.appearance),
                         accessibilityLabel: "Appearance")
+                }
+                HStack(alignment: .firstTextBaseline) {
+                    Text("Interface size")
+                    Spacer()
+                    SegmentedPicker(
+                        options: InterfaceSize.allCases.map { ($0, $0.title) },
+                        selection: model.optionalPreference(\.interfaceSize, default: .standard),
+                        accessibilityLabel: "Interface size")
                 }
                 Toggle(isOn: model.optionalPreference(\.barMode)) {
                     SettingRowLabel(title: "Start as a search bar", detail: "Show only the field until you type, like Spotlight.")
@@ -76,7 +84,7 @@ struct GeneralPane: View {
                 }
                 LabeledContent {
                     Button(model.applications.isLoading ? "Refreshing…" : "Refresh") {
-                        Task { await model.applications.refresh() }
+                        Task { await model.refreshApplications() }
                     }
                     .disabled(model.applications.isLoading)
                 } label: {

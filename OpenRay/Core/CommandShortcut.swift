@@ -94,6 +94,25 @@ struct CommandShortcut: Codable, Hashable, Sendable {
     /// Whether Carbon can register it: a key, with or without modifiers.
     var isKeyChord: Bool { gesture == nil }
 
+    /// Whether two modifier gestures would both fire from one press: a double tap and a single
+    /// tap of the same key, or two double taps of the same modifier. Only one of such a pair can work.
+    func gestureOverlaps(_ other: CommandShortcut) -> Bool {
+        guard let gesture, let otherGesture = other.gesture else { return false }
+        if self == other { return true }
+        func sideMatches(_ double: CommandShortcut, _ single: CommandShortcut) -> Bool {
+            guard let key = single.sides, key.count == 1, key.modifiers == double.modifiers else { return false }
+            return double.sides.map { $0 == key } ?? true
+        }
+        switch (gesture, otherGesture) {
+        case (.doubleTap, .modifiersOnly): return sideMatches(self, other)
+        case (.modifiersOnly, .doubleTap): return sideMatches(other, self)
+        case (.doubleTap, .doubleTap):
+            guard modifiers == other.modifiers else { return false }
+            return sides == nil || other.sides == nil || sides == other.sides
+        case (.modifiersOnly, .modifiersOnly): return false
+        }
+    }
+
     var usesPrintableKey: Bool { isKeyChord && Self.printableKeyCodes.contains(keyCode) }
 
     /// Worded keys (“⌘ Return”), for messages. Gestures use their caps.

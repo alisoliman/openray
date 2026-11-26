@@ -22,6 +22,9 @@ enum ProvidedDeletion {
 /// A question asked in the action bar before something runs. ↩ calls `perform`; esc cancels.
 struct ProvidedConfirmation {
     var id: String
+    /// This instance's identity. Asking the same question again makes a new one, so an approval
+    /// meant for an earlier prompt can't answer it.
+    let token = UUID()
     var question: String
     var detail: String
     var confirmTitle: String
@@ -39,6 +42,15 @@ struct ProvidedConfirmation {
         isDestructive = text.isDestructive
         self.perform = perform
     }
+}
+
+/// A fallback the person can choose in Settings, described without a search.
+struct FallbackCandidate: Identifiable, Equatable, Sendable {
+    /// The fallback row's id, `fallback.` included.
+    var id: String
+    var title: String
+    var symbol: String
+    var kind: Kind
 }
 
 /// What an empty provided scope says.
@@ -108,6 +120,11 @@ protocol CommandProvider: AnyObject {
     /// `fallback.`; the registry adds the prefix when it's missing.
     func fallbackItems(for query: String, in model: LauncherModel) -> [LauncherItem]
 
+    /// The fallbacks this provider can offer, described for Settings › Commands, whatever is typed.
+    /// The default describes the rows `fallbackItems` returns for a placeholder search; override it
+    /// when your rows depend on the query. Ids match the rows' (`fallback.` is added when missing).
+    func fallbackDescriptors(in model: LauncherModel) -> [FallbackCandidate]
+
     /// ↩ on one of this provider's rows. Commands with `mode: .view(scope)` never get here: the
     /// registry opens their scope. Arguments arrive resolved: defaults applied, text trimmed.
     func perform(_ item: LauncherItem, ref: ProvidedRef, in model: LauncherModel)
@@ -155,6 +172,11 @@ extension CommandProvider {
     var liveGroupTitle: String { "Results" }
     func liveItems(for query: String, scope: ProvidedScope?, in model: LauncherModel) async -> [LauncherItem] { [] }
     func fallbackItems(for query: String, in model: LauncherModel) -> [LauncherItem] { [] }
+    func fallbackDescriptors(in model: LauncherModel) -> [FallbackCandidate] {
+        fallbackItems(for: "…", in: model).map {
+            FallbackCandidate(id: $0.id, title: $0.title, symbol: $0.symbol, kind: $0.kind)
+        }
+    }
     func perform(_ item: LauncherItem, ref: ProvidedRef, in model: LauncherModel) {}
     func primaryTitle(for item: LauncherItem, ref: ProvidedRef, in model: LauncherModel) -> String? { nil }
     func primarySymbol(for item: LauncherItem, ref: ProvidedRef, in model: LauncherModel) -> String? { nil }
@@ -265,6 +287,14 @@ final class CommandRegistry {
         }
     }
 
+    func fallbackDescriptors(in model: LauncherModel) -> [FallbackCandidate] {
+        providers.flatMap { $0.fallbackDescriptors(in: model) }.map { candidate in
+            var candidate = candidate
+            if !candidate.id.hasPrefix("fallback.") { candidate.id = "fallback." + candidate.id }
+            return candidate
+        }
+    }
+
     /// Providers with a live search for this place: all of them in root search, the owner in its scope.
     func liveProviders(for scope: ProvidedScope?) -> [any CommandProvider] {
         guard let scope else { return providers.filter(\.providesLiveItems) }
@@ -295,6 +325,10 @@ final class CommandRegistry {
                 return
             }
             provider.perform(item, ref: ref, in: model)
+            return
+        }
+        guard model.isCommandEnabled(descriptor.id) else {
+            model.feedback = .warning("“\(item.title.truncatedForFeedback)” is turned off. Turn it on in Settings › Commands.")
             return
         }
         var resolved = ref
@@ -330,6 +364,10 @@ final class CommandRegistry {
                 let current = self.provider(id: ref.provider)?.commands(in: model).first { $0.id == ref.id }
                 guard let current else {
                     model.feedback = .error("“\(item.title.truncatedForFeedback)” is no longer available.")
+                    return
+                }
+                guard model.isCommandEnabled(current.id) else {
+                    model.feedback = .warning("“\(item.title.truncatedForFeedback)” was turned off.")
                     return
                 }
                 guard current.confirmation == question else {

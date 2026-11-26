@@ -18,20 +18,20 @@ struct KeyboardPane: View {
             Section {
                 Toggle(isOn: hyper(\.isEnabled)) {
                     SettingRowLabel(
-                        title: "Use Caps Lock as the Hyper key",
-                        detail: "Hold Caps Lock for ⌃⌥⇧⌘, so any key becomes a shortcut no app uses. Needs Accessibility.")
+                        title: "Use a Hyper key",
+                        detail: "Hold it for ⌃⌥⇧⌘, so any key becomes a shortcut no app uses. Needs Accessibility.")
                 }
                 .settingsSwitch()
                 .accessibilityIdentifier("keyboard.hyper")
+                Picker("Hyper key", selection: hyper(\.trigger)) {
+                    ForEach(HyperKeyTrigger.allCases) { Text($0.title).tag($0) }
+                }
+                .neutralMenus()
+                .disabled(!model.store.database.preferences.hyper.isEnabled)
                 Toggle(isOn: hyper(\.includesShift)) {
                     SettingRowLabel(title: "Include Shift", detail: "Off makes the Hyper key ⌃⌥⌘.")
                 }
                 .settingsSwitch()
-                .disabled(!model.store.database.preferences.hyper.isEnabled)
-                Picker("A quick press of Caps Lock", selection: hyper(\.quickPress)) {
-                    ForEach(HyperKeyQuickPress.allCases) { Text($0.title).tag($0) }
-                }
-                .neutralMenus()
                 .disabled(!model.store.database.preferences.hyper.isEnabled)
                 if let problem = model.hyperKey.problem, model.store.database.preferences.hyper.isEnabled {
                     Label(problem, systemImage: "exclamationmark.triangle.fill").foregroundStyle(OR.Color.warning)
@@ -41,7 +41,7 @@ struct KeyboardPane: View {
                 Text("Hyper Key")
             } footer: {
                 Text(
-                    "OpenRay remaps Caps Lock to F18 for this session and removes the remap when you turn this off."
+                    "Only keys pressed while it's held change; the key alone still works as itself. Nothing is remapped in macOS, so quitting OpenRay or turning this off leaves your keyboard as it was."
                 )
                 .font(.system(size: 11.5)).foregroundStyle(.secondary)
             }

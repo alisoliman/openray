@@ -111,7 +111,7 @@ struct Step0FollowUpTests {
             model.navigate(to: .clipboard)
             #expect(model.showsClipboardOptIn)
             model.performBoundCommand(targetID: "test.confirm")
-            #expect(model.confirmation?.id == "provided.test.confirm")
+            #expect(model.confirmation?.id.hasPrefix("provided.test.confirm.") == true)
             #expect(fake.performed.isEmpty)
             // Return answers the question shown in the opt-in bar; it doesn't turn on clipboard history.
             #expect(model.confirmFromReturn(isRepeat: false))
@@ -168,9 +168,14 @@ struct Step0FollowUpTests {
         #expect(ActionConfirmation.clearClipboardHistory(pinnedCount: 0).isDestructive)
         #expect(!CommandConfirmation(question: "Q?", detail: "", confirmTitle: "Go").isDestructive)
         let command = try #require(model.commandItems.first { $0.id == "test.confirm" })
+        model.confirmationSurfaceIsVisible = { true }
         model.perform(command)
-        #expect(model.confirmation?.isDestructive == true)
-        #expect(model.isConfirmationVisible)
+        let prompt = try #require(model.confirmation)
+        #expect(prompt.isDestructive && prompt.requiresVisibleApproval)
+        // Not yet drawn: nothing approves it.
+        #expect(model.confirmFromReturn(isRepeat: false))
+        #expect(fake.performed.isEmpty)
+        model.confirmationDidAppear(prompt.id)
         #expect(model.confirmFromReturn(isRepeat: true))
         #expect(fake.performed.isEmpty)
         #expect(model.confirmFromReturn(isRepeat: false))
@@ -217,7 +222,7 @@ struct Step0FollowUpTests {
         fake.confirmRun = true
         snapshot.perform()
         #expect(fake.performed.isEmpty)
-        #expect(model.confirmation?.id == "provided.test.run")
+        #expect(model.confirmation?.id.hasPrefix("provided.test.run.") == true)
         model.confirmation = nil
         // The command is gone: the old snapshot can't run it.
         fake.withdrawn = ["test.run"]
@@ -300,10 +305,16 @@ struct Step0FollowUpTests {
         saved.favoriteIDs.insert(beta.id)
         saved.usage = [UsageRecord(id: beta.id)]
         try JSONEncoder().encode(saved).write(to: url)
+        // The store alone only reads the record; it doesn't guess whether the row is gone.
         let reopened = LibraryStore(fileURL: url)
+        #expect(reopened.journaledCleanup[beta.id] == "test.fake")
+        #expect(reopened.database.favoriteIDs.contains(beta.id))
+        // The launcher asks the provider, which no longer has the row, and cleans up.
+        let relaunched = self.model([fake], store: reopened)
+        defer { relaunched.stop() }
         #expect(!reopened.database.favoriteIDs.contains(beta.id))
         #expect(!reopened.database.usage.contains { $0.id == beta.id })
-        #expect(reopened.pendingForgottenIDs.isEmpty)
+        #expect(reopened.journaledCleanup.isEmpty)
         #expect(!FileManager.default.fileExists(atPath: sidecar.path))
     }
 

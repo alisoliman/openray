@@ -17,6 +17,8 @@ struct ShortcutsPane: View {
     @State private var hotKeyPickerRevision = 0
     @State private var highlightedCommandID: String?
     @State private var isRecordingLauncher = false
+    /// A recorded launcher shortcut that would get in the way of typing or apps, until Keep Anyway.
+    @State private var pendingLauncher: CommandShortcut?
     /// An app, quicklink or snippet Settings was opened for, listed until the pane closes.
     @State private var extraRowID: String?
 
@@ -51,7 +53,7 @@ struct ShortcutsPane: View {
                                 if CommandShortcutRecording.isRemoveKey(event) {
                                     model.setLauncherShortcut(nil)
                                 } else if let shortcut = try? CommandShortcutRecording.shortcut(from: event) {
-                                    model.setLauncherShortcut(shortcut)
+                                    recordLauncher(shortcut)
                                 } else {
                                     model.launcherHotKeyRefusal =
                                         "Use Command, Control, Option or Shift with a key, F13 to F20 alone, or modifier keys on their own."
@@ -59,7 +61,7 @@ struct ShortcutsPane: View {
                             },
                             onRecordGesture: { shortcut in
                                 defer { stopRecordingLauncher() }
-                                model.setLauncherShortcut(shortcut)
+                                recordLauncher(shortcut)
                             },
                             onClear: model.store.database.preferences.launcherShortcut == nil
                                 ? nil : { model.setLauncherShortcut(nil) })
@@ -68,6 +70,20 @@ struct ShortcutsPane: View {
                         SettingRowLabel(
                             title: "Custom shortcut",
                             detail: "Any key with modifiers, F13–F20 alone, two modifiers together, Right ⌘, or a double tap such as ⌘ ⌘.")
+                    }
+                    if let pending = pendingLauncher {
+                        HStack(spacing: 6) {
+                            Image(systemName: "exclamationmark.triangle.fill").font(.system(size: 11))
+                            Text(CommandShortcutPolicy.conflictWarnings(for: pending).joined(separator: " "))
+                                .fixedSize(horizontal: false, vertical: true)
+                            Button("Keep Anyway") {
+                                model.setLauncherShortcut(pending)
+                                pendingLauncher = nil
+                            }
+                            .buttonStyle(.link)
+                            Button("Undo") { pendingLauncher = nil }.buttonStyle(.link)
+                        }
+                        .font(.system(size: 12)).foregroundStyle(OR.Color.warning)
                     }
                     if let error = model.launcherHotKeyRefusal ?? model.shortcutError {
                         Label(error, systemImage: "exclamationmark.triangle.fill").foregroundStyle(OR.Color.warning)
@@ -111,6 +127,17 @@ struct ShortcutsPane: View {
         guard !query.isEmpty else { return all }
         let matching = all.filter { SettingsSearch.wordPrefixScore(query, in: model.settingsSearchText(for: $0)) != nil }
         return matching.isEmpty ? all : matching
+    }
+
+    /// Saves a recorded launcher shortcut, or holds one that gets in the way of typing or apps
+    /// until Keep Anyway, as command shortcuts do.
+    private func recordLauncher(_ shortcut: CommandShortcut) {
+        if CommandShortcutPolicy.conflictWarnings(for: shortcut).isEmpty {
+            pendingLauncher = nil
+            model.setLauncherShortcut(shortcut)
+        } else {
+            pendingLauncher = shortcut
+        }
     }
 
     private func stopRecordingLauncher() {

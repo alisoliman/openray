@@ -46,7 +46,7 @@ struct SettingsWindowView: View {
         .onChange(of: activeState) { if activeState == .key { model.refreshPermissions() } }
         .onChange(of: navigation.search) {
             guard !query.isEmpty,
-                let best = SettingsSearch.bestPane(for: query, commands: commandSearchTexts)
+                let best = SettingsSearch.bestPane(for: query, commands: commandSearchTexts, catalog: catalogSearchTexts)
             else { return }
             navigation.pane = best
         }
@@ -55,7 +55,13 @@ struct SettingsWindowView: View {
 
     private var query: String { navigation.search.trimmingCharacters(in: .whitespaces) }
 
+    /// What Shortcuts lists: commands that can hold a binding, with bound apps, quicklinks and snippets.
     private var commandSearchTexts: [String] {
+        model.bindingRows(focusing: nil).map { model.settingsSearchText(for: $0) }
+    }
+
+    /// What Commands lists: every command, disabled ones and binding opt-outs included.
+    private var catalogSearchTexts: [String] {
         model.commandCatalog.flatMap(\.commands).map { model.settingsSearchText(for: $0) }
     }
 
@@ -77,7 +83,8 @@ struct SettingsWindowView: View {
     private func filtered(_ panes: [SettingsPane]) -> [SettingsPane] {
         guard !query.isEmpty else { return panes }
         let commands = commandSearchTexts
-        return panes.filter { SettingsSearch.score($0, query: query, commands: commands) != nil }
+        let catalog = catalogSearchTexts
+        return panes.filter { SettingsSearch.score($0, query: query, commands: commands, catalog: catalog) != nil }
     }
 
     private func sidebarRow(_ pane: SettingsPane) -> some View {
@@ -100,21 +107,23 @@ struct SettingsWindowView: View {
 enum SettingsSearch {
     /// How well a pane matches, or nil when it doesn't. `commands` are the bindable commands'
     /// titles and aliases; a match there keeps Shortcuts in the results.
-    static func score(_ pane: SettingsPane, query: String, commands: [String] = []) -> Int? {
+    /// `commands` are the rows Shortcuts lists, `catalog` the rows Commands lists (all commands);
+    /// each pane matches only rows it can show. A catalog match ranks just below a Shortcuts one,
+    /// so a bindable command still opens Shortcuts and a catalog-only one opens Commands.
+    static func score(_ pane: SettingsPane, query: String, commands: [String] = [], catalog: [String]? = nil) -> Int? {
         let title = SearchMatcher.score(query, in: pane.title)
         // Keyword and command matches rank below the same kind of match on a pane title.
         let keywords = wordPrefixScore(query, in: pane.title + " " + pane.keywords).map { $0 - 50 }
-        let command =
-            pane == .shortcuts || pane == .commands
-            ? commands.compactMap { wordPrefixScore(query, in: $0) }.max().map { $0 - 150 } : nil
+        let rows: [String]? = pane == .shortcuts ? commands : pane == .commands ? (catalog ?? commands) : nil
+        let command = rows?.compactMap { wordPrefixScore(query, in: $0) }.max().map { $0 - 150 }
         return [title, keywords, command].compactMap { $0 }.max()
     }
 
     /// The best-scoring pane. Ties keep sidebar order.
-    static func bestPane(for query: String, commands: [String] = []) -> SettingsPane? {
+    static func bestPane(for query: String, commands: [String] = [], catalog: [String]? = nil) -> SettingsPane? {
         var best: (pane: SettingsPane, score: Int)?
         for pane in SettingsPane.primary + SettingsPane.secondary {
-            guard let paneScore = Self.score(pane, query: query, commands: commands),
+            guard let paneScore = Self.score(pane, query: query, commands: commands, catalog: catalog),
                 paneScore > (best?.score ?? .min)
             else { continue }
             best = (pane, paneScore)

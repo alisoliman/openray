@@ -239,7 +239,8 @@ struct AppPreferences: Codable, Equatable, Sendable {
     var primaryActionPastes: Bool { primaryAction == .paste }
     /// The shortcut that opens the launcher: a recorded one, else the preset.
     var launcherHotKeyShortcut: CommandShortcut { launcherShortcut ?? hotKey.shortcut }
-    var usesCustomFallbacks: Bool { customFallbacks ?? false }
+    /// The launcher shortcut's name, recorded or preset, for menus and messages.
+    var launcherHotKeyTitle: String { launcherShortcut?.title ?? hotKey.title }
     var hyper: HyperKeySettings { hyperKey ?? HyperKeySettings() }
     var remembersSearchHistory: Bool { searchHistory ?? true }
 

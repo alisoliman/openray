@@ -49,6 +49,13 @@ extension LauncherModel {
         return bindableCommands.contains { $0.id == item.id }
     }
 
+    /// Whether a new alias or hotkey can be saved for this id now: a bindable command, or an
+    /// app, quicklink or snippet that exists and whose registration accepts it, bound or not.
+    func isBindableTarget(_ id: String) -> Bool {
+        if bindableCommands.contains(where: { $0.id == id }) { return true }
+        return (applicationItems + quicklinkItems + snippetItems).contains { $0.id == id && canBind($0) }
+    }
+
     /// The rows Settings › Shortcuts lists: every bindable command, plus the row it was opened
     /// for when that's an app, quicklink or snippet without a binding yet.
     func bindingRows(focusing id: String?) -> [LauncherItem] {

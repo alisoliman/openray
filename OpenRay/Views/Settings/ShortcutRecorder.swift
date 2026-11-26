@@ -109,7 +109,38 @@ struct CommandShortcutCapture: NSViewRepresentable {
     }
 }
 
+/// Where the recorder's local event monitor comes from. AppKit's in a normal launch; in the test
+/// host and verification mode an inert one that installs nothing, so no real key is consumed.
+@MainActor
+protocol LocalEventMonitoring {
+    func add(_ mask: NSEvent.EventTypeMask, handler: @escaping (NSEvent) -> NSEvent?) -> Any?
+    func remove(_ monitor: Any)
+}
+
+struct AppKitLocalEventMonitoring: LocalEventMonitoring {
+    func add(_ mask: NSEvent.EventTypeMask, handler: @escaping (NSEvent) -> NSEvent?) -> Any? {
+        NSEvent.addLocalMonitorForEvents(matching: mask, handler: handler)
+    }
+
+    func remove(_ monitor: Any) { NSEvent.removeMonitor(monitor) }
+}
+
+/// Records that monitoring started without watching anything.
+struct InertLocalEventMonitoring: LocalEventMonitoring {
+    func add(_ mask: NSEvent.EventTypeMask, handler: @escaping (NSEvent) -> NSEvent?) -> Any? { NSObject() }
+    func remove(_ monitor: Any) {}
+}
+
+extension SideEffectGuard {
+    /// The recorder's monitor for this launch.
+    @MainActor var localEventMonitoring: any LocalEventMonitoring {
+        isInert ? InertLocalEventMonitoring() : AppKitLocalEventMonitoring()
+    }
+}
+
 final class CommandShortcutCaptureView: NSView {
+    /// Inert in the test host and verification mode.
+    var monitoring: any LocalEventMonitoring = SideEffectGuard.current.localEventMonitoring
     var capture: ((NSEvent) -> Void)?
     var captureGesture: ((CommandShortcut) -> Void)?
     var cancel: (() -> Void)?
@@ -126,7 +157,7 @@ final class CommandShortcutCaptureView: NSView {
         NotificationCenter.default.addObserver(
             self, selector: #selector(windowResignedKey), name: NSWindow.didResignKeyNotification, object: window)
         gestures = ShortcutRecordingSession()
-        monitor = NSEvent.addLocalMonitorForEvents(matching: [.keyDown, .flagsChanged, .leftMouseDown, .rightMouseDown]) {
+        monitor = monitoring.add([.keyDown, .flagsChanged, .leftMouseDown, .rightMouseDown]) {
             [weak self] event in
             let consumed = MainActor.assumeIsolated {
                 guard let self, self.window?.isKeyWindow == true else { return false }
@@ -187,7 +218,7 @@ final class CommandShortcutCaptureView: NSView {
     func stopMonitoring() {
         pendingTimeout?.cancel()
         pendingTimeout = nil
-        if let monitor { NSEvent.removeMonitor(monitor) }
+        if let monitor { monitoring.remove(monitor) }
         monitor = nil
         NotificationCenter.default.removeObserver(self, name: NSWindow.didResignKeyNotification, object: nil)
     }

@@ -63,7 +63,7 @@ struct SearchFieldBar: View {
             jump: model.jumpSection, tertiary: model.performTertiary,
             selectsAllOnFocus: model.selectsQueryOnFocus,
             didSelectAll: { model.selectsQueryOnFocus = false },
-            readOnly: model.showsClipboardOptIn
+            readOnly: model.showsClipboardOptIn, fontSize: OR.scaled(20)
         )
         .frame(maxWidth: .infinity)
     }
@@ -313,13 +313,14 @@ struct ArgumentFieldsRow: View {
             text: text, placeholder: spec.placeholder + (spec.isOptional ? " (optional)" : ""),
             focusRequest: focused ? session.focusToken : -1,
             submit: model.submitArguments,
-            move: { offset in if options != nil { model.cycleArgumentOption(offset) } },
+            move: { offset in if options != nil { model.cycleArgumentOption(offset, at: index) } },
             cancel: model.goBack, paste: model.submitArguments,
             tab: { model.moveArgumentFocus(1) }, deleteOnEmpty: model.deleteBackwardInArguments,
-            moveHorizontally: { options != nil ? model.cycleArgumentOption($0) : false },
+            moveHorizontally: { options != nil ? model.cycleArgumentOption($0, at: index) : false },
             backtab: { model.moveArgumentFocus(-1) },
-            autoFocus: focused, secure: spec.type == .password, readOnly: options != nil,
-            fontSize: 15, accessibilityLabel: spec.placeholder + (spec.isOptional ? ", optional" : ""),
+            autoFocus: focused, secure: spec.type == .password, onFocus: { model.argumentFieldDidFocus(index) },
+            readOnly: options != nil,
+            fontSize: OR.scaled(15), accessibilityLabel: spec.placeholder + (spec.isOptional ? ", optional" : ""),
             identifier: "argument.\(spec.name)")
     }
 }

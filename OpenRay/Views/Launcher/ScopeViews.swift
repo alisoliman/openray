@@ -215,7 +215,8 @@ struct ClipboardOptInView: View {
                     ActionBarButton(title: "Turn On", keys: ["↩"], style: .accent) { model.enableClipboardHistory() }
                 },
                 onCancelConfirmation: { model.confirmation = nil },
-                onConfirm: { if let confirmation = model.confirmation { model.confirm(confirmation) } })
+                onConfirm: { if let confirmation = model.confirmation { model.confirm(confirmation) } },
+                onConfirmationShown: model.confirmationDidAppear, onApprove: model.approveConfirmation)
         }
     }
 

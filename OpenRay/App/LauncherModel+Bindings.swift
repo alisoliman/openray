@@ -45,7 +45,7 @@ extension LauncherModel {
     func validateCommandBinding(_ binding: CommandBinding) throws {
         try binding.validate()
         // Removing a binding always works; adding one needs a command that exists right now.
-        guard binding.isEmpty || bindableCommands.contains(where: { $0.id == binding.targetID }) else {
+        guard binding.isEmpty || isBindableTarget(binding.targetID) else {
             throw LibraryValidationError("This command isn't available right now.")
         }
         if let shortcut = binding.shortcut {
@@ -88,7 +88,8 @@ extension LauncherModel {
         guard isStarted, !isRecordingShortcut else { return }
         // The refusal was about an earlier choice; registration below reports the current state.
         launcherHotKeyRefusal = nil
-        guard clipboard.usesGeneralPasteboard || usesInjectedHotKey else {
+        // Only a normal launch registers real shortcuts; tests inject a registry with fake backends.
+        guard (clipboard.usesGeneralPasteboard && !sideEffects.isInert) || usesInjectedHotKey else {
             hotKey.unregister()
             shortcutError = nil
             commandShortcutErrors = [:]
@@ -98,12 +99,26 @@ extension LauncherModel {
         let bindings = registrableCommandBindings
         // A recorded launcher shortcut was checked when it was saved, so it registers as it is.
         if let custom = store.database.preferences.launcherShortcut {
-            let issues = hotKey.synchronize(
+            var issues = hotKey.synchronize(
                 launcherShortcut: custom, bindings: bindings,
                 onLauncher: { [weak self] in self?.launcherHotKeyPressed() },
                 onCommand: { [weak self] in self?.performBoundCommand(targetID: $0) },
                 title: { [weak self] id in self?.bindableCommands.first { $0.id == id }?.title })
             shortcutError = issues.first { $0.targetID == GlobalHotKey.launcherTargetID }?.message
+            // A modifier shortcut macOS won't deliver yet mustn't leave no way to open OpenRay:
+            // the preset works until it can. Allowing Accessibility re-runs this and restores it.
+            if let problem = shortcutError, !custom.isKeyChord {
+                let fallback =
+                    Self.launcherHotKey(
+                        for: stored, reserved: CommandShortcutPolicy.systemReservedShortcuts(),
+                        boundShortcuts: Set(bindings.compactMap(\.shortcut))) ?? stored
+                issues = hotKey.synchronize(
+                    launcher: fallback, bindings: bindings,
+                    onLauncher: { [weak self] in self?.launcherHotKeyPressed() },
+                    onCommand: { [weak self] in self?.performBoundCommand(targetID: $0) },
+                    title: { [weak self] id in self?.bindableCommands.first { $0.id == id }?.title })
+                shortcutError = "\(problem) Until then, \(fallback.title) opens OpenRay."
+            }
             commandShortcutErrors = Dictionary(
                 issues.filter { $0.targetID != GlobalHotKey.launcherTargetID }.map { ($0.targetID, $0.message) },
                 uniquingKeysWith: { first, second in first + " " + second })
@@ -212,7 +227,8 @@ extension LauncherModel {
                 launcherHotKeyRefusal = error.localizedDescription
                 return false
             }
-            if let owner = store.database.commandBindings.first(where: { $0.shortcut == shortcut }) {
+            // Only commands that exist now hold shortcuts; a missing one's saved shortcut is free.
+            if let owner = registrableCommandBindings.first(where: { $0.shortcut == shortcut }) {
                 let title = bindableCommands.first { $0.id == owner.targetID }?.title ?? "another command"
                 launcherHotKeyRefusal = "\(shortcut.title) is assigned to \(title). Remove it there first."
                 return false
@@ -259,7 +275,7 @@ extension LauncherModel {
         if let front, front.processIdentifier != ProcessInfo.processInfo.processIdentifier {
             previousApplication = front
         }
-        if runsWithoutPanel(command) {
+        if runsWithoutPanel(command), !needsArguments(command) {
             perform(command)
             // A problem to report, or a question to confirm, brings the panel up. Showing can
             // reset to Home, which clears both, so they're put back after.

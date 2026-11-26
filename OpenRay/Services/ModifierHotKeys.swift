@@ -6,7 +6,8 @@ import Foundation
 enum ModifierInput: Equatable, Sendable {
     /// The physical modifier keys now down.
     case flags(ModifierSides, time: TimeInterval)
-    /// Any other key went down, so a modifier gesture in progress is really a shortcut.
+    /// Any other key went down, or the mouse was clicked, so a modifier gesture in progress is
+    /// really a shortcut or a modified click.
     case key(time: TimeInterval)
 }
 
@@ -24,10 +25,22 @@ struct ModifierGestureDetector: Sendable {
     private var held: ModifierSides = []
     private var peak: ModifierSides = []
     private var interrupted = false
+    /// True once any key of the current press was released. Pressing another key after that
+    /// is a roll from one chord to another, not one gesture.
+    private var releasing = false
     private var pressedAt: TimeInterval = 0
     private var lastTap: (key: ModifierSides, time: TimeInterval)?
 
     init(gestures: [String: CommandShortcut] = [:]) { self.gestures = gestures }
+
+    /// Forgets any press in progress, as when monitoring stops or restarts.
+    mutating func reset() {
+        held = []
+        peak = []
+        interrupted = false
+        releasing = false
+        lastTap = nil
+    }
 
     /// Feeds one input. Returns the targets whose gesture it completed, in id order.
     mutating func handle(_ input: ModifierInput) -> [String] {
@@ -41,10 +54,18 @@ struct ModifierGestureDetector: Sendable {
             if held.isEmpty, !now.isEmpty {
                 peak = now
                 interrupted = false
+                releasing = false
                 pressedAt = time
                 return []
             }
-            peak.formUnion(now)
+            // Only keys held at the same moment form a gesture: a key pressed after another was
+            // released (rolling ⌥⌘ into ⌃⌘) breaks it.
+            if !now.subtracting(held).isEmpty {
+                if releasing { interrupted = true }
+                if now.count > peak.count { peak = now }
+            } else if now != held {
+                releasing = true
+            }
             guard now.isEmpty, !held.isEmpty else { return [] }
             // Every modifier is up: the press is over.
             guard !interrupted, time - pressedAt <= Self.maximumHold else {
@@ -92,22 +113,31 @@ protocol ModifierEventSource: AnyObject {
 final class NSEventModifierSource: ModifierEventSource {
     private var monitors: [Any] = []
 
+    private let sideEffects: SideEffectGuard
+
+    init(sideEffects: SideEffectGuard = .current) {
+        self.sideEffects = sideEffects
+    }
+
+    /// Installs the monitors. Returns true only when the global one is installed and macOS will
+    /// deliver it events (Accessibility); otherwise nothing stays installed.
     func start(_ handler: @escaping @MainActor (ModifierInput) -> Void) -> Bool {
         stop()
+        guard (try? sideEffects.check("watching modifier keys")) != nil, AXIsProcessTrusted() else { return false }
         let deliver: (NSEvent) -> Void = { event in
             let input = Self.input(for: event)
             MainActor.assumeIsolated { handler(input) }
         }
-        if let global = NSEvent.addGlobalMonitorForEvents(matching: [.flagsChanged, .keyDown], handler: deliver) {
-            monitors.append(global)
-        }
-        if let local = NSEvent.addLocalMonitorForEvents(matching: [.flagsChanged, .keyDown], handler: { event in
+        let events: NSEvent.EventTypeMask = [.flagsChanged, .keyDown, .leftMouseDown, .rightMouseDown, .otherMouseDown]
+        guard let global = NSEvent.addGlobalMonitorForEvents(matching: events, handler: deliver) else { return false }
+        monitors.append(global)
+        if let local = NSEvent.addLocalMonitorForEvents(matching: events, handler: { event in
             deliver(event)
             return event
         }) {
             monitors.append(local)
         }
-        return AXIsProcessTrusted()
+        return true
     }
 
     func stop() {
@@ -145,9 +175,12 @@ final class ModifierHotKeys {
     }
 
     var registeredIDs: [String] { detector.gestures.keys.sorted() }
+    /// True while modifier events are really being delivered.
+    var isDelivering: Bool { isListening }
 
     /// Replaces the watched gestures. Listens only while there's one. Returns false when
-    /// macOS won't deliver modifier events (Accessibility isn't allowed).
+    /// macOS won't deliver modifier events (Accessibility isn't allowed, or an inert launch);
+    /// the next call tries again, so allowing Accessibility later brings them back.
     @discardableResult
     func synchronize(_ gestures: [String: CommandShortcut], onTrigger: @escaping (String) -> Void) -> Bool {
         detector.gestures = gestures
@@ -157,8 +190,9 @@ final class ModifierHotKeys {
             return true
         }
         if isListening { return true }
-        isListening = true
-        return source.start { [weak self] input in self?.receive(input) }
+        detector.reset()
+        isListening = source.start { [weak self] input in self?.receive(input) }
+        return isListening
     }
 
     func receive(_ input: ModifierInput) {
@@ -167,6 +201,7 @@ final class ModifierHotKeys {
 
     func unregister() {
         detector.gestures = [:]
+        detector.reset()
         if isListening { source.stop() }
         isListening = false
     }

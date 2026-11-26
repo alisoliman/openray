@@ -178,6 +178,16 @@ final class GlobalHotKey {
                     .init(targetID: targetID, message: "\(shortcut.title) is inactive because \(ownerTitle) uses it."))
                 continue
             }
+            // A single tap and a double tap of one key would both fire; the first saved wins.
+            if let overlap = owners.first(where: { $0.key.gestureOverlaps(shortcut) }) {
+                let owner = overlap.value
+                let ownerTitle = owner == Self.launcherTargetID ? "the launcher" : (title(owner) ?? "another command")
+                issues.append(
+                    .init(
+                        targetID: targetID,
+                        message: "\(shortcut.title) is inactive because it overlaps \(overlap.key.title) for \(ownerTitle)."))
+                continue
+            }
             owners[shortcut] = targetID
             gestures[targetID] = shortcut
         }
@@ -252,6 +262,8 @@ final class CarbonHotKeyBackend: GlobalHotKeyBackend {
     }
 
     func register(_ shortcut: CommandShortcut, identifier: UInt32) throws {
+        // Global shortcuts reach every app; inert launches never register them.
+        try SideEffectGuard.check("registering global shortcuts")
         var reference: EventHotKeyRef?
         let status = RegisterEventHotKey(
             shortcut.keyCode, shortcut.modifiers.carbonFlags,

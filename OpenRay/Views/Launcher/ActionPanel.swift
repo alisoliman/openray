@@ -123,27 +123,32 @@ struct ActionContextMenu: View {
         let entries = model.actions(for: item).filter { $0.group != .panel }
         ForEach(Array(entries.enumerated()), id: \.element.id) { index, entry in
             if index > 0, entries[index - 1].group != entry.group { Divider() }
-            if entry.children.isEmpty {
-                Button(role: entry.isDestructive ? .destructive : nil) {
-                    model.selectedID = item.id
-                    entry.perform()
-                } label: {
-                    Label(entry.title, systemImage: entry.symbol)
+            ActionMenuEntry(model: model, item: item, entry: entry)
+        }
+    }
+}
+
+/// One entry in a menu: a button, or a submenu with its own entries, to any depth.
+struct ActionMenuEntry: View {
+    let model: LauncherModel
+    let item: LauncherItem
+    let entry: ActionEntry
+
+    var body: some View {
+        if entry.children.isEmpty {
+            Button(role: entry.isDestructive ? .destructive : nil) {
+                model.selectedID = item.id
+                entry.perform()
+            } label: {
+                Label(entry.title, systemImage: entry.symbol)
+            }
+        } else {
+            Menu {
+                ForEach(entry.children) { child in
+                    AnyView(ActionMenuEntry(model: model, item: item, entry: child))
                 }
-            } else {
-                // Submenus, as in ⌘K.
-                Menu {
-                    ForEach(entry.children) { child in
-                        Button(role: child.isDestructive ? .destructive : nil) {
-                            model.selectedID = item.id
-                            child.perform()
-                        } label: {
-                            Label(child.title, systemImage: child.symbol)
-                        }
-                    }
-                } label: {
-                    Label(entry.title, systemImage: entry.symbol)
-                }
+            } label: {
+                Label(entry.title, systemImage: entry.symbol)
             }
         }
     }
@@ -214,6 +219,7 @@ struct ShortcutsOverlay: View {
             },
             onCancelConfirmation: { model.confirmation = nil },
             onConfirm: { if let confirmation = model.confirmation { model.confirm(confirmation) } },
+            onConfirmationShown: model.confirmationDidAppear, onApprove: model.approveConfirmation,
             announces: false)
         .contentShape(.rect)
     }

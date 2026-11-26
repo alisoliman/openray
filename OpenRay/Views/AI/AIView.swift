@@ -171,7 +171,8 @@ struct AIView: View {
             context: { context },
             actions: { actions },
             onCancelConfirmation: { model.confirmation = nil },
-            onConfirm: { if let confirmation = model.confirmation { model.confirm(confirmation) } })
+            onConfirm: { if let confirmation = model.confirmation { model.confirm(confirmation) } },
+            onConfirmationShown: model.confirmationDidAppear, onApprove: model.approveConfirmation)
     }
 
     @ViewBuilder private var context: some View {

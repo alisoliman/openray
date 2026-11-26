@@ -40,7 +40,14 @@ final class LauncherModel {
     /// The writing command's attached text, shown in full over the AI view.
     var showsAttachmentPreview = false
     var feedback: Feedback? { didSet { scheduleFeedbackExpiry() } }
-    var confirmation: ActionConfirmation?
+    var confirmation: ActionConfirmation? {
+        didSet { if confirmation?.id != oldValue?.id { shownConfirmationID = nil } }
+    }
+    /// The prompt a visible action bar last reported showing. Only it can be approved when the
+    /// prompt requires visible approval.
+    @ObservationIgnored var shownConfirmationID: String?
+    /// Whether the surface showing prompts is on screen and key. Nil asks the panel; tests set it.
+    @ObservationIgnored var confirmationSurfaceIsVisible: (() -> Bool)?
     var focusRequest = 0
     /// Set when a remembered query returns; the field selects it so the next keystroke replaces it.
     var selectsQueryOnFocus = false
@@ -111,8 +118,10 @@ final class LauncherModel {
     /// A hotkey registry passed in by a test, backed by a fake. It may register while the
     /// pasteboard is isolated; the real Carbon one never does.
     @ObservationIgnored let usesInjectedHotKey: Bool
-    /// Caps Lock as Hyper, when turned on. Applied only by the real app, never in tests.
+    /// The Hyper key, when turned on. Applied only in a normal launch, never in tests.
     @ObservationIgnored let hyperKey: HyperKey
+    /// This launch's rule for side effects on the Mac. Executors the model runs check it first.
+    @ObservationIgnored let sideEffects: SideEffectGuard
     @ObservationIgnored weak var panel: LauncherPanelController?
     @ObservationIgnored var previousApplication: NSRunningApplication? {
         didSet {
@@ -144,6 +153,7 @@ final class LauncherModel {
         registry: CommandRegistry = CommandRegistry(), hotKey: GlobalHotKey? = nil, hyperKey: HyperKey? = nil,
         sideEffects: SideEffectGuard = .current
     ) {
+        self.sideEffects = sideEffects
         let store = store ?? LibraryStore(fileURL: sideEffects.isInert ? nil : LibraryStore.defaultURL)
         let pasteboard = pasteboard ?? (sideEffects.isInert ? NSPasteboard.withUniqueName() : .general)
         self.hyperKey = hyperKey ?? HyperKey()
@@ -157,6 +167,12 @@ final class LauncherModel {
         snippets = SnippetExpander(store: store)
         fileScope = store.database.preferences.fileSearchScope ?? .home
         store.commandBindingsDidChange = { [weak self] in self?.synchronizeCommandHotKeys() }
+        // Deletions an earlier session recorded but couldn't finish: clean up after the rows that
+        // are really gone, keep the records of rows that still exist.
+        store.reconcileJournaledCleanup { [registry] id, provider in
+            guard registry.provider(id: provider) != nil else { return nil }
+            return registry.item(withID: id, in: self) == nil
+        }
     }
 
     /// Compatibility shim: the last error or notice, as text.
@@ -270,11 +286,16 @@ final class LauncherModel {
     /// be seen, such as a toast, an error or a delete prompt, expands it.
     var isCollapsedToBar: Bool {
         store.database.preferences.usesBarMode && destination == .search && editor == nil && onboarding == nil
-            && section == .home && isQueryBlank && argumentLink == nil && !showActions && feedback == nil
+            && section == .home && isQueryBlank && argumentLink == nil && argumentSession == nil && !showActions
+            && feedback == nil
             && confirmation == nil && store.errorMessage == nil && shortcutError == nil
     }
 
     var groups: [LauncherResultGroup] {
+        // Open argument fields own the list: their command, whatever the query or scope.
+        if let session = argumentSession {
+            return [LauncherResultGroup(id: "argument.session", title: nil, items: [session.item])]
+        }
         if let link = argumentLink {
             let items = argumentItems(for: link)
             return [
@@ -465,10 +486,16 @@ final class LauncherModel {
     func start() async {
         guard !isStarted else { return }
         isStarted = true
-        if clipboard.usesGeneralPasteboard { hyperKey.removeStaleRemap(store.database.preferences.hyper) }
         applyPreferences()
         await applications.refresh()
-        synchronizeSelection()
+        // Apps can hold hotkeys, so register them once the catalog is known.
+        commandCatalogDidChange()
+    }
+
+    /// Rescans the app folders, then re-registers app hotkeys.
+    func refreshApplications() async {
+        await applications.refresh()
+        commandCatalogDidChange()
     }
 
     func stop() {
@@ -519,6 +546,7 @@ final class LauncherModel {
 
     private func resetToHome() {
         if editor != nil { editor = nil }
+        argumentSession = nil
         destination = .search
         argumentLink = nil
         section = .home
@@ -532,8 +560,8 @@ final class LauncherModel {
 
     func refreshPermissions() {
         accessibilityAllowed = windows.hasPermission
-        // The Hyper key follows its setting and Accessibility; the verification build never remaps keys.
-        if isStarted, clipboard.usesGeneralPasteboard {
+        // The Hyper key follows its setting and Accessibility; inert launches never change keys.
+        if isStarted, !sideEffects.isInert {
             hyperKey.apply(store.database.preferences.hyper, accessibilityAllowed: accessibilityAllowed)
         }
         clipboard.refreshAccessStatus()
@@ -584,6 +612,7 @@ final class LauncherModel {
         if section == .home { scopeReturnQuery = nil }
         destination = .search
         argumentLink = nil
+        argumentSession = nil
         self.section = section
         query = ""
         searchChanged()
@@ -601,6 +630,7 @@ final class LauncherModel {
         scopeReturnQuery = nil
         destination = .search
         argumentLink = nil
+        argumentSession = nil
         section = .home
         query = restored
         searchChanged()
@@ -636,6 +666,7 @@ final class LauncherModel {
         ai.open(action)
         destination = .ai
         argumentLink = nil
+        argumentSession = nil
         files.stop()
         cancelProvidedLiveItems()
         showActions = false

@@ -27,8 +27,9 @@ extension LauncherModel {
 
     func performSelected() {
         if let confirmation {
-            // A destructive prompt is answered only where it can be seen.
-            if !confirmation.isDestructive || isConfirmationVisible { confirm(confirmation) }
+            // A submission without key context can't answer a prompt that needs visible approval:
+            // only a fresh Return in the panel or a click on the shown button can.
+            if !confirmation.requiresVisibleApproval { confirm(confirmation) }
             return
         }
         guard !showActions else { return }
@@ -49,14 +50,20 @@ extension LauncherModel {
         showActions = false
         confirmation = nil
         feedback = nil
+        // With argument fields open, running their command means running the form.
+        if let session = argumentSession {
+            if item.id == session.item.id { submitArguments() }
+            return
+        }
         // A command that still needs an argument opens its fields instead of failing.
-        if argumentSession == nil, argumentSpecs(for: item).contains(where: { !$0.isOptional && $0.defaultValue == nil }) {
+        if needsArguments(item) {
             beginArguments(for: item)
             return
         }
         noteQueryPick(for: item)
         switch item.action {
         case .application(let app):
+            guard allowsSideEffect("opening apps") else { return }
             Task {
                 do {
                     _ = try await NSWorkspace.shared.openApplication(
@@ -94,6 +101,7 @@ extension LauncherModel {
             editor = .note(note)
             store.recordUse(of: item.id)
         case .window(let layout):
+            guard allowsSideEffect("arranging other apps' windows") else { return }
             guard accessibilityAllowed || windows.hasPermission else {
                 windows.requestPermission()
                 SystemSettingsLink.open(.accessibility)
@@ -149,8 +157,28 @@ extension LauncherModel {
         }
     }
 
+    /// Checks the launch's side-effect rule before an executor runs. Inert launches (the test host,
+    /// verification mode) say why instead of acting.
+    func allowsSideEffect(_ what: String) -> Bool {
+        do {
+            try sideEffects.check(what)
+            return true
+        } catch {
+            feedback = .error(error.localizedDescription)
+            return false
+        }
+    }
+
+    /// Inert launches never write the system clipboard, even when handed it.
+    private var mayWriteClipboard: Bool {
+        guard sideEffects.isInert, clipboard.usesGeneralPasteboard else { return true }
+        feedback = .error(SideEffectGuard.Blocked(what: "writing to the system clipboard", mode: sideEffects.mode).localizedDescription)
+        return false
+    }
+
     @discardableResult
     func copy(_ text: String, label: String? = nil) -> Bool {
+        guard mayWriteClipboard else { return false }
         if clipboard.copy(text) {
             toast("Copied “\((label ?? text).truncatedForFeedback)”")
             return true
@@ -161,6 +189,7 @@ extension LauncherModel {
 
     @discardableResult
     func copy(_ entry: ClipboardEntry) -> Bool {
+        guard mayWriteClipboard else { return false }
         if clipboard.copy(entry) {
             toast("Copied “\(entry.title.truncatedForFeedback)”")
             return true
@@ -181,7 +210,7 @@ extension LauncherModel {
     var targetAppName: String { previousApplicationName ?? "Your App" }
 
     func pasteSelected() {
-        if confirmation != nil || showActions || isCollapsedToBar { return }
+        if confirmation != nil || showActions || isCollapsedToBar || argumentSession != nil { return }
         if destination == .ai {
             pasteAIResponse()
             return
@@ -198,7 +227,7 @@ extension LauncherModel {
             registry.performSecondary(item, ref: ref, in: self)
             return
         }
-        guard item.supportsPaste else { return }
+        guard item.supportsPaste, mayWriteClipboard else { return }
         switch item.action {
         case .clipboard(let entry): finishPaste(copied: clipboard.copy(entry), label: entry.title)
         case .file(let url):
@@ -211,6 +240,7 @@ extension LauncherModel {
     }
 
     func paste(_ text: String, label: String? = nil) {
+        guard mayWriteClipboard else { return }
         finishPaste(copied: clipboard.copy(text), label: label ?? text)
     }
 
@@ -225,7 +255,7 @@ extension LauncherModel {
             feedback = .error(clipboard.lastCopyError ?? "Couldn't copy the content.")
             return
         }
-        guard clipboard.usesGeneralPasteboard else {
+        guard clipboard.usesGeneralPasteboard, !sideEffects.isInert else {
             feedback = .info("Copied to the isolated verification pasteboard. Cross-app paste is disabled in this mode.")
             return
         }
@@ -383,14 +413,36 @@ extension LauncherModel {
     /// key was handled, which is whenever a question is pending.
     func confirmFromReturn(isRepeat: Bool) -> Bool {
         guard let confirmation else { return false }
-        if !isRepeat, !confirmation.isDestructive || isConfirmationVisible { confirm(confirmation) }
+        if !isRepeat, canApprove(confirmation) { confirm(confirmation) }
         return true
     }
 
-    /// Whether a pending prompt is on screen: the panel is showing (there's no panel in tests),
-    /// and nothing covers its action bar.
+    /// The approve button: it answers only the prompt it showed, so a click landing as a new
+    /// prompt replaces the old one approves neither.
+    func approveConfirmation(id: String) {
+        guard let confirmation, confirmation.id == id, canApprove(confirmation) else { return }
+        confirm(confirmation)
+    }
+
+    /// An action bar reports the prompt it's showing, once it's drawn uncovered.
+    func confirmationDidAppear(_ id: String) {
+        if confirmation?.id == id { shownConfirmationID = id }
+    }
+
+    /// Whether the pending prompt can be approved now. One that needs visible approval must have
+    /// been shown as this very instance, on a surface that is visible and key.
+    func canApprove(_ confirmation: ActionConfirmation) -> Bool {
+        guard confirmation.requiresVisibleApproval else { return true }
+        return shownConfirmationID == confirmation.id && isConfirmationVisible
+    }
+
+    /// Whether prompts are on screen: the panel is visible, opaque and key, with nothing covering
+    /// its action bar. Tests without a panel set `confirmationSurfaceIsVisible`.
     var isConfirmationVisible: Bool {
-        confirmation != nil && panel?.isVisible != false && !showActions
+        guard confirmation != nil, !showActions else { return false }
+        if let check = confirmationSurfaceIsVisible { return check() }
+        guard let panel else { return false }
+        return panel.isSurfaceVisible && isPresented
     }
 
     func confirm(_ confirmation: ActionConfirmation) {
@@ -433,8 +485,25 @@ extension LauncherModel {
                 }
                 guard deleted else { return false }
             case .store(let remove):
-                guard remove() else { return false }
-                if !store.forget(itemIDs: [item.id]) {
+                // Record the cleanup first, so neither a failed save nor a quit after the
+                // deletion can leave Favorites and Recent pointing at the removed row.
+                let referenced =
+                    store.database.favoriteIDs.contains(item.id) || store.database.usage.contains { $0.id == item.id }
+                if referenced {
+                    do {
+                        try store.journalCleanup(of: item.id, provider: ref.provider)
+                    } catch {
+                        feedback = .error(
+                            "“\(item.title.truncatedForFeedback)” wasn't deleted: OpenRay couldn't record the change. \(error.localizedDescription)"
+                        )
+                        return false
+                    }
+                }
+                guard remove() else {
+                    store.unjournalCleanup(of: item.id)
+                    return false
+                }
+                if referenced, !store.forget(itemIDs: [item.id]) {
                     feedback = .warning(
                         "Deleted “\(item.title.truncatedForFeedback)”, but Favorites and Recent couldn't be updated. "
                             + "OpenRay tries again with the next change it saves.")
@@ -455,6 +524,8 @@ extension LauncherModel {
             }
             database.favoriteIDs.remove(item.id)
             database.usage.removeAll { $0.id == item.id }
+            // A deleted quicklink or snippet won't come back, so its alias and hotkey go with it.
+            database.commandBindings.removeAll { $0.targetID == item.id }
         }
         guard deleted else { return false }
         selectedID = next
@@ -560,6 +631,7 @@ extension LauncherModel {
     }
 
     private func open(_ url: URL, itemID: String) {
+        guard allowsSideEffect("opening files and links") else { return }
         if NSWorkspace.shared.open(url) {
             store.recordUse(of: itemID)
             panel?.dismiss(restoreFocus: false)
@@ -621,8 +693,19 @@ extension LauncherModel {
 
     /// Item actions first, then organisation, then panel-level actions.
     func actions(for item: LauncherItem?) -> [ActionEntry] {
+        // Entries outlive this call (⌘K snapshots them), so a command row keeps its identity.
+        let item = item.map(markingCommandIdentity)
         var entries: [ActionEntry] = []
         if destination == .ai { return aiActions() }
+        if argumentSession != nil {
+            return [
+                ActionEntry(id: "primary", title: "Run", symbol: "play", shortcut: .return, group: .item) { [weak self] in
+                    self?.submitArguments()
+                },
+                ActionEntry(id: "cancelArguments", title: "Close Arguments", symbol: "xmark", shortcut: .escape, group: .item)
+                { [weak self] in self?.cancelArguments() },
+            ]
+        }
         // Before history exists, the opt-in's two choices are the only actions.
         if showsClipboardOptIn {
             return [
@@ -733,7 +816,10 @@ extension LauncherModel {
                     ActionEntry(
                         id: "reveal", title: "Reveal in Finder", symbol: "folder", shortcut: .command("R", shift: true),
                         key: "r", modifiers: [.command, .shift], group: .item
-                    ) { NSWorkspace.shared.activateFileViewerSelecting([url]) })
+                    ) { [weak self] in
+                        guard self?.allowsSideEffect("revealing files in Finder") == true else { return }
+                        NSWorkspace.shared.activateFileViewerSelecting([url])
+                    })
                 entries.append(
                     ActionEntry(
                         id: "copyPath", title: "Copy Path", symbol: "doc.on.doc", shortcut: .command("C", shift: true),

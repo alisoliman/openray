@@ -166,6 +166,12 @@ final class LauncherPanelController: NSObject, NSWindowDelegate {
 
     var isVisible: Bool { window?.isVisible == true }
 
+    /// Visible, fully faded in and key: what a prompt needs before it can be approved.
+    var isSurfaceVisible: Bool {
+        guard let window else { return false }
+        return window.isVisible && window.alphaValue >= 1 && window.isKeyWindow && window.occlusionState.contains(.visible)
+    }
+
     func toggle() {
         if window?.isVisible == true { dismiss() } else { show() }
     }
@@ -176,6 +182,8 @@ final class LauncherPanelController: NSObject, NSWindowDelegate {
             model.previousApplication = front
             model.targetWindow = nil
         }
+        // The interface size applies as the panel appears, before anything is drawn or placed.
+        if window?.isVisible != true { applyInterfaceSize() }
         if window == nil { createWindow() }
         guard let window else { return }
         let wasVisible = window.isVisible
@@ -218,7 +226,8 @@ final class LauncherPanelController: NSObject, NSWindowDelegate {
         window.orderOut(nil)
         if isQuickLookVisible { QLPreviewPanel.shared().orderOut(nil) }
         model.files.stop()
-        if restoreFocus { model.previousApplication?.activate() }
+        // Activating another app is a side effect inert launches never take.
+        if restoreFocus, !model.sideEffects.isInert { model.previousApplication?.activate() }
     }
 
     /// Previews a file in the shared Quick Look panel above the launcher, or closes it.
@@ -268,6 +277,21 @@ final class LauncherPanelController: NSObject, NSWindowDelegate {
                 y: (panelTop + PanelGeometry.topMargin - size.height).rounded(),
                 width: size.width, height: size.height),
             display: false)
+    }
+
+    /// Sets the design tokens' scale from Settings › General › Interface size, and rebuilds the
+    /// panel's views when it changed, so every font and length takes it.
+    private func applyInterfaceSize() {
+        let scale = model.store.database.preferences.size.scale
+        guard OR.interfaceScale != scale else { return }
+        OR.interfaceScale = scale
+        guard let window else { return }
+        let size = PanelGeometry.windowSize
+        let host = NSHostingView(rootView: LauncherRootView(model: model))
+        host.sizingOptions = []
+        host.frame = NSRect(origin: .zero, size: size)
+        window.setContentSize(size)
+        window.contentView = host
     }
 
     static func screen(for choice: LauncherScreen) -> NSScreen? {

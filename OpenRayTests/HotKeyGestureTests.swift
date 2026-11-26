@@ -36,35 +36,20 @@ final class SilentHotKeyBackend: GlobalHotKeyBackend {
     func removeHandler() {}
 }
 
-@MainActor
-final class FakeRemapper: KeyRemapping {
-    var mappings: [KeyMapping] = []
-    var writes = 0
-    var fails = false
-    func currentMappings() throws -> [KeyMapping] { mappings }
-    func setMappings(_ mappings: [KeyMapping]) throws {
-        if fails { throw LibraryValidationError("Refused.") }
-        writes += 1
-        self.mappings = mappings
-    }
-}
-
+/// A Hyper event tap that never touches the system: tests read the mapping it was given.
 @MainActor
 final class FakeHyperTap: HyperEventTap {
-    var handler: (@MainActor (HyperKeyMachine.Input) -> HyperKeyMachine.Output)?
+    var map: (@Sendable (UInt64) -> UInt64)?
     var allowed = true
-    func start(_ handler: @escaping @MainActor (HyperKeyMachine.Input) -> HyperKeyMachine.Output) -> Bool {
+    var starts = 0
+    var isRunning: Bool { map != nil }
+    func start(map: @escaping @Sendable (UInt64) -> UInt64) -> Bool {
         guard allowed else { return false }
-        self.handler = handler
+        starts += 1
+        self.map = map
         return true
     }
-    func stop() { handler = nil }
-}
-
-@MainActor
-final class FakeCapsLock: CapsLockToggling {
-    var toggles = 0
-    func toggle() { toggles += 1 }
+    func stop() { map = nil }
 }
 
 @MainActor
@@ -262,98 +247,108 @@ struct HotKeyGestureTests {
 
     // MARK: Hyper key
 
-    @Test func theHyperKeyHoldsItsModifiersAndKnowsALonePress() {
-        var machine = HyperKeyMachine(modifiers: .all)
-        #expect(machine.handle(.keyDown) == .passUnchanged)
-        #expect(machine.handle(.hyperDown(isRepeat: false)) == .swallow)
-        #expect(machine.handle(.hyperDown(isRepeat: true)) == .swallow)
-        #expect(machine.handle(.keyDown) == .addModifiers(.all))
-        #expect(machine.handle(.keyUp) == .addModifiers(.all))
-        #expect(machine.handle(.hyperUp) == .swallow)
-        #expect(machine.handle(.keyDown) == .passUnchanged)
-        // Pressed and released alone.
-        #expect(machine.handle(.hyperDown(isRepeat: false)) == .swallow)
-        #expect(machine.handle(.hyperUp) == .quickPress)
-        machine.modifiers = [.command, .control, .option]
-        _ = machine.handle(.hyperDown(isRepeat: false))
-        #expect(machine.handle(.keyDown) == .addModifiers([.command, .control, .option]))
+    /// Flags as a key event carries them: device bits per physical key, plus the generic modifier.
+    private let rightCommandDown: UInt64 = 0x10 | CGEventFlags.maskCommand.rawValue
+    private let leftCommandDown: UInt64 = 0x08 | CGEventFlags.maskCommand.rawValue
+    private let hyperFlags: UInt64 =
+        CGEventFlags.maskCommand.rawValue | CGEventFlags.maskControl.rawValue | CGEventFlags.maskAlternate.rawValue
+        | CGEventFlags.maskShift.rawValue
+
+    @Test func theHyperMappingAddsModifiersOnlyWhileTheKeyIsPhysicallyDown() {
+        let map = { (flags: UInt64) in HyperKeyMapping.flags(flags, trigger: .rightCommand, modifiers: .all) }
+        // Held: every Hyper modifier is added.
+        #expect(map(rightCommandDown) & hyperFlags == hyperFlags)
+        // The left key is a plain ⌘.
+        #expect(map(leftCommandDown) == leftCommandDown)
+        // Released, or a release that was never seen: the event's own flags say the key is up.
+        #expect(map(0) == 0)
+        #expect(map(CGEventFlags.maskShift.rawValue) == CGEventFlags.maskShift.rawValue)
+        // Inconsistent flags (the device bit without its modifier) pass unchanged.
+        #expect(map(0x10) == 0x10)
+        // Without Shift, Shift isn't added.
+        let noShift = HyperKeyMapping.flags(rightCommandDown, trigger: .rightCommand, modifiers: [.command, .control, .option])
+        #expect(noShift & CGEventFlags.maskShift.rawValue == 0)
+        // Other keys: Right ⌥.
+        let rightOption: UInt64 = 0x40 | CGEventFlags.maskAlternate.rawValue
+        #expect(HyperKeyMapping.flags(rightOption, trigger: .rightOption, modifiers: .all) & hyperFlags == hyperFlags)
+        #expect(HyperKeyMapping.flags(rightOption, trigger: .rightCommand, modifiers: .all) == rightOption)
     }
 
-    @Test func theRemapKeepsOtherMappingsAndReadsHidutilOutput() {
-        let other = KeyMapping(source: 0x7_0000_00E0, destination: 0x7_0000_00E3)
-        #expect(HyperRemapPlan.adding(to: [other]) == [other, .capsLockToF18])
-        #expect(HyperRemapPlan.adding(to: [.capsLockToF18]) == [.capsLockToF18])
-        #expect(HyperRemapPlan.removing(from: [other, .capsLockToF18]) == [other])
-        let output = """
-            (
-                    {
-                    HIDKeyboardModifierMappingDst = 30064771181;
-                    HIDKeyboardModifierMappingSrc = 30064771129;
-                },
-                    {
-                    HIDKeyboardModifierMappingDst = 30064771299;
-                    HIDKeyboardModifierMappingSrc = 30064771296;
-                }
-            )
-            """
-        #expect(HyperRemapPlan.parse(output) == [.capsLockToF18, other])
-        #expect(HyperRemapPlan.parse("(null)").isEmpty)
-        #expect(
-            HyperRemapPlan.json([.capsLockToF18])
-                == #"{"UserKeyMapping":[{"HIDKeyboardModifierMappingSrc":30064771129,"HIDKeyboardModifierMappingDst":30064771181}]}"#)
-    }
-
-    @Test func turningTheHyperKeyOnAndOffRemapsAndRestores() {
-        let remapper = FakeRemapper()
-        let other = KeyMapping(source: 0x7_0000_00E0, destination: 0x7_0000_00E3)
-        remapper.mappings = [other]
+    @Test func aLostReleaseNeverOutlivesTheKey() {
+        // The mapping holds no state: whatever happened before, a key event with the key up passes unchanged.
         let tap = FakeHyperTap()
-        let capsLock = FakeCapsLock()
-        let hyper = HyperKey(remapper: remapper, tap: tap, capsLock: capsLock)
-        var settings = HyperKeySettings()
-        // Off by default: nothing is touched.
-        hyper.apply(settings, accessibilityAllowed: true)
-        #expect(remapper.writes == 0)
-        settings.isEnabled = true
-        // Without Accessibility it says why and touches nothing.
-        hyper.apply(settings, accessibilityAllowed: false)
-        #expect(remapper.writes == 0)
+        let hyper = HyperKey(tap: tap)
+        hyper.apply(HyperKeySettings(isEnabled: true), accessibilityAllowed: true)
+        guard let map = tap.map else {
+            Issue.record("The tap didn't start")
+            return
+        }
+        #expect(map(rightCommandDown) != rightCommandDown)
+        // A key-up for the Hyper key went missing; the next keys show it's up.
+        for _ in 0..<3 { #expect(map(0) == 0) }
+        #expect(map(CGEventFlags.maskAlternate.rawValue) == CGEventFlags.maskAlternate.rawValue)
+    }
+
+    @Test func turningTheHyperKeyOnAndOffOnlyStartsAndStopsTheTap() {
+        let tap = FakeHyperTap()
+        let hyper = HyperKey(tap: tap)
+        // Off by default: nothing starts.
+        hyper.apply(HyperKeySettings(), accessibilityAllowed: true)
+        #expect(tap.starts == 0)
+        // Without Accessibility it says why and starts nothing.
+        hyper.apply(HyperKeySettings(isEnabled: true), accessibilityAllowed: false)
+        #expect(tap.starts == 0)
         #expect(hyper.problem?.contains("Accessibility") == true)
-        hyper.apply(settings, accessibilityAllowed: true)
+        hyper.apply(HyperKeySettings(isEnabled: true), accessibilityAllowed: true)
         #expect(hyper.isActive)
-        #expect(remapper.mappings == [other, .capsLockToF18])
         #expect(hyper.problem == nil)
-        // A lone press toggles Caps Lock, as chosen.
-        _ = tap.handler?(.hyperDown(isRepeat: false))
-        #expect(tap.handler?(.hyperUp) == .quickPress)
-        #expect(capsLock.toggles == 1)
-        settings.quickPress = .nothing
-        hyper.apply(settings, accessibilityAllowed: true)
-        _ = tap.handler?(.hyperDown(isRepeat: false))
-        _ = tap.handler?(.hyperUp)
-        #expect(capsLock.toggles == 1)
-        // Off again: the tap stops and only OpenRay's mapping goes.
-        settings.isEnabled = false
-        hyper.apply(settings, accessibilityAllowed: true)
+        // The same settings again don't restart it; a new key does.
+        hyper.apply(HyperKeySettings(isEnabled: true), accessibilityAllowed: true)
+        #expect(tap.starts == 1)
+        hyper.apply(HyperKeySettings(isEnabled: true, trigger: .rightOption), accessibilityAllowed: true)
+        #expect(tap.starts == 2)
+        // Off: the tap stops, and nothing outlasts it.
+        hyper.apply(HyperKeySettings(), accessibilityAllowed: true)
         #expect(!hyper.isActive)
-        #expect(tap.handler == nil)
-        #expect(remapper.mappings == [other])
+        #expect(tap.map == nil)
+        // A refused tap reports it.
+        tap.allowed = false
+        hyper.apply(HyperKeySettings(isEnabled: true), accessibilityAllowed: true)
+        #expect(!hyper.isActive)
+        #expect(hyper.problem != nil)
     }
 
-    @Test func aRefusedTapUndoesTheRemapAndAStaleRemapIsRemoved() {
-        let remapper = FakeRemapper()
-        let tap = FakeHyperTap()
-        tap.allowed = false
-        let hyper = HyperKey(remapper: remapper, tap: tap, capsLock: FakeCapsLock())
-        var settings = HyperKeySettings()
-        settings.isEnabled = true
-        hyper.apply(settings, accessibilityAllowed: true)
-        #expect(!hyper.isActive)
-        #expect(remapper.mappings.isEmpty)
-        #expect(hyper.problem != nil)
-        // A remap a crash left behind goes at the next launch while the Hyper key is off.
-        remapper.mappings = [.capsLockToF18]
-        hyper.removeStaleRemap(HyperKeySettings())
-        #expect(remapper.mappings.isEmpty)
+    @Test func hyperSettingsDecodeWhateverAnotherBuildSaved() throws {
+        let partial = try JSONDecoder().decode(HyperKeySettings.self, from: Data(#"{"isEnabled":true}"#.utf8))
+        #expect(partial == HyperKeySettings(isEnabled: true))
+        let unknownKey = try JSONDecoder().decode(
+            HyperKeySettings.self, from: Data(#"{"isEnabled":true,"trigger":"capsLock","quickPress":"x"}"#.utf8))
+        #expect(unknownKey.trigger == .rightCommand)
+    }
+
+    // MARK: Live adapters stay inert here
+
+    @Test func liveKeyboardAdaptersAreInertInTheTestHost() throws {
+        #expect(SideEffectGuard.isInert)
+        // The real event tap and modifier monitors refuse to start.
+        let tap = CGHyperEventTap()
+        let started = tap.start(map: { $0 })
+        #expect(!started)
+        #expect(!tap.isRunning)
+        #expect(!NSEventModifierSource().start { _ in })
+        // Carbon refuses to register a global shortcut.
+        #expect(throws: SideEffectGuard.Blocked.self) {
+            try CarbonHotKeyBackend().register(LauncherHotKey.optionSpace.shortcut, identifier: 1)
+        }
+        // The shortcut recorder watches nothing.
+        #expect(CommandShortcutCaptureView().monitoring is InertLocalEventMonitoring)
+        // A model handed the system clipboard and a real hotkey registry still stays inert.
+        let model = LauncherModel(store: LibraryStore(fileURL: nil), ai: AIChatModel(engine: TestAIEngine()), pasteboard: .general)
+        defer { model.stop() }
+        model.isStarted = true
+        model.synchronizeCommandHotKeys()
+        #expect(model.hotKey.modifierHotKeys.registeredIDs.isEmpty)
+        #expect(!model.copy("never written"))
+        #expect(model.feedback?.style == .error)
     }
 }

@@ -128,6 +128,18 @@ extension LauncherModel {
         return false
     }
 
+    /// A provided row that stands for a registered command keeps that identity in snapshots (⌘K,
+    /// argument fields), so it's refused rather than run unconfirmed if the command goes away.
+    func markingCommandIdentity(_ item: LauncherItem) -> LauncherItem {
+        guard case .provided(var ref) = item.action, !ref.has(.descriptor),
+            registry.descriptor(for: ref, in: self) != nil
+        else { return item }
+        ref.traits.insert(.descriptor)
+        var marked = item
+        marked.action = .provided(ref)
+        return marked
+    }
+
     // MARK: - Sections
 
     /// ⌘↓ and ⌘↑: the first row of the next or previous group.
@@ -199,14 +211,6 @@ extension LauncherModel {
 
     // MARK: - Fallbacks
 
-    /// A fallback the person can choose, for Settings.
-    struct FallbackCandidate: Identifiable, Equatable {
-        var id: String
-        var title: String
-        var symbol: String
-        var kind: Kind
-    }
-
     var webSearchQuicklink: Quicklink? {
         let links = store.database.quicklinks.filter(\.needsQuery)
         return links.first { $0.keyword.lowercased() == "web" } ?? links.first
@@ -217,9 +221,8 @@ extension LauncherModel {
         link.id == webSearchQuicklink?.id ? "fallback.web" : "fallback.quicklink.\(link.id)"
     }
 
-    /// Every fallback row for a search: Ask AI, each search quicklink, Search Files, then the
-    /// providers' fallbacks. `fallbackItems` shows the chosen ones in their order.
-    func fallbackCandidateItems(for term: String) -> [LauncherItem] {
+    /// The built-in fallback rows for a search: Ask AI, each search quicklink, Search Files.
+    private func builtInFallbackItems(for term: String) -> [LauncherItem] {
         var items = [
             LauncherItem(
                 id: "fallback.ai", title: "Ask AI", subtitle: ai.availability.isAvailable ? "" : "Not available yet",
@@ -245,35 +248,49 @@ extension LauncherModel {
                             provider: LauncherCommandProvider.registration.id, id: LauncherCommandProvider.searchFilesID,
                             payload: term, primaryTitle: "Search Files"))))
         }
-        return items + registry.fallbackItems(for: term, in: self)
+        return items
     }
 
-    /// The fallbacks shown before anything was chosen: Ask AI, the web search, and every provider's.
-    private func defaultFallbackIDs(among candidates: [LauncherItem]) -> [String] {
-        let providerIDs = Set(registry.fallbackItems(for: "x", in: self).map(\.id))
-        return candidates.map(\.id).filter { $0 == "fallback.ai" || $0 == "fallback.web" || providerIDs.contains($0) }
+    /// Every fallback row for this search, built-in then the providers'. Providers may offer
+    /// different rows for different searches; these are the real ones for `term`.
+    func fallbackCandidateItems(for term: String) -> [LauncherItem] {
+        builtInFallbackItems(for: term) + registry.fallbackItems(for: term, in: self)
     }
 
-    /// The fallbacks in use, in order: the saved choice, or the defaults.
+    /// True once fallbacks were chosen by hand. A saved order from before the flag existed counts.
+    var usesCustomFallbacks: Bool {
+        store.database.preferences.customFallbacks ?? !store.database.fallbackOrder.isEmpty
+    }
+
+    /// Whether a row is on by default: Ask AI, the web search, and every provider's fallback.
+    private func isDefaultFallback(_ id: String, providerIDs: Set<String>) -> Bool {
+        id == "fallback.ai" || id == "fallback.web" || providerIDs.contains(id)
+    }
+
+    /// The fallbacks in use, in order, for Settings and ⌘K: the saved choice, or the defaults.
     var enabledFallbackIDs: [String] {
-        let candidates = fallbackCandidateItems(for: "x").map(\.id)
-        guard store.database.preferences.usesCustomFallbacks else {
-            return defaultFallbackIDs(among: fallbackCandidateItems(for: "x"))
-        }
-        return store.database.fallbackOrder.filter(candidates.contains)
+        guard !usesCustomFallbacks else { return store.database.fallbackOrder }
+        let providerIDs = Set(registry.fallbackDescriptors(in: self).map(\.id))
+        return fallbackCandidates.map(\.id).filter { isDefaultFallback($0, providerIDs: providerIDs) }
     }
 
-    /// The fallback rows for a search, in the chosen order.
+    /// The fallback rows for a search, from that search's real candidates: in the saved order once
+    /// chosen, otherwise the default ones in their usual order.
     func orderedFallbackItems(for term: String) -> [LauncherItem] {
-        let candidates = fallbackCandidateItems(for: term)
-        let index = Dictionary(candidates.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
-        return enabledFallbackIDs.compactMap { index[$0] }
+        let builtIn = builtInFallbackItems(for: term)
+        let provided = registry.fallbackItems(for: term, in: self)
+        guard usesCustomFallbacks else {
+            return builtIn.filter { isDefaultFallback($0.id, providerIDs: []) } + provided
+        }
+        let index = Dictionary((builtIn + provided).map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
+        return store.database.fallbackOrder.compactMap { index[$0] }
     }
 
+    /// Every fallback the person can choose, for Settings: stable names, whatever is typed.
     var fallbackCandidates: [FallbackCandidate] {
-        fallbackCandidateItems(for: "…").map {
+        builtInFallbackItems(for: "").map {
             FallbackCandidate(id: $0.id, title: $0.title, symbol: $0.symbol, kind: $0.kind)
-        }
+        } + registry.fallbackDescriptors(in: self)
     }
 
     /// The fallback a result row could be added as: a search quicklink, or a fallback row itself.
@@ -377,12 +394,17 @@ extension LauncherModel {
         let entries = currentActionEntries
         let filter = filter.trimmingCharacters(in: .whitespaces)
         guard !filter.isEmpty else { return entries }
-        func matches(_ entries: [ActionEntry], path: String?) -> [ActionEntry] {
+        // Entries found inside submenus are titled and identified by their path, so two submenus'
+        // children with the same id stay distinct.
+        func matches(_ entries: [ActionEntry], path: (title: String, id: String)?) -> [ActionEntry] {
             entries.flatMap { entry -> [ActionEntry] in
                 var shown = entry
-                if let path { shown.title = "\(path) › \(entry.title)" }
+                if let path {
+                    shown.title = "\(path.title) › \(entry.title)"
+                    shown.id = "\(path.id)/\(entry.id)"
+                }
                 let own = SearchMatcher.score(filter, in: entry.title) != nil ? [shown] : []
-                return own + matches(entry.children, path: shown.title)
+                return own + matches(entry.children, path: (shown.title, shown.id))
             }
         }
         return matches(entries, path: nil)
@@ -443,36 +465,49 @@ extension LauncherModel {
 
     /// The arguments a row asks for before it runs: a registered command's declared ones.
     func argumentSpecs(for item: LauncherItem) -> [ArgumentSpec] {
-        guard case .provided(let ref) = item.action, ref.has(.descriptor), ref.arguments.isEmpty,
+        guard case .provided(let ref) = item.action, ref.arguments.isEmpty,
             let descriptor = registry.descriptor(for: ref, in: self)
         else { return [] }
         return Array(descriptor.arguments.prefix(ArgumentSession.maximumFields))
+    }
+
+    /// Whether running a row would need its argument fields first: a required argument with no
+    /// default and no value yet.
+    func needsArguments(_ item: LauncherItem) -> Bool {
+        argumentSession == nil && argumentSpecs(for: item).contains { !$0.isOptional && $0.defaultValue == nil }
     }
 
     /// Opens a command's argument fields, the first one holding `initial`. Returns false when
     /// the row takes no arguments.
     @discardableResult
     func beginArguments(for item: LauncherItem, initial: String = "") -> Bool {
+        let item = markingCommandIdentity(item)
         let specs = argumentSpecs(for: item)
         guard !specs.isEmpty, case .provided(let ref) = item.action else { return false }
-        beginArguments(item: item, specs: specs, initial: initial) { [weak self] values in
+        return beginArguments(item: item, specs: specs, initial: initial) { [weak self] values in
             var filled = item
             var resolved = ref
             resolved.arguments = values
             filled.action = .provided(resolved)
             self?.perform(filled)
         }
-        return true
     }
 
     /// Opens argument fields for anything: up to three specs, run with the resolved values.
     /// Slices use this for rows that aren't registered commands, such as multi-argument quicklinks.
+    @discardableResult
     func beginArguments(
         item: LauncherItem, specs: [ArgumentSpec], initial: String = "",
         run: @escaping @MainActor ([String: String]) -> Void
-    ) {
+    ) -> Bool {
         let specs = Array(specs.prefix(ArgumentSession.maximumFields))
-        guard !specs.isEmpty else { return }
+        guard !specs.isEmpty else { return false }
+        // The fields live in the search bar: not during setup or an editor, and AI makes way.
+        guard onboarding == nil, editor == nil else {
+            feedback = .warning("Finish what's open first, then run “\(item.title.truncatedForFeedback)” again.")
+            return false
+        }
+        if destination == .ai { leaveAI() }
         var values: [String: String] = [:]
         for spec in specs {
             if case .dropdown(let options) = spec.type {
@@ -486,6 +521,7 @@ extension LauncherModel {
         argumentSession = ArgumentSession(item: item, specs: specs, values: values, run: run)
         selectedID = item.id
         focusRequest += 1
+        return true
     }
 
     func setArgumentValue(_ value: String, at index: Int) {
@@ -506,12 +542,22 @@ extension LauncherModel {
     }
 
     /// ↑ and ↓ (or ← and →) on a dropdown field choose the previous or next option.
+    /// The field that holds the keyboard says so, as when it's clicked. Focus doesn't move again.
+    func argumentFieldDidFocus(_ index: Int) {
+        guard var session = argumentSession, session.specs.indices.contains(index), session.focus != index else { return }
+        session.focus = index
+        argumentSession = session
+    }
+
     @discardableResult
-    func cycleArgumentOption(_ offset: Int) -> Bool {
-        guard var session = argumentSession, case .dropdown(let options) = session.specs[session.focus].type,
+    func cycleArgumentOption(_ offset: Int, at field: Int? = nil) -> Bool {
+        guard var session = argumentSession else { return false }
+        let index = field ?? session.focus
+        guard session.specs.indices.contains(index), case .dropdown(let options) = session.specs[index].type,
             !options.isEmpty
         else { return false }
-        let name = session.specs[session.focus].name
+        session.focus = index
+        let name = session.specs[index].name
         let current = options.firstIndex { $0.value == session.values[name] }
         let next = current.map { ($0 + offset + options.count) % options.count } ?? (offset > 0 ? 0 : options.count - 1)
         session.values[name] = options[next].value
