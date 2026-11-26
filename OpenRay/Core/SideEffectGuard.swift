@@ -56,19 +56,27 @@ struct SideEffectGuard: Equatable, Sendable {
     /// True in the test host and in verification mode.
     var isInert: Bool { mode != .live }
 
-    /// Throws `Blocked` unless side effects are allowed. Call it first, before any OS call.
+    /// The rule that actually applies: an injected `.live` guard can never re-enable side effects
+    /// in a process that is itself inert (the test host or isolated verification). An inert
+    /// instance stays inert, so fakes can still simulate the inert modes in a live process.
+    var effective: SideEffectGuard { isInert ? self : .current }
+
+    /// Throws `Blocked` unless side effects are allowed by both this guard and the process.
+    /// Call it first, before any OS call.
     func check(_ what: String) throws {
-        if isInert { throw Blocked(what: what, mode: mode) }
+        let rule = effective
+        if rule.isInert { throw Blocked(what: what, mode: rule.mode) }
     }
 
-    /// Writes to the general pasteboard are refused while inert; named private pasteboards are fine.
+    /// Writes to the general pasteboard are refused while this guard or the process is inert;
+    /// named private pasteboards are fine.
     func mayWrite(toPasteboardNamed name: NSPasteboard.Name) -> Bool {
-        !isInert || name != .general
+        !effective.isInert || name != .general
     }
 
     func checkWrite(toPasteboardNamed name: NSPasteboard.Name) throws {
         guard mayWrite(toPasteboardNamed: name) else {
-            throw Blocked(what: "writing to the system clipboard", mode: mode)
+            throw Blocked(what: "writing to the system clipboard", mode: effective.mode)
         }
     }
 
