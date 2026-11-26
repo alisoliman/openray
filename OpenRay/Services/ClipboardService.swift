@@ -23,16 +23,28 @@ enum ClipboardPolicy {
 }
 
 extension ClipboardPolicy {
-    /// What `{clipboard}` may insert: the board's plain text, unless the copy is
-    /// marked concealed, transient or auto-generated. OpenRay's own copies are fine.
-    @MainActor static func placeholderText(from pasteboard: NSPasteboard) -> String? {
+    /// What `{clipboard}` may insert: the board's plain text, read within one
+    /// pasteboard generation, unless macOS denies access, Secure Input is on, or the
+    /// copy is marked concealed, transient or auto-generated. OpenRay's own copies are fine.
+    @MainActor static func placeholderText(
+        from pasteboard: NSPasteboard, secureInput: Bool = IsSecureEventInputEnabled()
+    ) -> String? {
+        guard !secureInput, pasteboard.accessBehavior != .alwaysDeny else { return nil }
+        let generation = pasteboard.changeCount
         let types = Set((pasteboard.types ?? []).map(\.rawValue))
         guard ignoredTypes.subtracting(["com.openray.generated"]).isDisjoint(with: types),
             types.contains(NSPasteboard.PasteboardType.string.rawValue),
-            let data = pasteboard.data(forType: .string), data.count <= ClipboardLimits.textBytes
+            let data = pasteboard.data(forType: .string), data.count <= ClipboardLimits.textBytes,
+            pasteboard.changeCount == generation
         else { return nil }
         return String(data: data, encoding: .utf8)
     }
+}
+
+extension SideEffectGuard {
+    /// The policy an adapter enforces. An injected policy can only add restrictions:
+    /// when this process is inert, its own policy wins over an injected live one.
+    var restrictedByProcess: SideEffectGuard { isInert ? self : .current }
 }
 
 struct ClipboardCaptureContext: Sendable {
@@ -73,6 +85,9 @@ final class ClipboardService {
     @ObservationIgnored private var previousPolicy: CapturePolicy?
     @ObservationIgnored private let sideEffects: SideEffectGuard
     @ObservationIgnored private let textRecognizer: (any TextRecognizing)?
+    /// The pasteboard generation last copied from an excluded app, so `{clipboard}`
+    /// never inserts it. Known only while capture runs.
+    @ObservationIgnored private var excludedGeneration: Int?
     /// Text recognition for the last captured image, while it runs. Tests await it.
     @ObservationIgnored private(set) var pendingRecognition: Task<Void, Never>?
 
@@ -91,6 +106,7 @@ final class ClipboardService {
         sideEffects: SideEffectGuard = .current
     ) {
         self.store = store
+        let sideEffects = sideEffects.restrictedByProcess
         self.sideEffects = sideEffects
         self.textRecognizer = textRecognizer
         let pasteboard = Self.pasteboard(for: pasteboard, sideEffects: sideEffects)
@@ -149,7 +165,10 @@ final class ClipboardService {
                 types: [], sourceBundleID: source.sourceBundleID,
                 excluded: store.database.preferences.effectiveClipboardExclusions,
                 secureInput: source.secureInput)
-        else { return }
+        else {
+            excludedGeneration = change
+            return
+        }
         let types = Set((pasteboard.types ?? []).map(\.rawValue))
         guard
             ClipboardPolicy.shouldCapture(
@@ -261,7 +280,11 @@ final class ClipboardService {
 
     /// The current text for `{clipboard}`, read now and only when asked, with the
     /// same concealed and transient checks capture uses.
-    func placeholderText() -> String? { ClipboardPolicy.placeholderText(from: pasteboard) }
+    func placeholderText() -> String? {
+        refreshAccessStatus()
+        guard pasteboard.changeCount != excludedGeneration else { return nil }
+        return ClipboardPolicy.placeholderText(from: pasteboard)
+    }
 
     /// The board a service uses: a private one instead of the general pasteboard
     /// while side effects are inert, so default construction in tests and
@@ -397,13 +420,13 @@ enum SyntheticInput {
         else {
             throw LibraryValidationError("The target app or clipboard changed. Your text is copied; paste it with ⌘V.")
         }
-        try key(CGKeyCode(kVK_ANSI_V), flags: .maskCommand)
+        try key(CGKeyCode(kVK_ANSI_V), flags: .maskCommand, toProcess: application.processIdentifier)
     }
 
     /// Posts one key press to `pid` only. Every synthetic key event OpenRay sends
     /// for snippets goes through here or `postText`.
     static func postKey(_ code: CGKeyCode, toProcess pid: pid_t, sideEffects: SideEffectGuard = .current) throws {
-        try sideEffects.check("typing into other apps")
+        try sideEffects.restrictedByProcess.check("typing into other apps")
         guard let down = CGEvent(keyboardEventSource: nil, virtualKey: code, keyDown: true),
             let up = CGEvent(keyboardEventSource: nil, virtualKey: code, keyDown: false)
         else {
@@ -417,7 +440,7 @@ enum SyntheticInput {
 
     /// Types up to 20 UTF-16 code units into `pid` only.
     static func postText(_ chunk: [UInt16], toProcess pid: pid_t, sideEffects: SideEffectGuard = .current) throws {
-        try sideEffects.check("typing into other apps")
+        try sideEffects.restrictedByProcess.check("typing into other apps")
         guard let down = CGEvent(keyboardEventSource: nil, virtualKey: 0, keyDown: true),
             let up = CGEvent(keyboardEventSource: nil, virtualKey: 0, keyDown: false)
         else {
@@ -445,7 +468,8 @@ enum SyntheticInput {
         return result
     }
 
-    private static func key(_ code: CGKeyCode, flags: CGEventFlags = []) throws {
+    /// ⌘V goes to the app it's meant for only, so a focus change can't send it elsewhere.
+    private static func key(_ code: CGKeyCode, flags: CGEventFlags = [], toProcess pid: pid_t) throws {
         try SideEffectGuard.check("pasting into other apps")
         guard let down = CGEvent(keyboardEventSource: nil, virtualKey: code, keyDown: true),
             let up = CGEvent(keyboardEventSource: nil, virtualKey: code, keyDown: false)
@@ -455,7 +479,7 @@ enum SyntheticInput {
         for event in [down, up] {
             event.flags = flags
             event.setIntegerValueField(.eventSourceUserData, value: marker)
-            event.post(tap: .cghidEventTap)
+            event.postToPid(pid)
         }
     }
 }

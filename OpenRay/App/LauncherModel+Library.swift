@@ -51,10 +51,41 @@ struct PanelLibraryFileAccess: LibraryFileAccess {
 extension LauncherModel {
     // MARK: Primary action
 
-    /// The one place the Copy/Paste preference plugs in: Slice 1 returns `.paste`
-    /// here when people choose ↩ = paste. Clipboard entries and snippets read it in
-    /// `perform` and `paste`, and their ↩ and ⌘↩ titles follow.
-    var contentPrimaryAction: ContentPrimaryAction { .copy }
+    /// What ↩ does on clipboard entries and snippets; ⌘↩ always does the other, so the
+    /// two keys never do the same thing. This is the one plug-in point for Slice 1's
+    /// preference: on merging, return `.paste` when `preferences.primaryActionPastes`
+    /// is true. `primaryActionOverride` lets tests drive both modes.
+    var contentPrimaryAction: ContentPrimaryAction { primaryActionOverride ?? .copy }
+
+    /// ↩ on a clipboard entry or snippet.
+    func performContent(_ item: LauncherItem) {
+        contentPrimaryAction == .paste ? pasteContent(item) : copyContent(item)
+    }
+
+    /// ⌘↩ on a clipboard entry or snippet: the action ↩ doesn't do.
+    func performSecondaryContent(_ item: LauncherItem) {
+        contentPrimaryAction == .paste ? copyContent(item) : pasteContent(item)
+    }
+
+    /// Copies a clipboard entry or a rendered snippet.
+    func copyContent(_ item: LauncherItem) {
+        switch item.action {
+        case .clipboard(let entry): if copy(entry) { store.recordUse(of: item.id) }
+        case .snippet(let snippet): runSnippet(snippet, itemID: item.id, action: .copy)
+        default: break
+        }
+    }
+
+    /// Pastes a clipboard entry or a rendered snippet into the app you came from.
+    func pasteContent(_ item: LauncherItem) {
+        switch item.action {
+        case .clipboard(let entry):
+            finishPaste(copied: clipboard.copy(entry), label: entry.title)
+            store.recordUse(of: item.id)
+        case .snippet(let snippet): runSnippet(snippet, itemID: item.id, action: .paste)
+        default: break
+        }
+    }
 
     // MARK: Placeholder values
 
@@ -77,32 +108,64 @@ extension LauncherModel {
 
     // MARK: Snippets
 
-    func renderSnippet(_ snippet: Snippet) -> PlaceholderRendering {
-        let plan = snippet.template.plan(snippets: PlaceholderValues.snippetLookup(store.database))
-        return plan.render(placeholderValues(for: plan))
+    /// The one plan for a snippet's fields, value conversion and rendering.
+    func snippetPlan(_ snippet: Snippet) -> PlaceholderPlan {
+        snippet.template.plan(snippets: PlaceholderValues.snippetLookup(store.database))
     }
 
-    /// The snippet's text for copying or pasting, or nil after saying what's missing.
-    func snippetText(_ snippet: Snippet) -> String? {
-        let rendering = renderSnippet(snippet)
+    /// Copies or pastes a snippet. One that needs a typed value runs as its command,
+    /// whose fields ask for every argument (Slice 1); until those fields exist, the
+    /// registry says which value is missing.
+    func runSnippet(_ snippet: Snippet, itemID: String, action: ContentPrimaryAction) {
+        let plan = snippetPlan(snippet)
+        if plan.arguments.contains(where: \.isRequired),
+            let command = registry.item(withID: LibraryCommandProvider.commandID(for: snippet, action: action), in: self)
+        {
+            perform(command)
+            return
+        }
+        runSnippet(snippet, plan: plan, arguments: [:], itemID: itemID, action: action)
+    }
+
+    /// Runs a snippet with values by `ArgumentSpec.name`, as `ProvidedRef.arguments` carries them.
+    func runSnippet(_ snippet: Snippet, arguments: [String: String], action: ContentPrimaryAction) {
+        runSnippet(snippet, plan: snippetPlan(snippet), arguments: arguments, itemID: "snippet.\(snippet.id)", action: action)
+    }
+
+    private func runSnippet(
+        _ snippet: Snippet, plan: PlaceholderPlan, arguments: [String: String], itemID: String, action: ContentPrimaryAction
+    ) {
+        // Nothing is read for a snippet that can't run.
+        if let issue = plan.blockingIssues.first {
+            feedback = .warning(issue.message)
+            return
+        }
+        var values: PlaceholderValues
+        do {
+            let resolved = try plan.resolveArguments(arguments)
+            values = placeholderValues(for: plan)
+            values.arguments = resolved
+        } catch {
+            feedback = .warning(error.localizedDescription)
+            return
+        }
+        let rendering = plan.render(values)
         if let issue = rendering.blockingIssues.first {
             feedback = .warning(issue.message)
-            return nil
+            return
         }
-        return rendering.text
-    }
-
-    func copySnippet(_ snippet: Snippet, itemID: String) {
-        guard let text = snippetText(snippet) else { return }
-        if copy(text, label: snippet.name) { store.recordUse(of: itemID) }
-    }
-
-    func pasteSnippet(_ snippet: Snippet) {
-        guard let text = snippetText(snippet) else { return }
-        paste(text, label: snippet.name)
+        switch action {
+        case .copy: if copy(rendering.text, label: snippet.name) { store.recordUse(of: itemID) }
+        case .paste: paste(rendering.text, label: snippet.name)
+        }
     }
 
     // MARK: Quicklinks
+
+    /// The one plan for a quicklink's fields, value conversion and rendering.
+    func quicklinkPlan(_ link: Quicklink) -> PlaceholderPlan {
+        link.plan(snippets: PlaceholderValues.snippetLookup(store.database))
+    }
 
     /// Opens a quicklink with values by `ArgumentSpec.name`, as `ProvidedRef.arguments` carries them.
     @discardableResult
@@ -110,12 +173,23 @@ extension LauncherModel {
         openQuicklink(link) { try link.resolution(arguments: arguments, values: $0) }
     }
 
+    /// The editor's Test: the sample values its preview shows and its Open With app,
+    /// through the same guarded opener. Nothing is recorded and the editor stays open.
+    @discardableResult
+    func testQuicklink(_ link: Quicklink, arguments: [String: String]) -> Task<Void, Never>? {
+        openQuicklink(link, recordsUse: false) { try link.resolution(arguments: arguments, values: $0) }
+    }
+
     /// Resolves the link with the values its placeholders need right now, then opens it
     /// in its Open With app or the default one, through the guarded opener.
-    func openQuicklink(_ link: Quicklink, resolve: (PlaceholderValues) throws -> QuicklinkResolution)
-        -> Task<Void, Never>?
-    {
-        let plan = link.linkTemplate.template.plan(snippets: PlaceholderValues.snippetLookup(store.database))
+    func openQuicklink(
+        _ link: Quicklink, recordsUse: Bool = true, resolve: (PlaceholderValues) throws -> QuicklinkResolution
+    ) -> Task<Void, Never>? {
+        let plan = quicklinkPlan(link)
+        if let issue = plan.blockingIssues.first {
+            feedback = .error(issue.message)
+            return nil
+        }
         let resolution: QuicklinkResolution
         do { resolution = try resolve(placeholderValues(for: plan)) } catch {
             feedback = .error(error.localizedDescription)
@@ -131,6 +205,7 @@ extension LauncherModel {
         return Task { [weak self] in
             do {
                 try await opener.open(resolution.url, with: application)
+                guard recordsUse else { return }
                 self?.store.recordUse(of: itemID)
                 self?.panel?.dismiss(restoreFocus: false)
             } catch {
@@ -142,6 +217,28 @@ extension LauncherModel {
     /// Links that need several values run as their command, which asks for each one.
     func quicklinkCommand(for link: Quicklink) -> LauncherItem? {
         registry.item(withID: LibraryCommandProvider.commandID(for: link), in: self)
+    }
+
+    /// ↩ on a quicklink row. A link with one field takes the typed term (a blank term
+    /// takes its default); a link with more runs as its command, with the term in the first field.
+    func performQuicklink(_ link: Quicklink, argument: String) {
+        let fields = quicklinkPlan(link).arguments
+        if fields.count > 1, var command = quicklinkCommand(for: link) {
+            if !argument.isEmpty, case .provided(var ref) = command.action {
+                ref.arguments[fields[0].id.specName] = argument
+                command.action = .provided(ref)
+            }
+            perform(command)
+        } else if fields.count == 1, argument.isEmpty, argumentLink?.id != link.id {
+            beginArgument(link)
+        } else {
+            openQuicklink(link, query: argument)
+        }
+    }
+
+    /// ↩ does nothing on a blank argument row only when the link's field is required.
+    func quicklinkArgumentIsRequired(_ link: Quicklink) -> Bool {
+        quicklinkPlan(link).arguments.first?.isRequired ?? false
     }
 
     // MARK: Clipboard
@@ -191,10 +288,13 @@ extension LauncherModel {
         return entries
     }
 
-    /// Opens a new snippet with the text, for a name and keyword before saving.
+    /// Opens a new snippet with the text, for a name and keyword before saving. Copied
+    /// text is literal: anything in it that looks like a placeholder is escaped, so the
+    /// snippet pastes exactly what was copied and never reads private values.
     func saveAsSnippet(_ text: String, title: String) {
         let name = String(title.trimmingCharacters(in: .whitespacesAndNewlines).prefix(60))
-        editor = .snippet(Snippet(name: name.isEmpty ? "Clipboard Text" : name, keyword: "", content: text))
+        let content = PlaceholderParser.escaping(text, context: .snippet) { _ in false }
+        editor = .snippet(Snippet(name: name.isEmpty ? "Clipboard Text" : name, keyword: "", content: content))
     }
 
     @discardableResult
@@ -262,7 +362,7 @@ extension LauncherModel {
             feedback = .error(error.localizedDescription)
             return false
         }
-        let resolver = applicationResolver
+        let resolveApplication = { (imported: ImportedQuicklink) in self.importedApplication(imported) }
         let saved = store.update { database in
             switch preview {
             case .snippets(let plan, _):
@@ -276,9 +376,7 @@ extension LauncherModel {
                 }
             case .quicklinks(let plan, _):
                 database.quicklinks += plan.additions.map { imported in
-                    Quicklink(
-                        name: imported.name, template: imported.link, keyword: "",
-                        openWith: imported.openWith.flatMap { QuicklinkOpenWith.resolve($0, using: resolver)?.quicklinkApplication })
+                    Quicklink(name: imported.name, template: imported.link, keyword: "", openWith: resolveApplication(imported))
                 }
             }
         }
@@ -294,9 +392,52 @@ extension LauncherModel {
         let database = store.database
         switch kind {
         case .snippets: return try LibraryImport.exportSnippets(database.snippets.map(ImportedSnippet.init))
-        case .quicklinks:
-            return try LibraryImport.exportQuicklinks(database.quicklinks.map { ImportedQuicklink($0, openWith: $0.openWith?.name) })
+        case .quicklinks: return try LibraryImport.exportQuicklinks(database.quicklinks.map { ImportedQuicklink($0) })
         }
+    }
+
+    /// Writes an export, never over the library itself or its clipboard data, whatever
+    /// the path, link or letter case that leads there.
+    func exportLibrary(_ kind: LibraryTransferKind, to url: URL) throws {
+        guard !isLibraryData(url) else {
+            throw LibraryValidationError("Choose another file. Exporting there would replace your library.")
+        }
+        try exportLibrary(kind).write(to: url, options: .atomic)
+    }
+
+    /// True for `library.json`, a link to it, the same file by another name, or anything
+    /// in the clipboard data folder beside it.
+    func isLibraryData(_ url: URL) -> Bool {
+        guard let library = store.fileURL else { return false }
+        let destination = url.standardizedFileURL.resolvingSymlinksInPath()
+        let source = library.standardizedFileURL.resolvingSymlinksInPath()
+        if destination.path.lowercased() == source.path.lowercased() { return true }
+        let dataFolder = source.deletingLastPathComponent().appending(path: "ClipboardImages").path.lowercased() + "/"
+        if destination.path.lowercased().hasPrefix(dataFolder) { return true }
+        // Hard links and other names for the same file.
+        if let a = try? destination.resourceValues(forKeys: [.fileResourceIdentifierKey]).fileResourceIdentifier,
+            let b = try? source.resourceValues(forKeys: [.fileResourceIdentifierKey]).fileResourceIdentifier
+        {
+            return a.isEqual(b)
+        }
+        return false
+    }
+
+    /// An imported link's Open With app. OpenRay's own exports carry the bundle
+    /// identifier, kept even if that app isn't installed right now. A name, as other
+    /// launchers export, is matched against installed apps, nested bundles included.
+    func importedApplication(_ imported: ImportedQuicklink) -> QuicklinkApplication? {
+        if let identifier = imported.openWithBundleIdentifier, QuicklinkOpenWith.isBundleIdentifier(identifier) {
+            return applicationResolver.application(bundleIdentifier: identifier)?.quicklinkApplication
+                ?? QuicklinkApplication(bundleIdentifier: identifier, name: imported.openWith ?? identifier)
+        }
+        guard let value = imported.openWith else { return nil }
+        if let app = applications.applications.first(where: {
+            $0.name.caseInsensitiveCompare(value) == .orderedSame || $0.bundleIdentifier == value
+        }), let identifier = app.bundleIdentifier {
+            return QuicklinkApplication(bundleIdentifier: identifier, name: app.name)
+        }
+        return QuicklinkOpenWith.resolve(value, using: applicationResolver)?.quicklinkApplication
     }
 
     /// Asks for a file, then imports it. `.rayconfig` archives are refused before reading.
@@ -315,7 +456,7 @@ extension LauncherModel {
     func runExport(_ kind: LibraryTransferKind, files: any LibraryFileAccess) {
         guard let url = files.chooseExportDestination(for: kind) else { return }
         do {
-            try exportLibrary(kind).write(to: url, options: .atomic)
+            try exportLibrary(kind, to: url)
             toast("Exported \(kind.title.lowercased()) to \(url.lastPathComponent)")
         } catch {
             feedback = .error(error.localizedDescription)

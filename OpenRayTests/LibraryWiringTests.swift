@@ -93,19 +93,21 @@ struct SnippetQuicklinkModelTests {
             template: ##"https://github.com/{argument name="org" default="apple"}/{argument}/{argument name="#1" options="a, b"}"##,
             keyword: "")
         let specs = link.argumentSpecs
-        #expect(specs.map(\.name) == ["org", "#1", "##1"])
+        #expect(specs.map(\.name) == ["org", "#1", "#=#1"])
         #expect(specs[0] == ArgumentSpec(name: "org", placeholder: "org", isOptional: true, defaultValue: "apple"))
         #expect(specs[1] == ArgumentSpec(name: "#1", placeholder: "Argument 1"))
         #expect(specs[2].type == .dropdown([.init(title: "a", value: "a"), .init(title: "b", value: "b")]))
         #expect(Set(specs.map(\.name)).count == specs.count)
-        #expect(link.needsSeveralValues)
-        #expect(!legacy.needsSeveralValues)
-        #expect(PlaceholderArgument.ID.snippetUnnamed(snippet: "Sig", index: 2).specName == "#Sig#2")
+        #expect(PlaceholderArgument.ID.snippetUnnamed(snippet: "Sig", index: 2).specName == "#2@Sig")
+        // The three kinds never collide, even with names chosen to look alike.
+        #expect(PlaceholderArgument.ID.named("#foo#1").specName != PlaceholderArgument.ID.snippetUnnamed(snippet: "#foo", index: 1).specName)
+        #expect(PlaceholderArgument.ID.named("#1").specName != PlaceholderArgument.ID.unnamed(1).specName)
+        #expect(PlaceholderArgument.ID.named("query").specName == "query")
 
         // ArgumentSpec.resolve output feeds the link directly.
-        let typed = ["#1": "swift", "##1": "b"]
+        let typed = ["#1": "swift", "#=#1": "b"]
         let values = (try? ArgumentSpec.resolve(specs, typed: typed)) ?? [:]
-        #expect(values == ["org": "apple", "#1": "swift", "##1": "b"])
+        #expect(values == ["org": "apple", "#1": "swift", "#=#1": "b"])
         let url = try? link.resolution(arguments: values, values: PlaceholderValues()).url
         #expect(url?.absoluteString == "https://github.com/apple/swift/b")
     }
@@ -119,7 +121,14 @@ struct SnippetQuicklinkModelTests {
     @Test func singleTermPathFillsTheFirstArgument() throws {
         let link = Quicklink(name: "T", template: #"https://x.com/{argument name="q"}?lang={argument name="l" default="en"}"#, keyword: "t")
         #expect(try link.resolvedURL(query: "a b").absoluteString == "https://x.com/a%20b?lang=en")
-        #expect(link.needsQuery && !link.needsSeveralValues)
+        #expect(link.needsQuery)
+        // Values go through ArgumentSpec rules: blank isn't a value, dropdowns need an option.
+        #expect(throws: LibraryValidationError("Enter a search term for this quicklink.")) {
+            try Quicklink(name: "S", template: "https://x.com/?q={query}", keyword: "").resolvedURL(query: "   ")
+        }
+        let choice = Quicklink(name: "C", template: #"x://{argument name="tone" options="happy, sad"}"#, keyword: "")
+        #expect(throws: LibraryValidationError.self) { try choice.resolvedURL(query: "angry") }
+        #expect(try choice.resolvedURL(query: "sad").absoluteString == "x://sad")
     }
 
     @Test func openWithAndTagsPersistAndOlderLinksDecode() throws {
@@ -149,10 +158,12 @@ struct ClipboardSideStorageTests {
         var entry = ClipboardEntry(text: "Bold", sourceName: "F")
         entry.richText = ClipboardRichText(rtf: rtf)
         #expect(store.capture(entry))
-        let id = try #require(store.database.clipboard.first?.id)
-        let side = directory.appending(path: "ClipboardImages/\(id.uuidString).rich")
+        // Named by its digest, which is all library.json stores.
+        let digest = try #require(store.database.clipboard.first?.richTextDigest)
+        let side = directory.appending(path: "ClipboardImages/\(digest).rich")
         #expect(FileManager.default.fileExists(atPath: side.path))
-        #expect(!(try String(contentsOf: url, encoding: .utf8)).contains("rich"))
+        let json = try String(contentsOf: url, encoding: .utf8)
+        #expect(json.contains(digest) && !json.contains("\"rich\""))
 
         let reloaded = LibraryStore(fileURL: url)
         #expect(reloaded.database.clipboard.first?.richText == ClipboardRichText(rtf: rtf))
@@ -162,13 +173,15 @@ struct ClipboardSideStorageTests {
         #expect(!FileManager.default.fileExists(atPath: side.path))
         #expect(LibraryStore(fileURL: url).database.clipboard.first?.richText == nil)
 
-        // Deleting the entry removes any side file.
+        // Deleting the entry removes its side file.
         var again = ClipboardEntry(text: "Bold", sourceName: "F")
         again.richText = ClipboardRichText(html: Data("<b>Bold</b>".utf8))
         #expect(reloaded.capture(again))
-        #expect(FileManager.default.fileExists(atPath: side.path))
+        let againDigest = try #require(reloaded.database.clipboard.first?.richTextDigest)
+        let againSide = directory.appending(path: "ClipboardImages/\(againDigest).rich")
+        #expect(FileManager.default.fileExists(atPath: againSide.path))
         #expect(reloaded.update { $0.clipboard = [] })
-        #expect(!FileManager.default.fileExists(atPath: side.path))
+        #expect(!FileManager.default.fileExists(atPath: againSide.path))
     }
 
     @Test func recognizedTextIsSavedBesideTheImageAndSearchable() throws {
@@ -248,7 +261,7 @@ struct LauncherLibraryWiringTests {
     @Test func theProviderIsRegisteredAndItsCommandsAreBindable() {
         #expect(CommandProviders.all.contains { $0.id == LibraryCommandProvider.registration.id })
         #expect(CuratedCommand.supports("library.importSnippets"))
-        #expect(CuratedCommand.supports(LibraryCommandProvider.quicklinkPrefix + UUID().uuidString))
+        #expect(!CuratedCommand.supports(LibraryCommandProvider.runPrefix + "quicklink." + UUID().uuidString))
         let (model, _) = makeModel()
         let ids = model.registry.commandItems(in: model).map(\.id)
         #expect(LibraryCommandProvider.Command.allCases.map(\.rawValue).allSatisfy(ids.contains))
@@ -279,7 +292,16 @@ struct LauncherLibraryWiringTests {
             LauncherItem(id: "snippet.\(snippet.id)", title: "Ask", subtitle: "", symbol: "curlybraces", kind: .snippet,
                 badge: "Snippet", action: .snippet(snippet)))
         #expect(model.clipboard.readText() == "unchanged")
-        #expect(model.feedback?.style == .warning && model.feedback?.text == "Enter a value for “who”.")
+        // It runs as its command, whose fields ask; until Slice 1 draws them, the registry says what's missing.
+        #expect(model.feedback?.style == .warning && model.feedback?.text == "Enter who.")
+        let command = model.registry.item(withID: LibraryCommandProvider.commandID(for: snippet, action: .copy), in: model)
+        guard case .provided(var ref)? = command?.action, let command else {
+            Issue.record("Expected the snippet's copy command")
+            return
+        }
+        ref.arguments = ["who": "Ann"]
+        model.registry.perform(command, ref: ref, in: model)
+        #expect(model.clipboard.readText() == "Dear Ann")
     }
 
     @Test func quicklinksOpenWithTheirAppAndFreshValues() async throws {

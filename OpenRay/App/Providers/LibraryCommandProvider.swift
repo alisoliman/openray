@@ -1,27 +1,36 @@
 import Foundation
 
-/// Slice 2's commands: import and export of snippets and quicklinks, and one command
-/// per quicklink that needs several values.
+/// Slice 2's commands: import and export of snippets and quicklinks, plus the run
+/// commands that carry fields for quicklinks and snippets needing typed values.
 ///
-/// A quicklink command declares the link's `argumentSpecs`, so the registry resolves
-/// `ref.arguments` before `perform` and warns about a missing required value. It's
-/// hidden from search: the quicklink's own row stays the one people see, and its ↩
-/// runs this command when one typed term isn't enough. Slice 1's argument fields fill
-/// `ref.arguments` and call `model.perform` on it.
+/// A run command declares the item's `ArgumentSpec`s from its full placeholder plan,
+/// so the registry resolves `ref.arguments` before `perform`, and Slice 1's argument
+/// fields (Step 0 contract §10.2) open on ↩ when a required value is missing. Run
+/// commands are hidden from search and never bindable: aliases and hotkeys belong to
+/// the item's own row (`quicklink.<UUID>`, `snippet.<UUID>`), which Slice 1 registers.
 @MainActor
 final class LibraryCommandProvider: CommandProvider {
     nonisolated static let registration = CommandProviderRegistration(
-        id: "library", bindablePrefixes: ["library.", quicklinkPrefix]
+        id: "library", bindablePrefixes: ["library.import", "library.export"]
     ) { LibraryCommandProvider() }
 
-    nonisolated static let quicklinkPrefix = "quicklink.run."
+    /// Outside every bindable prefix, so no binding can ever target a run command.
+    nonisolated static let runPrefix = "library.run."
 
-    nonisolated static func commandID(for link: Quicklink) -> String { quicklinkPrefix + link.id.uuidString }
+    nonisolated static func commandID(for link: Quicklink) -> String { runPrefix + "quicklink." + link.id.uuidString }
+
+    nonisolated static func commandID(for snippet: Snippet, action: ContentPrimaryAction) -> String {
+        runPrefix + (action == .paste ? "pasteSnippet." : "copySnippet.") + snippet.id.uuidString
+    }
 
     /// Picks files for import and export. Tests replace it.
     var files: any LibraryFileAccess
 
     var id: String { Self.registration.id }
+
+    /// Field lists by item, kept while the item's text and the snippets it references
+    /// are unchanged, so building the command list on every keystroke never re-plans everything.
+    private var fieldCache: [UUID: (source: String, references: [String: String?], specs: [ArgumentSpec])] = [:]
 
     init() { files = PanelLibraryFileAccess() }
 
@@ -50,14 +59,56 @@ final class LibraryCommandProvider: CommandProvider {
                     + (command.kind == .snippets && command.isImport ? ["text replacements", "raycast"] : []),
                 mode: .noView)
         }
-        let quicklinks = model.store.database.quicklinks.filter(\.needsSeveralValues).map { link in
-            CommandDescriptor(
-                id: Self.commandID(for: link), title: link.name,
-                subtitle: "Quicklink · \(link.placeholderArguments.count) values", kind: .quicklink, symbol: "link",
-                keywords: [link.keyword] + link.tagList, arguments: link.argumentSpecs, mode: .noView,
-                badge: "Quicklink", showsInRoot: false)
+        let database = model.store.database
+        let lookup = PlaceholderValues.snippetLookup(database)
+        var live = Set<UUID>()
+        // A quicklink with more than one field can't run from one typed term.
+        let quicklinks: [CommandDescriptor] = database.quicklinks.compactMap { link in
+            live.insert(link.id)
+            let specs = fields(for: link.id, source: link.template, lookup: lookup) { link.plan(snippets: lookup) }
+            guard specs.count > 1 else { return nil }
+            return CommandDescriptor(
+                id: Self.commandID(for: link), title: link.name, subtitle: "Quicklink · \(specs.count) values",
+                kind: .quicklink, symbol: "link", keywords: [link.keyword] + link.tagList, arguments: specs,
+                mode: .noView, badge: "Quicklink", showsInRoot: false, isBindable: false)
         }
-        return transfers + quicklinks
+        // A snippet with fields runs as copy or paste, as ↩ and ⌘↩ do on its row.
+        let snippets: [CommandDescriptor] = database.snippets.flatMap { snippet -> [CommandDescriptor] in
+            live.insert(snippet.id)
+            let specs = fields(for: snippet.id, source: snippet.content, lookup: lookup) {
+                snippet.template.plan(snippets: lookup)
+            }
+            guard !specs.isEmpty else { return [] }
+            return [ContentPrimaryAction.copy, .paste].map { action in
+                CommandDescriptor(
+                    id: Self.commandID(for: snippet, action: action), title: snippet.name,
+                    subtitle: action == .copy ? "Snippet · copy" : "Snippet · paste", kind: .snippet, symbol: "curlybraces",
+                    keywords: [snippet.keyword] + snippet.tagList, arguments: specs, mode: .noView, badge: "Snippet",
+                    showsInRoot: false, isBindable: false)
+            }
+        }
+        fieldCache = fieldCache.filter { live.contains($0.key) }
+        return transfers + quicklinks + snippets
+    }
+
+    private func fields(
+        for id: UUID, source: String, lookup: (String) -> String?, plan: () -> PlaceholderPlan
+    ) -> [ArgumentSpec] {
+        // The cache comes first: unchanged text compares equal at once, so a keystroke
+        // costs one check per item. Items without fields are cached too.
+        if let cached = fieldCache[id], cached.source == source,
+            cached.references.allSatisfy({ lookup($0.key) == $0.value })
+        {
+            return cached.specs
+        }
+        guard source.contains("{") else {
+            fieldCache[id] = (source, [:], [])
+            return []
+        }
+        let built = plan()
+        let references = Dictionary(uniqueKeysWithValues: built.requirements.snippets.map { ($0, lookup($0)) })
+        fieldCache[id] = (source, references, built.argumentSpecs)
+        return built.argumentSpecs
     }
 
     func perform(_ item: LauncherItem, ref: ProvidedRef, in model: LauncherModel) {
@@ -66,9 +117,16 @@ final class LibraryCommandProvider: CommandProvider {
             if command.isImport { model.runImport(command.kind, files: files) } else { model.runExport(command.kind, files: files) }
             return
         }
-        guard ref.id.hasPrefix(Self.quicklinkPrefix),
-            let link = model.store.database.quicklinks.first(where: { Self.commandID(for: $0) == ref.id })
-        else { return }
-        model.openQuicklink(link, arguments: ref.arguments)
+        let database = model.store.database
+        if let link = database.quicklinks.first(where: { Self.commandID(for: $0) == ref.id }) {
+            model.openQuicklink(link, arguments: ref.arguments)
+            return
+        }
+        for snippet in database.snippets {
+            for action in [ContentPrimaryAction.copy, .paste] where Self.commandID(for: snippet, action: action) == ref.id {
+                model.runSnippet(snippet, arguments: ref.arguments, action: action)
+                return
+            }
+        }
     }
 }

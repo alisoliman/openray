@@ -87,11 +87,11 @@ struct InlineEditorView: View {
         }
     }
 
+    /// Opens the link with the preview's sample values and its Open With app, through
+    /// the guarded opener, which is inert in tests and verification.
     private func testQuicklink() {
-        let link = Quicklink(name: draft.name, template: draft.content, keyword: draft.keyword)
-        if let url = try? link.resolvedURL(query: link.needsQuery ? "swift concurrency" : "") {
-            NSWorkspace.shared.open(url)
-        }
+        let sample = draft.quicklinkSample
+        model.testQuicklink(sample.link, arguments: sample.arguments)
     }
 
     private func pasteNote() {

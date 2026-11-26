@@ -176,13 +176,23 @@ final class EditorDraft {
 
     var snippetPreview: String { Snippet(name: name, keyword: keyword, content: content).expanded() }
 
-    var quicklinkPreview: (url: String, valid: Bool) {
-        let link = Quicklink(name: name, template: content, keyword: keyword)
-        // Every argument gets a sample: its first option, or a search term.
+    /// The draft as a link, with a sample for every field of its full plan: the field's
+    /// first option, or a search term. The preview and Test both use it.
+    var quicklinkSample: (link: Quicklink, arguments: [String: String]) {
+        var link = Quicklink(name: name, template: content, keyword: keyword)
+        link.openWith = openWith
+        let database = store?.database ?? LibraryDatabase()
+        let fields = link.plan(snippets: PlaceholderValues.snippetLookup(database)).arguments
         let samples = Dictionary(
-            link.placeholderArguments.map { ($0.id.specName, $0.options.first ?? "swift concurrency") },
-            uniquingKeysWith: { first, _ in first })
-        if let url = try? link.resolution(arguments: samples, values: PlaceholderValues()).url {
+            fields.map { ($0.id.specName, $0.options.first ?? "swift concurrency") }, uniquingKeysWith: { first, _ in first })
+        return (link, samples)
+    }
+
+    var quicklinkPreview: (url: String, valid: Bool) {
+        let sample = quicklinkSample
+        let snippets = Dictionary(
+            (store?.database.snippets ?? []).map { ($0.name, $0.content) }, uniquingKeysWith: { first, _ in first })
+        if let url = try? sample.link.resolution(arguments: sample.arguments, values: PlaceholderValues(snippets: snippets)).url {
             return (url.absoluteString, true)
         }
         return (content.isEmpty ? "https://example.com/search?q={query}" : content, false)

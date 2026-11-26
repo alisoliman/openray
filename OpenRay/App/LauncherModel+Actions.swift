@@ -73,22 +73,9 @@ extension LauncherModel {
             store.recordUse(of: item.id)
             openSettings()
         case .quicklink(let link, let argument):
-            if link.needsSeveralValues, let command = quicklinkCommand(for: link) {
-                // One typed term can't fill several values; the command asks for each.
-                perform(command)
-            } else if link.needsQuery && argument.isEmpty {
-                beginArgument(link)
-            } else {
-                openQuicklink(link, query: argument)
-            }
-        case .clipboard(let entry):
-            if contentPrimaryAction == .paste {
-                paste(item)
-            } else if copy(entry) {
-                store.recordUse(of: item.id)
-            }
-        case .snippet(let snippet):
-            if contentPrimaryAction == .paste { pasteSnippet(snippet) } else { copySnippet(snippet, itemID: item.id) }
+            performQuicklink(link, argument: argument)
+        case .clipboard, .snippet:
+            performContent(item)
         case .calculation(let calculation): copy(calculation.value, label: calculation.value)
         case .note(let note):
             editor = .note(note)
@@ -199,28 +186,17 @@ extension LauncherModel {
             return
         }
         guard item.supportsPaste else { return }
-        // With ↩ = paste, ⌘↩ copies instead.
-        if contentPrimaryAction == .paste {
-            switch item.action {
-            case .clipboard(let entry):
-                if copy(entry) { store.recordUse(of: item.id) }
-                return
-            case .snippet(let snippet):
-                copySnippet(snippet, itemID: item.id)
-                return
-            default: break
-            }
-        }
         switch item.action {
-        case .clipboard(let entry): finishPaste(copied: clipboard.copy(entry), label: entry.title)
-        case .snippet(let snippet): pasteSnippet(snippet)
+        case .clipboard, .snippet:
+            // ⌘↩ does what ↩ doesn't, so the two keys never both copy.
+            performSecondaryContent(item)
+            return
         case .file(let url):
             let entry = ClipboardEntry(content: .files([url]), sourceName: "OpenRay")
             finishPaste(copied: clipboard.copy(entry), label: url.lastPathComponent)
         default:
             if let text = item.copyText { paste(text, label: item.title) }
         }
-        if case .clipboard = item.action { store.recordUse(of: item.id) }
     }
 
     func paste(_ text: String, label: String? = nil) {
@@ -542,7 +518,7 @@ extension LauncherModel {
             $0.preferences.clipboardPaused = false
             $0.preferences.clipboardImagesEnabled = choices.images
             $0.preferences.clipboardFilesEnabled = choices.files
-            $0.preferences.clipboardRetentionDays = choices.days
+            $0.preferences.setClipboardRetention(days: choices.days)
             $0.preferences.clipboardLimit = choices.limit
         }) {
             applyPreferences()
@@ -934,7 +910,8 @@ extension LauncherModel {
     func returnIsInert(for item: LauncherItem) -> Bool {
         guard let link = argumentLink, item.id == "argument.\(link.id)", case .quicklink(_, let argument) = item.action
         else { return false }
-        return argument.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        // A blank term runs with the field's default; only a required field waits for one.
+        return argument.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && quicklinkArgumentIsRequired(link)
     }
 
     /// A source is still streaming, so an empty list isn't the final answer yet.

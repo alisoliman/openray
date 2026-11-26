@@ -13,23 +13,20 @@ struct Quicklink: Codable, Identifiable, Equatable, Sendable {
     var linkTemplate: QuicklinkTemplate { QuicklinkTemplate(template) }
     var tagList: [String] { tags ?? [] }
 
-    /// The arguments the link asks for, in order: `{argument …}` placeholders, plus
-    /// the legacy `{query}` and `{Name}` forms.
+    /// The arguments written in the link itself, in order: `{argument …}`
+    /// placeholders and the legacy `{query}` and `{Name}`. Links that reference
+    /// snippets can ask for more; use `plan(snippets:)` for every field.
     var placeholderArguments: [PlaceholderArgument] { linkTemplate.arguments }
 
     /// True when the link takes at least one typed value.
     var needsQuery: Bool { !placeholderArguments.isEmpty }
 
-    /// One spec per argument, named by `PlaceholderArgument.ID.specName`. A `{query}`
-    /// link keeps `[ArgumentSpec.query]`.
+    /// One spec per argument written in the link. A `{query}` link keeps
+    /// `[ArgumentSpec.query]`. `plan(snippets:).argumentSpecs` includes referenced snippets.
     var argumentSpecs: [ArgumentSpec] { placeholderArguments.map(\.argumentSpec) }
 
-    /// The argument a single typed term fills: the first one.
-    var primaryArgument: PlaceholderArgument? { placeholderArguments.first }
-
-    /// More than one argument needs a value, so the one-term path can't open it on
-    /// its own; it needs every field (`resolution(arguments:values:)`).
-    var needsSeveralValues: Bool { placeholderArguments.filter(\.isRequired).count > 1 }
+    /// The one plan for this link's fields, value conversion and rendering.
+    func plan(snippets: (String) -> String?) -> PlaceholderPlan { linkTemplate.template.plan(snippets: snippets) }
 
     func argument(in input: String) -> String? {
         guard !keyword.isEmpty else { return nil }
@@ -39,25 +36,43 @@ struct Quicklink: Codable, Identifiable, Equatable, Sendable {
         return parts.count == 2 ? String(parts[1]).trimmingCharacters(in: .whitespacesAndNewlines) : ""
     }
 
-    /// The URL for one typed term, which fills the first argument; other arguments
-    /// use their defaults. Placeholders that read the clipboard or selection render empty.
+    /// The URL for one typed term, which fills the only argument. Placeholders that
+    /// read the clipboard or selection render empty.
     func resolvedURL(query: String = "") throws -> URL {
         try resolution(query: query, values: PlaceholderValues()).url
     }
 
-    /// One typed term for the first argument, with the rest of the values from `values`.
+    /// One typed term for the link's first argument, resolved like a form field: a
+    /// blank term takes the default, a dropdown must get one of its options. Links
+    /// with more than one field go through `resolution(arguments:values:)`.
     func resolution(query: String, values: PlaceholderValues) throws -> QuicklinkResolution {
-        guard let primary = primaryArgument else { return try resolution(arguments: [:], values: values) }
-        return try resolution(arguments: [primary.id.specName: query], values: values)
+        let plan = plan(snippets: values.snippetText(named:))
+        guard let first = plan.arguments.first else { return try resolution(plan: plan, typed: [:], values: values) }
+        return try resolution(plan: plan, typed: [first.id.specName: query], values: values)
     }
 
-    /// Values by `ArgumentSpec.name`, as `ProvidedRef.arguments` carries them.
+    /// Values by `ArgumentSpec.name`, as `ProvidedRef.arguments` carries them, for every
+    /// field of the full plan, including arguments in referenced snippets.
     func resolution(arguments: [String: String], values: PlaceholderValues) throws -> QuicklinkResolution {
+        try resolution(plan: plan(snippets: values.snippetText(named:)), typed: arguments, values: values)
+    }
+
+    private func resolution(plan: PlaceholderPlan, typed: [String: String], values: PlaceholderValues) throws
+        -> QuicklinkResolution
+    {
         var values = values
-        for argument in placeholderArguments {
-            if let value = arguments[argument.id.specName] { values.arguments[argument.id] = value }
+        do {
+            values.arguments = try plan.resolveArguments(typed)
+        } catch {
+            // The legacy search term keeps its familiar sentence.
+            if plan.arguments.count == 1, plan.arguments.first?.id == .named("query"),
+                (typed["query"] ?? "").trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            {
+                throw LibraryValidationError("Enter a search term for this quicklink.")
+            }
+            throw error
         }
-        return try linkTemplate.resolve(using: values)
+        return try linkTemplate.resolve(plan: plan, values: values)
     }
 
     func validate() throws {

@@ -52,8 +52,12 @@ struct QuicklinkTemplate: Hashable, Sendable {
     /// Blocking issues anywhere, including inside referenced snippets, and invalid
     /// placeholders, whose literal braces don't belong in a link, stop it.
     func resolve(using source: some PlaceholderDataSource) throws -> QuicklinkResolution {
+        try resolve(plan: template.plan(snippets: source.snippetText(named:)), values: source)
+    }
+
+    /// Renders an existing plan of this link, so fields, values and output come from one plan.
+    func resolve(plan: PlaceholderPlan, values source: some PlaceholderDataSource) throws -> QuicklinkResolution {
         guard !link.isEmpty else { throw LibraryValidationError("Enter a URL, a deeplink or a file path.") }
-        let plan = template.plan(snippets: source.snippetText(named:))
         if let issue = plan.issues.first(where: { $0.blocksExecution || Self.isInvalid($0) }) {
             throw LibraryValidationError(issue.message)
         }
@@ -244,7 +248,9 @@ enum QuicklinkOpeners {
     /// The opener the app should use: an inert one in the test host and in
     /// verification runs, the workspace otherwise.
     @MainActor static func makeDefault(sideEffects: SideEffectGuard = .current) -> any QuicklinkOpening {
-        sideEffects.isInert ? InertQuicklinkOpener(sideEffects: sideEffects) : WorkspaceQuicklinkOpener(sideEffects: sideEffects)
+        let sideEffects = sideEffects.restrictedByProcess
+        return sideEffects.isInert
+            ? InertQuicklinkOpener(sideEffects: sideEffects) : WorkspaceQuicklinkOpener(sideEffects: sideEffects)
     }
 }
 
@@ -262,7 +268,7 @@ struct WorkspaceQuicklinkOpener: QuicklinkOpening {
     var sideEffects = SideEffectGuard.current
 
     func open(_ url: URL, with application: ResolvedApplication?) async throws {
-        try sideEffects.check("opening links and apps")
+        try sideEffects.restrictedByProcess.check("opening links and apps")
         let configuration = NSWorkspace.OpenConfiguration()
         if let application {
             _ = try await NSWorkspace.shared.open([url], withApplicationAt: application.url, configuration: configuration)

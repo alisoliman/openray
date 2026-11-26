@@ -184,8 +184,13 @@ struct QuicklinkReviewFixTests {
         await #expect(throws: SideEffectGuard.Blocked(what: "opening links and apps", mode: mode)) {
             try await opener.open(URL(string: "https://example.com")!, with: nil)
         }
-        // Built only, never called.
-        #expect(QuicklinkOpeners.makeDefault(sideEffects: SideEffectGuard(mode: .live)) is WorkspaceQuicklinkOpener)
+        // An injected live policy can't lift this process's: still inert, and the
+        // workspace opener refuses too, before any system call.
+        #expect(QuicklinkOpeners.makeDefault(sideEffects: SideEffectGuard(mode: .live)) is InertQuicklinkOpener)
         #expect(QuicklinkOpeners.makeDefault() is InertQuicklinkOpener)
+        await #expect(throws: SideEffectGuard.Blocked.self) {
+            try await WorkspaceQuicklinkOpener(sideEffects: SideEffectGuard(mode: .live))
+                .open(URL(string: "https://example.com")!, with: nil)
+        }
     }
 }

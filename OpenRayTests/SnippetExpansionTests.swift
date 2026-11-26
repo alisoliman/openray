@@ -17,7 +17,7 @@ private final class RecordingInserter: SnippetInserting {
 /// can check where text and caret end up without sending any real input.
 @MainActor
 private final class FakeEditor: KeystrokeTarget {
-    enum Event: Equatable { case delete, type(String), left, setCaret(Int) }
+    enum Event: Equatable { case delete, type(String), setCaret(Int) }
 
     var text: String
     /// UTF-16 caret location.
@@ -25,6 +25,8 @@ private final class FakeEditor: KeystrokeTarget {
     var events: [Event] = []
     var reportsCaret = true
     var allowsSettingCaret = true
+    /// False for a field whose text can't be read, such as one without Accessibility support.
+    var readsText = true
     /// The focus changes once this many events have been sent.
     var focusLostAfter: Int?
 
@@ -53,10 +55,9 @@ private final class FakeEditor: KeystrokeTarget {
         caret += chunk.count
     }
 
-    func pressLeftArrow() throws {
-        events.append(.left)
-        let before = String(decoding: Array(text.utf16)[..<caret], as: UTF16.self)
-        caret = String(before.dropLast()).utf16.count
+    func precedingText(utf16Count: Int) -> String? {
+        guard readsText, caret >= utf16Count else { return nil }
+        return String(decoding: Array(text.utf16)[(caret - utf16Count)..<caret], as: UTF16.self)
     }
 
     func caretLocation() -> Int? { reportsCaret ? caret : nil }
@@ -158,19 +159,19 @@ struct SnippetMatcherTests {
         let rendering = Placeholders.render(logger.content, context: .snippet, source: PlaceholderValues())
         let immediate = SnippetExpansionPlan(
             trigger: .init(snippet: logger, delimiter: nil), rendering: rendering, mode: .immediately)
-        #expect(immediate == SnippetExpansionPlan(deleteCount: 4, text: "console.log();", caretLeft: 2))
+        #expect(immediate == SnippetExpansionPlan(deletedText: ";log", text: "console.log();", caretLeft: 2))
         let keeping = SnippetExpansionPlan(
             trigger: .init(snippet: logger, delimiter: " "), rendering: rendering, mode: .afterDelimiterKeeping)
-        #expect(keeping == SnippetExpansionPlan(deleteCount: 5, text: "console.log(); ", caretLeft: 3))
+        #expect(keeping == SnippetExpansionPlan(deletedText: ";log ", text: "console.log(); ", caretLeft: 3))
         let discarding = SnippetExpansionPlan(
             trigger: .init(snippet: logger, delimiter: "."), rendering: rendering, mode: .afterDelimiterDiscarding)
-        #expect(discarding == SnippetExpansionPlan(deleteCount: 5, text: "console.log();", caretLeft: 2))
+        #expect(discarding == SnippetExpansionPlan(deletedText: ";log.", text: "console.log();", caretLeft: 2))
 
         let emoji = Placeholders.render("😀{cursor}😀é", context: .snippet, source: PlaceholderValues())
         let plan = SnippetExpansionPlan(trigger: .init(snippet: logger, delimiter: nil), rendering: emoji, mode: .immediately)
         #expect(plan.caretLeft == 2 && plan.caretUTF16Left == 3)
         #expect(!plan.hasRightToLeftText)
-        #expect(SnippetExpansionPlan(deleteCount: 0, text: "שלום", caretLeft: 0).hasRightToLeftText)
+        #expect(SnippetExpansionPlan(deletedText: "", text: "שלום", caretLeft: 0).hasRightToLeftText)
     }
 
     @Test(arguments: ["@@", ";;addr", "!email", "/sig", "€x", "a", "x+y=z", "ü1", String(repeating: "k", count: 32)])
@@ -192,45 +193,60 @@ struct SnippetMatcherTests {
 
 @MainActor
 struct KeystrokeScriptTests {
-    @Test func typesInChunksAndUsesArrowsWhenTheEditorCantReportTheCaret() throws {
+    @Test func typesInChunksAndSetsTheCaretByOffset() throws {
         let editor = FakeEditor(text: "Say ;log")
-        editor.reportsCaret = false
         let text = "console.log(" + String(repeating: "x", count: 30) + ");"
-        let plan = SnippetExpansionPlan(deleteCount: 4, text: text, caretLeft: 2)
+        let plan = SnippetExpansionPlan(deletedText: ";log", text: text, caretLeft: 2)
         #expect(try KeystrokeScript.run(plan, on: editor) == .completed)
         #expect(editor.text == "Say " + text)
         #expect(editor.textBeforeCaret == "Say " + text.dropLast(2))
-        #expect(editor.events.filter { $0 == .left }.count == 2)
         #expect(editor.events.filter { if case .type = $0 { true } else { false } }.count == 3)
+        #expect(editor.events.last == .setCaret(("Say " + text.dropLast(2)).utf16.count))
     }
 
-    @Test func setsTheCaretByOffsetWhenTheEditorAllowsIt() throws {
+    @Test func emojiCaretOffsetsUseUTF16() throws {
         let editor = FakeEditor(text: "x ;s")
-        let plan = SnippetExpansionPlan(deleteCount: 2, text: "<😀>", caretLeft: 2, caretUTF16Left: 3)
+        let plan = SnippetExpansionPlan(deletedText: ";s", text: "<😀>", caretLeft: 2, caretUTF16Left: 3)
         #expect(try KeystrokeScript.run(plan, on: editor) == .completed)
         #expect(editor.text == "x <😀>")
         #expect(editor.textBeforeCaret == "x <")
-        #expect(editor.events.last == .setCaret(3))
-        #expect(!editor.events.contains(.left))
     }
 
-    @Test func rightToLeftTextNeverUsesArrows() throws {
-        let editor = FakeEditor(text: ";h")
-        editor.reportsCaret = false
-        let plan = SnippetExpansionPlan(deleteCount: 2, text: "שלום עולם", caretLeft: 4)
-        #expect(try KeystrokeScript.run(plan, on: editor) == .completed)
-        #expect(!editor.events.contains(.left))
-        #expect(editor.caret == editor.text.utf16.count)
-
+    @Test func withoutAnOffsetTheCaretStaysAtTheEnd() throws {
+        // Arrow keys move visually, which isn't the logical offset in right-to-left
+        // paragraphs, so they're never used, whatever the inserted text.
+        for text in ["שלום עולם", "plain ascii"] {
+            let editor = FakeEditor(text: ";h")
+            editor.reportsCaret = false
+            #expect(try KeystrokeScript.run(SnippetExpansionPlan(deletedText: ";h", text: text, caretLeft: 4), on: editor) == .completed)
+            #expect(editor.caret == editor.text.utf16.count)
+            #expect(!editor.events.contains { if case .setCaret = $0 { true } else { false } })
+        }
         let capable = FakeEditor(text: ";h")
-        #expect(try KeystrokeScript.run(plan, on: capable) == .completed)
+        #expect(try KeystrokeScript.run(SnippetExpansionPlan(deletedText: ";h", text: "שלום עולם", caretLeft: 4), on: capable) == .completed)
         #expect(capable.textBeforeCaret == "שלום ")
+    }
+
+    @Test func nothingIsDeletedUnlessTheKeywordIsRightBeforeTheCaret() throws {
+        let plan = SnippetExpansionPlan(deletedText: ";hi", text: "Hello!")
+        // Another field: different text before its caret.
+        let other = FakeEditor(text: "unrelated")
+        #expect(try KeystrokeScript.run(plan, on: other) == .unconfirmed)
+        #expect(other.events.isEmpty && other.text == "unrelated")
+        // A selection, or a field that can't be read, is never deleted from either.
+        let unreadable = FakeEditor(text: "x ;hi")
+        unreadable.readsText = false
+        #expect(try KeystrokeScript.run(plan, on: unreadable) == .unconfirmed)
+        #expect(unreadable.events.isEmpty)
+        let moved = FakeEditor(text: ";hi tail")
+        moved.caret = 1
+        #expect(try KeystrokeScript.run(plan, on: moved) == .unconfirmed)
     }
 
     @Test func stopsAtTheFirstFocusChange() throws {
         let editor = FakeEditor(text: ";hi")
         editor.focusLostAfter = 2
-        let plan = SnippetExpansionPlan(deleteCount: 3, text: "Hello!", caretLeft: 0)
+        let plan = SnippetExpansionPlan(deletedText: ";hi", text: "Hello!")
         #expect(try KeystrokeScript.run(plan, on: editor) == .interrupted)
         #expect(editor.events == [.delete, .delete])
 
@@ -241,9 +257,15 @@ struct KeystrokeScriptTests {
 
         let midText = FakeEditor(text: ";hi")
         midText.focusLostAfter = 4
-        let long = SnippetExpansionPlan(deleteCount: 3, text: String(repeating: "y", count: 100), caretLeft: 0)
+        let long = SnippetExpansionPlan(deletedText: ";hi", text: String(repeating: "y", count: 100))
         #expect(try KeystrokeScript.run(long, on: midText) == .interrupted)
         #expect(midText.events.count == 4)
+
+        // Focus that moves while the caret waits leaves the old field's selection alone.
+        let placing = FakeEditor(text: ";c")
+        placing.focusLostAfter = 2
+        #expect(try KeystrokeScript.run(SnippetExpansionPlan(deletedText: ";c", text: "a", caretLeft: 1), on: placing) == .interrupted)
+        #expect(!placing.events.contains { if case .setCaret = $0 { true } else { false } })
     }
 }
 
@@ -307,7 +329,7 @@ struct SnippetExpanderTests {
         let (expander, inserter, counter) = makeExpander(snippets: [snippet, signature], history: ["stale"], current: "fresh")
         #expect(
             type(" ;re", into: expander)
-                == .inserted(SnippetExpansionPlan(deleteCount: 3, text: "On 2022-06-15 you wrote: fresh / Ann!", caretLeft: 1)))
+                == .inserted(SnippetExpansionPlan(deletedText: ";re", text: "On 2022-06-15 you wrote: fresh / Ann!", caretLeft: 1)))
         #expect(inserter.plans.map(\.1) == [42])
         #expect(counter.clipboardReads == 1)
         #expect(counter.failures == 0)
@@ -315,7 +337,7 @@ struct SnippetExpanderTests {
 
     @Test func theClipboardIsReadOnlyWhenNeeded() {
         let (expander, _, counter) = makeExpander(snippets: [greeting], current: "fresh")
-        #expect(type(";hi", into: expander) == .inserted(SnippetExpansionPlan(deleteCount: 3, text: "Hello!", caretLeft: 0)))
+        #expect(type(";hi", into: expander) == .inserted(SnippetExpansionPlan(deletedText: ";hi", text: "Hello!", caretLeft: 0)))
         #expect(counter.clipboardReads == 0)
     }
 
@@ -323,12 +345,12 @@ struct SnippetExpanderTests {
         let snippet = Snippet(name: "Older", keyword: ";o", content: "[{clipboard offset=1}]")
         // The newest history entry is the current clipboard, so offset 1 skips it.
         let (on, _, _) = makeExpander(snippets: [snippet], history: ["now", "before"], current: "now")
-        #expect(type(";o", into: on) == .inserted(SnippetExpansionPlan(deleteCount: 2, text: "[before]", caretLeft: 0)))
+        #expect(type(";o", into: on) == .inserted(SnippetExpansionPlan(deletedText: ";o", text: "[before]", caretLeft: 0)))
         // A copy not captured yet is still the current clipboard; history starts at offset 1.
         let (pending, _, _) = makeExpander(snippets: [snippet], history: ["now", "before"], current: "newer")
-        #expect(type(";o", into: pending) == .inserted(SnippetExpansionPlan(deleteCount: 2, text: "[now]", caretLeft: 0)))
+        #expect(type(";o", into: pending) == .inserted(SnippetExpansionPlan(deletedText: ";o", text: "[now]", caretLeft: 0)))
         let (off, _, _) = makeExpander(snippets: [snippet], history: ["now", "before"], current: "now", captures: false)
-        #expect(type(";o", into: off) == .inserted(SnippetExpansionPlan(deleteCount: 2, text: "[]", caretLeft: 0)))
+        #expect(type(";o", into: off) == .inserted(SnippetExpansionPlan(deletedText: ";o", text: "[]", caretLeft: 0)))
     }
 
     @Test func missingInputsRefuseBeforeAnythingIsDeleted() {
@@ -348,7 +370,7 @@ struct SnippetExpanderTests {
             name: "Tone", keyword: ";t",
             content: "Feeling {argument name=\"mood\" default=\"fine\"}, {calculator expression=\"2 * 21\"}")
         let (expander, _, _) = makeExpander(snippets: [snippet])
-        #expect(type(";t", into: expander) == .inserted(SnippetExpansionPlan(deleteCount: 2, text: "Feeling fine, 42", caretLeft: 0)))
+        #expect(type(";t", into: expander) == .inserted(SnippetExpansionPlan(deletedText: ";t", text: "Feeling fine, 42", caretLeft: 0)))
     }
 
     @Test func oversizedExpansionsAreRefused() {
@@ -361,7 +383,7 @@ struct SnippetExpanderTests {
     @Test func interruptedAndFailedInsertionsAreReported() {
         let (expander, inserter, counter) = makeExpander(snippets: [greeting])
         inserter.result = .interrupted
-        #expect(type(";hi", into: expander) == .interrupted(SnippetExpansionPlan(deleteCount: 3, text: "Hello!", caretLeft: 0)))
+        #expect(type(";hi", into: expander) == .interrupted(SnippetExpansionPlan(deletedText: ";hi", text: "Hello!", caretLeft: 0)))
         #expect(counter.failures == 1)
     }
 
@@ -369,7 +391,7 @@ struct SnippetExpanderTests {
         let (expander, inserter, _) = makeExpander(snippets: [greeting])
         expander.settings = SnippetExpansionSettings(mode: .afterDelimiterDiscarding, expandsWithinWords: true)
         #expect(type("abc;hi", into: expander) == nil)
-        #expect(type(".", into: expander) == .inserted(SnippetExpansionPlan(deleteCount: 4, text: "Hello!", caretLeft: 0)))
+        #expect(type(".", into: expander) == .inserted(SnippetExpansionPlan(deletedText: ";hi.", text: "Hello!", caretLeft: 0)))
         #expect(type(";hi\t", into: expander) == nil)
         #expect(inserter.plans.count == 1)
     }
@@ -416,7 +438,7 @@ struct SnippetExpanderTests {
         #expect(SnippetInserters.makeDefault(sideEffects: sideEffects) is InertSnippetInserter)
         #expect(throws: SideEffectGuard.Blocked(what: "typing into other apps", mode: mode)) {
             try InertSnippetInserter(sideEffects: sideEffects).insert(
-                SnippetExpansionPlan(deleteCount: 1, text: "x", caretLeft: 0), into: 1)
+                SnippetExpansionPlan(deletedText: "x", text: "x", caretLeft: 0), into: 1)
         }
         // A default expander reaches only the inert inserter and never reads the real clipboard.
         let store = LibraryStore(fileURL: nil)
@@ -429,14 +451,19 @@ struct SnippetExpanderTests {
         #expect(
             outcome
                 == .failed(
-                    SnippetExpansionPlan(deleteCount: 2, text: "", caretLeft: 0),
+                    SnippetExpansionPlan(deletedText: ";c", text: "", caretLeft: 0),
                     SideEffectGuard.Blocked(what: "typing into other apps", mode: mode).localizedDescription))
     }
 
-    @Test func aLiveLaunchGetsTheLiveInserter() {
-        // Built only, never called: constructing it has no effect.
-        #expect(SnippetInserters.makeDefault(sideEffects: SideEffectGuard(mode: .live)) is LiveSnippetInserter)
+    @Test func injectingALivePolicyCantLiftTheTestHosts() {
+        // An injected policy can only add restrictions; this process stays inert.
+        #expect(SideEffectGuard(mode: .live).restrictedByProcess == .current)
+        #expect(SnippetInserters.makeDefault(sideEffects: SideEffectGuard(mode: .live)) is InertSnippetInserter)
         #expect(SnippetInserters.makeDefault() is InertSnippetInserter)
+        #expect(throws: SideEffectGuard.Blocked.self) {
+            try LiveSnippetInserter(sideEffects: SideEffectGuard(mode: .live)).insert(
+                SnippetExpansionPlan(deletedText: "x", text: "y"), into: 1)
+        }
     }
 
     @Test func snapshotsReadOnlyWhatThePlanNeeds() {

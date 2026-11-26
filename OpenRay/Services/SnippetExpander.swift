@@ -158,19 +158,21 @@ struct SnippetExpansionPlan: Equatable, Sendable {
     /// Longer expansions are refused before anything is deleted.
     static let maximumTextUTF16 = 65_536
 
-    /// Backspaces to remove the keyword and, in the delimiter modes, the delimiter.
-    var deleteCount: Int
-    /// The same text in UTF-16 code units, for setting the caret by offset.
-    var deleteUTF16Count: Int
+    /// What was typed and is replaced: the keyword and, in the delimiter modes, the
+    /// delimiter. It must sit right before the caret before anything is deleted.
+    var deletedText: String
     var text: String
-    /// Characters after `{cursor}`: ← presses when arrows are used.
+    /// Characters after `{cursor}`.
     var caretLeft: Int
-    /// The same in UTF-16 code units, when the caret is set by offset.
+    /// The same in UTF-16 code units, for setting the caret by offset.
     var caretUTF16Left: Int
 
-    init(deleteCount: Int, deleteUTF16Count: Int? = nil, text: String, caretLeft: Int, caretUTF16Left: Int? = nil) {
-        self.deleteCount = deleteCount
-        self.deleteUTF16Count = deleteUTF16Count ?? deleteCount
+    /// Backspaces to remove `deletedText`.
+    var deleteCount: Int { deletedText.count }
+    var deleteUTF16Count: Int { deletedText.utf16.count }
+
+    init(deletedText: String, text: String, caretLeft: Int = 0, caretUTF16Left: Int? = nil) {
+        self.deletedText = deletedText
         self.text = text
         self.caretLeft = caretLeft
         self.caretUTF16Left = caretUTF16Left ?? caretLeft
@@ -191,15 +193,12 @@ struct SnippetExpansionPlan: Equatable, Sendable {
                 }
             }
         }
-        self.init(
-            deleteCount: deleted.count, deleteUTF16Count: deleted.utf16.count, text: text, caretLeft: caretLeft,
-            caretUTF16Left: caretUTF16Left)
+        self.init(deletedText: deleted, text: text, caretLeft: caretLeft, caretUTF16Left: caretUTF16Left)
     }
 
     var exceedsLimit: Bool { text.utf16.count > Self.maximumTextUTF16 }
 
-    /// ← moves visually, so in right-to-left text it doesn't move back logically;
-    /// the caret is then only set by offset.
+    /// Right-to-left text in the insertion. The caret is only ever set by text offset.
     var hasRightToLeftText: Bool {
         text.unicodeScalars.contains { scalar in
             switch scalar.value {
@@ -221,10 +220,12 @@ struct SnippetExpansionPlan: Equatable, Sendable {
 protocol KeystrokeTarget {
     /// The same app is frontmost, the same element has focus and no secure field is active.
     func isUnchanged() -> Bool
+    /// The `utf16Count` code units right before a collapsed caret in the focused field,
+    /// or nil when the selection isn't collapsed or the field can't be read.
+    func precedingText(utf16Count: Int) -> String?
     func pressDelete() throws
     /// Types up to 20 UTF-16 code units.
     func type(_ chunk: [UInt16]) throws
-    func pressLeftArrow() throws
     /// The caret's UTF-16 location in the focused text, or nil when the editor doesn't report it.
     func caretLocation() -> Int?
     /// Waits briefly until the editor reports the caret at `location`, so it has
@@ -241,10 +242,15 @@ enum KeystrokeScript {
         case completed
         /// Focus or the frontmost app changed; nothing more was sent.
         case interrupted
+        /// The typed keyword wasn't right before the caret in the focused field, or the
+        /// field couldn't be read. Nothing was sent.
+        case unconfirmed
     }
 
     @MainActor static func run(_ plan: SnippetExpansionPlan, on target: some KeystrokeTarget) throws -> Result {
         guard target.isUnchanged() else { return .interrupted }
+        // Deleting is only safe in the field that has the keyword right before its caret.
+        guard target.precedingText(utf16Count: plan.deleteUTF16Count) == plan.deletedText else { return .unconfirmed }
         let start = plan.caretLeft > 0 ? target.caretLocation() : nil
         for _ in 0..<plan.deleteCount {
             guard target.isUnchanged() else { return .interrupted }
@@ -266,20 +272,15 @@ enum KeystrokeScript {
         }
         guard plan.caretLeft > 0 else { return .completed }
         guard target.isUnchanged() else { return .interrupted }
-        // Prefer the text offset, once the editor shows it has the whole insertion.
+        // The caret moves only by text offset, once the editor shows it has the whole
+        // insertion. Where that isn't possible it stays at the end: arrow keys move
+        // visually, which isn't the logical offset in right-to-left paragraphs.
         if let start {
             let end = start - plan.deleteUTF16Count + plan.text.utf16.count
-            if end - plan.caretUTF16Left >= 0, target.waitForCaret(at: end),
-                target.setCaretLocation(end - plan.caretUTF16Left)
-            {
-                return .completed
+            if end - plan.caretUTF16Left >= 0, target.waitForCaret(at: end) {
+                guard target.isUnchanged() else { return .interrupted }
+                _ = target.setCaretLocation(end - plan.caretUTF16Left)
             }
-        }
-        // Arrows are a safe fallback only where they move logically.
-        guard !plan.hasRightToLeftText else { return .completed }
-        for _ in 0..<plan.caretLeft {
-            guard target.isUnchanged() else { return .interrupted }
-            try target.pressLeftArrow()
         }
         return .completed
     }
@@ -295,7 +296,9 @@ enum SnippetInserters {
     /// The inserter the app should use: an inert one in the test host and in
     /// verification runs, live keyboard events otherwise.
     @MainActor static func makeDefault(sideEffects: SideEffectGuard = .current) -> any SnippetInserting {
-        sideEffects.isInert ? InertSnippetInserter(sideEffects: sideEffects) : LiveSnippetInserter(sideEffects: sideEffects)
+        let sideEffects = sideEffects.restrictedByProcess
+        return sideEffects.isInert
+            ? InertSnippetInserter(sideEffects: sideEffects) : LiveSnippetInserter(sideEffects: sideEffects)
     }
 }
 
@@ -313,6 +316,7 @@ struct LiveSnippetInserter: SnippetInserting {
     var sideEffects = SideEffectGuard.current
 
     func insert(_ plan: SnippetExpansionPlan, into processID: pid_t) throws -> KeystrokeScript.Result {
+        let sideEffects = sideEffects.restrictedByProcess
         try sideEffects.check("typing into other apps")
         return try KeystrokeScript.run(
             plan, on: AccessibilityKeystrokeTarget(processID: processID, sideEffects: sideEffects))
@@ -330,7 +334,7 @@ final class AccessibilityKeystrokeTarget: KeystrokeTarget {
 
     init(processID: pid_t, sideEffects: SideEffectGuard = .current) {
         self.processID = processID
-        self.sideEffects = sideEffects
+        self.sideEffects = sideEffects.restrictedByProcess
         application = AXUIElementCreateApplication(processID)
         focused = Self.focusedElement(in: application)
     }
@@ -353,11 +357,21 @@ final class AccessibilityKeystrokeTarget: KeystrokeTarget {
         try SyntheticInput.postText(chunk, toProcess: processID, sideEffects: sideEffects)
     }
 
-    func pressLeftArrow() throws {
-        try SyntheticInput.postKey(CGKeyCode(kVK_LeftArrow), toProcess: processID, sideEffects: sideEffects)
+    func precedingText(utf16Count: Int) -> String? {
+        guard let focused, let range = selectedRange(), range.length == 0, range.location >= utf16Count else { return nil }
+        var request = CFRange(location: range.location - utf16Count, length: utf16Count)
+        guard let parameter = AXValueCreate(.cfRange, &request) else { return nil }
+        var value: CFTypeRef?
+        guard
+            AXUIElementCopyParameterizedAttributeValue(
+                focused, kAXStringForRangeParameterizedAttribute as CFString, parameter, &value) == .success
+        else { return nil }
+        return value as? String
     }
 
-    func caretLocation() -> Int? {
+    func caretLocation() -> Int? { selectedRange()?.location }
+
+    private func selectedRange() -> CFRange? {
         guard let focused else { return nil }
         var value: CFTypeRef?
         guard AXUIElementCopyAttributeValue(focused, kAXSelectedTextRangeAttribute as CFString, &value) == .success,
@@ -365,7 +379,7 @@ final class AccessibilityKeystrokeTarget: KeystrokeTarget {
         else { return nil }
         var range = CFRange()
         guard AXValueGetValue(value as! AXValue, .cfRange, &range) else { return nil }
-        return range.location
+        return range
     }
 
     func waitForCaret(at location: Int) -> Bool {
@@ -409,10 +423,13 @@ extension PlaceholderValues {
         currentClipboard: () -> String?, now: Date = .now
     ) -> PlaceholderValues {
         var values = PlaceholderValues(now: now)
-        if requirements.clipboard {
+        let needsHistory =
+            database.preferences.clipboardEnabled && requirements.clipboardOffsets.contains(where: { $0 > 0 })
+        // The current clipboard is read only for `{clipboard}`, or to line history up with it.
+        if requirements.clipboardOffsets.contains(0) || needsHistory {
             let current = currentClipboard()
             values.currentClipboard = current
-            if database.preferences.clipboardEnabled, requirements.clipboardOffsets.contains(where: { $0 > 0 }) {
+            if needsHistory {
                 var history = database.clipboard.compactMap(\.plainText)
                 if let current, history.first == current { history.removeFirst() }
                 values.clipboardHistory = history
@@ -422,12 +439,17 @@ extension PlaceholderValues {
         return values
     }
 
-    /// Snippet text by name, exact first, then case-insensitive.
+    /// Snippet text by name, exact first, then case-insensitive. The index is built once,
+    /// so each lookup is constant time however many snippets the library has.
     static func snippetLookup(_ database: LibraryDatabase) -> (String) -> String? {
-        { name in
-            database.snippets.first { $0.name == name }?.content
-                ?? database.snippets.first { $0.name.caseInsensitiveCompare(name) == .orderedSame }?.content
+        var exact: [String: String] = [:]
+        var folded: [String: String] = [:]
+        for snippet in database.snippets {
+            if exact[snippet.name] == nil { exact[snippet.name] = snippet.content }
+            let key = snippet.name.lowercased()
+            if folded[key] == nil { folded[key] = snippet.content }
         }
+        return { name in exact[name] ?? folded[name.lowercased()] }
     }
 }
 
@@ -466,9 +488,13 @@ final class SnippetExpander {
     private let store: LibraryStore
     private let inserter: any SnippetInserting
     private let isSecureInputEnabled: @MainActor () -> Bool
-    private let values: ValuesProvider
+    private let valuesOverride: ValuesProvider?
     private let failureFeedback: @MainActor () -> Void
     private let sideEffects: SideEffectGuard
+    /// Reads the current clipboard for `{clipboard}`, only when a run needs it. The
+    /// launcher sets it to its clipboard service, which also skips copies from
+    /// excluded apps; the default reads the general pasteboard, never while inert.
+    var clipboardReader: @MainActor () -> String?
     private var monitor: Any?
     private var mouseMonitor: Any?
     private var matcher = SnippetMatcher()
@@ -494,20 +520,13 @@ final class SnippetExpander {
         sideEffects: SideEffectGuard = .current
     ) {
         self.store = store
+        let sideEffects = sideEffects.restrictedByProcess
         self.sideEffects = sideEffects
         self.inserter = inserter ?? SnippetInserters.makeDefault(sideEffects: sideEffects)
         self.isSecureInputEnabled = isSecureInputEnabled
-        self.values = values ?? Self.liveValues(sideEffects: sideEffects)
+        valuesOverride = values
         self.failureFeedback = failureFeedback ?? Self.alertSound(sideEffects: sideEffects)
-    }
-
-    /// Reads the general pasteboard for `{clipboard}` when a run needs it, never while inert.
-    static func liveValues(sideEffects: SideEffectGuard) -> ValuesProvider {
-        { database, requirements in
-            PlaceholderValues.snapshot(library: database, requirements: requirements) {
-                sideEffects.isInert ? nil : ClipboardPolicy.placeholderText(from: .general)
-            }
-        }
+        clipboardReader = { sideEffects.isInert ? nil : ClipboardPolicy.placeholderText(from: .general) }
     }
 
     static func alertSound(sideEffects: SideEffectGuard) -> @MainActor () -> Void {
@@ -587,7 +606,15 @@ final class SnippetExpander {
         // defaults, and a required one refuses the expansion.
         let plan = PlaceholderTemplate(trigger.snippet.content, context: .snippet)
             .plan(snippets: PlaceholderValues.snippetLookup(database))
-        let rendering = plan.render(values(database, plan.requirements), options: Self.renderOptions)
+        // Nothing is read for a template that can't run.
+        guard plan.blockingIssues.isEmpty else {
+            failureFeedback()
+            return .refused(plan.blockingIssues)
+        }
+        let values =
+            valuesOverride?(database, plan.requirements)
+            ?? PlaceholderValues.snapshot(library: database, requirements: plan.requirements, currentClipboard: clipboardReader)
+        let rendering = plan.render(values, options: Self.renderOptions)
         let expansion = SnippetExpansionPlan(trigger: trigger, rendering: rendering, mode: settings.mode)
         var blocking = rendering.blockingIssues
         if expansion.exceedsLimit && !blocking.contains(.outputTooLong) { blocking.append(.outputTooLong) }
@@ -598,7 +625,7 @@ final class SnippetExpander {
         do {
             switch try inserter.insert(expansion, into: input.processID) {
             case .completed: return .inserted(expansion)
-            case .interrupted:
+            case .interrupted, .unconfirmed:
                 failureFeedback()
                 return .interrupted(expansion)
             }

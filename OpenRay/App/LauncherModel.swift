@@ -102,6 +102,8 @@ final class LauncherModel {
     // Slice 2: quicklinks open through the guarded opener, which is inert in tests and verification.
     @ObservationIgnored var quicklinkOpener: any QuicklinkOpening = QuicklinkOpeners.makeDefault()
     @ObservationIgnored var applicationResolver: any ApplicationResolving = WorkspaceApplicationResolver()
+    /// Forces what ↩ does on clipboard entries and snippets; see `contentPrimaryAction`.
+    @ObservationIgnored var primaryActionOverride: ContentPrimaryAction?
     @ObservationIgnored let hotKey: GlobalHotKey
     /// A hotkey registry passed in by a test, backed by a fake. It may register while the
     /// pasteboard is isolated; the real Carbon one never does.
@@ -140,6 +142,8 @@ final class LauncherModel {
         self.ai = ai
         clipboard = ClipboardService(store: store, pasteboard: pasteboard)
         snippets = SnippetExpander(store: store)
+        // {clipboard} in expanded snippets reads through the service, which skips excluded copies.
+        snippets.clipboardReader = { [clipboard] in clipboard.placeholderText() }
         fileScope = store.database.preferences.fileSearchScope ?? .home
         store.commandBindingsDidChange = { [weak self] in self?.synchronizeCommandHotKeys() }
     }
