@@ -96,10 +96,8 @@ typealias AIActionItem = AIActionItems.Item
 @MainActor
 final class FoundationModelEngine: AIEngine {
     private var session: LanguageModelSession?
-    private var sessionAction: AIAction?
-    /// The configuration behind a request session; nil while an action session is active.
-    private var sessionProfile: AIRequestProfile?
-    private var sessionToolIDs: [String] = []
+    /// What the session was built for.
+    private var ledger = AISessionLedger()
     /// The model the next session uses. Private Cloud Compute only while it can answer.
     private var modelChoice: AIModelChoice = .onDevice
 
@@ -119,8 +117,12 @@ final class FoundationModelEngine: AIEngine {
     }
 
     var capabilities: AIModelCapabilities {
+        #if OPENRAY_PRIVATE_CLOUD_COMPUTE
         let capabilities: LanguageModelCapabilities =
             usesPrivateCloud ? PrivateCloudComputeLanguageModel().capabilities : SystemLanguageModel.default.capabilities
+        #else
+        let capabilities = SystemLanguageModel.default.capabilities
+        #endif
         var result: AIModelCapabilities = []
         if capabilities.contains(.vision) { result.insert(.vision) }
         if capabilities.contains(.reasoning) { result.insert(.reasoning) }
@@ -129,7 +131,9 @@ final class FoundationModelEngine: AIEngine {
         return result
     }
 
+    /// Nil unless this build may use Private Cloud Compute (`AIModelSelection.isBuildEnabled`).
     var privateCloudStatus: AIPrivateCloudStatus? {
+        #if OPENRAY_PRIVATE_CLOUD_COMPUTE
         let model = PrivateCloudComputeLanguageModel()
         switch model.availability {
         case .available:
@@ -146,6 +150,9 @@ final class FoundationModelEngine: AIEngine {
             @unknown default: return .unavailable("Unavailable")
             }
         }
+        #else
+        return nil
+        #endif
     }
 
     private var usesPrivateCloud: Bool {
@@ -167,7 +174,9 @@ final class FoundationModelEngine: AIEngine {
     }
 
     func contextSize() async -> Int {
+        #if OPENRAY_PRIVATE_CLOUD_COMPUTE
         if usesPrivateCloud, let size = try? await PrivateCloudComputeLanguageModel().contextSize { return size }
+        #endif
         return SystemLanguageModel.default.contextSize
     }
 
@@ -185,32 +194,30 @@ final class FoundationModelEngine: AIEngine {
 
     func prepare(for action: AIAction) {
         guard availability.isAvailable else { return }
-        if session == nil || sessionAction != action || sessionProfile != nil {
-            session = LanguageModelSession(instructions: action.instructions)
-            sessionAction = action
-            sessionProfile = nil
-            session?.prewarm()
-        }
+        // Reopening the same chat keeps the conversation the model has.
+        guard !ledger.keepsSession(preparing: action) || session == nil else { return }
+        session = LanguageModelSession(instructions: action.instructions)
+        ledger = AISessionLedger(exists: true, action: action)
+        session?.prewarm()
     }
 
     func reset() {
         session = nil
-        sessionAction = nil
-        sessionProfile = nil
-        sessionToolIDs = []
+        ledger = AISessionLedger()
     }
 
     /// Rebuilds the chat session from its transcript up to, not including, the latest prompt.
-    /// The instructions entry is kept.
+    /// The instructions entry is kept, and the next request registers its tools again.
     func discardLastExchange() {
-        guard let session, sessionAction == .chat || sessionProfile?.keepsContext == true else {
+        guard let session, ledger.keepsContext else {
             reset()
             return
         }
         let entries = Array(session.transcript)
         guard let index = entries.lastIndex(where: { if case .prompt = $0 { true } else { false } }) else { return }
         self.session = makeSession(
-            profile: sessionProfile ?? .chat, tools: [], transcript: Transcript(entries: entries[..<index]))
+            profile: ledger.profile ?? .chat, tools: [], transcript: Transcript(entries: entries[..<index]))
+        ledger = ledger.afterRebuildingWithoutTools()
     }
 
     // MARK: Sessions
@@ -223,11 +230,13 @@ final class FoundationModelEngine: AIEngine {
     private func makeSession(profile: AIRequestProfile, tools: [any Tool], transcript: Transcript? = nil)
         -> LanguageModelSession
     {
+        #if OPENRAY_PRIVATE_CLOUD_COMPUTE
         if usesPrivateCloud {
             let model = PrivateCloudComputeLanguageModel()
             if let transcript { return LanguageModelSession(model: model, tools: tools, transcript: transcript) }
             return LanguageModelSession(model: model, tools: tools, instructions: Instructions(profile.instructions))
         }
+        #endif
         let model = systemModel(for: profile)
         if let transcript { return LanguageModelSession(model: model, tools: tools, transcript: transcript) }
         return LanguageModelSession(model: model, tools: tools, instructions: profile.instructions)
@@ -237,55 +246,62 @@ final class FoundationModelEngine: AIEngine {
     /// mentioning a tool doesn't forget the conversation.
     private func session(for request: AIRequest, tools: [any Tool]) -> LanguageModelSession {
         let toolIDs = tools.map(\.name)
-        if let session, sessionAction == nil, let profile = sessionProfile, profile == request.profile {
-            if toolIDs == sessionToolIDs { return session }
-            if profile.keepsContext {
+        switch session.map({ _ in ledger.plan(for: request.profile, toolIDs: toolIDs) }) ?? .fresh {
+        case .reuse:
+            if let session { return session }
+        case .retool:
+            if let session {
                 var entries = Array(session.transcript)
                 if let first = entries.first, case .instructions(let instructions) = first {
                     entries[0] = .instructions(
                         Transcript.Instructions(
                             segments: instructions.segments, toolDefinitions: tools.map { Transcript.ToolDefinition(tool: $0) }))
                 }
-                let rebuilt = makeSession(profile: profile, tools: tools, transcript: Transcript(entries: entries))
+                let rebuilt = makeSession(profile: request.profile, tools: tools, transcript: Transcript(entries: entries))
                 self.session = rebuilt
-                sessionToolIDs = toolIDs
+                ledger.toolIDs = toolIDs
                 return rebuilt
             }
+        case .fresh:
+            break
         }
         let fresh = makeSession(profile: request.profile, tools: tools)
         session = fresh
-        sessionAction = nil
-        sessionProfile = request.profile
-        sessionToolIDs = toolIDs
+        ledger = AISessionLedger(exists: true, profile: request.profile, toolIDs: toolIDs)
         return fresh
     }
 
     func rebuild(_ context: AIConversationContext) {
-        var entries: [Transcript.Entry] = [
-            .instructions(
-                Transcript.Instructions(segments: [.text(Transcript.TextSegment(content: context.instructions))], toolDefinitions: []))
-        ]
+        var entries: [Transcript.Entry] = [Self.instructionsEntry(context.instructions)]
         for turn in context.turns {
             entries.append(.prompt(Transcript.Prompt(segments: [.text(Transcript.TextSegment(content: turn.prompt))])))
             entries.append(.response(Transcript.Response(segments: [.text(Transcript.TextSegment(content: turn.response))])))
         }
         session = makeSession(profile: context.profile, tools: [], transcript: Transcript(entries: entries))
-        sessionAction = nil
-        sessionProfile = context.profile
-        sessionToolIDs = []
+        ledger = AISessionLedger(exists: true, profile: context.profile)
+    }
+
+    private static func instructionsEntry(_ text: String) -> Transcript.Entry {
+        .instructions(Transcript.Instructions(segments: [.text(Transcript.TextSegment(content: text))], toolDefinitions: []))
     }
 
     func exportTranscript() -> Data? {
-        guard let session, sessionAction == .chat || sessionProfile?.keepsContext == true else { return nil }
+        guard let session, ledger.keepsContext else { return nil }
         return try? JSONEncoder().encode(session.transcript)
     }
 
-    func restoreTranscript(_ data: Data, profile: AIRequestProfile) -> Bool {
-        guard let transcript = try? JSONDecoder().decode(Transcript.self, from: data) else { return false }
-        session = makeSession(profile: profile, tools: [], transcript: transcript)
-        sessionAction = nil
-        sessionProfile = profile
-        sessionToolIDs = []
+    /// Resumes a saved transcript under the agent's current instructions: the saved
+    /// instructions entry is replaced, so an edited agent never answers with old ones.
+    func restoreTranscript(_ data: Data, context: AIConversationContext) -> Bool {
+        guard let saved = try? JSONDecoder().decode(Transcript.self, from: data) else { return false }
+        var entries = Array(saved)
+        if let first = entries.first, case .instructions = first {
+            entries[0] = Self.instructionsEntry(context.instructions)
+        } else {
+            entries.insert(Self.instructionsEntry(context.instructions), at: 0)
+        }
+        session = makeSession(profile: context.profile, tools: [], transcript: Transcript(entries: entries))
+        ledger = AISessionLedger(exists: true, profile: context.profile)
         return true
     }
 
@@ -300,10 +316,9 @@ final class FoundationModelEngine: AIEngine {
         onSnapshot: @escaping @MainActor (AIResponseSnapshot) -> Void
     ) async throws {
         guard availability.isAvailable else { throw AIServiceError.unavailable(availability) }
-        if session == nil || sessionAction != action || sessionProfile != nil {
+        if session == nil || ledger.action != action {
             session = LanguageModelSession(instructions: action.instructions)
-            sessionAction = action
-            sessionProfile = nil
+            ledger = AISessionLedger(exists: true, action: action)
         }
         guard let session else { throw AIServiceError.unavailable(.unavailable) }
         do {
@@ -368,7 +383,8 @@ final class FoundationModelEngine: AIEngine {
 
     func stream(_ request: AIRequest, onSnapshot: @escaping @MainActor (AIResponseSnapshot) -> Void) async throws {
         guard availability.isAvailable else { throw AIServiceError.unavailable(availability) }
-        let tools = FoundationModelTool.tools(for: request)
+        // Tools only for a model that can call them.
+        let tools = capabilities.contains(.toolCalling) ? FoundationModelTool.tools(for: request) : []
         let session = session(for: request, tools: tools)
         let profile = request.profile
         let toolMode: GenerationOptions.ToolCallingMode? =
@@ -463,6 +479,7 @@ final class FoundationModelEngine: AIEngine {
         case let error as SystemLanguageModel.Error:
             if case .assetsUnavailable = error { return AIServiceError.unavailable(.preparing) }
             return AIServiceError.failed(error.localizedDescription)
+        #if OPENRAY_PRIVATE_CLOUD_COMPUTE
         case let error as PrivateCloudComputeLanguageModel.Error:
             switch error {
             case .quotaLimitReached:
@@ -470,6 +487,7 @@ final class FoundationModelEngine: AIEngine {
                     "You've reached the Private Cloud Compute limit for now. Turn off the larger model in Settings to keep going on this Mac.")
             default: return AIServiceError.failed(error.localizedDescription)
             }
+        #endif
         default:
             return AIServiceError.failed(error.localizedDescription)
         }

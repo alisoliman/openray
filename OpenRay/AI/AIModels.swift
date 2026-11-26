@@ -240,8 +240,9 @@ protocol AIEngine: AnyObject {
     func rebuild(_ context: AIConversationContext)
     /// The conversation's FoundationModels transcript as JSON, for saved chats.
     func exportTranscript() -> Data?
-    /// Resumes a conversation from `exportTranscript()` data. False when it can't.
-    func restoreTranscript(_ data: Data, profile: AIRequestProfile) -> Bool
+    /// Resumes a conversation from `exportTranscript()` data, under `context`'s current
+    /// instructions. False when it can't.
+    func restoreTranscript(_ data: Data, context: AIConversationContext) -> Bool
     /// The model future sessions use. Private Cloud Compute is used only while it can answer.
     func setModelChoice(_ choice: AIModelChoice)
     /// Private Cloud Compute's availability and quota, or nil when the SDK has no such model.

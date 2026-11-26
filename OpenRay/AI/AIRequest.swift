@@ -85,10 +85,27 @@ enum AIPrivateCloudStatus: Equatable, Sendable {
 }
 
 enum AIModelSelection {
-    /// The model a request uses. Private Cloud Compute only when the person opted in and it
-    /// can answer; otherwise the on-device model, so a quota or outage never blocks AI.
-    static func resolve(preference: AIModelChoice, privateCloud: AIPrivateCloudStatus?) -> AIModelChoice {
-        guard preference == .privateCloud, let privateCloud, privateCloud.isUsable else { return .onDevice }
+    /// Whether this build may use Private Cloud Compute at all. It needs Apple's managed
+    /// `com.apple.developer.private-cloud-compute` entitlement, which Developer ID builds can't
+    /// carry, so the code is compiled in only with the `OPENRAY_PRIVATE_CLOUD_COMPUTE` flag,
+    /// off by default. Without it OpenRay is on-device only.
+    #if OPENRAY_PRIVATE_CLOUD_COMPUTE
+    static let isBuildEnabled = true
+    #else
+    static let isBuildEnabled = false
+    #endif
+
+    /// Why the larger model isn't offered in this build.
+    static let buildUnavailableReason =
+        "This version of OpenRay runs on this Mac only. Apple's larger Private Cloud Compute model needs an entitlement that's available to App Store apps."
+
+    /// The model a request uses. Private Cloud Compute only in a build that may use it, when
+    /// the person opted in and it can answer; otherwise the on-device model, so a quota or
+    /// outage never blocks AI.
+    static func resolve(
+        preference: AIModelChoice, privateCloud: AIPrivateCloudStatus?, buildAllows: Bool = isBuildEnabled
+    ) -> AIModelChoice {
+        guard buildAllows, preference == .privateCloud, let privateCloud, privateCloud.isUsable else { return .onDevice }
         return .privateCloud
     }
 }
@@ -151,6 +168,51 @@ struct AIRequest: Sendable {
     var fallbackAction: AIAction = .chat
 }
 
+/// What a FoundationModels session was built for, and what the next request does with it.
+/// Pure, so the engine's session bookkeeping is tested without a model.
+struct AISessionLedger: Equatable, Sendable {
+    var exists = false
+    /// The writing action an action session serves; nil for request sessions.
+    var action: AIAction? = nil
+    /// The configuration of a request session.
+    var profile: AIRequestProfile? = nil
+    /// The tools registered with the session.
+    var toolIDs: [String] = []
+
+    enum Plan: Equatable, Sendable {
+        /// Use the session as it is.
+        case reuse
+        /// Same conversation, different tools: rebuild it from its transcript with the new tools.
+        case retool
+        /// Start a new session.
+        case fresh
+    }
+
+    /// Whether the session carries a conversation.
+    var keepsContext: Bool { exists && (action == .chat || profile?.keepsContext == true) }
+
+    func plan(for profile: AIRequestProfile, toolIDs: [String]) -> Plan {
+        guard exists, action == nil, self.profile == profile else { return .fresh }
+        if toolIDs == self.toolIDs { return .reuse }
+        return profile.keepsContext ? .retool : .fresh
+    }
+
+    /// Whether preparing for an action keeps the session: reopening a chat keeps its conversation.
+    func keepsSession(preparing action: AIAction) -> Bool {
+        guard exists else { return false }
+        if self.action == action { return true }
+        return action == .chat && self.action == nil && profile?.keepsContext == true
+    }
+
+    /// After the transcript was rebuilt with no tools (Try Again): the next request registers
+    /// its tools again, even the same ones.
+    func afterRebuildingWithoutTools() -> AISessionLedger {
+        var next = self
+        next.toolIDs = []
+        return next
+    }
+}
+
 /// A conversation's context, rebuilt after condensation or when a saved chat resumes.
 struct AIConversationContext: Equatable, Sendable {
     struct Turn: Equatable, Sendable {
@@ -210,7 +272,7 @@ extension AIEngine {
 
     func rebuild(_ context: AIConversationContext) { reset() }
     func exportTranscript() -> Data? { nil }
-    func restoreTranscript(_ data: Data, profile: AIRequestProfile) -> Bool { false }
+    func restoreTranscript(_ data: Data, context: AIConversationContext) -> Bool { false }
     func setModelChoice(_ choice: AIModelChoice) {}
     var privateCloudStatus: AIPrivateCloudStatus? { nil }
     func makeSibling() -> any AIEngine { InertAIEngine() }
