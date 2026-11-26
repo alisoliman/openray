@@ -309,7 +309,7 @@ extension LauncherModel {
                 ) { [weak self] in self?.browseEnclosingFolder() })
         }
         if section == .applications, let provider = applicationsProvider {
-            let keeping = Set(applicationSettings.keepRunningBundleIDs)
+            let keeping = Set(store.database.keepRunningBundleIDs)
             if !provider.running.batchTargets(keeping: keeping, quitting: false).isEmpty {
                 entries.append(
                     ActionEntry(id: "apps.hideAll", title: "Hide All Apps…", symbol: "eye.slash", group: .panel) {
@@ -680,10 +680,14 @@ extension LauncherModel {
 
     /// Hide All and Quit All name the apps they'll act on, then act on exactly those processes:
     /// apps opened while the prompt shows, and apps added to Keep running meanwhile, are left alone.
-    func askToBatch(quitting: Bool) {
+    /// This is the one Quit All route: ⌘K here, and Quit All Apps and Quit Others from search.
+    /// `spared`, the app OpenRay opened over, makes it Quit Others.
+    func askToBatch(quitting: Bool, sparing spared: AppIdentity? = nil) {
         guard let running = applicationsProvider?.running else { return }
-        let keeping = Set(applicationSettings.keepRunningBundleIDs)
-        let snapshot = running.batchTargets(keeping: keeping, quitting: quitting).filter { quitting || !$0.isHidden }
+        let keeping = Set(store.database.keepRunningBundleIDs)
+        let snapshot = running.batchTargets(keeping: keeping, quitting: quitting).filter {
+            (quitting || !$0.isHidden) && $0.pid != spared?.pid
+        }
         guard !snapshot.isEmpty else {
             feedback = .info(quitting ? "No apps to quit." : "No apps to hide.")
             return
@@ -695,14 +699,14 @@ extension LauncherModel {
             ProvidedConfirmation(
                 id: quitting ? "applications.quitAll" : "applications.hideAll",
                 CommandConfirmation(
-                    question: "\(verb) \(names.count) app\(names.count == 1 ? "" : "s")?",
+                    question: "\(verb) \(names.count) app\(names.count == 1 ? "" : "s")\(spared.map { " except \($0.name)" } ?? "")?",
                     detail: "\(listed).\(quitting ? " Apps can ask to save first." : "") Apps you keep running in Settings › Applications stay as they are.",
                     confirmTitle: quitting ? "Quit All" : "Hide All", symbol: quitting ? "xmark.circle" : "eye.slash",
                     // Quitting can lose unsaved work; hiding loses nothing.
                     isDestructive: quitting)
             ) { [weak self] in
                 guard let self else { return }
-                let keepingNow = Set(self.applicationSettings.keepRunningBundleIDs)
+                let keepingNow = Set(self.store.database.keepRunningBundleIDs)
                 let result = running.act(on: snapshot, quitting: quitting, keeping: keepingNow)
                 self.reportBatch(result, verb: quitting ? "Asked" : "Hid", noun: quitting ? "quit" : "hide")
             })

@@ -79,7 +79,7 @@ final class SystemCommandProvider: CommandProvider {
     func context(in model: LauncherModel) -> SystemCommandContext {
         SystemCommandContext(
             foregroundApplication: foreground(model),
-            excludedBundleIdentifiers: Set(model.store.database.systemCommandSettings.quitExclusions))
+            excludedBundleIdentifiers: Set(model.store.database.keepRunningBundleIDs))
     }
 
     // MARK: Commands
@@ -152,7 +152,19 @@ final class SystemCommandProvider: CommandProvider {
             let context = context(in: model)
             let action: SystemAction
             do {
-                action = try command.action(argument: ref.arguments["level"], context: context)
+                switch try command.route(argument: ref.arguments["level"], context: context) {
+                case .action(let routed):
+                    action = routed
+                case .quitApps(let spared):
+                    // The one Quit All route: Applications names the exact apps and asks.
+                    guard model.applicationsProvider != nil else {
+                        model.feedback = .error("\(command.title) needs the Applications commands, which aren't available.")
+                        return
+                    }
+                    model.store.recordUse(of: item.id)
+                    model.askToBatch(quitting: true, sparing: spared)
+                    return
+                }
             } catch {
                 // Said in the panel, before it closes: nothing has run.
                 model.feedback = .warning(error.localizedDescription)

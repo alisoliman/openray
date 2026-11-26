@@ -37,42 +37,47 @@ struct WindowManagementSettings: Equatable, Sendable {
 /// System command settings, stored in `commandPreferences["system.settings"]`.
 struct SystemCommandSettings: Equatable, Sendable {
     static let storageKey = "system.settings"
+    /// Where builds before the shared Keep Running list saved Quit All exclusions. Read once and
+    /// moved into `LibraryDatabase.keepRunningBundleIDs` on the next write; never written.
+    static let legacyExclusionsKey = "quitExclusions"
 
     /// Empty Trash asks first. On by default.
     var confirmsEmptyingTrash = true
-    /// Quit All Apps, Quit Others and Hide Others ask first. On by default.
-    var confirmsQuittingApps = true
-    /// Bundle identifiers Quit All Apps leaves running, in the order they were added.
-    var quitExclusions: [String] = []
+    /// Hide Others asks first. On by default. (Quit All and Quit Others always ask: they name
+    /// the exact apps they'll quit.) Stored under the key the earlier quit toggle used.
+    var confirmsHidingOtherApps = true
 
-    init(confirmsEmptyingTrash: Bool = true, confirmsQuittingApps: Bool = true, quitExclusions: [String] = []) {
+    init(confirmsEmptyingTrash: Bool = true, confirmsHidingOtherApps: Bool = true) {
         self.confirmsEmptyingTrash = confirmsEmptyingTrash
-        self.confirmsQuittingApps = confirmsQuittingApps
-        self.quitExclusions = quitExclusions
+        self.confirmsHidingOtherApps = confirmsHidingOtherApps
     }
 
     init(_ values: [String: String]?) {
         let values = values ?? [:]
         confirmsEmptyingTrash = values["confirmEmptyTrash"] != "false"
-        confirmsQuittingApps = values["confirmQuitApps"] != "false"
-        var seen = Set<String>()
-        quitExclusions = (values["quitExclusions"] ?? "").split(separator: "\n").map {
-            $0.trimmingCharacters(in: .whitespaces)
-        }.filter { !$0.isEmpty && seen.insert($0).inserted }
+        confirmsHidingOtherApps = values["confirmQuitApps"] != "false"
     }
 
     var values: [String: String] {
-        [
-            "confirmEmptyTrash": String(confirmsEmptyingTrash), "confirmQuitApps": String(confirmsQuittingApps),
-            "quitExclusions": quitExclusions.joined(separator: "\n"),
-        ]
+        ["confirmEmptyTrash": String(confirmsEmptyingTrash), "confirmQuitApps": String(confirmsHidingOtherApps)]
     }
 
-    /// Restart, Shut Down and Log Out always ask; Empty Trash and the quit commands follow the settings.
+    /// Exclusions an earlier build saved here, in order, without duplicates.
+    static func legacyExclusions(_ values: [String: String]?) -> [String] {
+        unique((values?[legacyExclusionsKey] ?? "").split(separator: "\n").map { $0.trimmingCharacters(in: .whitespaces) })
+    }
+
+    static func unique(_ ids: [String]) -> [String] {
+        var seen = Set<String>()
+        return ids.filter { !$0.isEmpty && seen.insert($0).inserted }
+    }
+
+    /// Restart, Shut Down and Log Out always ask; Empty Trash and Hide Others follow the settings.
+    /// Quit All and Quit Others ask in Applications' batch flow, which names the apps.
     func asksFirst(_ id: SystemCommand.ID) -> Bool {
         switch id {
         case .emptyTrash: confirmsEmptyingTrash
-        case .quitAllApps, .quitAllAppsExceptFrontmost, .hideOtherApps: confirmsQuittingApps
+        case .hideOtherApps: confirmsHidingOtherApps
         default: SystemCommand.command(id).needsConfirmation
         }
     }
@@ -86,6 +91,27 @@ extension LibraryDatabase {
 
     var systemCommandSettings: SystemCommandSettings {
         get { SystemCommandSettings(commandPreferences[SystemCommandSettings.storageKey]) }
-        set { commandPreferences[SystemCommandSettings.storageKey] = newValue.values }
+        set {
+            // Move any older Quit All exclusions into Keep Running first, so this write keeps them.
+            keepRunningBundleIDs = keepRunningBundleIDs
+            commandPreferences[SystemCommandSettings.storageKey] = newValue.values
+        }
+    }
+
+    /// Keep Running: the one list of apps that Hide All, Quit All, Quit Others and Hide Others
+    /// leave alone, stored with Settings › Applications. Exclusions an earlier build saved in
+    /// Settings › System are read too, after it, and moved here on the next write.
+    var keepRunningBundleIDs: [String] {
+        get {
+            let applications = ApplicationSettings(commandPreferences[ApplicationSettings.key]).keepRunningBundleIDs
+            let legacy = SystemCommandSettings.legacyExclusions(commandPreferences[SystemCommandSettings.storageKey])
+            return SystemCommandSettings.unique(applications + legacy)
+        }
+        set {
+            var applications = ApplicationSettings(commandPreferences[ApplicationSettings.key])
+            applications.keepRunningBundleIDs = SystemCommandSettings.unique(newValue)
+            commandPreferences[ApplicationSettings.key] = applications.values
+            commandPreferences[SystemCommandSettings.storageKey]?[SystemCommandSettings.legacyExclusionsKey] = nil
+        }
     }
 }

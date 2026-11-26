@@ -8,11 +8,12 @@ extension SettingsPane {
         kind: .system, symbol: "power",
         keywords:
             "system commands quit all apps exclusions keep running confirm empty trash restart shut down log out automation apple events sound"
-    ) { model, _ in AnyView(SystemPane(model: model)) }
+    ) { model, navigation in AnyView(SystemPane(model: model, navigation: navigation)) }
 }
 
 struct SystemPane: View {
     @Bindable var model: LauncherModel
+    var navigation: SettingsNavigation? = nil
 
     private var settings: SystemCommandSettings { model.store.database.systemCommandSettings }
 
@@ -23,49 +24,27 @@ struct SystemPane: View {
                     SettingRowLabel(title: "Confirm before emptying the Trash", detail: "Empty Trash asks in the action bar first.")
                 }
                 .settingsSwitch()
-                Toggle(isOn: binding(\.confirmsQuittingApps)) {
-                    SettingRowLabel(
-                        title: "Confirm before hiding or quitting apps",
-                        detail: "Quit All Apps, Quit Others and Hide Others ask in the action bar first.")
+                Toggle(isOn: binding(\.confirmsHidingOtherApps)) {
+                    SettingRowLabel(title: "Confirm before hiding other apps", detail: "Hide Others asks in the action bar first.")
                 }
                 .settingsSwitch()
             } header: {
                 Text("Confirmations")
             } footer: {
-                Text("Restart, Shut Down and Log Out always ask.")
+                Text("Restart, Shut Down and Log Out always ask. Quit All and Quit Others always name the apps they'll quit and ask.")
                     .font(.system(size: 12)).foregroundStyle(.secondary)
             }
             Section {
-                if settings.quitExclusions.isEmpty {
-                    Text("Every app quits. Add apps that should keep running, such as a music player.")
-                        .foregroundStyle(.secondary)
+                LabeledContent {
+                    Button("Open Applications Settings") { navigation?.pane = .applications }
+                        .disabled(navigation == nil)
+                } label: {
+                    SettingRowLabel(
+                        title: Self.keepRunningSummary(model.store.database.keepRunningBundleIDs),
+                        detail: "Quit All, Quit Others, Hide Others and Hide All leave these apps alone. Edit the list in Settings › Applications.")
                 }
-                ForEach(settings.quitExclusions, id: \.self) { bundleIdentifier in
-                    HStack {
-                        Text(Self.appName(for: bundleIdentifier))
-                        Spacer()
-                        Button(role: .destructive) {
-                            save { $0.quitExclusions.removeAll { $0 == bundleIdentifier } }
-                        } label: {
-                            Image(systemName: "minus.circle")
-                        }
-                        .buttonStyle(.borderless)
-                        .help("Stop keeping \(Self.appName(for: bundleIdentifier)) running")
-                        .accessibilityLabel("Remove \(Self.appName(for: bundleIdentifier))")
-                    }
-                }
-                Menu("Add App…") {
-                    ForEach(addableApps) { app in
-                        Button(app.name) { save { $0.quitExclusions.append(app.bundleIdentifier) } }
-                    }
-                }
-                .disabled(addableApps.isEmpty)
-                .fixedSize()
             } header: {
-                Text("Quit All Apps keeps running")
-            } footer: {
-                Text("OpenRay and Finder always keep running.")
-                    .font(.system(size: 12)).foregroundStyle(.secondary)
+                Text("Keep running")
             }
             Section("Permissions") {
                 IconRow(
@@ -90,30 +69,12 @@ struct SystemPane: View {
         opener.open(ExternalOpener.automationSettings)
     }
 
-    struct AddableApp: Identifiable, Hashable {
-        var name: String
-        var bundleIdentifier: String
-        var id: String { bundleIdentifier }
-    }
-
-    /// Running apps with a Dock icon that aren't excluded yet, by name.
-    private var addableApps: [AddableApp] {
-        let excluded = Set(settings.quitExclusions).union(AppSelection.neverQuit)
-        let own = Bundle.main.bundleIdentifier
-        var seen = Set<String>()
-        return NSWorkspace.shared.runningApplications.compactMap { app -> AddableApp? in
-            guard app.activationPolicy == .regular, let id = app.bundleIdentifier, id != own, !excluded.contains(id),
-                seen.insert(id).inserted
-            else { return nil }
-            return AddableApp(name: app.localizedName ?? id, bundleIdentifier: id)
-        }.sorted { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
-    }
-
-    static func appName(for bundleIdentifier: String) -> String {
-        guard let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: bundleIdentifier) else {
-            return bundleIdentifier
+    static func keepRunningSummary(_ ids: [String]) -> String {
+        switch ids.count {
+        case 0: "No apps kept running"
+        case 1: "1 app kept running"
+        default: "\(ids.count) apps kept running"
         }
-        return FileManager.default.displayName(atPath: url.path).replacingOccurrences(of: ".app", with: "")
     }
 
     private func binding(_ path: WritableKeyPath<SystemCommandSettings, Bool>) -> Binding<Bool> {

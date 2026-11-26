@@ -239,9 +239,28 @@ struct SystemCommand: Identifiable, Sendable {
         return confirmation
     }
 
-    /// The action to perform, given the typed argument and the app you came from.
+    /// How a command runs: through the system executor, or, for Quit All and Quit Others,
+    /// through Applications' batch flow, which names the exact apps it will quit and acts on
+    /// only those. That flow is the one Quit All route, from search and from ⌘K alike.
+    enum Route: Equatable, Sendable {
+        case action(SystemAction)
+        /// Quit every regular app except Keep Running ones, and except `sparing` when set.
+        case quitApps(sparing: AppIdentity?)
+    }
+
+    func route(argument: String? = nil, context: SystemCommandContext = .init()) throws -> Route {
+        switch id {
+        case .quitAllApps: return .quitApps(sparing: nil)
+        case .quitAllAppsExceptFrontmost:
+            return .quitApps(sparing: try context.requireForeground("the app you want to keep"))
+        default: return .action(try action(argument: argument, context: context))
+        }
+    }
+
+    /// The executor action, given the typed argument and the app you came from.
     /// Commands that keep or restart "the app you were using" need a live,
     /// external foreground app; they never fall back to acting on every app.
+    /// Quit All and Quit Others have no executor action: see `route`.
     func action(argument: String? = nil, context: SystemCommandContext = .init()) throws -> SystemAction {
         switch id {
         case .lockScreen: return .lockScreen
@@ -271,13 +290,12 @@ struct SystemCommand: Identifiable, Sendable {
         case .ejectAllDisks: return .ejectAllDisks
         case .toggleHiddenFiles: return .toggleHiddenFiles
         case .hideOtherApps:
-            return .hideOtherApps(keeping: try context.requireForeground("the app you want to keep"))
-        case .unhideAllApps: return .unhideApps
-        case .quitAllApps: return .quitAllApps(excluded: context.excludedBundleIdentifiers)
-        case .quitAllAppsExceptFrontmost:
-            return .quitOtherApps(
+            return .hideOtherApps(
                 keeping: try context.requireForeground("the app you want to keep"),
                 excluded: context.excludedBundleIdentifiers)
+        case .unhideAllApps: return .unhideApps
+        case .quitAllApps, .quitAllAppsExceptFrontmost:
+            throw LibraryValidationError("\(title) runs through Applications, which names the apps it will quit.")
         case .restartFrontmostApp:
             return .restartApp(try context.requireForeground("the app you want to restart"))
         case .dismissNotifications: return .dismissNotifications
@@ -327,20 +345,14 @@ struct SystemCommand: Identifiable, Sendable {
             return HUDMessage(count == 1 ? "Ejected 1 disk" : "Ejected \(count) disks", symbol: "eject.fill")
         case .apps(let count):
             let noun = count == 1 ? "1 app" : "\(count) apps"
-            switch id {
-            case .hideOtherApps:
-                return count == 0
-                    ? HUDMessage("No other apps to hide", symbol: "eye.slash", style: .info)
-                    : HUDMessage("Hid \(noun)", symbol: "eye.slash.fill")
-            case .unhideAllApps:
+            if id == .unhideAllApps {
                 return count == 0
                     ? HUDMessage("No hidden apps", symbol: "eye", style: .info)
                     : HUDMessage("Unhid \(noun)", symbol: "eye")
-            default:
-                return count == 0
-                    ? HUDMessage("No apps to quit", symbol: "xmark.circle", style: .info)
-                    : HUDMessage("Quitting \(noun)", symbol: "xmark.circle")
             }
+            return count == 0
+                ? HUDMessage("No other apps to hide", symbol: "eye.slash", style: .info)
+                : HUDMessage("Hid \(noun)", symbol: "eye.slash.fill")
         case .app(let name):
             return HUDMessage("Restarted \(name)", symbol: "arrow.clockwise")
         case .notifications(let count):
@@ -353,6 +365,7 @@ struct SystemCommand: Identifiable, Sendable {
     }
 
     /// The executor: works out the action, has `performer` carry it out, and returns the HUD to show.
+    /// Throws for Quit All and Quit Others, which run through Applications (`route`).
     @MainActor
     func run(
         with performer: any SystemActionPerforming, argument: String? = nil,
@@ -407,7 +420,7 @@ struct SystemCommandContext: Equatable, Sendable {
     /// The app that was frontmost when the launcher opened. Capture it when the
     /// launcher opens; a window chosen with the target chip must never replace it.
     var foregroundApplication: AppIdentity?
-    /// Apps that Quit All Apps leaves running.
+    /// Keep Running: apps that Hide Others leaves alone, as Applications' Hide All and Quit All do.
     var excludedBundleIdentifiers: Set<String> = []
 
     /// The foreground app, which must be another app than OpenRay.
@@ -443,10 +456,8 @@ enum SystemAction: Equatable, Sendable {
     case media(MediaKey)
     case volume(VolumeChange)
     case toggleMicrophoneMute
-    case hideOtherApps(keeping: AppIdentity)
+    case hideOtherApps(keeping: AppIdentity, excluded: Set<String>)
     case unhideApps
-    case quitAllApps(excluded: Set<String>)
-    case quitOtherApps(keeping: AppIdentity, excluded: Set<String>)
     case restartApp(AppIdentity)
     case dismissNotifications
     case toggleWiFi
@@ -523,9 +534,6 @@ struct RunningAppInfo: Equatable, Sendable {
 }
 
 enum AppSelection {
-    /// Finder relaunches itself; quitting it only flashes the desktop.
-    static let neverQuit: Set<String> = [SystemCommand.finder]
-
     /// Confirms the app to keep is still the same running app. Throws when it
     /// has quit, when its PID now belongs to another app, or when it is OpenRay.
     static func verify(_ keep: AppIdentity, in apps: [RunningAppInfo], ownPID: pid_t) throws {
@@ -534,25 +542,19 @@ enum AppSelection {
         }
     }
 
-    static func hideTargets(_ apps: [RunningAppInfo], keeping: AppIdentity, ownPID: pid_t) throws -> [RunningAppInfo] {
+    /// Everything regular and visible except OpenRay, the app to keep, and Keep Running apps.
+    static func hideTargets(
+        _ apps: [RunningAppInfo], keeping: AppIdentity, excluded: Set<String> = [], ownPID: pid_t
+    ) throws -> [RunningAppInfo] {
         try verify(keeping, in: apps, ownPID: ownPID)
-        return apps.filter { $0.isRegular && !$0.isHidden && $0.pid != ownPID && $0.pid != keeping.pid }
+        return apps.filter { app in
+            app.isRegular && !app.isHidden && app.pid != ownPID && app.pid != keeping.pid
+                && !(app.bundleIdentifier.map(excluded.contains) ?? false)
+        }
     }
 
     static func unhideTargets(_ apps: [RunningAppInfo], ownPID: pid_t) -> [RunningAppInfo] {
         apps.filter { $0.isRegular && $0.isHidden && $0.pid != ownPID }
-    }
-
-    /// Quit All passes no app to keep; Quit Others passes the verified foreground app.
-    static func quitTargets(
-        _ apps: [RunningAppInfo], keeping: AppIdentity?, excluded: Set<String>, ownPID: pid_t
-    ) throws -> [RunningAppInfo] {
-        if let keeping { try verify(keeping, in: apps, ownPID: ownPID) }
-        return apps.filter { app in
-            guard app.isRegular, app.pid != ownPID, app.pid != keeping?.pid else { return false }
-            guard let bundleIdentifier = app.bundleIdentifier else { return true }
-            return !excluded.contains(bundleIdentifier) && !neverQuit.contains(bundleIdentifier)
-        }
     }
 }
 
@@ -730,8 +732,9 @@ final class LiveSystemActions: SystemActionPerforming {
         case .toggleMicrophoneMute:
             let outcome = try microphone.toggle()
             return .microphones(muted: outcome.muted, changed: outcome.changed.count, unchanged: outcome.unchanged)
-        case .hideOtherApps(let keeping):
-            let targets = try AppSelection.hideTargets(runningApps(), keeping: keeping, ownPID: ownPID)
+        case .hideOtherApps(let keeping, let excluded):
+            let targets = try AppSelection.hideTargets(
+                runningApps(), keeping: keeping, excluded: excluded, ownPID: ownPID)
             var count = 0
             for app in targets where NSRunningApplication(processIdentifier: app.pid)?.hide() == true { count += 1 }
             return .apps(count: count)
@@ -740,12 +743,6 @@ final class LiveSystemActions: SystemActionPerforming {
             var count = 0
             for app in targets where NSRunningApplication(processIdentifier: app.pid)?.unhide() == true { count += 1 }
             return .apps(count: count)
-        case .quitAllApps(let excluded):
-            return .apps(count: quit(try AppSelection.quitTargets(
-                runningApps(), keeping: nil, excluded: excluded, ownPID: ownPID)))
-        case .quitOtherApps(let keeping, let excluded):
-            return .apps(count: quit(try AppSelection.quitTargets(
-                runningApps(), keeping: keeping, excluded: excluded, ownPID: ownPID)))
         case .restartApp(let identity):
             return try await restartApp(identity)
         case .dismissNotifications:
@@ -770,12 +767,6 @@ final class LiveSystemActions: SystemActionPerforming {
                 pid: $0.processIdentifier, bundleIdentifier: $0.bundleIdentifier, name: $0.localizedName ?? "App",
                 isRegular: $0.activationPolicy == .regular, isHidden: $0.isHidden, launchDate: $0.launchDate)
         }
-    }
-
-    private func quit(_ targets: [RunningAppInfo]) -> Int {
-        var count = 0
-        for app in targets where NSRunningApplication(processIdentifier: app.pid)?.terminate() == true { count += 1 }
-        return count
     }
 
     private func requireAccessibility() throws {
