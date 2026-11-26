@@ -262,6 +262,16 @@ final class TranslationService {
         self.detector = detector
     }
 
+    /// Restores the remembered source language, such as one saved in the library.
+    func restore(lastSource: TranslationLanguage) {
+        self.lastSource = lastSource
+    }
+
+    /// Whether the models for a direction are on this Mac.
+    func availability(from source: TranslationLanguage, to target: TranslationLanguage) async -> TranslationAvailability {
+        await engine.availability(from: source.language, to: target.language)
+    }
+
     /// The source and target to use. `fixedTarget` is for custom pair commands, which
     /// always translate into their target and never reverse.
     func plan(_ request: TranslationRequest, fixedTarget: Bool = false) throws -> (
