@@ -61,7 +61,7 @@ extension LauncherModel {
                     ? (keywordMatch ? "Keyword match · \(destination)" : destination) : "Search for “\(argument)”",
                 // One glyph wherever a quicklink appears: token, action bar, retarget rows.
                 symbol: "link", kind: .quicklink, badge: "Quicklink",
-                keywords: link.keyword, action: .quicklink(link, argument))
+                keywords: ([link.keyword] + link.tagList).joined(separator: " "), action: .quicklink(link, argument))
         }
     }
 
@@ -71,7 +71,8 @@ extension LauncherModel {
             return LauncherItem(
                 id: "snippet.\(snippet.id)", title: snippet.name, subtitle: firstLine,
                 symbol: "curlybraces", kind: .snippet, badge: "Snippet",
-                keywords: snippet.keyword + " " + snippet.content, action: .snippet(snippet))
+                keywords: ([snippet.keyword] + snippet.tagList + [snippet.content]).joined(separator: " "),
+                action: .snippet(snippet))
         }
     }
 

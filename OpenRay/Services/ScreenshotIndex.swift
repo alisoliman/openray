@@ -1,34 +1,24 @@
 import AppKit
 import ImageIO
 import Observation
-import Vision
 
 // MARK: - Text recognition
 
-/// Reads the text in an image file. A small protocol of Slice 4's own, so tests use a fake;
-/// it can sit on Slice 2's `TextRecognizing` once that's merged.
+/// Reads the text in an image file. The screenshot index's seam, so tests use a fake.
 protocol ImageTextRecognizing: Sendable {
     func recognizeText(inImageAt url: URL, accurate: Bool) async throws -> String
 }
 
-/// On-device recognition with Vision. Nothing leaves this Mac.
-struct VisionScreenshotRecognizer: ImageTextRecognizing {
-    /// Larger images are skipped rather than decoded.
-    static let maximumBytes = 64_000_000
+/// Screenshot OCR on the shared on-device recognizer (`Core/TextRecognition.swift`), with
+/// Fast or Accurate as Settings › Screenshots chooses. Nothing leaves this Mac, and while
+/// inert it reads fixtures only.
+struct ScreenshotTextRecognizer: ImageTextRecognizing {
+    var recognizer: any TextRecognizing = VisionTextRecognizer()
 
     func recognizeText(inImageAt url: URL, accurate: Bool) async throws -> String {
         try InertReadBoundary.check(url)
-        let size = (try? url.resourceValues(forKeys: [.fileSizeKey]))?.fileSize ?? 0
-        guard size > 0, size <= Self.maximumBytes else { return "" }
-        var request = RecognizeTextRequest()
-        request.recognitionLevel = accurate ? .accurate : .fast
-        request.usesLanguageCorrection = accurate
-        request.automaticallyDetectsLanguage = true
-        let observations = try await request.perform(on: url)
-        try Task.checkCancellation()
-        return observations.compactMap { $0.topCandidates(1).first?.string }
-            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }.filter { !$0.isEmpty }
-            .joined(separator: "\n")
+        let options = TextRecognitionOptions(level: accurate ? .accurate : .fast, usesLanguageCorrection: accurate)
+        return try await recognizer.recognizeText(inImageAt: url, options: options).text
     }
 }
 
@@ -394,7 +384,7 @@ final class ScreenshotIndex {
     nonisolated static let limit = 5_000
 
     init(
-        recognizer: any ImageTextRecognizing = VisionScreenshotRecognizer(), sideEffects: SideEffectGuard = .current,
+        recognizer: any ImageTextRecognizing = ScreenshotTextRecognizer(), sideEffects: SideEffectGuard = .current,
         folders: (@MainActor (ScreenshotSettings) -> [ScreenshotFolder])? = nil
     ) {
         let sideEffects = SideEffectGuard.atLeastCurrent(sideEffects)

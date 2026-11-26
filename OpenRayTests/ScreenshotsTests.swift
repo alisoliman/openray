@@ -388,3 +388,43 @@ struct ScreenshotsTests {
         #expect(provider.index.records.isEmpty)
     }
 }
+
+/// Slice 2's recognizer protocol, answering from a table and recording the options it got.
+final class RecordingTextRecognizer: TextRecognizing, @unchecked Sendable {
+    private let lock = NSLock()
+    private var _levels: [TextRecognitionOptions.Level] = []
+    var levels: [TextRecognitionOptions.Level] { lock.withLock { _levels } }
+
+    func recognizeText(in imageData: Data, options: TextRecognitionOptions) async throws -> TextRecognitionResult {
+        TextRecognitionResult(lines: [])
+    }
+
+    func recognizeText(inImageAt url: URL, options: TextRecognitionOptions) async throws -> TextRecognitionResult {
+        lock.withLock { _levels.append(options.level) }
+        return TextRecognitionResult(lines: [
+            RecognizedTextLine(text: "Invoice 42", confidence: 1, boundingBox: .zero),
+            RecognizedTextLine(text: "Total €12", confidence: 1, boundingBox: .zero),
+        ])
+    }
+
+    func barcodePayloads(in imageData: Data) async throws -> [String] { [] }
+}
+
+@MainActor
+struct ScreenshotRecognizerAdapterTests {
+    @Test func screenshotOCRRunsOnTheSharedRecognizerWithTheChosenLevel() async throws {
+        let shared = RecordingTextRecognizer()
+        let adapter = ScreenshotTextRecognizer(recognizer: shared)
+        let fixture = FileManager.default.temporaryDirectory.appending(path: "OpenRayOCR-\(UUID()).png")
+        try Data().write(to: fixture)
+        defer { try? FileManager.default.removeItem(at: fixture) }
+        #expect(try await adapter.recognizeText(inImageAt: fixture, accurate: false) == "Invoice 42\nTotal €12")
+        _ = try await adapter.recognizeText(inImageAt: fixture, accurate: true)
+        #expect(shared.levels == [.fast, .accurate])
+        // The test host never reads a real screenshot, even through the adapter.
+        await #expect(throws: SideEffectGuard.Blocked.self) {
+            try await adapter.recognizeText(inImageAt: URL(fileURLWithPath: "/OpenRayNoSuchFolder/shot.png"), accurate: false)
+        }
+        #expect(shared.levels.count == 2)
+    }
+}

@@ -8,7 +8,7 @@ struct FormEditorBody: View {
     @FocusState private var focus: Field?
     @State private var selection: TextSelection?
 
-    enum Field: Hashable { case name, keyword, content }
+    enum Field: Hashable { case name, keyword, content, tags }
 
     var body: some View {
         HStack(spacing: 0) {
@@ -25,8 +25,9 @@ struct FormEditorBody: View {
                 }
                 if draft.isQuicklink {
                     FieldGroup(
-                        "Link", help: "Insert {query} where the search term goes, or use a file or folder path.",
-                        error: draft.contentError
+                        "Link",
+                        help: "Any URL, deeplink, or file or folder path. Insert {argument name=\"…\"} or {query} where a value goes.",
+                        error: draft.contentError ?? draft.placeholderNotes.first
                     ) {
                         HStack(spacing: 8) {
                             TextField(
@@ -36,12 +37,37 @@ struct FormEditorBody: View {
                             .textFieldStyle(.plain).font(OR.Font.mono).focused($focus, equals: .content)
                             .accessibilityLabel("Link").accessibilityHint(draft.contentError ?? "")
                             .accessibilityIdentifier("editor.content")
-                            if !draft.content.contains("{query}") {
+                            if !draft.content.contains("{query}") && !draft.content.contains("{argument") {
                                 Button { draft.content += "{query}" } label: { PlaceholderChip(text: "{query}") }
                                     .buttonStyle(.plain).help("Insert {query}")
                             }
+                            placeholderMenu(for: .quicklink) { draft.content += $0 }
                         }
                         .fieldBox(focused: focus == .content, invalid: draft.contentError != nil)
+                    }
+                }
+                FieldGroup("Tags", help: "Separate tags with commas.", error: draft.tagsError) {
+                    TextField("", text: $draft.tags, prompt: Text("work, email").foregroundStyle(OR.Color.text3))
+                        .textFieldStyle(.plain).font(OR.Font.body).focused($focus, equals: .tags)
+                        .fieldBox(focused: focus == .tags, invalid: draft.tagsError != nil)
+                        .accessibilityLabel("Tags, optional").accessibilityHint(draft.tagsError ?? "")
+                        .accessibilityIdentifier("editor.tags")
+                }
+                if draft.isQuicklink {
+                    FieldGroup("Open With", help: "The app the link opens in.") {
+                        Picker("Open With", selection: openWithBinding) {
+                            Text("Default App").tag(String?.none)
+                            if let current = draft.openWith,
+                                !model.applications.applications.contains(where: { $0.bundleIdentifier == current.bundleIdentifier })
+                            {
+                                Text(current.name).tag(String?.some(current.bundleIdentifier))
+                            }
+                            ForEach(model.applications.applications.filter { $0.bundleIdentifier != nil }) { app in
+                                Text(app.name).tag(app.bundleIdentifier)
+                            }
+                        }
+                        .labelsHidden().pickerStyle(.menu)
+                        .accessibilityIdentifier("editor.openWith")
                     }
                 }
                 FieldGroup(
@@ -67,15 +93,16 @@ struct FormEditorBody: View {
                             .accessibilityLabel("Snippet text").accessibilityHint(draft.contentError ?? "")
                             .accessibilityIdentifier("editor.content")
                         HStack(spacing: 6) {
-                            if let error = draft.contentError {
+                            if let error = draft.contentError ?? draft.placeholderNotes.first {
                                 Label(error, systemImage: "exclamationmark.triangle").labelStyle(TightLabelStyle())
                                     .font(OR.Font.callout).foregroundStyle(OR.Color.danger)
                             } else {
                                 Text("Insert").font(OR.Font.callout).foregroundStyle(OR.Color.text2)
-                                ForEach(["{date}", "{time}"], id: \.self) { token in
+                                ForEach(["{clipboard}", "{cursor}", "{date}", "{time}"], id: \.self) { token in
                                     Button { insert(token) } label: { PlaceholderChip(text: token) }
                                         .buttonStyle(.plain).help("Insert \(token) at the caret")
                                 }
+                                placeholderMenu(for: .snippet) { insert($0) }
                             }
                         }
                     }
@@ -197,6 +224,35 @@ struct FormEditorBody: View {
     private func opener(valid: Bool) -> String {
         guard valid else { return model.defaultBrowserName }
         return model.openerName(for: Quicklink(name: draft.name, template: draft.content, keyword: draft.keyword))
+    }
+
+    /// Every placeholder this kind of item honors, for the ones without a chip.
+    private func placeholderMenu(for context: PlaceholderContext, insert: @escaping (String) -> Void) -> some View {
+        Menu {
+            ForEach(Placeholder.Kind.suggested(in: context), id: \.self) { kind in
+                Button(kind.title) { insert(kind.insertionText) }
+            }
+        } label: {
+            PlaceholderChip(text: "More…")
+        }
+        .menuStyle(.button).buttonStyle(.plain).fixedSize()
+        .help("Insert a placeholder")
+        .accessibilityLabel("Insert a placeholder")
+    }
+
+    /// The picker's tag is the bundle identifier; nil means the default app.
+    private var openWithBinding: Binding<String?> {
+        Binding(
+            get: { draft.openWith?.bundleIdentifier },
+            set: { identifier in
+                guard let identifier else {
+                    draft.openWith = nil
+                    return
+                }
+                if let app = model.applications.applications.first(where: { $0.bundleIdentifier == identifier }) {
+                    draft.openWith = QuicklinkApplication(bundleIdentifier: identifier, name: app.name)
+                }
+            })
     }
 
     private func insert(_ token: String) {

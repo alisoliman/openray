@@ -206,8 +206,16 @@ struct AppPreferences: Codable, Equatable, Sendable {
     // Whether capture was paused (true) or turned off (false) while it isn't
     // running. Nil until either is chosen; see LibraryDatabase.clipboardIsPaused.
     var clipboardPaused: Bool? = nil
+    // Slice 2: clipboard, snippets, quicklinks. Optional, so earlier libraries keep decoding.
+    /// An explicit retention choice, including 3 months and unlimited. Nil uses `clipboardRetentionDays`.
+    var clipboardRetention: ClipboardRetention? = nil
+    /// Clipboard entries in Everything's search. Off unless turned on.
+    var clipboardInRootSearch: Bool? = nil
+    /// When typed keywords expand. Nil keeps the original behavior.
+    var snippetExpansion: SnippetExpansionSettings? = nil
 
     var capturesClipboardImages: Bool { clipboardImagesEnabled ?? false }
+    var showsClipboardInRootSearch: Bool { clipboardInRootSearch ?? false }
     var capturesClipboardFiles: Bool { clipboardFilesEnabled ?? false }
     var remembersLastQuery: Bool { rememberLastQuery ?? true }
     var usesBarMode: Bool { barMode ?? false }
