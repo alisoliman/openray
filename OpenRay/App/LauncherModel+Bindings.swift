@@ -8,7 +8,7 @@ extension LauncherModel {
     func bindingWarnings(for binding: CommandBinding) -> [String] {
         guard let shortcut = binding.shortcut else { return [] }
         var warnings = CommandShortcutPolicy.conflictWarnings(for: shortcut)
-        if shortcut == store.database.preferences.hotKey.shortcut {
+        if shortcut == store.database.preferences.launcherHotKeyShortcut {
             warnings.append("It opens OpenRay, so this command won't use it while the launcher does.")
         }
         // Only commands that exist now hold their shortcuts, so a missing command's saved one isn't a conflict.
@@ -96,6 +96,19 @@ extension LauncherModel {
         }
         let stored = store.database.preferences.hotKey
         let bindings = registrableCommandBindings
+        // A recorded launcher shortcut was checked when it was saved, so it registers as it is.
+        if let custom = store.database.preferences.launcherShortcut {
+            let issues = hotKey.synchronize(
+                launcherShortcut: custom, bindings: bindings,
+                onLauncher: { [weak self] in self?.launcherHotKeyPressed() },
+                onCommand: { [weak self] in self?.performBoundCommand(targetID: $0) },
+                title: { [weak self] id in self?.bindableCommands.first { $0.id == id }?.title })
+            shortcutError = issues.first { $0.targetID == GlobalHotKey.launcherTargetID }?.message
+            commandShortcutErrors = Dictionary(
+                issues.filter { $0.targetID != GlobalHotKey.launcherTargetID }.map { ($0.targetID, $0.message) },
+                uniquingKeysWith: { first, second in first + " " + second })
+            return
+        }
         // A saved choice macOS now reserves (Input Sources, say) would leave no way
         // to open OpenRay, so register the first choice that works without saving it.
         let launcher =
@@ -169,10 +182,44 @@ extension LauncherModel {
             launcherHotKeyRefusal = Self.reservedLauncherHotKeyMessage(value)
             return false
         }
-        // A failed write keeps the working shortcut; the library error explains it.
-        guard store.update({ $0.preferences.hotKey = value }) else { return false }
+        // A failed write keeps the working shortcut; the library error explains it. Choosing a
+        // preset replaces a recorded shortcut.
+        guard store.update({
+            $0.preferences.hotKey = value
+            $0.preferences.launcherShortcut = nil
+        }) else { return false }
         launcherHotKeyRefusal = nil
         // Registration below reports any new problem.
+        shortcutError = nil
+        applyPreferences()
+        return true
+    }
+
+    /// Records any shortcut for the launcher: a key with modifiers, F13–F20 alone, or a modifier
+    /// gesture. Nil goes back to the chosen preset. A shortcut macOS reserves, or one a command
+    /// already uses, is refused and explained in `launcherHotKeyRefusal`.
+    @discardableResult
+    func setLauncherShortcut(_ shortcut: CommandShortcut?) -> Bool {
+        if let shortcut {
+            do {
+                if shortcut.isKeyChord {
+                    try CommandShortcutPolicy.validate(
+                        shortcut: shortcut, reservedShortcuts: CommandShortcutPolicy.systemReservedShortcuts())
+                } else {
+                    try shortcut.validate()
+                }
+            } catch {
+                launcherHotKeyRefusal = error.localizedDescription
+                return false
+            }
+            if let owner = store.database.commandBindings.first(where: { $0.shortcut == shortcut }) {
+                let title = bindableCommands.first { $0.id == owner.targetID }?.title ?? "another command"
+                launcherHotKeyRefusal = "\(shortcut.title) is assigned to \(title). Remove it there first."
+                return false
+            }
+        }
+        guard store.update({ $0.preferences.launcherShortcut = shortcut }) else { return false }
+        launcherHotKeyRefusal = nil
         shortcutError = nil
         applyPreferences()
         return true

@@ -25,7 +25,6 @@ struct GlobalHotKeyTests {
     @Test func unsupportedGesturesAreRejected() {
         let invalid = [
             CommandShortcut(keyCode: 8, modifiers: []),
-            CommandShortcut(keyCode: 8, modifiers: .all),
             CommandShortcut(keyCode: 8, modifiers: .init(rawValue: 1 << 8)),
             CommandShortcut(keyCode: UInt32(kVK_Command), modifiers: .command),
             CommandShortcut(keyCode: UInt32(kVK_RightCommand), modifiers: .command),

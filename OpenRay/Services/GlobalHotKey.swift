@@ -25,6 +25,8 @@ final class GlobalHotKey {
 
     private let backend: any GlobalHotKeyBackend
     private let reservedShortcuts: @MainActor () -> Set<CommandShortcut>
+    /// Modifier-only and double-tap shortcuts, which Carbon can't register.
+    let modifierHotKeys: ModifierHotKeys
     private var registrations: [String: Registration] = [:]
     private var nextIdentifier: UInt32 = 1
     private var handlerInstalled = false
@@ -34,10 +36,12 @@ final class GlobalHotKey {
     init(
         backend: any GlobalHotKeyBackend = CarbonHotKeyBackend(),
         reservedShortcuts: @escaping @MainActor () -> Set<CommandShortcut> = CommandShortcutPolicy
-            .systemReservedShortcuts
+            .systemReservedShortcuts,
+        modifierHotKeys: ModifierHotKeys? = nil
     ) {
         self.backend = backend
         self.reservedShortcuts = reservedShortcuts
+        self.modifierHotKeys = modifierHotKeys ?? ModifierHotKeys()
     }
 
     isolated deinit { unregister() }
@@ -48,17 +52,31 @@ final class GlobalHotKey {
         onLauncher: @escaping () -> Void, onCommand: @escaping (String) -> Void,
         title: (String) -> String? = { _ in nil }
     ) -> [HotKeyRegistrationIssue] {
+        synchronize(
+            launcherShortcut: launcher.shortcut, bindings: bindings, onLauncher: onLauncher, onCommand: onCommand,
+            title: title)
+    }
+
+    /// Registers the launcher shortcut and command shortcuts. Key shortcuts go to Carbon;
+    /// modifier-only and double-tap ones to `modifierHotKeys`.
+    func synchronize(
+        launcherShortcut: CommandShortcut, bindings: [CommandBinding],
+        onLauncher: @escaping () -> Void, onCommand: @escaping (String) -> Void,
+        title: (String) -> String? = { _ in nil }
+    ) -> [HotKeyRegistrationIssue] {
         self.onLauncher = onLauncher
         self.onCommand = onCommand
         let reserved = reservedShortcuts()
         var issues: [HotKeyRegistrationIssue] = []
         var desired: [(String, CommandShortcut)] = []
         var owners: [CommandShortcut: String] = [:]
-        let candidates =
-            [(Self.launcherTargetID, launcher.shortcut)]
+        let all =
+            [(Self.launcherTargetID, launcherShortcut)]
             + bindings.compactMap { binding in
                 binding.shortcut.map { (binding.targetID, $0) }
             }
+        issues += synchronizeGestures(all.filter { !$0.1.isKeyChord }, title: title)
+        let candidates = all.filter(\.1.isKeyChord)
         for (targetID, shortcut) in candidates {
             guard targetID == Self.launcherTargetID || CuratedCommand.supports(targetID) else {
                 issues.append(.init(targetID: targetID, message: "This command does not support a global hotkey."))
@@ -83,8 +101,10 @@ final class GlobalHotKey {
         // Keep the old launcher until its replacement succeeds, unless macOS now reserves it.
         for (targetID, registration) in registrations {
             if targetID == Self.launcherTargetID {
-                if (try? CommandShortcutPolicy.validate(shortcut: registration.shortcut, reservedShortcuts: reserved))
-                    == nil
+                // A launcher that's now a modifier gesture leaves Carbon entirely.
+                if !launcherShortcut.isKeyChord
+                    || (try? CommandShortcutPolicy.validate(shortcut: registration.shortcut, reservedShortcuts: reserved))
+                        == nil
                 {
                     remove(targetID)
                 }
@@ -136,7 +156,48 @@ final class GlobalHotKey {
         return issues
     }
 
+    /// Hands modifier gestures to `modifierHotKeys`, one owner per gesture.
+    private func synchronizeGestures(
+        _ candidates: [(String, CommandShortcut)], title: (String) -> String?
+    ) -> [HotKeyRegistrationIssue] {
+        var issues: [HotKeyRegistrationIssue] = []
+        var gestures: [String: CommandShortcut] = [:]
+        var owners: [CommandShortcut: String] = [:]
+        for (targetID, shortcut) in candidates {
+            guard targetID == Self.launcherTargetID || CuratedCommand.supports(targetID) else {
+                issues.append(.init(targetID: targetID, message: "This command does not support a global hotkey."))
+                continue
+            }
+            do { try shortcut.validate() } catch {
+                issues.append(.init(targetID: targetID, message: error.localizedDescription))
+                continue
+            }
+            if let owner = owners[shortcut] {
+                let ownerTitle = owner == Self.launcherTargetID ? "the launcher" : (title(owner) ?? "another command")
+                issues.append(
+                    .init(targetID: targetID, message: "\(shortcut.title) is inactive because \(ownerTitle) uses it."))
+                continue
+            }
+            owners[shortcut] = targetID
+            gestures[targetID] = shortcut
+        }
+        let delivered = modifierHotKeys.synchronize(gestures) { [weak self] id in self?.fire(id) }
+        if !delivered {
+            issues += gestures.keys.sorted().map {
+                .init(
+                    targetID: $0,
+                    message: "Modifier shortcuts need Accessibility. Allow OpenRay in System Settings › Privacy & Security.")
+            }
+        }
+        return issues
+    }
+
+    private func fire(_ targetID: String) {
+        if targetID == Self.launcherTargetID { onLauncher?() } else { onCommand?(targetID) }
+    }
+
     func unregister() {
+        modifierHotKeys.unregister()
         for registration in registrations.values { backend.unregister(identifier: registration.identifier) }
         registrations.removeAll()
         if handlerInstalled { backend.removeHandler() }

@@ -111,6 +111,8 @@ final class LauncherModel {
     /// A hotkey registry passed in by a test, backed by a fake. It may register while the
     /// pasteboard is isolated; the real Carbon one never does.
     @ObservationIgnored let usesInjectedHotKey: Bool
+    /// Caps Lock as Hyper, when turned on. Applied only by the real app, never in tests.
+    @ObservationIgnored let hyperKey: HyperKey
     @ObservationIgnored weak var panel: LauncherPanelController?
     @ObservationIgnored var previousApplication: NSRunningApplication? {
         didSet {
@@ -136,8 +138,9 @@ final class LauncherModel {
 
     init(
         store: LibraryStore = LibraryStore(), ai: AIChatModel = AIChatModel(), pasteboard: NSPasteboard = .general,
-        registry: CommandRegistry = CommandRegistry(), hotKey: GlobalHotKey? = nil
+        registry: CommandRegistry = CommandRegistry(), hotKey: GlobalHotKey? = nil, hyperKey: HyperKey? = nil
     ) {
+        self.hyperKey = hyperKey ?? HyperKey()
         self.store = store
         self.registry = registry
         memory = LauncherMemoryStore(fileURL: LauncherMemoryStore.fileURL(besideLibrary: store.fileURL))
@@ -456,6 +459,7 @@ final class LauncherModel {
     func start() async {
         guard !isStarted else { return }
         isStarted = true
+        if clipboard.usesGeneralPasteboard { hyperKey.removeStaleRemap(store.database.preferences.hyper) }
         applyPreferences()
         await applications.refresh()
         synchronizeSelection()
@@ -469,6 +473,7 @@ final class LauncherModel {
         snippets.stop()
         files.stop()
         cancelProvidedLiveItems()
+        hyperKey.stop()
         ai.cancel()
     }
 
@@ -521,6 +526,10 @@ final class LauncherModel {
 
     func refreshPermissions() {
         accessibilityAllowed = windows.hasPermission
+        // The Hyper key follows its setting and Accessibility; the verification build never remaps keys.
+        if isStarted, clipboard.usesGeneralPasteboard {
+            hyperKey.apply(store.database.preferences.hyper, accessibilityAllowed: accessibilityAllowed)
+        }
         clipboard.refreshAccessStatus()
         loginEnabled = SMAppService.mainApp.status == .enabled
         loginNeedsApproval = SMAppService.mainApp.status == .requiresApproval

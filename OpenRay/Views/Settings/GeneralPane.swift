@@ -6,12 +6,18 @@ extension SettingsPane {
         id: "general", title: "General",
         subtitle: "How OpenRay looks and opens.",
         kind: .system, symbol: "slider.horizontal.3",
-        keywords: "appearance light dark theme bar mode compact remember last query search applications index refresh"
+        keywords: "appearance light dark theme bar mode compact remember last query search applications index refresh pop root screen display monitor return copy paste primary action history ranking reset"
     ) { model, _ in AnyView(GeneralPane(model: model)) }
 }
 
 struct GeneralPane: View {
     @Bindable var model: LauncherModel
+
+    private var popToRoot: Binding<PopToRootDelay> {
+        Binding(
+            get: { model.store.database.preferences.popToRootDelay },
+            set: { value in model.store.update { $0.preferences.popToRoot = value } })
+    }
 
     var body: some View {
         SettingsPaneScaffold(pane: .general) {
@@ -31,12 +37,43 @@ struct GeneralPane: View {
                 .settingsSwitch()
             }
             Section("Search") {
-                Toggle(isOn: model.optionalPreference(\.rememberLastQuery, default: true)) {
+                Picker(selection: popToRoot) {
+                    ForEach(PopToRootDelay.allCases) { Text($0.title).tag($0) }
+                } label: {
                     SettingRowLabel(
-                        title: "Remember the last search for 90 seconds",
-                        detail: "Reopening OpenRay shows it selected, so typing replaces it.")
+                        title: "Back to Everything",
+                        detail: "Until then, reopening OpenRay shows your last search, selected so typing replaces it.")
+                }
+                .neutralMenus()
+                Picker("Open on", selection: model.optionalPreference(\.launcherScreen, default: .mouse)) {
+                    ForEach(LauncherScreen.allCases) { Text($0.title).tag($0) }
+                }
+                .neutralMenus()
+                Picker(selection: model.optionalPreference(\.primaryAction, default: .copy)) {
+                    ForEach(PrimaryAction.allCases) { Text($0.title).tag($0) }
+                } label: {
+                    SettingRowLabel(
+                        title: "Return on clipboard items, snippets and results",
+                        detail: "⌘↩ does the other.")
+                }
+                .neutralMenus()
+                Toggle(isOn: model.optionalPreference(\.searchHistory, default: true)) {
+                    SettingRowLabel(
+                        title: "Remember searches",
+                        detail: "↑ in an empty field brings back earlier searches.")
                 }
                 .settingsSwitch()
+                LabeledContent {
+                    HStack {
+                        Button("Clear History") { model.clearSearchHistory() }
+                            .disabled(model.memory.memory.history.isEmpty)
+                        Button("Reset Ranking") { model.resetAllRanking() }
+                    }
+                } label: {
+                    SettingRowLabel(
+                        title: "Learned ranking",
+                        detail: "OpenRay ranks what you pick for a search higher the next time.")
+                }
                 LabeledContent {
                     Button(model.applications.isLoading ? "Refreshing…" : "Refresh") {
                         Task { await model.applications.refresh() }
@@ -59,5 +96,16 @@ struct GeneralPane: View {
                 }
             }
         }
+    }
+}
+
+extension LauncherModel {
+    /// A binding to an optional preference that reads `fallback` while it's unset.
+    func optionalPreference<Value>(_ path: WritableKeyPath<AppPreferences, Value?>, default fallback: Value) -> Binding<Value> {
+        Binding(
+            get: { self.store.database.preferences[keyPath: path] ?? fallback },
+            set: { value in
+                if self.store.update({ $0.preferences[keyPath: path] = value }) { self.applyPreferences() }
+            })
     }
 }
