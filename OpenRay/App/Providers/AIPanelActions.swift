@@ -6,7 +6,9 @@ extension LauncherModel {
     func slice7AIActions() -> [ActionEntry] {
         let hub = aiHub
         var entries: [ActionEntry] = []
-        if let approval = ai.environment.toolBroker?.pendingApprovals.first {
+        // A write is approved on its card, where every value it would write is shown; ⌘K
+        // offers quick answers for reads only.
+        if let approval = ai.environment.toolBroker?.pendingApprovals.first, !approval.isAction {
             let broker = ai.environment.toolBroker
             entries.append(
                 ActionEntry(id: "tool.allow", title: "Allow \(approval.title)", symbol: "checkmark.circle", group: .item) {

@@ -133,6 +133,8 @@ final class AIChatModel {
     var chatID: UUID?
     /// A chat in Recently Deleted: shown, but nothing can be sent until it's restored.
     var isReadOnly = false
+    /// Why the current reply was stopped by OpenRay rather than by the person.
+    @ObservationIgnored private var stoppedReason: String?
     /// Changes whenever this becomes a different conversation, so work that finishes later
     /// (a capture, a file read) can tell it no longer belongs here.
     private(set) var conversationToken = UUID()
@@ -304,9 +306,22 @@ final class AIChatModel {
         errorMessage = nil
     }
 
-    /// Drops a deleted agent, even mid-reply; the next request goes to the assistant.
+    /// Drops a deleted agent, even mid-reply: a reply it was writing stops, and the next
+    /// request goes to the assistant.
     func forgetAgent(_ id: UUID) {
-        if agent?.id == id { agent = nil }
+        guard agent?.id == id else { return }
+        agent = nil
+        if isGenerating {
+            cancel()
+            stoppedReason = "The agent was deleted, so its reply stopped."
+        }
+    }
+
+    /// The agent lost tools: a reply it's writing stops, so it can't read with them.
+    func agentToolsRevoked(_ id: UUID) {
+        guard agent?.id == id, isGenerating else { return }
+        cancel()
+        stoppedReason = "The agent's tools changed, so its reply stopped."
     }
 
     /// The agent as it's defined now: edits apply, and a deleted one falls back to the assistant.
@@ -419,6 +434,7 @@ final class AIChatModel {
             defer {
                 self.isGenerating = false
                 self.isCancelling = false
+                self.stoppedReason = nil
                 self.generationTask = nil
                 self.onConversationChange?()
             }
@@ -455,7 +471,9 @@ final class AIChatModel {
                 self.engine.reset()
                 self.environment.toolBroker?.declineAll()
                 if self.isCancelling || error is CancellationError {
-                    self.errorMessage = "Response stopped. The next message starts a fresh session."
+                    self.errorMessage =
+                        self.stoppedReason.map { "\($0) The next message starts a fresh session." }
+                        ?? "Response stopped. The next message starts a fresh session."
                 } else {
                     self.errorMessage = error.localizedDescription
                 }
@@ -495,9 +513,17 @@ final class AIChatModel {
         let profile = (agent ?? .assistant).profile(capabilities: capabilities, hasTools: !plan.tools.isEmpty)
         try await prepareContext(prompt: prompt, profile: profile, tools: plan.tools, before: userMessageID)
         try Task.checkCancellation()
+        // Every call is checked against the grants at that moment: a tool the person mentioned
+        // in this turn, or one the current agent still grants.
+        let mentioned = plan.mode == .required ? Set(plan.tools.map(\.id)) : []
+        let invoker = environment.toolBroker.map { broker in
+            GrantedToolInvoker(broker: broker) { [weak self] toolID in
+                mentioned.contains(toolID) || (self?.currentAgent()?.toolIDs.contains(toolID) ?? false)
+            }
+        }
         let request = AIRequest(
             prompt: prompt, images: turn?.images ?? [], profile: profile, tools: plan.tools, toolMode: plan.mode,
-            toolInvoker: plan.tools.isEmpty ? nil : environment.toolBroker, fallbackAction: .chat)
+            toolInvoker: plan.tools.isEmpty ? nil : invoker, fallbackAction: .chat)
         try await engine.stream(request, onSnapshot: onSnapshot)
     }
 
@@ -669,12 +695,15 @@ final class AIChatModel {
     }
 
     /// Stops any reply and empties the conversation, even mid-reply: its chat was deleted.
-    func detach() async {
+    /// Nothing happens when it has meanwhile become another conversation.
+    func detach(ifStill token: UUID? = nil) async {
+        guard token == nil || token == conversationToken else { return }
         isReadOnly = true
         if isGenerating {
             cancel()
             await waitForResponse()
         }
+        guard token == nil || token == conversationToken else { return }
         newConversation(action: .chat)
     }
 }

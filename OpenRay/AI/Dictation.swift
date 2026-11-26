@@ -82,7 +82,8 @@ final class SpeechDictation: AIDictating {
         audio.prepare()
         try audio.start()
         isListening = true
-        task = recognizer.recognitionTask(with: request, resultHandler: Self.handler(onText: onText, owner: self))
+        task = recognizer.recognitionTask(
+            with: request, resultHandler: Self.handler(onText: onText, owner: self, attempt: attempt))
     }
 
     /// Built outside the main actor: the audio thread calls it.
@@ -92,15 +93,17 @@ final class SpeechDictation: AIDictating {
     }
 
     /// Built outside the main actor: Speech calls it on its own queue, and it hops back.
+    /// Results from an earlier start, delivered after Stop, are dropped.
     nonisolated private static func handler(
-        onText: @escaping @MainActor (String) -> Void, owner: SpeechDictation
+        onText: @escaping @MainActor (String) -> Void, owner: SpeechDictation, attempt: UUID
     ) -> @Sendable (SFSpeechRecognitionResult?, (any Error)?) -> Void {
         { [weak owner] result, error in
             let text = result?.bestTranscription.formattedString
             let finished = error != nil || result?.isFinal == true
             Task { @MainActor in
+                guard let owner, owner.attempt == attempt else { return }
                 if let text { onText(text) }
-                if finished { owner?.stop() }
+                if finished { owner.stop() }
             }
         }
     }

@@ -144,10 +144,7 @@ private struct AIChatSettingsSection: View {
                 "Keep chats",
                 selection: Binding(
                     get: { hub.settings.chatRetention },
-                    set: { value in
-                        hub.updateSettings { $0.chatRetention = value }
-                        hub.chatStore.purge(retention: value)
-                    })
+                    set: { value in hub.setChatRetention(value) })
             ) {
                 ForEach(ChatRetention.allCases) { Text($0.title).tag($0) }
             }
@@ -162,7 +159,7 @@ private struct AIChatSettingsSection: View {
             } label: {
                 SettingRowLabel(
                     title: "\(hub.chatStore.chats.count.formatted()) saved chat\(hub.chatStore.chats.count == 1 ? "" : "s")",
-                    detail: hub.chatStore.errorMessage ?? "Saved in chats.json beside your library. Deleted chats stay in Recently Deleted for \(ChatStore.recentlyDeletedDays) days.")
+                    detail: hub.chatStore.errorMessage ?? "Saved in the AIChats folder beside your library, and carried by library backups under Other Data. Deleted chats stay in Recently Deleted for \(ChatStore.recentlyDeletedDays) days.")
             }
         } header: {
             Text("Chat")

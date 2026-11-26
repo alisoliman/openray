@@ -123,6 +123,16 @@ protocol AIToolInvoking: Sendable {
     func invoke(toolID: String, arguments: AIToolArguments) async -> String
 }
 
+/// A conversation's tools: calls go through the broker with the conversation's current grants.
+struct GrantedToolInvoker: AIToolInvoking {
+    let broker: AIToolBroker
+    let isGranted: @MainActor @Sendable (String) -> Bool
+
+    func invoke(toolID: String, arguments: AIToolArguments) async -> String {
+        await broker.invoke(toolID: toolID, arguments: arguments, isGranted: isGranted)
+    }
+}
+
 /// Where tool permissions live: `commandPreferences["ai"]["tool.<id>"]` in the app.
 @MainActor
 protocol AIToolPermissionStoring: AnyObject {
@@ -206,17 +216,29 @@ final class AIToolBroker: AIToolInvoking {
         return spec.isAction && stored == .always ? .ask : stored
     }
 
-    /// The values a call would use, labeled by parameter, longest values shortened.
+    /// The values a call would use, labeled by parameter, in full: what's approved is exactly
+    /// what's written.
     static func fields(for spec: AIToolSpec, arguments: AIToolArguments) -> [AIToolApproval.Field] {
         spec.parameters.compactMap { parameter in
             guard let value = arguments[parameter.name] else { return nil }
-            let shown = value.count > 600 ? String(value.prefix(600)) + "…" : value
-            return AIToolApproval.Field(label: parameter.name.capitalized, value: shown)
+            return AIToolApproval.Field(label: parameter.name.capitalized, value: value)
         }
     }
 
     func invoke(toolID: String, arguments: AIToolArguments) async -> String {
+        await invoke(toolID: toolID, arguments: arguments, isGranted: nil)
+    }
+
+    /// Runs a call. `isGranted`, when given, is the conversation's current grant for the tool,
+    /// asked before anything happens and again after an approval: a tool the person took away
+    /// from the agent mid-turn never runs.
+    func invoke(toolID: String, arguments: AIToolArguments, isGranted: (@MainActor (String) -> Bool)?) async -> String {
         guard let executor = executors[toolID] else { return AIToolError.unknownTool(toolID).localizedDescription }
+        let revoked = "This tool is no longer allowed in this conversation, so nothing was done."
+        if let isGranted, !isGranted(toolID) {
+            log(executor.spec, executor.describe(arguments), .declined)
+            return revoked
+        }
         let spec = executor.spec
         let detail = executor.describe(arguments)
         // An action this launch may not perform is refused before anyone is asked about it.
@@ -246,6 +268,10 @@ final class AIToolBroker: AIToolInvoking {
         if Task.isCancelled {
             log(spec, detail, .declined)
             return "The request was stopped, so nothing was done."
+        }
+        if let isGranted, !isGranted(toolID) {
+            log(spec, detail, .declined)
+            return revoked
         }
         do {
             let output = try await executor.run(arguments)

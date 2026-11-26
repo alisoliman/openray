@@ -107,8 +107,12 @@ struct ToolApprovalCards: View {
                         ForEach(Array(approval.fields.enumerated()), id: \.offset) { _, field in
                             VStack(alignment: .leading, spacing: 1) {
                                 Text(field.label).font(OR.Font.caption).foregroundStyle(OR.Color.text2)
-                                Text(field.value).font(.system(size: 12.5)).foregroundStyle(OR.Color.text)
-                                    .textSelection(.enabled).lineLimit(8).fixedSize(horizontal: false, vertical: true)
+                                // The whole value, scrollable when long.
+                                ScrollView {
+                                    Text(field.value).font(.system(size: 12.5)).foregroundStyle(OR.Color.text)
+                                        .textSelection(.enabled).frame(maxWidth: .infinity, alignment: .leading)
+                                }
+                                .frame(maxHeight: 160)
                             }
                         }
                     }
@@ -203,9 +207,18 @@ struct DictationButton: View {
         }
         base = chat.draft.isEmpty || chat.draft.hasSuffix(" ") ? chat.draft : chat.draft + " "
         isListening = true
+        // Words go only to the conversation dictation started in.
+        let token = chat.conversationToken
         Task {
             do {
-                try await dictation.start { text in chat.draft = base + text }
+                try await dictation.start { text in
+                    guard chat.conversationToken == token else {
+                        dictation.stop()
+                        isListening = false
+                        return
+                    }
+                    chat.draft = base + text
+                }
             } catch {
                 isListening = false
                 chat.report(error.localizedDescription)

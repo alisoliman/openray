@@ -30,6 +30,9 @@ final class AIHub {
         SideEffectGuard.isInert ? InertScreenCapture() as any AIScreenCapturing : LiveScreenCapture()
     @ObservationIgnored var recognizer: any TextRecognizing = VisionTextRecognizer()
     @ObservationIgnored var fileSearcher: (any AIFileSearching)?
+    /// Stand-ins for the calendar and the command path, for tests. Nil uses the launcher's.
+    @ObservationIgnored var calendarReader: (any AICalendarReading)?
+    @ObservationIgnored var commandRunner: (any AICommandRunning)?
     @ObservationIgnored var translator: (any AITextTranslating)?
     @ObservationIgnored var dictation: any AIDictating =
         SideEffectGuard.isInert ? InertDictation() as any AIDictating : SpeechDictation()
@@ -44,21 +47,53 @@ final class AIHub {
     func bind(to model: LauncherModel) -> AIHub {
         guard launcher == nil else { return self }
         launcher = model
+        if let libraryURL = model.store.fileURL { ChatStore.migrateLegacyFile(nextTo: libraryURL) }
         chatStore = ChatStore(fileURL: model.store.fileURL.map(ChatStore.url(nextTo:)))
         broker = makeBroker()
         if translator == nil { translator = TranslationServiceTranslator() }
         if let panelChat { configure(panelChat) }
         applySettings()
-        chatStore.purge(retention: settings.chatRetention)
+        applyRetention()
         return self
+    }
+
+    /// Changes how long chats are kept: saved first, then applied, so a failed save deletes nothing.
+    @discardableResult
+    func setChatRetention(_ retention: ChatRetention) -> Bool {
+        guard updateSettings({ $0.chatRetention = retention }) else { return false }
+        applyRetention()
+        return true
+    }
+
+    /// Moves chats past the retention period to Recently Deleted. An open chat that moved turns
+    /// read-only at once, like one deleted by hand.
+    func applyRetention(now: Date = .now) {
+        chatStore.purge(retention: settings.chatRetention, now: now)
+        reconcileWindowChat()
+    }
+
+    /// Makes the window's conversation match its saved chat: read-only once it's in Recently
+    /// Deleted, detached once it's gone.
+    private func reconcileWindowChat() {
+        guard let chat = windowChatStorage, let id = chat.chatID else { return }
+        switch chatStore.refusal(forSaving: id) {
+        case .inRecentlyDeleted?: chat.isReadOnly = true
+        case .removed?: detachWindowChat(if: [id])
+        case nil: break
+        }
     }
 
     /// Tools over the launcher's library. Each conversation has its own broker, so its
     /// approval cards show where it is: the panel or the window.
     func makeBroker() -> AIToolBroker? {
         guard let launcher else { return nil }
+        // The calendar My Schedule reads (Slice 6), and the launcher's own command path (Slice 5).
+        let calendarService = (launcher.registry.provider(id: "calendar") as? CalendarCommandProvider)?.service
         return AIToolBroker(
-            executors: AIToolCatalog.standard(store: launcher.store, files: fileSearcher ?? SpotlightFileSearcher()),
+            executors: AIToolCatalog.standard(
+                store: launcher.store, files: fileSearcher ?? SpotlightFileSearcher(),
+                calendar: calendarReader ?? calendarService.map { CalendarServiceReader(service: $0, store: launcher.store) },
+                commands: commandRunner ?? LauncherCommandRunner(model: launcher)),
             permissions: LibraryToolPermissions(store: launcher.store))
     }
 
@@ -166,7 +201,17 @@ final class AIHub {
             launcher.feedback = .warning(message)
             return false
         }
-        let record = agent.record(createdAt: launcher.store.database.agents.first { $0.id == agent.id }?.createdAt ?? .now)
+        let previous = launcher.store.database.agents.first { $0.id == agent.id }
+        let record = agent.record(createdAt: previous?.createdAt ?? .now)
+        defer {
+            // Tools taken away stop a reply that could still be using them.
+            let kept = Set(agent.toolIDs)
+            if let previous, !(previous.toolIDs ?? []).allSatisfy(kept.contains),
+                launcher.store.database.agents.first(where: { $0.id == agent.id })?.toolIDs == agent.toolIDs
+            {
+                for chat in [panelChat, windowChatStorage].compactMap({ $0 }) { chat.agentToolsRevoked(agent.id) }
+            }
+        }
         return launcher.store.update { database in
             if let index = database.agents.firstIndex(where: { $0.id == record.id }) {
                 database.agents[index] = record
@@ -191,6 +236,7 @@ final class AIHub {
         guard let launcher else { return false }
         let saved = launcher.store.update { database in
             database.agents.removeAll { $0.id == id }
+            // A deleted agent takes its default-agent setting with it.
             var settings = AISettings(database: database)
             if settings.defaultAgentID == id { settings.defaultAgentID = nil }
             settings.write(into: &database)
@@ -240,6 +286,7 @@ final class AIHub {
     func openChatWindow() {
         // Made before the window draws, so its view never creates state mid-update.
         _ = windowChat
+        if chatStore.reloadIfChangedOnDisk() { reconcileWindowChat() }
         windowRequests += 1
         launcher?.panel?.dismiss(restoreFocus: false)
         presentWindow?()
@@ -250,6 +297,11 @@ final class AIHub {
     @discardableResult
     func continueInChat() -> Bool {
         guard let panelChat, let state = panelChat.transferState() else { return false }
+        // The window can't take another chat mid-reply; nothing is copied or cleared then.
+        if let windowChatStorage, windowChatStorage.isGenerating {
+            launcher?.feedback = .warning("The chat window is still writing a reply. Try again when it finishes.")
+            return false
+        }
         guard saveWindowChat() else {
             launcher?.feedback = .error(saveError ?? "The chat window's conversation couldn't be saved.")
             return false
@@ -270,9 +322,19 @@ final class AIHub {
     @discardableResult
     func saveWindowChat() -> Bool {
         guard let chat = windowChatStorage, !chat.isGenerating, !chat.isReadOnly,
-            chat.messages.contains(where: { $0.role == .user }), chatStore.refusal(forSaving: chat.chatID) == nil
+            chat.messages.contains(where: { $0.role == .user })
         else {
             saveError = nil
+            return true
+        }
+        if let refusal = chatStore.refusal(forSaving: chat.chatID) {
+            // A writable conversation whose chat was deleted meanwhile: say so, rather than
+            // passing over its new messages in silence.
+            chat.isReadOnly = true
+            saveError =
+                refusal == .inRecentlyDeleted
+                ? "This chat moved to Recently Deleted, so its newest messages weren't saved. Restore it to keep them."
+                : "This chat was deleted, so its newest messages weren't saved."
             return true
         }
         guard let saved = chatStore.save(chat.conversationState(), id: chat.chatID) else {
@@ -350,9 +412,11 @@ final class AIHub {
         if let ids {
             guard let id = chat.chatID, ids.contains(id) else { return }
         }
-        // Read-only first, so a reply finishing now can't save into the deleted chat.
+        // Read-only first, so a reply finishing now can't save into the deleted chat. The reset
+        // applies only if the window still shows that conversation when it runs.
         chat.isReadOnly = true
-        Task { await chat.detach() }
+        let token = chat.conversationToken
+        Task { await chat.detach(ifStill: token) }
     }
 
     // MARK: Attachments
