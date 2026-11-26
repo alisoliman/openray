@@ -226,9 +226,24 @@ final class DeepLinkRouter: CommandProvider {
 
     // MARK: Focus (Slice 6 hook)
 
-    /// Starts a focus session for `openray://focus/start?goal=…&duration=…`, once asked and
-    /// approved. Slice 6 sets it at launch; while it's nil, Focus links say Focus isn't available.
+    /// Overrides how an approved Focus link starts its session. Nil (the app) uses Slice 6's
+    /// Focus provider, the same path its own length rows take; see `startFocus`.
     static var focusStarter: (@MainActor (_ goal: String?, _ duration: Duration?, _ model: LauncherModel) -> Void)?
+
+    /// Starts a session through Slice 6's Focus provider: its own `focus.length.<minutes>` row with
+    /// the goal, so the person's Focus preferences, categories and app blocking all apply. A link
+    /// without a duration starts one with no time limit (0), as the provider's own rows do.
+    static func startFocus(goal: String?, duration: Duration?, in model: LauncherModel) {
+        let minutes = duration.map { max(1, Int(($0.timeInterval / 60).rounded())) } ?? 0
+        let id = "focus.length.\(minutes)"
+        let row = LauncherItem(
+            id: id, title: "Start Focus", subtitle: goal ?? "", symbol: "scope", kind: .command, badge: "Focus",
+            action: .provided(
+                ProvidedRef(
+                    provider: FocusCommandProvider.registration.id, id: id, payload: String(minutes),
+                    arguments: ["goal": goal ?? ""], traits: [])))
+        model.perform(row)
+    }
 
     /// The id a Focus link's request carries in place of a command.
     static let focusCommandID = "focus.start"
@@ -236,7 +251,7 @@ final class DeepLinkRouter: CommandProvider {
     static func focusRequest(url: URL, goal: String?, duration: Duration?, source: DeepLinkSource) -> DeepLinkRequest {
         var arguments: [String: String] = [:]
         if let goal { arguments["Goal"] = goal }
-        if let duration { arguments["Minutes"] = String(Int(duration.timeInterval / 60)) }
+        if let duration { arguments["Minutes"] = String(max(1, Int((duration.timeInterval / 60).rounded()))) }
         return DeepLinkRequest(
             url: url, commandID: focusCommandID, title: "Start Focus", arguments: arguments, specs: [],
             fallbackText: nil, source: source, background: false)
@@ -269,10 +284,13 @@ final class DeepLinkRouter: CommandProvider {
         do { route = try DeepLink.parse(url) } catch { return fail(error.localizedDescription, in: model) }
         switch route {
         case .focus(let goal, let duration):
-            // Slice 6 hook: Focus sets `DeepLinkRouter.focusStarter`. Until it does, the link
-            // explains itself. A Focus link asks first like any other; see `startFocus`.
-            guard Self.focusStarter != nil else {
-                return fail("Focus sessions aren't available in this version of OpenRay yet.", in: model)
+            // Served by Slice 6's Focus provider (or `focusStarter`, when set). A Focus link asks
+            // first like any other, and is refused while Start Focus Session is turned off.
+            guard Self.focusStarter != nil || model.registry.provider(id: FocusCommandProvider.registration.id) != nil else {
+                return fail("Focus sessions aren't available in this version of OpenRay.", in: model)
+            }
+            guard !model.store.database.disabledCommandIDs.contains(FocusCommandProvider.startID) else {
+                return fail("Start Focus Session is turned off in Settings.", in: model)
             }
             return .asked(ask(Self.focusRequest(url: url, goal: goal, duration: duration, source: source), in: model))
         case .command(let commandID, let arguments, let fallbackText, let background):
@@ -442,10 +460,15 @@ final class DeepLinkRouter: CommandProvider {
     func approve(_ requestID: UUID, in model: LauncherModel) {
         guard let request = pending, request.id == requestID else { return }
         pending = nil
-        if request.commandID == Self.focusCommandID, let start = Self.focusStarter {
+        if request.commandID == Self.focusCommandID {
             model.navigate(to: .home)
             let minutes = request.arguments["Minutes"].flatMap(Int.init)
-            start(request.arguments["Goal"], minutes.map { .seconds($0 * 60) }, model)
+            let duration = minutes.map { Duration.seconds($0 * 60) }
+            if let start = Self.focusStarter {
+                start(request.arguments["Goal"], duration, model)
+            } else {
+                Self.startFocus(goal: request.arguments["Goal"], duration: duration, in: model)
+            }
             return
         }
         guard let item = Self.commandItem(withID: request.commandID, in: model),

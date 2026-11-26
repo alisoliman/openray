@@ -473,3 +473,31 @@ extension DeepLinkTests {
         #expect(started.first?.duration == .seconds(1_500))
     }
 }
+
+extension DeepLinkTests {
+    @Test("A Focus link starts a session through Slice 6's Focus provider, after asking")
+    func focusThroughProvider() throws {
+        let apps = FakeFocusApps()
+        let notices = FakeFocusNotices()
+        let controller = FocusController(apps: apps, notices: notices, runsTicker: false)
+        let focus = FocusCommandProvider(controller: controller)
+        let (model, router, _, _, _) = harness(extra: [focus])
+        let url = try #require(URL(string: "openray://focus/start?goal=Write%20the%20report&duration=40"))
+        #expect(isAsked(router.handle(url, source: browser, in: model)))
+        #expect(controller.session == nil, "Nothing starts before the question is answered")
+        pressReturn(model)
+        let session = try #require(controller.session)
+        #expect(session.configuration.goal == "Write the report")
+        #expect(session.configuration.duration == 40 * 60)
+        #expect(notices.started.count == 1)
+        try controller.complete()
+
+        // Without a duration, no time limit; with Start Focus Session turned off, refused.
+        router.handle(try #require(URL(string: "openray://focus/start?goal=Read")), source: browser, in: model)
+        pressReturn(model)
+        #expect(controller.session?.configuration.duration == nil)
+        try controller.complete()
+        model.store.update { $0.disabledCommandIDs.insert(FocusCommandProvider.startID) }
+        #expect(failure(router.handle(url, source: browser, in: model))?.contains("turned off") == true)
+    }
+}
