@@ -596,7 +596,11 @@ extension LauncherModel {
     /// read on this Mac (Slice 7's `sendFilesToAI`). The returned task ends once it's attached.
     @discardableResult
     func sendFileToAI(_ url: URL) -> Task<Void, Never> {
-        if !ai.isGenerating { ai.newConversation(action: .chat) }
+        if !ai.isGenerating {
+            // A writing command's unsent work or result is put away first, as other navigation does.
+            stashWritingSession()
+            ai.newConversation(action: .chat)
+        }
         return Task { await sendFilesToAI([url]) }
     }
 

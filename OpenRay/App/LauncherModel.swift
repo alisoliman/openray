@@ -811,8 +811,11 @@ final class LauncherModel {
     /// Writing commands always run fresh on the current selection. A query or
     /// attachment starts a new chat, unless it is the question that started the
     /// chat on screen; opening AI with neither resumes the chat as it was.
+    /// `runsCapturedSelection` (Quick Fix) runs the command at once, but only on a selection this
+    /// call just captured: never on a resumed passage, which may belong to another app.
     func openAI(
-        _ action: AIAction = .chat, prompt: String? = nil, attachment: AIAttachment? = nil, command: AICommandRun? = nil
+        _ action: AIAction = .chat, prompt: String? = nil, attachment: AIAttachment? = nil, command: AICommandRun? = nil,
+        runsCapturedSelection: Bool = false
     ) {
         // Slice 7: agents, tools and saved chats connect on first use.
         _ = aiHub
@@ -887,13 +890,23 @@ final class LauncherModel {
             switchingWhileBusy
             ? .warning("Stop the current response or wait for it to finish before switching AI commands.") : nil
         guard !switchingWhileBusy else { return }
+        // While a reply is written, its passage, attachment and target stay exactly as they are.
+        if action != .chat, ai.isGenerating {
+            if attachment != nil {
+                feedback = .warning("Stop the current response or wait for it to finish before choosing another passage.")
+            }
+            focusRequest += 1
+            return
+        }
+        var attachedFreshSelection = false
         if refusedPassage {
             ai.report(Self.passageTooLong)
         } else if let attachment {
             ai.attach(attachment)
         } else if action != .chat {
-            if ai.hasWritingWork { offerNewSelection() } else { attachSelectionFromPreviousApp() }
+            if ai.hasWritingWork { offerNewSelection() } else { attachedFreshSelection = attachSelectionFromPreviousApp() }
         }
+        if runsCapturedSelection, attachedFreshSelection, ai.canSend { ai.send() }
         if sendPrompt, let prompt, !prompt.isEmpty, action == .chat {
             // Without AI the question waits in the composer; it is never sent on its own later.
             ai.draft = prompt
@@ -936,21 +949,27 @@ final class LauncherModel {
     }
 
     /// Writing commands pick up the selected text from the app you came from. Choosing it again
-    /// over a result starts a new passage, once the selection is known to fit.
-    func attachSelectionFromPreviousApp(reportErrors: Bool = false) {
-        guard readsSelectionImplicitly || reportErrors else { return }
+    /// over a result starts a new passage, once the selection is known to fit. Returns whether
+    /// a selection was attached.
+    @discardableResult
+    func attachSelectionFromPreviousApp(reportErrors: Bool = false) -> Bool {
+        guard readsSelectionImplicitly || reportErrors else { return false }
+        // A writing reply in flight keeps its passage and target.
+        guard ai.action == .chat || !ai.isGenerating else { return false }
         do {
             let selection = try captureSelection()
             if ai.action != .chat, !ai.messages.isEmpty {
                 guard selection.text.count <= AIChatModel.inputLimit else {
                     ai.report(Self.passageTooLong)
-                    return
+                    return false
                 }
                 ai.newConversation(action: ai.action)
             }
             attachSelection(selection)
+            return ai.attachments.contains { $0.source == .selection && $0.text == selection.text }
         } catch {
             if reportErrors { feedback = .error(error.localizedDescription) }
+            return false
         }
     }
 
@@ -1002,10 +1021,12 @@ final class LauncherModel {
 
     /// Offers a selection that differs from the passage being worked on; it never replaces the
     /// work on its own (main #13's “Use as new passage”).
+    ///
+    /// The same selection is recognized by its whole identity (app, element, range and text), so
+    /// identical text selected in another app or another place is still offered.
     private func offerNewSelection() {
-        guard readsSelectionImplicitly, let selection = try? captureSelection() else { return }
-        let current = ai.attachments.first?.text ?? ai.lastSource ?? ai.draft
-        guard selection.text != current else { return }
+        guard !ai.isGenerating, readsSelectionImplicitly, let selection = try? captureSelection() else { return }
+        if let pin = aiSelectionTarget, pin.conversation == ai.conversationToken, pin.context.matches(selection) { return }
         pendingNewSelection = selection
     }
 
@@ -1023,6 +1044,8 @@ final class LauncherModel {
     }
 
     func attachClipboardToAI() {
+        // A writing reply in flight keeps its passage and target.
+        guard ai.action == .chat || !ai.isGenerating else { return }
         if let text = clipboard.readText(), !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             // A clipboard passage has nothing to replace, even when its text matches the selection.
             if ai.action != .chat {

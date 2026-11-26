@@ -1205,6 +1205,8 @@ extension LauncherModel {
                 ActionEntry(id: "chat", title: "Continue in Chat", symbol: "bubble.left.and.text.bubble.right", group: .organize)
                 { [weak self] in
                     guard let self, !self.ai.isGenerating, let text = self.ai.latestResponse?.text else { return }
+                    // The writing command keeps its work for when it's opened again.
+                    self.stashWritingSession()
                     self.ai.newConversation(action: .chat)
                     self.ai.open(.chat)
                     self.ai.attach(AIAttachment(source: .response, text: text))

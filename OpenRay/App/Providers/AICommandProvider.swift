@@ -132,9 +132,8 @@ final class AICommandProvider: CommandProvider {
     /// Placeholders are read now, after the arguments validate.
     func run(commandID: String, arguments: [String: String], in model: LauncherModel, startsWritingCommands: Bool) {
         if let action = AIWritingCommandProvider.writingActions.first(where: { "ai.\($0.id)" == commandID }) {
-            model.openAI(action)
-            // Only a fresh passage runs on its own; resumed work waits for the person.
-            if startsWritingCommands, model.ai.messages.isEmpty, model.ai.canSend { model.ai.send() }
+            // Only a selection captured by this run goes at once; resumed work waits for the person.
+            model.openAI(action, runsCapturedSelection: startsWritingCommands)
             return
         }
         guard let command = model.aiHub.aiCommands.first(where: { $0.id == commandID }) else {

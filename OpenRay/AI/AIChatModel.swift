@@ -377,6 +377,8 @@ final class AIChatModel {
     /// chip per clipboard, selection and carried-over result, and any number of files, notes,
     /// images and screens.
     func attach(_ attachment: AIAttachment) {
+        // A writing reply in flight keeps the passage it was asked about.
+        guard action == .chat || !isGenerating else { return }
         let limit = action == .chat && attachment.source.isCondensable ? Self.condensableLimit : Self.inputLimit
         guard attachment.text.count <= limit else {
             errorMessage =
@@ -397,6 +399,7 @@ final class AIChatModel {
     }
 
     func removeAttachment(_ id: AIAttachment.ID) {
+        guard action == .chat || !isGenerating else { return }
         attachments.removeAll { $0.id == id }
         // The instruction field only shows with a passage, so don't keep a hidden one.
         if action != .chat, attachments.isEmpty { instruction = "" }
