@@ -124,6 +124,11 @@ final class LauncherModel {
     @ObservationIgnored var isRecordingShortcut = false
     @ObservationIgnored var commandBindingEditorCount = 0
     @ObservationIgnored private var scopeReturnQuery: String?
+    /// Set when ↑/↓/←/→ move the selection, cleared by a new query. See `synchronizeSelection`.
+    @ObservationIgnored private(set) var selectionMovedByHand = false
+    /// Counts query changes, so a provider can tell one search from the next even when the text
+    /// is the same.
+    @ObservationIgnored private(set) var searchGeneration = 0
     @ObservationIgnored private var aiReturn: (section: LauncherSection, query: String)?
     @ObservationIgnored private var lastHiddenAt: Date?
     @ObservationIgnored private var feedbackTask: Task<Void, Never>?
@@ -226,15 +231,34 @@ final class LauncherModel {
                 return comparison == .orderedSame ? $0.0.id < $1.0.id : comparison == .orderedAscending
             }.map(\.0)
         }
-        if section == .home || section == .calculator, let calculation = Calculator.evaluate(trimmed) {
-            items.insert(
-                LauncherItem(
-                    id: "calculation", title: calculation.result, subtitle: calculation.expression,
-                    symbol: "equal", kind: .calculator, badge: "Calculator", action: .calculation(calculation)),
-                at: 0)
+        if section == .home || section == .calculator, let answer = calculatorAnswerItem(for: trimmed) {
+            // First in the list so the cap never drops it; searchGroups decides where it shows.
+            items.insert(answer, at: 0)
         }
         let shown = Self.capped(items, in: section)
         return trimmed.isEmpty ? shown : shown.map { Self.explainingMatch($0, query: trimmed) }
+    }
+
+    /// The calculator's answer for a query, as a row. With the calculator provider registered
+    /// it's the provider's row, using its settings (currency rates, rem size), and ↩, ⌘↩, ⌘K
+    /// and history go through it; otherwise a plain `.calculation` row. A words-only answer
+    /// ("time", "today") gets `CalculatorProvider.wordAnswerID`, so root search ranks it as an
+    /// ordinary row instead of putting it first.
+    private func calculatorAnswerItem(for query: String) -> LauncherItem? {
+        let provider = registry.provider(id: CalculatorProvider.registration.id) as? CalculatorProvider
+        // Only root search has results that arrive later.
+        let pending = section == .home && CalculatorProvider.isSearchPending(self)
+        if let provider {
+            return provider.answer(for: query, in: self).map {
+                CalculatorProvider.answerItem(for: $0, searchPending: pending)
+            }
+        }
+        guard let calculation = Calculator.evaluate(query) else { return nil }
+        let wordID = pending ? CalculatorProvider.pendingWordAnswerID : CalculatorProvider.wordAnswerID
+        return LauncherItem(
+            id: calculation.isAmbiguous ? wordID : CalculatorProvider.answerID,
+            title: calculation.result, subtitle: calculation.expression, symbol: "equal", kind: .calculator,
+            badge: "Calculator", action: .calculation(calculation))
     }
 
     /// Home keeps up to 45 instant rows and 20 Spotlight rows, capped separately
@@ -289,7 +313,9 @@ final class LauncherModel {
     var orderedResults: [LauncherItem] { groups.flatMap(\.items) }
     var selectedItem: LauncherItem? {
         let ordered = orderedResults
-        return ordered.first { $0.id == selectedID } ?? ordered.first
+        if let selected = ordered.first(where: { $0.id == selectedID }) { return selected }
+        let fallback = ProvisionalSelection.defaultID(in: ordered)
+        return ordered.first { $0.id == fallback }
     }
 
     /// Up to sixteen favorites (⌘1–⌘8 open the first eight) and four recents.
@@ -325,9 +351,12 @@ final class LauncherModel {
     private func searchGroups(_ items: [LauncherItem]) -> [LauncherResultGroup] {
         var groups: [LauncherResultGroup] = []
         var instant = items.filter { !$0.isLiveResult }
-        if let calculation = instant.first(where: { $0.id == "calculation" }) {
+        // A words-only calculator answer never takes the Top Hit; it follows Files and live rows.
+        let wordAnswer = instant.first { CalculatorProvider.isWordAnswer($0.id) }
+        instant.removeAll { CalculatorProvider.isWordAnswer($0.id) }
+        if let calculation = instant.first(where: { $0.id == CalculatorProvider.answerID }) {
             groups.append(LauncherResultGroup(id: "calculator", title: "Calculator", style: .calculator, items: [calculation]))
-            instant.removeAll { $0.id == "calculation" }
+            instant.removeAll { $0.id == CalculatorProvider.answerID }
         } else if let top = instant.first {
             groups.append(LauncherResultGroup(id: "top", title: "Top Hit", items: [top]))
             instant.removeFirst()
@@ -359,6 +388,9 @@ final class LauncherModel {
                 return false
             }
             groups.append(LauncherResultGroup(id: "live.\(provider.id)", title: provider.liveGroupTitle, items: rows))
+        }
+        if let wordAnswer {
+            groups.append(LauncherResultGroup(id: "calculator", title: "Calculator", items: [wordAnswer]))
         }
         groups.append(
             LauncherResultGroup(
@@ -824,7 +856,22 @@ final class LauncherModel {
 
     func synchronizeSelection() {
         let items = orderedResults
-        if !items.contains(where: { $0.id == selectedID }) { selectedID = items.first?.id }
+        // A words-only answer chosen while search was pending stays chosen once it settles.
+        if selectedID == CalculatorProvider.pendingWordAnswerID,
+            items.contains(where: { $0.id == CalculatorProvider.wordAnswerID })
+        {
+            selectedID = CalculatorProvider.wordAnswerID
+        }
+        let preferred = ProvisionalSelection.defaultID(in: items)
+        if !items.contains(where: { $0.id == selectedID }) {
+            selectedID = preferred
+        } else if !selectionMovedByHand, selectedID != preferred,
+            ProvisionalSelection.followsDefault(selectedID: selectedID, items: items)
+        {
+            // See ProvisionalSelection: an untouched selection follows the default around a
+            // words-only answer or Translate's language rows, so ↩ never lands on them by accident.
+            selectedID = preferred
+        }
     }
 
     /// Vertical movement. Grids move by row; lists move by one and wrap.
@@ -885,6 +932,7 @@ final class LauncherModel {
     /// Moving the selection by hand drops a pending confirmation and a stale error.
     /// Programmatic selection (search, delete, ⌘-numbers) keeps its feedback.
     private func selectionWillChange() {
+        selectionMovedByHand = true
         confirmation = nil
         if feedback?.style == .error || feedback?.style == .warning { feedback = nil }
     }
@@ -901,7 +949,8 @@ final class LauncherModel {
     /// Posts a VoiceOver announcement without moving focus. Medium priority
     /// keeps toasts, which are announced at high priority, in front.
     func announceForVoiceOver(_ text: String) {
-        guard NSWorkspace.shared.isVoiceOverEnabled, !text.isEmpty else { return }
+        // Never speaks from the test host or verification mode.
+        guard !SideEffectGuard.isInert, NSWorkspace.shared.isVoiceOverEnabled, !text.isEmpty else { return }
         NSAccessibility.post(
             element: NSApp as Any, notification: .announcementRequested,
             userInfo: [.announcement: text, .priority: NSAccessibilityPriorityLevel.medium.rawValue])
@@ -932,6 +981,8 @@ final class LauncherModel {
 
     private func searchChanged() {
         selectedID = nil
+        selectionMovedByHand = false
+        searchGeneration += 1
         if feedback?.style != .working { feedback = nil }
         confirmation = nil
         guard query.count <= 512 else {
