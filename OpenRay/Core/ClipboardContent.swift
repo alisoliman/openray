@@ -87,8 +87,10 @@ struct ClipboardEntry: Codable, Identifiable, Equatable, Sendable {
     /// Pinned entries are exempt from retention and the entry limit, not from the byte budget.
     var isPinned = false
     /// The formatted versions of copied text, when the source app offered them.
+    /// Kept in memory; `LibraryStore` persists it beside the images, not in `library.json`.
     var richText: ClipboardRichText?
     /// Text found in an image by on-device recognition, so image entries are searchable.
+    /// Kept in memory; `LibraryStore` persists it beside the images, not in `library.json`.
     var recognizedText: String?
 
     init(id: UUID = UUID(), text: String, copiedAt: Date = .now, sourceName: String, sourceBundleID: String? = nil) {
@@ -222,7 +224,8 @@ struct ClipboardEntry: Codable, Identifiable, Equatable, Sendable {
         sourceName = try container.decode(String.self, forKey: .sourceName)
         sourceBundleID = try container.decodeIfPresent(String.self, forKey: .sourceBundleID)
         isPinned = try container.decodeIfPresent(Bool.self, forKey: .pinned) ?? false
-        // Added with Paste As and image text recognition; older libraries have neither.
+        // Formatting and recognized text live in side files. Early test builds wrote them
+        // inline, so they're still read here if present.
         richText = try container.decodeIfPresent(ClipboardRichText.self, forKey: .rich)
         recognizedText = try container.decodeIfPresent(String.self, forKey: .recognizedText)
         // Version 1 entries contained only a `text` field, without a kind tag.
@@ -243,8 +246,6 @@ struct ClipboardEntry: Codable, Identifiable, Equatable, Sendable {
         try container.encode(sourceName, forKey: .sourceName)
         try container.encodeIfPresent(sourceBundleID, forKey: .sourceBundleID)
         if isPinned { try container.encode(true, forKey: .pinned) }
-        if let richText, !richText.isEmpty { try container.encode(richText, forKey: .rich) }
-        try container.encodeIfPresent(recognizedText, forKey: .recognizedText)
         switch content {
         case .text(let text):
             try container.encode("text", forKey: .kind)
@@ -591,6 +592,9 @@ struct ClipboardRetentionPolicy: Equatable, Sendable {
     static let itemRange = 1...5_000
 
     var retention: ClipboardRetention
+    /// Days to keep, or nil for no limit. Usually `retention.days`; a saved day count
+    /// that isn't one of the choices is kept exactly.
+    var retentionDays: Int?
     var maximumItems: Int
     var byteBudget: Int
 
@@ -598,14 +602,27 @@ struct ClipboardRetentionPolicy: Equatable, Sendable {
         retention: ClipboardRetention = .default, maximumItems: Int = 100,
         byteBudget: Int = ClipboardLimits.historyBytes
     ) {
+        self.init(retentionDays: retention.days, maximumItems: maximumItems, byteBudget: byteBudget)
         self.retention = retention
+    }
+
+    init(retentionDays: Int?, maximumItems: Int, byteBudget: Int = ClipboardLimits.historyBytes) {
+        retention = retentionDays.map(ClipboardRetention.init(days:)) ?? .unlimited
+        self.retentionDays = retentionDays.map { max(1, $0) }
         self.maximumItems = min(Self.itemRange.upperBound, max(Self.itemRange.lowerBound, maximumItems))
         self.byteBudget = max(0, byteBudget)
     }
 
+    /// The policy saved preferences describe. An explicit choice wins over the day
+    /// count older builds store, which stays the default (7 days).
+    init(preferences: AppPreferences) {
+        let days = preferences.clipboardRetention.map(\.days) ?? preferences.clipboardRetentionDays
+        self.init(retentionDays: days, maximumItems: min(500, preferences.clipboardLimit))
+    }
+
     /// Entries copied at or before this moment have expired. Nil when they never do.
     func cutoff(now: Date) -> Date? {
-        retention.days.map { now.addingTimeInterval(-Double($0) * 86_400) }
+        retentionDays.map { now.addingTimeInterval(-Double($0) * 86_400) }
     }
 
     /// The entries to keep, in their original order (newest first).

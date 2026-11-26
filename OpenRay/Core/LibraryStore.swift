@@ -33,10 +33,21 @@ final class LibraryStore {
                 "Your library could not be loaded. The original file is untouched. \(error.localizedDescription)"
             return
         }
+        // Formatting and recognized text are kept beside the images.
+        for index in database.clipboard.indices {
+            let entry = database.clipboard[index]
+            if entry.richText == nil, case .text = entry.content {
+                database.clipboard[index].richText = images.richText(for: entry.id)
+            }
+            if entry.recognizedText == nil, let image = entry.image {
+                database.clipboard[index].recognizedText = images.recognizedText(forImage: image.id)
+            }
+        }
         // An interrupted image capture can leave a PNG that no saved entry owns.
         // Only a successfully decoded library can authorize removing those files.
         do {
             try images.reconcile(keeping: database.clipboard.compactMap(\.image))
+            try images.reconcileSideData(keeping: database.clipboard)
         } catch {
             errorMessage =
                 "Your library was loaded, but some unused clipboard images could not be removed: \(error.localizedDescription)"
@@ -93,7 +104,10 @@ final class LibraryStore {
                 Task { await ClipboardImageProcessor.shared.forget(removedImages) }
             }
             errorMessage = nil
-            do { try images.reconcile(keeping: next.clipboard.compactMap(\.image)) } catch {
+            do {
+                try images.reconcile(keeping: next.clipboard.compactMap(\.image))
+                try images.reconcileSideData(keeping: next.clipboard)
+            } catch {
                 errorMessage =
                     "The library was saved, but some unused clipboard images could not be removed: \(error.localizedDescription)"
             }
@@ -259,7 +273,30 @@ final class LibraryStore {
                 "The last copy wasn't saved: pinned entries fill the \(budget) clipboard budget. Unpin some to keep new copies."
             return false
         }
-        return update(insert)
+        guard update(insert) else { return false }
+        // Formatting is optional: if its file can't be written, the copy is still saved.
+        if case .text = entry.content, let stored = database.clipboard.first(where: { $0.content == entry.content }) {
+            if let richText = stored.richText {
+                try? images.saveRichText(richText, for: stored.id)
+            } else {
+                // A recopy without formatting mustn't bring back an earlier copy's.
+                images.removeRichText(for: stored.id)
+            }
+        }
+        return true
+    }
+
+    /// Saves text recognized in a captured image beside it, and makes the entries
+    /// showing that image searchable by it. False when no entry shows the image.
+    @discardableResult
+    func setRecognizedText(_ text: String, forImage imageID: String) -> Bool {
+        guard !isReadOnly, database.clipboard.contains(where: { $0.image?.id == imageID }) else { return false }
+        do { try images.saveRecognizedText(text, forImage: imageID) } catch { return false }
+        return update { database in
+            for index in database.clipboard.indices where database.clipboard[index].image?.id == imageID {
+                database.clipboard[index].recognizedText = text
+            }
+        }
     }
 
     @discardableResult
@@ -301,31 +338,10 @@ final class LibraryStore {
     }
 
     private static func pruneClipboard(in database: inout LibraryDatabase, now: Date) {
-        let cutoff = now.addingTimeInterval(-Double(max(1, database.preferences.clipboardRetentionDays)) * 86_400)
         let previousIDs = Set(database.clipboard.map { "clipboard.\($0.id)" })
-        var unpinned = 0
-        let limit = max(1, min(500, database.preferences.clipboardLimit))
-        // Pinned entries are exempt from retention and the entry count, but not the byte budget.
-        let candidates = database.clipboard.filter { entry in
-            if entry.isPinned { return true }
-            guard entry.copiedAt > cutoff, unpinned < limit else { return false }
-            unpinned += 1
-            return true
-        }
-        // Pinned entries claim the budget first, so newer captures can't push
-        // them out. Within each pass the newest entries win.
-        var bytes = 0
-        var kept = Set<UUID>()
-        for pinned in [true, false] {
-            for entry in candidates where entry.isPinned == pinned {
-                let cost = max(0, entry.byteCount)
-                if cost <= ClipboardLimits.historyBytes - bytes {
-                    bytes += cost
-                    kept.insert(entry.id)
-                }
-            }
-        }
-        database.clipboard = candidates.filter { kept.contains($0.id) }
+        // Pinned entries are exempt from retention and the entry count, but not the byte budget,
+        // which they claim first. Within each pass the newest entries win.
+        database.clipboard = ClipboardRetentionPolicy(preferences: database.preferences).prune(database.clipboard, now: now)
         let expiredIDs = previousIDs.subtracting(database.clipboard.map { "clipboard.\($0.id)" })
         database.favoriteIDs.subtract(expiredIDs)
         database.usage.removeAll { expiredIDs.contains($0.id) }

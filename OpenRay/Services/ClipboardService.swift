@@ -72,6 +72,9 @@ final class ClipboardService {
     @ObservationIgnored private let captureContext: @MainActor () -> ClipboardCaptureContext
     @ObservationIgnored private var previousPolicy: CapturePolicy?
     @ObservationIgnored private let sideEffects: SideEffectGuard
+    @ObservationIgnored private let textRecognizer: (any TextRecognizing)?
+    /// Text recognition for the last captured image, while it runs. Tests await it.
+    @ObservationIgnored private(set) var pendingRecognition: Task<Void, Never>?
 
     private struct CapturePolicy: Equatable {
         var enabled: Bool
@@ -84,10 +87,12 @@ final class ClipboardService {
         store: LibraryStore, pasteboard: NSPasteboard = .general,
         imageProcessor: any ClipboardImagePreparing = ClipboardImageProcessor.shared,
         captureContext: @escaping @MainActor () -> ClipboardCaptureContext = ClipboardCaptureContext.current,
+        textRecognizer: (any TextRecognizing)? = VisionTextRecognizer(),
         sideEffects: SideEffectGuard = .current
     ) {
         self.store = store
         self.sideEffects = sideEffects
+        self.textRecognizer = textRecognizer
         let pasteboard = Self.pasteboard(for: pasteboard, sideEffects: sideEffects)
         self.pasteboard = pasteboard
         self.imageProcessor = imageProcessor
@@ -189,9 +194,11 @@ final class ClipboardService {
                 guard !Task.isCancelled, generation == captureGeneration, store.database.preferences.clipboardEnabled,
                     store.database.preferences.capturesClipboardImages
                 else { return }
-                if !store.captureImage(
+                if store.captureImage(
                     prepared, copiedAt: copiedAt, sourceName: source.sourceName, sourceBundleID: source.sourceBundleID)
                 {
+                    recognizeText(in: prepared)
+                } else {
                     contentMessage = store.captureRejection
                 }
             } else if let data = pasteboard.data(forType: .string) {
@@ -218,6 +225,39 @@ final class ClipboardService {
     }
 
     func readText() -> String? { pasteboard.string(forType: .string) }
+
+    /// Text in an entry's image, recognized now if it wasn't at capture, and saved.
+    func recognizedText(of entry: ClipboardEntry) async -> String? {
+        guard let image = entry.image, let png = store.imageData(for: image) else { return nil }
+        let recognizer = textRecognizer ?? VisionTextRecognizer()
+        guard let text = try? await recognizer.recognizeText(in: png).storableText else { return nil }
+        store.setRecognizedText(text, forImage: image.id)
+        return text
+    }
+
+    /// The payloads of QR codes and barcodes in an entry's image.
+    func barcodePayloads(of entry: ClipboardEntry) async -> [String] {
+        guard let image = entry.image, let png = store.imageData(for: image) else { return [] }
+        let recognizer = textRecognizer ?? VisionTextRecognizer()
+        return (try? await recognizer.barcodePayloads(in: png)) ?? []
+    }
+
+    /// Finds text in a captured image on this Mac, off the main actor, and saves it
+    /// beside the image so the entry is searchable by it. Images already recognized are skipped.
+    private func recognizeText(in prepared: PreparedClipboardImage) {
+        guard let textRecognizer else { return }
+        let imageID = prepared.image.id
+        guard !store.database.clipboard.contains(where: { $0.image?.id == imageID && $0.recognizedText != nil }) else {
+            return
+        }
+        let png = prepared.png
+        pendingRecognition = Task { [weak self] in
+            guard let result = try? await textRecognizer.recognizeText(in: png), !Task.isCancelled,
+                let text = result.storableText
+            else { return }
+            self?.store.setRecognizedText(text, forImage: imageID)
+        }
+    }
 
     /// The current text for `{clipboard}`, read now and only when asked, with the
     /// same concealed and transient checks capture uses.

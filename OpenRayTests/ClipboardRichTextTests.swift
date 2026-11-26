@@ -233,18 +233,18 @@ struct ClipboardRichTextTests {
 
     // MARK: Storage
 
-    @Test func richFieldsRoundTripAndOlderEntriesStillDecode() throws {
+    @Test func formattingAndRecognizedTextStayOutOfTheLibraryJSON() throws {
         var entry = ClipboardEntry(text: "Bold", copiedAt: Date(timeIntervalSince1970: 100), sourceName: "Fixture")
         entry.richText = ClipboardRichText(rtf: sampleRTF, html: sampleHTML)
-        let data = try JSONEncoder().encode(entry)
-        #expect(try JSONDecoder().decode(ClipboardEntry.self, from: data) == entry)
+        entry.recognizedText = "ignored"
+        let json = String(decoding: try JSONEncoder().encode(entry), as: UTF8.self)
+        #expect(!json.contains("rich") && !json.contains("recognizedText"))
+        let decoded = try JSONDecoder().decode(ClipboardEntry.self, from: Data(json.utf8))
+        #expect(decoded.richText == nil && decoded.recognizedText == nil && decoded.plainText == "Bold")
 
         let old = Data(#"{"id":"\#(UUID().uuidString)","kind":"text","text":"Old","copiedAt":0,"sourceName":"App"}"#.utf8)
-        let decoded = try JSONDecoder().decode(ClipboardEntry.self, from: old)
-        #expect(decoded.richText == nil && decoded.recognizedText == nil && decoded.plainText == "Old")
-
-        let plainJSON = String(decoding: try JSONEncoder().encode(ClipboardEntry(text: "x", sourceName: "A")), as: UTF8.self)
-        #expect(!plainJSON.contains("rich") && !plainJSON.contains("recognizedText"))
+        let older = try JSONDecoder().decode(ClipboardEntry.self, from: old)
+        #expect(older.richText == nil && older.recognizedText == nil && older.plainText == "Old")
     }
 
     @Test func recognizedTextMakesImagesSearchable() throws {
@@ -252,8 +252,6 @@ struct ClipboardRichTextTests {
         var entry = ClipboardEntry(content: .image(image), sourceName: "Preview")
         entry.recognizedText = "Quarterly invoice"
         #expect(entry.searchableText.contains("Quarterly invoice"))
-        let data = try JSONEncoder().encode(entry)
-        #expect(try JSONDecoder().decode(ClipboardEntry.self, from: data).recognizedText == "Quarterly invoice")
         #expect(entry.isValid)
         entry.recognizedText = String(repeating: "x", count: ClipboardLimits.recognizedTextBytes + 1)
         #expect(!entry.isValid)
