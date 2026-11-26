@@ -559,7 +559,7 @@ extension LauncherModel {
             switch item.action {
             case .quicklink(let link, _): database.quicklinks.removeAll { $0.id == link.id }
             case .snippet(let snippet): database.snippets.removeAll { $0.id == snippet.id }
-            case .note(let note): database.notes.removeAll { $0.id == note.id }
+            case .note(let note): database.moveNoteToRecentlyDeleted(note.id)
             case .clipboard(let entry): database.clipboard.removeAll { $0.id == entry.id }
             default: return
             }

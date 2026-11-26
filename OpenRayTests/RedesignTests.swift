@@ -541,7 +541,9 @@ struct RedesignTests {
         #expect(model.store.database.favoriteIDs.contains(itemID))
         model.goBack()
         #expect(model.editor == nil)
-        #expect(model.store.database.notes.isEmpty)
+        // Closing moves it to Recently Deleted, recoverable for 60 days, not out of the library.
+        #expect(model.store.database.liveNotes.isEmpty)
+        #expect(model.store.database.notes.first?.isDeleted == true)
         #expect(!model.store.database.favoriteIDs.contains(itemID))
         #expect(!model.store.database.usage.contains { $0.id == itemID })
         model.files.stop()
