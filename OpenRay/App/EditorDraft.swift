@@ -40,8 +40,9 @@ final class EditorDraft {
             tags = item.tagList
             application = item.openWith
         case .snippet(let item):
+            // Old snippets open in the new syntax, escaped, so saving keeps their text literal.
             values = (
-                item.name, item.keyword, item.content, item.expandsAsYouType,
+                item.name, item.keyword, item.editableContent, item.expandsAsYouType,
                 !store.database.snippets.contains { $0.id == item.id }, nil
             )
             tags = item.tagList
@@ -188,13 +189,19 @@ final class EditorDraft {
         return (link, samples)
     }
 
-    var quicklinkPreview: (url: String, valid: Bool) {
+    /// The link the preview shows and Test opens, resolved with the samples and
+    /// nothing live: clipboard, selection and history placeholders render empty.
+    var quicklinkTest: (url: URL, openWith: QuicklinkApplication?)? {
         let sample = quicklinkSample
         let snippets = Dictionary(
-            (store?.database.snippets ?? []).map { ($0.name, $0.content) }, uniquingKeysWith: { first, _ in first })
-        if let url = try? sample.link.resolution(arguments: sample.arguments, values: PlaceholderValues(snippets: snippets)).url {
-            return (url.absoluteString, true)
-        }
+            (store?.database.snippets ?? []).map { ($0.name, $0.referenceSource()) }, uniquingKeysWith: { first, _ in first })
+        guard let url = try? sample.link.resolution(arguments: sample.arguments, values: PlaceholderValues(snippets: snippets)).url
+        else { return nil }
+        return (url, sample.link.openWith)
+    }
+
+    var quicklinkPreview: (url: String, valid: Bool) {
+        if let test = quicklinkTest { return (test.url.absoluteString, true) }
         return (content.isEmpty ? "https://example.com/search?q={query}" : content, false)
     }
 
@@ -226,6 +233,7 @@ final class EditorDraft {
             item.content = content
             item.expandsKeyword = expandsKeyword ? nil : false
             item.tags = tagList.isEmpty ? nil : tagList
+            item.placeholderVersion = Snippet.currentPlaceholderVersion
             saved = store.save(item)
         case .note:
             return saveNote()

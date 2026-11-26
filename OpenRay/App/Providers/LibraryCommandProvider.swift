@@ -75,9 +75,8 @@ final class LibraryCommandProvider: CommandProvider {
         // A snippet with fields runs as copy or paste, as ↩ and ⌘↩ do on its row.
         let snippets: [CommandDescriptor] = database.snippets.flatMap { snippet -> [CommandDescriptor] in
             live.insert(snippet.id)
-            let specs = fields(for: snippet.id, source: snippet.content, lookup: lookup) {
-                snippet.template.plan(snippets: lookup)
-            }
+            guard let template = snippet.dynamicTemplate else { return [] }
+            let specs = fields(for: snippet.id, source: snippet.content, lookup: lookup) { template.plan(snippets: lookup) }
             guard !specs.isEmpty else { return [] }
             return [ContentPrimaryAction.copy, .paste].map { action in
                 CommandDescriptor(
@@ -106,6 +105,12 @@ final class LibraryCommandProvider: CommandProvider {
             return []
         }
         let built = plan()
+        // An over-budget plan records no references, so it's never cached: repairing
+        // a referenced snippet must bring its fields back.
+        guard !built.issues.contains(.tooComplex) else {
+            fieldCache[id] = nil
+            return []
+        }
         let references = Dictionary(uniqueKeysWithValues: built.requirements.snippets.map { ($0, lookup($0)) })
         fieldCache[id] = (source, references, built.argumentSpecs)
         return built.argumentSpecs

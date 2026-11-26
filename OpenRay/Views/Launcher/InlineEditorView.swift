@@ -87,11 +87,11 @@ struct InlineEditorView: View {
         }
     }
 
-    /// Opens the link with the preview's sample values and its Open With app, through
-    /// the guarded opener, which is inert in tests and verification.
+    /// Opens exactly the link the preview shows, in its Open With app, through the
+    /// guarded opener, which is inert in tests and verification.
     private func testQuicklink() {
-        let sample = draft.quicklinkSample
-        model.testQuicklink(sample.link, arguments: sample.arguments)
+        guard let test = draft.quicklinkTest else { return }
+        model.testQuicklink(test.url, openWith: test.openWith)
     }
 
     private func pasteNote() {

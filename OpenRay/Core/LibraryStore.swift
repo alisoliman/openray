@@ -38,8 +38,9 @@ final class LibraryStore {
         for index in database.clipboard.indices {
             let entry = database.clipboard[index]
             if let digest = entry.richTextDigest {
+                // A file that can't be read now keeps its reference, so it's never cleaned
+                // up, and a later read (the next launch, or a copy) can still use it.
                 database.clipboard[index].richText = images.richText(digest: digest)
-                if database.clipboard[index].richText == nil { database.clipboard[index].richTextDigest = nil }
             } else if let richText = entry.richText {
                 database.clipboard[index].richTextDigest = try? images.saveRichText(richText)
             }
@@ -333,6 +334,9 @@ final class LibraryStore {
 
     func imageResource(for image: ClipboardImage) -> ClipboardImageResource? { images.resource(for: image) }
     func imageData(for image: ClipboardImage) -> Data? { images.data(for: image) }
+
+    /// Formatting for an entry whose side file couldn't be read when the library loaded.
+    func richText(digest: String) -> ClipboardRichText? { images.richText(digest: digest) }
 
     func pruneClipboard(now: Date = .now) {
         var next = database

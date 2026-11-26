@@ -27,10 +27,12 @@ extension ClipboardPolicy {
     /// pasteboard generation, unless macOS denies access, Secure Input is on, or the
     /// copy is marked concealed, transient or auto-generated. OpenRay's own copies are fine.
     @MainActor static func placeholderText(
-        from pasteboard: NSPasteboard, secureInput: Bool = IsSecureEventInputEnabled()
+        from pasteboard: NSPasteboard, secureInput: Bool = IsSecureEventInputEnabled(), expectedGeneration: Int? = nil
     ) -> String? {
         guard !secureInput, pasteboard.accessBehavior != .alwaysDeny else { return nil }
         let generation = pasteboard.changeCount
+        // The generation the caller already judged, e.g. for its source app, or nothing.
+        if let expectedGeneration, generation != expectedGeneration { return nil }
         let types = Set((pasteboard.types ?? []).map(\.rawValue))
         guard ignoredTypes.subtracting(["com.openray.generated"]).isDisjoint(with: types),
             types.contains(NSPasteboard.PasteboardType.string.rawValue),
@@ -88,6 +90,9 @@ final class ClipboardService {
     /// The pasteboard generation last copied from an excluded app, so `{clipboard}`
     /// never inserts it. Known only while capture runs.
     @ObservationIgnored private var excludedGeneration: Int?
+    /// The last generation whose source app is known: classified by the capture poll,
+    /// or written by OpenRay itself.
+    @ObservationIgnored private var attributedGeneration: Int?
     /// Text recognition for the last captured image, while it runs. Tests await it.
     @ObservationIgnored private(set) var pendingRecognition: Task<Void, Never>?
 
@@ -167,8 +172,10 @@ final class ClipboardService {
                 secureInput: source.secureInput)
         else {
             excludedGeneration = change
+            attributedGeneration = change
             return
         }
+        attributedGeneration = change
         let types = Set((pasteboard.types ?? []).map(\.rawValue))
         guard
             ClipboardPolicy.shouldCapture(
@@ -280,10 +287,16 @@ final class ClipboardService {
 
     /// The current text for `{clipboard}`, read now and only when asked, with the
     /// same concealed and transient checks capture uses.
-    func placeholderText() -> String? {
+    /// The current text for `{clipboard}`. A copy known to come from an excluded app is
+    /// never returned. With `unattributedIsExcluded`, as for quicklinks, which send it
+    /// elsewhere, a copy the capture poll hasn't attributed to an app yet isn't either.
+    /// The decision and the read are tied to one pasteboard generation.
+    func placeholderText(unattributedIsExcluded: Bool = false) -> String? {
         refreshAccessStatus()
-        guard pasteboard.changeCount != excludedGeneration else { return nil }
-        return ClipboardPolicy.placeholderText(from: pasteboard)
+        let generation = pasteboard.changeCount
+        guard generation != excludedGeneration else { return nil }
+        if unattributedIsExcluded, generation != attributedGeneration { return nil }
+        return ClipboardPolicy.placeholderText(from: pasteboard, expectedGeneration: generation)
     }
 
     /// The board a service uses: a private one instead of the general pasteboard
@@ -358,6 +371,9 @@ final class ClipboardService {
     @discardableResult
     func copy(_ entry: ClipboardEntry, as format: ClipboardPasteFormat) -> Bool {
         lastCopyError = nil
+        var entry = entry
+        // Formatting that couldn't be read at launch is tried again now.
+        if entry.richText == nil, let digest = entry.richTextDigest { entry.richText = store.richText(digest: digest) }
         guard entry.isValid else {
             lastCopyError = "This saved clipboard entry is invalid."
             return false
@@ -395,6 +411,7 @@ final class ClipboardService {
         pasteboard.clearContents()
         let success = pasteboard.writeObjects(items)
         lastChange = pasteboard.changeCount
+        attributedGeneration = lastChange
         return success
     }
 }

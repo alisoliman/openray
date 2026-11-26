@@ -155,7 +155,7 @@ struct PreviewPane: View {
                 ("Keyword", snippet.keyword.isEmpty ? "None" : snippet.keyword),
                 ("Expands as you type", expansion(of: snippet)),
             ]
-            let arguments = snippet.template.arguments
+            let arguments = snippet.dynamicTemplate?.arguments ?? []
             if !arguments.isEmpty { rows.append(("Asks for", arguments.map(\.title).joined(separator: ", "))) }
             if !snippet.tagList.isEmpty { rows.append(("Tags", snippet.tagList.joined(separator: ", "))) }
             return rows

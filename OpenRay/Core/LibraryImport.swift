@@ -31,8 +31,9 @@ struct ImportedSnippet: Codable, Equatable, Sendable {
         self.keyword = keyword?.isEmpty == true ? nil : keyword
     }
 
+    /// Exports write the new syntax; an old snippet's other placeholders are escaped.
     init(_ snippet: Snippet) {
-        self.init(name: snippet.name, text: snippet.content, keyword: snippet.keyword)
+        self.init(name: snippet.name, text: snippet.editableContent, keyword: snippet.keyword)
     }
 }
 
@@ -297,9 +298,12 @@ extension LibraryImport {
     ) -> SnippetImportPlan {
         var plan = SnippetImportPlan()
         // Hashed, so a 10,000-row file is planned in linear time.
-        func key(_ snippet: ImportedSnippet) -> String {
-            [snippet.name, snippet.text, snippet.keyword ?? ""].joined(separator: "\u{0}")
+        struct Key: Hashable {
+            var name: String
+            var text: String
+            var keyword: String?
         }
+        func key(_ snippet: ImportedSnippet) -> Key { Key(name: snippet.name, text: snippet.text, keyword: snippet.keyword) }
         var known = Set(existing.map { key(ImportedSnippet($0)) })
         func isDuplicate(_ candidate: ImportedSnippet) -> Bool { known.contains(key(candidate)) }
         func add(_ snippet: ImportedSnippet) {
@@ -360,10 +364,13 @@ extension LibraryImport {
                 plan.skippedConflicts.append(item)
             case .replaceExisting:
                 plan.keywordConflicts.append(item)
+                // A superseded row no longer counts as planned.
                 if let holder {
+                    for old in plan.replacements where old.existingID == holder { known.remove(key(old.snippet)) }
                     plan.replacements.removeAll { $0.existingID == holder }
                     plan.replacements.append(.init(existingID: holder, snippet: item))
                 } else if let earlier {
+                    known.remove(key(plan.additions[earlier]))
                     plan.additions[earlier] = item
                 }
                 known.insert(key(item))
