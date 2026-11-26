@@ -95,7 +95,11 @@ enum ChatRetention: String, CaseIterable, Identifiable, Sendable {
 final class ChatStore {
     /// Deleted chats stay this long before they're gone for good.
     static let recentlyDeletedDays = 30
-    static let fileName = "chats.json"
+    /// The folder beside library.json that holds the chats, and the one file in it. Archives
+    /// carry it as a portable store (`LibraryArchive.portableStores`, Other Data).
+    nonisolated static let folderName = "AIChats"
+    nonisolated static let fileName = "chats.json"
+    nonisolated static var archivePath: String { "\(folderName)/\(fileName)" }
 
     private(set) var chats: [SavedChat] = []
     /// Why chats can't be saved, such as an unreadable file. Nil when all is well.
@@ -105,6 +109,8 @@ final class ChatStore {
     @ObservationIgnored let fileURL: URL?
     /// Makes every write fail with this reason, so tests can check nothing is lost.
     @ObservationIgnored var writeFailureForTesting: String?
+    /// The file's modification date when this store last read or wrote it.
+    @ObservationIgnored private var knownModification: Date?
 
     private struct File: Codable {
         var version = 1
@@ -117,9 +123,52 @@ final class ChatStore {
         load()
     }
 
-    /// `chats.json` beside the library file.
-    static func url(nextTo libraryURL: URL) -> URL {
-        libraryURL.deletingLastPathComponent().appending(path: fileName)
+    /// `AIChats/chats.json` beside the library file.
+    nonisolated static func url(nextTo libraryURL: URL) -> URL {
+        libraryURL.deletingLastPathComponent().appending(path: folderName, directoryHint: .isDirectory).appending(path: fileName)
+    }
+
+    /// Moves chats an earlier build kept directly beside the library into their folder, once.
+    nonisolated static func migrateLegacyFile(nextTo libraryURL: URL) {
+        let legacy = libraryURL.deletingLastPathComponent().appending(path: fileName)
+        let current = url(nextTo: libraryURL)
+        let manager = FileManager.default
+        guard manager.fileExists(atPath: legacy.path), !manager.fileExists(atPath: current.path),
+            let data = try? Data(contentsOf: legacy), isReadable(data)
+        else { return }
+        try? manager.createDirectory(at: current.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try? manager.moveItem(at: legacy, to: current)
+    }
+
+    // MARK: Archives
+
+    /// The store's read rule: a chats file this build can open and write.
+    nonisolated static func isReadable(_ data: Data) -> Bool { decode(data).map { $0.version <= 1 } ?? false }
+
+    /// The chats file an import writes. Replace takes the archive's chats; Merge keeps the ones
+    /// here and adds the archive's, an archived chat replacing one here with the same id. Nil
+    /// when the archive's file can't be read.
+    nonisolated static func combined(existing: Data?, incoming: Data, merging: Bool) -> Data? {
+        guard let archived = decode(incoming), archived.version <= 1 else { return nil }
+        var chats = archived.chats
+        if merging, let existing, let current = decode(existing), current.version <= 1 {
+            let incomingIDs = Set(archived.chats.map(\.id))
+            chats = current.chats.filter { !incomingIDs.contains($0.id) } + archived.chats
+        }
+        return encode(File(chats: chats))
+    }
+
+    nonisolated private static func decode(_ data: Data) -> File? {
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+        return try? decoder.decode(File.self, from: data)
+    }
+
+    nonisolated private static func encode(_ file: File) -> Data? {
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .iso8601
+        encoder.outputFormatting = [.sortedKeys]
+        return try? encoder.encode(file)
     }
 
     // MARK: Reading
@@ -272,9 +321,10 @@ final class ChatStore {
     /// a fresh model session, rebuilt from those messages.
     @discardableResult
     func branch(_ id: UUID, through messageID: UUID, now: Date = .now) -> SavedChat? {
-        guard let source = self.chat(id: id), let index = source.messages.firstIndex(where: { $0.id == messageID }) else {
-            return nil
-        }
+        // A chat in Recently Deleted stays there until it's restored; it isn't copied out.
+        guard let source = self.chat(id: id), !source.isDeleted,
+            let index = source.messages.firstIndex(where: { $0.id == messageID })
+        else { return nil }
         let messages = Array(source.messages[...index])
         let keepsSummary = source.summarizedMessageCount <= messages.count
         let branch = SavedChat(
@@ -286,6 +336,7 @@ final class ChatStore {
     }
 
     /// Applies the retention setting and empties Recently Deleted of chats older than thirty days.
+    /// The hub calls it (`AIHub.applyRetention`), so an open chat that moves is reconciled.
     func purge(retention: ChatRetention, now: Date = .now) {
         let calendar = Calendar.current
         var next = chats
@@ -316,15 +367,40 @@ final class ChatStore {
         for (order, index) in pinned.enumerated() { chats[index].pinOrder = order }
     }
 
-    /// Writes `next`, then publishes it. Nothing changes when the write fails.
+    /// Writes `next`, then publishes it. Nothing changes when the write fails. A file replaced
+    /// on disk since it was read (an archive import) is never written over: the store reads it
+    /// again and refuses this change.
     @discardableResult
     private func commit(_ next: [SavedChat]) -> Bool {
+        if reloadIfChangedOnDisk() {
+            errorMessage = "Your chats were replaced on disk, such as by an import, so they were read again. Try once more."
+            return false
+        }
         guard persist(next) else { return false }
         chats = next
+        knownModification = Self.modificationDate(of: fileURL)
         return true
     }
 
+    /// Reads the file again when it changed on disk since this store last read or wrote it.
+    /// True when it did.
+    @discardableResult
+    func reloadIfChangedOnDisk() -> Bool {
+        guard let fileURL, Self.modificationDate(of: fileURL) != knownModification else { return false }
+        isReadOnly = false
+        errorMessage = nil
+        chats = []
+        load()
+        return true
+    }
+
+    private static func modificationDate(of url: URL?) -> Date? {
+        guard let url else { return nil }
+        return (try? FileManager.default.attributesOfItem(atPath: url.path))?[.modificationDate] as? Date
+    }
+
     private func load() {
+        knownModification = Self.modificationDate(of: fileURL)
         guard let fileURL, FileManager.default.fileExists(atPath: fileURL.path) else { return }
         do {
             let data = try Data(contentsOf: fileURL)
