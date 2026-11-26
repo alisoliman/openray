@@ -292,10 +292,13 @@ protocol HTTPDataLoading: Sendable {
     func data(from url: URL) async throws -> (Data, URLResponse)
 }
 
+/// The live network adapter. Inert in the test host and in verification mode.
 struct URLSessionDataLoader: HTTPDataLoading {
     private static let session = URLSession(configuration: .ephemeral)
+    var sideEffects: SideEffectGuard = .current
 
     func data(from url: URL) async throws -> (Data, URLResponse) {
+        try sideEffects.check("downloading currency rates")
         var request = URLRequest(url: url, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: 20)
         request.httpShouldHandleCookies = false
         return try await Self.session.data(for: request)
@@ -358,9 +361,26 @@ private final class ECBRateReader: NSObject, XMLParserDelegate {
     }
 }
 
-/// The last downloaded rates, kept on disk so conversions work offline.
+/// Answers nothing: the rate source while side effects are off.
+struct InertRateProvider: CurrencyRateProvider {
+    var sideEffects: SideEffectGuard = .current
+
+    func fetchRates() async throws -> CurrencyRateTable {
+        try sideEffects.check("downloading currency rates")
+        throw CurrencyRateError.unreadable
+    }
+}
+
+/// The last downloaded rates, kept on disk so conversions work offline. A cache without a
+/// file reads nothing and writes nothing.
 struct CurrencyRateCache: Sendable {
-    var fileURL: URL
+    var fileURL: URL?
+
+    /// The app's cache, or none in the test host and verification mode, so they never read
+    /// the person's saved rates.
+    static func standard(_ sideEffects: SideEffectGuard = .current) -> CurrencyRateCache {
+        CurrencyRateCache(fileURL: sideEffects.isInert ? nil : defaultURL)
+    }
 
     static var defaultURL: URL {
         FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
@@ -369,13 +389,14 @@ struct CurrencyRateCache: Sendable {
     }
 
     func load() -> CurrencyRateTable? {
-        guard let data = try? Data(contentsOf: fileURL) else { return nil }
+        guard let fileURL, let data = try? Data(contentsOf: fileURL) else { return nil }
         let decoder = JSONDecoder()
         decoder.dateDecodingStrategy = .iso8601
         return try? decoder.decode(CurrencyRateTable.self, from: data)
     }
 
     func save(_ table: CurrencyRateTable) throws {
+        guard let fileURL else { return }
         try FileManager.default.createDirectory(
             at: fileURL.deletingLastPathComponent(), withIntermediateDirectories: true)
         let encoder = JSONEncoder()
@@ -404,8 +425,7 @@ final class CurrencyRateStore {
 
     init(
         isEnabled: Bool = false, provider: any CurrencyRateProvider = ECBRateProvider(),
-        cache: CurrencyRateCache = CurrencyRateCache(fileURL: CurrencyRateCache.defaultURL),
-        now: @escaping @Sendable () -> Date = { Date() }
+        cache: CurrencyRateCache = .standard(), now: @escaping @Sendable () -> Date = { Date() }
     ) {
         self.isEnabled = isEnabled
         self.provider = provider

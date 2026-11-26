@@ -120,7 +120,10 @@ final class LauncherModel {
     @ObservationIgnored var commandBindingEditorCount = 0
     @ObservationIgnored private var scopeReturnQuery: String?
     /// Set when ↑/↓/←/→ move the selection, cleared by a new query. See `synchronizeSelection`.
-    @ObservationIgnored private var selectionMovedByHand = false
+    @ObservationIgnored private(set) var selectionMovedByHand = false
+    /// Counts query changes, so a provider can tell one search from the next even when the text
+    /// is the same.
+    @ObservationIgnored private(set) var searchGeneration = 0
     @ObservationIgnored private var aiReturn: (section: LauncherSection, query: String)?
     @ObservationIgnored private var lastHiddenAt: Date?
     @ObservationIgnored private var feedbackTask: Task<Void, Never>?
@@ -235,10 +238,10 @@ final class LauncherModel {
     /// ordinary row instead of putting it first.
     private func calculatorAnswerItem(for query: String) -> LauncherItem? {
         let provider = registry.provider(id: CalculatorProvider.registration.id) as? CalculatorProvider
-        guard let calculation = Calculator.evaluate(query, context: provider?.context(in: self) ?? .live) else {
-            return nil
+        if let provider {
+            return provider.answer(for: query, in: self).map(CalculatorProvider.answerItem(for:))
         }
-        if provider != nil { return CalculatorProvider.answerItem(for: calculation) }
+        guard let calculation = Calculator.evaluate(query) else { return nil }
         return LauncherItem(
             id: calculation.isAmbiguous ? CalculatorProvider.wordAnswerID : CalculatorProvider.answerID,
             title: calculation.result, subtitle: calculation.expression, symbol: "equal", kind: .calculator,
@@ -924,7 +927,8 @@ final class LauncherModel {
     /// Posts a VoiceOver announcement without moving focus. Medium priority
     /// keeps toasts, which are announced at high priority, in front.
     func announceForVoiceOver(_ text: String) {
-        guard NSWorkspace.shared.isVoiceOverEnabled, !text.isEmpty else { return }
+        // Never speaks from the test host or verification mode.
+        guard !SideEffectGuard.isInert, NSWorkspace.shared.isVoiceOverEnabled, !text.isEmpty else { return }
         NSAccessibility.post(
             element: NSApp as Any, notification: .announcementRequested,
             userInfo: [.announcement: text, .priority: NSAccessibilityPriorityLevel.medium.rawValue])
@@ -956,6 +960,7 @@ final class LauncherModel {
     private func searchChanged() {
         selectedID = nil
         selectionMovedByHand = false
+        searchGeneration += 1
         if feedback?.style != .working { feedback = nil }
         confirmation = nil
         guard query.count <= 512 else {

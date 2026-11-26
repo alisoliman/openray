@@ -3,10 +3,12 @@ import Foundation
 /// The calculator's commands, answer rows, history and currency rates.
 ///
 /// Root search and the Calculator scope show one answer for the query. `LauncherModel` builds
-/// it with `answerItem(for:)`: an unambiguous answer ("2 + 3", "5pm ldn in sf") is the
+/// it from `answer(for:in:)`: an unambiguous answer ("2 + 3", "5pm ldn in sf") is the
 /// calculator card on top; a words-only one ("time", "today") is an ordinary row that never
-/// takes the Top Hit. ↩ copies and ⌘↩ pastes through `AnswerDelivery`, and both record the
-/// calculation in the history (`LibraryDatabase.calculatorHistory`).
+/// takes the Top Hit, and while search results are still arriving its ↩ waits for them, so a
+/// file or app named like the word gets ↩ instead. Each search's answer is a snapshot: the card,
+/// ↩, ⌘↩ and the history all use the value that was shown. ↩ copies and ⌘↩ pastes through
+/// `AnswerDelivery`, and both record the calculation in `LibraryDatabase.calculatorHistory`.
 @MainActor
 final class CalculatorProvider: CommandProvider {
     nonisolated static let registration = CommandProviderRegistration(
@@ -20,6 +22,12 @@ final class CalculatorProvider: CommandProvider {
 
     nonisolated static let historyID = "calculator.history"
     nonisolated static let refreshID = "calculator.refreshCurrencies"
+    /// History rows per page, under the launcher's 100-row scope cap with room for paging rows.
+    nonisolated static let historyPageSize = 98
+    /// How long ↩ on a words-only answer waits for pending search results.
+    nonisolated static let pendingSearchWait: Duration = .milliseconds(800)
+    /// How often an open launcher checks whether opted-in rates are due.
+    nonisolated static let staleCheckInterval: TimeInterval = 3_600
 
     static let historyScope = ProvidedScope(
         id: historyID, provider: "calculator", title: "Calculator History", symbol: "clock.arrow.circlepath",
@@ -36,14 +44,33 @@ final class CalculatorProvider: CommandProvider {
 
     /// The opt-in daily reference rates. Off until the owner turns them on in Settings.
     let rates: CurrencyRateStore
-    /// Only the app's provider sets `CalculatorSettings`; providers built in tests leave it alone.
+    /// Only the app's provider in a normal launch sets `CalculatorSettings`.
     private let publishesSettings: Bool
     private let now: () -> Date
     private var isConfigured = false
+    private var lastStaleCheck: Date?
+    private var snapshot: (key: SnapshotKey, calculation: Calculation?)?
+    private var pendingActivation: Task<Void, Never>?
 
-    init() {
-        rates = CurrencyRateStore()
-        publishesSettings = true
+    /// What makes an answer current: the query, the search it belongs to and the settings.
+    private struct SnapshotKey: Equatable {
+        var query: String
+        var search: Int
+        var presentation: Int
+        var rates: Date?
+        var pixelsPerEm: Double
+    }
+
+    /// The app's provider. In the test host and verification mode it neither reads the saved
+    /// rates nor fetches new ones.
+    init(sideEffects: SideEffectGuard = .current) {
+        if sideEffects.isInert {
+            rates = CurrencyRateStore(provider: InertRateProvider(sideEffects: sideEffects), cache: CurrencyRateCache(fileURL: nil))
+            publishesSettings = false
+        } else {
+            rates = CurrencyRateStore()
+            publishesSettings = true
+        }
         now = { Date() }
     }
 
@@ -64,20 +91,28 @@ final class CalculatorProvider: CommandProvider {
             .map { min(max($0, 8), 32) } ?? 16
     }
 
-    /// Turns the daily rates on or off, saves the choice and fetches when they're due.
+    /// Turns the daily rates on or off, saves the choice, re-registers hotkeys for the
+    /// Refresh Currencies command it adds or removes, and fetches when rates are due.
     func setCurrencyRates(_ enabled: Bool, in model: LauncherModel) {
         guard model.store.update({
             $0.commandPreferences[Self.preferencesKey, default: [:]][Self.currencyRatesKey] = enabled ? "on" : "off"
-        }) else { return }
+        }) else {
+            model.feedback = .error(model.store.errorMessage ?? "Couldn't save the setting.")
+            return
+        }
         rates.isEnabled = enabled
         publish(in: model)
+        model.commandCatalogDidChange()
         if enabled { refresh(in: model, force: false) }
     }
 
     func setPixelsPerEm(_ pixels: Double, in model: LauncherModel) {
         guard model.store.update({
             $0.commandPreferences[Self.preferencesKey, default: [:]][Self.pixelsPerEmKey] = Calculator.format(pixels)
-        }) else { return }
+        }) else {
+            model.feedback = .error(model.store.errorMessage ?? "Couldn't save the setting.")
+            return
+        }
         publish(in: model)
     }
 
@@ -90,20 +125,38 @@ final class CalculatorProvider: CommandProvider {
         }
     }
 
-    /// What calculations see: the rates when they're on, and the rem size.
+    /// What calculations see: this provider's clock, the rates when they're on, and the rem size.
     func context(in model: LauncherModel) -> CalculatorContext {
         configure(model)
+        checkForStaleRates(in: model)
         return CalculatorContext(
-            currencyRates: rates.activeRates, pixelsPerEm: Self.pixelsPerEm(in: model.store.database))
+            now: now(), currencyRates: rates.activeRates, pixelsPerEm: Self.pixelsPerEm(in: model.store.database))
     }
 
-    /// Reads the saved choice the first time the launcher asks, then fetches if rates are due.
+    /// While the launcher is in use, checks at most hourly whether opted-in rates are due.
+    private func checkForStaleRates(in model: LauncherModel) {
+        guard rates.isEnabled, !rates.isRefreshing, rates.isStale else { return }
+        let date = now()
+        if let lastStaleCheck, date.timeIntervalSince(lastStaleCheck) < Self.staleCheckInterval { return }
+        lastStaleCheck = date
+        refresh(in: model, force: false)
+    }
+
+    /// Reads the saved choice the first time the launcher asks, fetches if rates are due, and
+    /// drops expired history.
     private func configure(_ model: LauncherModel) {
         guard !isConfigured else { return }
         isConfigured = true
         rates.isEnabled = Self.currencyRatesEnabled(in: model.store.database)
         publish(in: model)
-        if rates.isEnabled { refresh(in: model, force: false) }
+        if rates.isEnabled {
+            lastStaleCheck = now()
+            refresh(in: model, force: false)
+        }
+        Task { [weak self, weak model] in
+            guard let self, let model else { return }
+            self.pruneHistory(in: model)
+        }
     }
 
     private func publish(in model: LauncherModel) {
@@ -112,10 +165,24 @@ final class CalculatorProvider: CommandProvider {
             .init(currencyRates: rates.activeRates, pixelsPerEm: Self.pixelsPerEm(in: model.store.database)))
     }
 
-    // MARK: Answer rows
+    // MARK: Answers
 
-    /// The answer row for a calculation. Its ref carries the typed expression; the provider
-    /// evaluates it again to act, so the row stays a plain value.
+    /// The answer for the current search, computed once: until the query, the search, the
+    /// panel's showing, the rates or the rem size change, the same value is shown, copied,
+    /// pasted and recorded.
+    func answer(for query: String, in model: LauncherModel) -> Calculation? {
+        let context = context(in: model)
+        let key = SnapshotKey(
+            query: query, search: model.searchGeneration, presentation: model.presentation,
+            rates: context.currencyRates?.fetchedAt, pixelsPerEm: context.pixelsPerEm)
+        if let snapshot, snapshot.key == key { return snapshot.calculation }
+        let calculation = Calculator.evaluate(query, context: context)
+        snapshot = (key, calculation)
+        return calculation
+    }
+
+    /// The answer row for a calculation. Its ref carries the typed expression; actions read the
+    /// search's snapshot, so they use the value the row shows.
     static func answerItem(for calculation: Calculation) -> LauncherItem {
         LauncherItem(
             id: calculation.isAmbiguous ? wordAnswerID : answerID, title: calculation.result,
@@ -126,10 +193,10 @@ final class CalculatorProvider: CommandProvider {
                     copyText: calculation.value, primaryTitle: "Copy Answer", traits: [.paste])))
     }
 
-    /// The calculation behind an answer or history row.
+    /// The calculation behind an answer row.
     func calculation(for ref: ProvidedRef, in model: LauncherModel) -> Calculation? {
         guard ref.id == "answer", let expression = ref.payload else { return nil }
-        return Calculator.evaluate(expression, context: context(in: model))
+        return answer(for: expression, in: model)
     }
 
     // MARK: Commands
@@ -161,19 +228,45 @@ final class CalculatorProvider: CommandProvider {
 
     // MARK: History scope
 
-    func scopeItems(_ scope: ProvidedScope, query: String, in model: LauncherModel) -> [LauncherItem] {
-        guard scope.id == Self.historyID else { return [] }
-        return historyItems(in: model)
+    /// The history within its three months, newest first.
+    func history(in model: LauncherModel) -> CalculatorHistory {
+        var history = CalculatorHistory(records: model.store.database.calculatorHistory)
+        history.prune(now: now())
+        return history
     }
 
-    func historyItems(in model: LauncherModel) -> [LauncherItem] {
+    /// Saves the history without expired entries, when any have expired.
+    @discardableResult
+    func pruneHistory(in model: LauncherModel) -> Bool {
+        let kept = history(in: model).records
+        guard kept.count != model.store.database.calculatorHistory.count else { return true }
+        return model.store.update { $0.calculatorHistory = kept }
+    }
+
+    func scopeItems(_ scope: ProvidedScope, query: String, in model: LauncherModel) -> [LauncherItem] {
+        guard scope.id == Self.historyID else { return [] }
+        // Opening History directly also loads settings and drops expired entries.
+        configure(model)
+        return historyItems(in: model, query: query, page: scope.arguments["page"].flatMap(Int.init) ?? 0)
+    }
+
+    /// History rows. Browsing pages through every kept entry, with rows for newer and older
+    /// pages; a search looks through all of them.
+    func historyItems(in model: LauncherModel, query: String = "", page: Int = 0) -> [LauncherItem] {
         let today = now()
         let relative = RelativeDateTimeFormatter()
         relative.unitsStyle = .abbreviated
         relative.dateTimeStyle = .named
-        return CalculatorHistory(records: model.store.database.calculatorHistory).entries.map { entry in
+        let history = history(in: model)
+        let entries = query.isEmpty ? history.entries : history.matching(query)
+        let pages = max(1, (entries.count + Self.historyPageSize - 1) / Self.historyPageSize)
+        let page = query.isEmpty ? min(max(page, 0), pages - 1) : 0
+        let shown = query.isEmpty
+            ? Array(entries.dropFirst(page * Self.historyPageSize).prefix(Self.historyPageSize))
+            : Array(entries.prefix(Self.historyPageSize))
+        var items = shown.map { entry in
             LauncherItem(
-                id: "calculator.history.\(entry.id.uuidString)", title: entry.result, subtitle: entry.expression,
+                id: "calculator-history.\(entry.id.uuidString)", title: entry.result, subtitle: entry.expression,
                 symbol: "equal", kind: .calculator, badge: relative.localizedString(for: entry.date, relativeTo: today),
                 keywords: "\(entry.expression) \(entry.value)",
                 action: .provided(
@@ -181,6 +274,20 @@ final class CalculatorProvider: CommandProvider {
                         provider: id, id: "history", payload: entry.id.uuidString, copyText: entry.value,
                         primaryTitle: "Copy Answer", traits: [.paste, .delete])))
         }
+        if query.isEmpty, page > 0 {
+            items.insert(pageItem(page - 1, title: "Newer Calculations", symbol: "chevron.up"), at: 0)
+        }
+        if query.isEmpty, page < pages - 1 {
+            items.append(pageItem(page + 1, title: "Older Calculations", symbol: "chevron.down"))
+        }
+        return items
+    }
+
+    private func pageItem(_ page: Int, title: String, symbol: String) -> LauncherItem {
+        LauncherItem(
+            id: "calculator-history-page.\(page)", title: title, subtitle: "Page \(page + 1)", symbol: symbol,
+            kind: .calculator, badge: "History",
+            action: .provided(ProvidedRef(provider: id, id: "historyPage", payload: "\(page)", primaryTitle: "Show \(title)", traits: [])))
     }
 
     func emptyState(for scope: ProvidedScope, query: String, isLoading: Bool, in model: LauncherModel)
@@ -227,24 +334,29 @@ final class CalculatorProvider: CommandProvider {
                 }
             }
         case "answer":
-            guard let calculation = calculation(for: ref, in: model) else { return }
-            if AnswerDelivery.primary(calculation.value, label: calculation.value, in: model) {
-                record(calculation, in: model)
-            }
+            activate(item, ref: ref, secondary: false, in: model)
         case "history":
             guard let text = ref.copyText else { return }
             AnswerDelivery.primary(text, label: item.title, in: model)
+        case "historyPage":
+            var scope = Self.historyScope
+            scope.arguments = ["page": ref.payload ?? "0"]
+            model.navigate(to: .provided(scope))
         default: break
         }
     }
 
     func primaryTitle(for item: LauncherItem, ref: ProvidedRef, in model: LauncherModel) -> String? {
-        guard ref.id == "answer" || ref.id == "history" else { return nil }
+        guard ref.id == "answer" || ref.id == "history" else { return ref.primaryTitle }
         return AnswerDelivery.primaryTitle(copy: "Copy Answer", in: model)
     }
 
     func primarySymbol(for item: LauncherItem, ref: ProvidedRef, in model: LauncherModel) -> String? {
-        ref.id == "answer" || ref.id == "history" ? "doc.on.doc" : nil
+        switch ref.id {
+        case "answer", "history": "doc.on.doc"
+        case "historyPage": "arrow.right.circle"
+        default: nil
+        }
     }
 
     func secondaryTitle(for item: LauncherItem, ref: ProvidedRef, in model: LauncherModel) -> String? {
@@ -255,16 +367,65 @@ final class CalculatorProvider: CommandProvider {
     func performSecondary(_ item: LauncherItem, ref: ProvidedRef, in model: LauncherModel) {
         switch ref.id {
         case "answer":
-            guard let calculation = calculation(for: ref, in: model) else { return }
-            if AnswerDelivery.secondary(calculation.value, label: calculation.value, in: model) {
-                record(calculation, in: model)
-            }
+            activate(item, ref: ref, secondary: true, in: model)
         case "history":
             guard let text = ref.copyText else { return }
             AnswerDelivery.secondary(text, label: item.title, in: model)
         default: break
         }
     }
+
+    // MARK: Words-only answers while search is pending
+
+    /// Whether a words-only answer is only first because other results haven't arrived yet.
+    static func isProvisional(_ item: LauncherItem, in model: LauncherModel) -> Bool {
+        item.id == wordAnswerID && !model.selectionMovedByHand && isSearchPending(model)
+    }
+
+    static func isSearchPending(_ model: LauncherModel) -> Bool {
+        model.files.isSearching || model.isLoadingProvidedItems
+    }
+
+    /// ↩ and ⌘↩ on an answer. A words-only answer that was only selected because nothing else
+    /// had arrived waits, up to `pendingSearchWait`, for search to settle, then acts on whatever
+    /// is selected: a file or app named like the word if one arrived, else the answer.
+    private func activate(_ item: LauncherItem, ref: ProvidedRef, secondary: Bool, in model: LauncherModel) {
+        guard Self.isProvisional(item, in: model) else {
+            deliver(ref, secondary: secondary, in: model)
+            return
+        }
+        guard pendingActivation == nil else { return }
+        let search = model.searchGeneration
+        pendingActivation = Task { [weak self, weak model] in
+            let deadline = ContinuousClock.now.advanced(by: Self.pendingSearchWait)
+            while let model, Self.isSearchPending(model), ContinuousClock.now < deadline, !Task.isCancelled {
+                try? await Task.sleep(for: .milliseconds(20))
+            }
+            guard let self else { return }
+            self.pendingActivation = nil
+            guard let model, model.searchGeneration == search, !Task.isCancelled else { return }
+            model.synchronizeSelection()
+            guard let selected = model.selectedItem else { return }
+            if selected.id == Self.wordAnswerID, case .provided(let ref) = selected.action {
+                self.deliver(ref, secondary: secondary, in: model)
+            } else if secondary {
+                model.paste(selected)
+            } else {
+                model.perform(selected)
+            }
+        }
+    }
+
+    private func deliver(_ ref: ProvidedRef, secondary: Bool, in model: LauncherModel) {
+        guard let calculation = calculation(for: ref, in: model) else { return }
+        let delivered =
+            secondary
+            ? AnswerDelivery.secondary(calculation.value, label: calculation.value, in: model)
+            : AnswerDelivery.primary(calculation.value, label: calculation.value, in: model)
+        if delivered { record(calculation, in: model) }
+    }
+
+    // MARK: Actions
 
     func actions(for item: LauncherItem, ref: ProvidedRef, in model: LauncherModel) -> [ActionEntry] {
         switch ref.id {
@@ -391,11 +552,15 @@ final class CalculatorProvider: CommandProvider {
                     confirmTitle: "Clear History", symbol: "trash")
             ) { [weak model] in
                 guard let model else { return }
-                if model.store.update({ $0.calculatorHistory = [] }) { model.toast("Cleared Calculator History") }
+                if model.store.update({ $0.calculatorHistory = [] }) {
+                    model.toast("Cleared Calculator History")
+                } else {
+                    model.feedback = .error(model.store.errorMessage ?? "Couldn't clear the history.")
+                }
             })
     }
 
-    /// Keeps a copied or pasted answer in the history.
+    /// Keeps a copied or pasted answer in the history, dropping expired entries in the same save.
     func record(_ calculation: Calculation, in model: LauncherModel) {
         var history = CalculatorHistory(records: model.store.database.calculatorHistory)
         let date = now()
@@ -406,15 +571,14 @@ final class CalculatorProvider: CommandProvider {
 }
 
 extension LauncherItem {
-    /// The calculation a calculator row shows: the provider's answer row, or a built-in
-    /// `.calculation`. Nil for every other row.
+    /// The calculation a calculator row shows: the provider's answer row (the search's
+    /// snapshot), or a built-in `.calculation`. Nil for every other row.
     @MainActor func calculatorAnswer(in model: LauncherModel) -> Calculation? {
         switch action {
         case .calculation(let calculation): return calculation
         case .provided(let ref) where ref.provider == CalculatorProvider.registration.id:
             let provider = model.registry.provider(id: ref.provider) as? CalculatorProvider
-            return provider?.calculation(for: ref, in: model)
-                ?? ref.payload.flatMap { Calculator.evaluate($0) }
+            return provider?.calculation(for: ref, in: model) ?? ref.payload.flatMap { Calculator.evaluate($0) }
         default: return nil
         }
     }

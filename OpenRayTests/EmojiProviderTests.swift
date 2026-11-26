@@ -8,12 +8,13 @@ import Testing
 struct EmojiProviderTests {
     private let pasteboard = NSPasteboard.withUniqueName()
 
-    private func setUp() -> (EmojiProvider, LauncherModel) {
+    private func setUp(store: LibraryStore = LibraryStore(fileURL: nil)) -> (EmojiProvider, LauncherModel) {
         let provider = EmojiProvider(catalog: .bundled, now: { CalculatorClock.now })
         let model = LauncherModel(
-            store: LibraryStore(fileURL: nil), ai: AIChatModel(engine: TestAIEngine()), pasteboard: pasteboard,
+            store: store, ai: AIChatModel(engine: TestAIEngine()), pasteboard: pasteboard,
             registry: CommandRegistry(providers: [provider]))
         model.navigate(to: .provided(EmojiProvider.scope))
+        model.files.stop()
         return (provider, model)
     }
 
@@ -23,31 +24,52 @@ struct EmojiProviderTests {
         model.synchronizeSelection()
     }
 
-    @Test func browsingShowsEveryCategoryAsAGrid() throws {
-        let (_, model) = setUp()
-        defer { model.stop() }
-        let groups = model.groups
-        #expect(groups.first?.id == "emoji.smileys-emotion")
-        #expect(groups.last?.id == "emoji.shapes")
-        #expect(groups.allSatisfy { $0.style == .grid && $0.columns == GridColumns.defaultCount && $0.tile != nil })
-        // The whole catalog, past the launcher's 100-row scope cap.
-        #expect(groups.flatMap(\.items).count == EmojiCatalog.bundled.entries.count)
-        #expect(model.selectedItem?.title == "😀")
+    private func browse(_ model: LauncherModel, _ title: String) throws {
+        let tile = try #require(model.orderedResults.first { $0.title == title }, "\(title)")
+        model.perform(tile)
+        model.files.stop()
+        model.synchronizeSelection()
     }
 
-    @Test func repeatedTilesHaveSectionScopedIDs() throws {
+    // MARK: Browsing through the shared pipeline
+
+    @Test func theFirstScreenShowsPinsFrequentAndCategories() throws {
         let (provider, model) = setUp()
         defer { model.stop() }
+        #expect(model.groups.map(\.id) == ["emoji.categories"])
+        #expect(model.results.count == EmojiCategory.allCases.count)
+        #expect(model.groups.first?.columns == GridColumns.defaultCount)
         provider.update(in: model) {
             $0.togglePin("🔥")
             $0.recordUse("🔥", at: CalculatorClock.now)
             $0.recordUse("🍕", at: CalculatorClock.now)
         }
-        let groups = model.groups
-        #expect(groups.map(\.id).prefix(3) == ["emoji.pinned", "emoji.frequent", "emoji.smileys-emotion"])
-        let ids = groups.flatMap(\.items).map(\.id)
+        #expect(model.groups.map(\.id) == ["emoji.pinned", "emoji.frequent", "emoji.categories"])
+        #expect(model.groups[1].items.map(\.title) == ["🍕"])
+        let ids = model.orderedResults.map(\.id)
         #expect(Set(ids).count == ids.count)
-        #expect(ids.contains("emoji.pinned.🔥") && ids.contains("emoji.travel-places.🔥"))
+    }
+
+    @Test func largeCategoriesPageUnderTheScopeCap() throws {
+        let (_, model) = setUp()
+        defer { model.stop() }
+        try browse(model, "People & Body")
+        let total = EmojiCatalog.bundled.entries(in: .peopleBody).count
+        #expect(total > 100)
+        var seen: [String] = []
+        for page in 0..<((total + EmojiProvider.pageSize - 1) / EmojiProvider.pageSize) {
+            #expect(model.results.count <= 100)
+            let tiles = model.orderedResults.filter { $0.id.hasPrefix("emoji-tile.") }
+            seen += tiles.map(\.title)
+            let titled = try #require(model.groups.first { $0.id == "emoji.people-body" }?.title)
+            #expect(titled.hasPrefix("People & Body · \(page * EmojiProvider.pageSize + 1)–"))
+            if seen.count < total { try browse(model, "More") }
+        }
+        #expect(seen.count == total)
+        #expect(model.orderedResults.contains { $0.title == "More" } == false)
+        try browse(model, "Previous")
+        try browse(model, "All Categories")
+        #expect(model.groups.map(\.id) == ["emoji.categories"])
     }
 
     @Test func searchRanksResultsInOneGroup() throws {
@@ -56,10 +78,42 @@ struct EmojiProviderTests {
         search(model, "thumbs up")
         #expect(model.groups.map(\.id) == ["emoji.results"])
         #expect(model.selectedItem?.title == "👍")
+        #expect(model.results.count <= EmojiProvider.pageSize)
         search(model, "zzqx")
         #expect(model.groups.isEmpty)
         #expect(model.providedEmptyState(for: EmojiProvider.scope).title.contains("zzqx"))
     }
+
+    @Test func oversizedPastesAreNotSearched() {
+        let (_, model) = setUp()
+        defer { model.stop() }
+        search(model, String(repeating: "smile ", count: 20))
+        #expect(model.results.isEmpty)
+        #expect(model.providedEmptyState(for: EmojiProvider.scope).title == "That's too long to search")
+        search(model, String(repeating: "x", count: 600))
+        #expect(model.results.isEmpty)
+    }
+
+    @Test func aGlobalAliasStillWins() throws {
+        let (_, model) = setUp()
+        defer { model.stop() }
+        #expect(model.store.saveCommandBinding(CommandBinding(targetID: EmojiProvider.searchID, alias: "zz")))
+        search(model, "zz")
+        #expect(model.results.map(\.id) == [EmojiProvider.searchID])
+        #expect(model.selectedItem?.id == EmojiProvider.searchID)
+    }
+
+    @Test func gridArrowsMoveByTheGroupsColumns() throws {
+        let (_, model) = setUp()
+        defer { model.stop() }
+        let first = try #require(model.groups.first)
+        model.moveSelection(1)
+        #expect(model.selectedID == first.items[GridColumns.defaultCount].id)
+        model.moveSelectionHorizontally(1)
+        #expect(model.selectedID == first.items[GridColumns.defaultCount + 1].id)
+    }
+
+    // MARK: ↩, ⌘↩ and ⌘K
 
     @Test func returnCopiesAndRecordsUse() throws {
         let (_, model) = setUp()
@@ -70,7 +124,6 @@ struct EmojiProviderTests {
         let record = try #require(model.store.database.emojiUsage.first { $0.id == "👍" })
         #expect(record.count == 1)
         #expect(record.lastUsed == CalculatorClock.now)
-        // ⌘↩ is the paste hook; the isolated pasteboard copies.
         let item = try #require(model.selectedItem)
         #expect(model.secondaryTitle(for: item) != nil)
         model.pasteSelected()
@@ -85,22 +138,46 @@ struct EmojiProviderTests {
         #expect(model.selectedItem?.title == "👍🏽")
         model.performSelected()
         #expect(pasteboard.string(forType: .string) == "👍🏽")
-        // Usage stays on the base emoji.
         #expect(model.store.database.emojiUsage.map(\.id) == ["👍"])
         #expect(model.store.database.commandPreferences["emoji.search"]?["skinTone"] == "3")
     }
 
-    @Test func actionsPinZoomAndCopyTones() throws {
+    @Test func skinToneActionsOpenAChooserBeforeCopyingOrPasting() throws {
         let (_, model) = setUp()
         defer { model.stop() }
         search(model, "thumbs up")
-        let item = try #require(model.selectedItem)
-        let actions = model.actions(for: item)
-        let ids = actions.map(\.id)
-        #expect(ids.contains("emoji.pasteTone") && ids.contains("emoji.copyTone") && ids.contains("emoji.copyUnicode"))
-        #expect(actions.first { $0.id == "emoji.copyTone" }?.children.count == SkinTone.allCases.count)
-        try #require(actions.first { $0.id == "emoji.copyTone" }?.children.last).perform()
+        let thumbs = try #require(model.selectedItem)
+        let actions = model.actions(for: thumbs)
+        let paste = try #require(actions.first { $0.id == "emoji.pasteTone" })
+        #expect(paste.children.count == SkinTone.allCases.count)
+        // The real entry point (keyboard, action panel, context menu) runs the parent.
+        paste.perform()
+        #expect(pasteboard.string(forType: .string) == nil)
+        #expect(model.section.providedScope?.id == EmojiProvider.tonesID)
+        model.files.stop()
+        #expect(model.results.map(\.title) == ["👍", "👍🏻", "👍🏼", "👍🏽", "👍🏾", "👍🏿"])
+        #expect(model.groups.first?.columns == SkinTone.allCases.count)
+        #expect(pasteboard.string(forType: .string) == nil)
+
+        model.navigate(to: .provided(EmojiProvider.scope))
+        search(model, "thumbs up")
+        let again = try #require(model.selectedItem)
+        try #require(model.actions(for: again).first { $0.id == "emoji.copyTone" }).perform()
+        model.files.stop()
+        let dark = try #require(model.results.last)
+        model.selectedID = dark.id
+        model.performSelected()
         #expect(pasteboard.string(forType: .string) == "👍🏿")
+        #expect(model.section.providedScope?.id == EmojiProvider.searchID)
+        #expect(model.store.database.emojiUsage.first { $0.id == "👍" }?.count == 1)
+    }
+
+    @Test func pinZoomAndUnicode() throws {
+        let (_, model) = setUp()
+        defer { model.stop() }
+        search(model, "thumbs up")
+        let thumbs = try #require(model.selectedItem)
+        let actions = model.actions(for: thumbs)
         try #require(actions.first { $0.id == "emoji.copyUnicode" }).perform()
         #expect(pasteboard.string(forType: .string) == "U+1F44D")
         try #require(actions.first { $0.id == "emoji.pin" }).perform()
@@ -110,16 +187,6 @@ struct EmojiProviderTests {
         search(model, "")
         #expect(model.groups.first?.id == "emoji.pinned")
         #expect(model.groups.first?.columns == 7)
-    }
-
-    @Test func gridArrowsMoveByTheGroupsColumns() throws {
-        let (_, model) = setUp()
-        defer { model.stop() }
-        let first = try #require(model.groups.first)
-        model.moveSelection(1)
-        #expect(model.selectedID == first.items[GridColumns.defaultCount].id)
-        model.moveSelectionHorizontally(1)
-        #expect(model.selectedID == first.items[GridColumns.defaultCount + 1].id)
     }
 
     @Test func customKeywordsAreEditedInTheSearchField() throws {
@@ -141,6 +208,48 @@ struct EmojiProviderTests {
         #expect(model.store.database.emojiUsage.first { $0.id == "🔥" }?.keywords == ["lit", "hot"])
         search(model, "lit")
         #expect(model.selectedItem?.title == "🔥")
+    }
+
+    @Test func aFailedSaveKeepsTheEditorOpenAndSaysWhy() throws {
+        let directory = FileManager.default.temporaryDirectory.appending(path: "openray-emoji-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: directory) }
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let url = directory.appending(path: "library.json")
+        var object = try #require(
+            JSONSerialization.jsonObject(with: JSONEncoder().encode(LibraryDatabase())) as? [String: Any])
+        object["schemaVersion"] = LibraryDatabase.currentSchemaVersion + 1
+        try JSONSerialization.data(withJSONObject: object).write(to: url)
+        let (provider, model) = setUp(store: LibraryStore(fileURL: url))
+        defer { model.stop() }
+        #expect(model.store.isReadOnly)
+        search(model, "fire")
+        let item = try #require(model.selectedItem)
+        guard case .provided(let ref) = item.action else { return }
+        provider.edit(item, ref: ref, in: model)
+        search(model, "lit")
+        model.performSelected()
+        #expect(model.section.providedScope?.id == EmojiProvider.keywordsID)
+        #expect(model.feedback?.style == .error)
+        #expect(!provider.update(in: model) { $0.togglePin("🔥") })
+    }
+
+    @Test func savedCountsAtTheLimitNeverOverflow() throws {
+        let store = LibraryStore(fileURL: nil)
+        #expect(store.update {
+            $0.emojiUsage = [
+                EmojiUsageRecord(id: "👍", score: 1, count: .max, lastUsed: CalculatorClock.now),
+                EmojiUsageRecord(id: "🔥"),
+            ]
+        })
+        let (_, model) = setUp(store: store)
+        defer { model.stop() }
+        search(model, "thumbs up")
+        model.performSelected()
+        #expect(model.store.database.emojiUsage.first { $0.id == "👍" }?.count == EmojiUsage.maximumCount)
+        var usage = EmojiUsage(records: ["x": .init(score: .greatestFiniteMagnitude, count: .max, lastUsed: CalculatorClock.now)])
+        usage.record("x", at: CalculatorClock.now)
+        #expect(usage.records["x"]?.count == EmojiUsage.maximumCount)
+        #expect(usage.records["x"]?.score == EmojiUsage.maximumScore)
     }
 
     @Test func preferencesRoundTripThroughRecords() {
