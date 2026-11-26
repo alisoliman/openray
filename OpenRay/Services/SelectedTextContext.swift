@@ -11,7 +11,28 @@ struct SelectedTextContext {
     let sourceName: String
     let validateForPaste: () throws -> Void
     var element: AXUIElement?
+    /// Where the text was selected. Without it the result can be read and copied, but never
+    /// replaces anything: identical text elsewhere in the same field would pass every other check.
     var range: NSRange?
+
+    /// Whether a result may replace this selection in place.
+    var canReplace: Bool { range != nil }
+
+    /// The check right before Replace: the app still runs, the same element is focused, and it
+    /// still holds the same text at the same place, which must have been known at capture.
+    nonisolated static func verifyUnchanged(
+        capturedText: String, capturedRange: NSRange?, appIsRunning: Bool, sameElement: Bool, currentText: String?,
+        currentRange: NSRange?, sourceName: String
+    ) throws {
+        guard capturedRange != nil else {
+            throw LibraryValidationError(
+                "\(sourceName) doesn't say where the selection is, so nothing was replaced. Your result is copied; paste it with ⌘V.")
+        }
+        guard appIsRunning, sameElement, currentText == capturedText, currentRange == capturedRange else {
+            throw LibraryValidationError(
+                "The original selection in \(sourceName) changed. Your rewrite is copied; select where it belongs and paste with ⌘V.")
+        }
+    }
 
     func matches(_ other: SelectedTextContext) -> Bool {
         guard text == other.text, application?.processIdentifier == other.application?.processIdentifier,
@@ -38,18 +59,14 @@ struct SelectedTextContext {
         }
         let text = try selectedText(in: element)
         let range = selectedRange(in: element)
-        var context = SelectedTextContext(
-            text: text, application: application, sourceName: application.localizedName ?? "your app"
-        ) {
-            guard !application.isTerminated,
-                CFEqual(try focusedElement(in: app), element),
-                try selectedText(in: element) == text,
-                range == nil || selectedRange(in: element) == range
-            else {
-                throw LibraryValidationError(
-                    "The original selection in \(application.localizedName ?? "your app") changed. Your rewrite is copied; select where it belongs and paste with ⌘V."
-                )
-            }
+        let sourceName = application.localizedName ?? "your app"
+        var context = SelectedTextContext(text: text, application: application, sourceName: sourceName) {
+            let focused = try? focusedElement(in: app)
+            try verifyUnchanged(
+                capturedText: text, capturedRange: range, appIsRunning: !application.isTerminated,
+                sameElement: focused.map { CFEqual($0, element) } ?? false,
+                currentText: try? selectedText(in: element), currentRange: selectedRange(in: element),
+                sourceName: sourceName)
         }
         context.element = element
         context.range = range

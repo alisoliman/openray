@@ -133,7 +133,8 @@ final class AICommandProvider: CommandProvider {
     func run(commandID: String, arguments: [String: String], in model: LauncherModel, startsWritingCommands: Bool) {
         if let action = AIWritingCommandProvider.writingActions.first(where: { "ai.\($0.id)" == commandID }) {
             model.openAI(action)
-            if startsWritingCommands, model.ai.canSend { model.ai.send() }
+            // Only a fresh passage runs on its own; resumed work waits for the person.
+            if startsWritingCommands, model.ai.messages.isEmpty, model.ai.canSend { model.ai.send() }
             return
         }
         guard let command = model.aiHub.aiCommands.first(where: { $0.id == commandID }) else {

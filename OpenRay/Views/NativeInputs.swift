@@ -149,7 +149,15 @@ struct LauncherSearchInput: NSViewRepresentable {
             }
         }
 
+        /// Keys an input method's composition owns: they commit or cancel it, never run a command.
+        /// ↑ and ↓ still move the selection while composing (see `syncingTheQuery…` tests).
+        static let compositionKeys: Set<Selector> = [
+            #selector(NSResponder.insertNewline(_:)), #selector(NSResponder.insertTab(_:)),
+            #selector(NSResponder.insertBacktab(_:)), #selector(NSResponder.cancelOperation(_:)),
+        ]
+
         func control(_ control: NSControl, textView: NSTextView, doCommandBy commandSelector: Selector) -> Bool {
+            if textView.hasMarkedText(), Self.compositionKeys.contains(commandSelector) { return false }
             switch commandSelector {
             case #selector(NSResponder.moveDown(_:)): parent.move(1)
             case #selector(NSResponder.moveUp(_:)): parent.move(-1)

@@ -279,10 +279,17 @@ extension LauncherModel {
 
     /// The selection the current writing result replaces: the one its passage came from, pinned
     /// to this conversation (main #13). Nil for chat and for passages from elsewhere.
+    ///
+    /// The pinned selection must still be the passage on screen (a clipboard or typed passage,
+    /// even with the same text, has no target), the result must come from it, and its place in
+    /// the app must be known.
     var aiReplaceTarget: SelectedTextContext? {
         guard ai.action != .chat, let pin = aiSelectionTarget, pin.conversation == ai.conversationToken,
-            (ai.lastSource ?? ai.attachments.first?.text) == pin.passage
+            pin.context.canReplace
         else { return nil }
+        if ai.command != nil { return ai.lastAttachment?.id == pin.attachmentID ? pin.context : nil }
+        guard ai.attachments.first?.id == pin.attachmentID else { return nil }
+        if ai.lastSource != nil, ai.lastAttachment?.id != pin.attachmentID { return nil }
         return pin.context
     }
 
@@ -390,8 +397,9 @@ extension LauncherModel {
         ai.newConversation(action: action)
         ai.open(action)
         ai.attach(AIAttachment(source: target == nil ? .response : .selection, text: result, appName: appName))
-        if let target, ai.attachments.first?.text == result {
-            aiSelectionTarget = PinnedSelection(context: target, conversation: ai.conversationToken, passage: result)
+        // The target is carried forward explicitly, bound to the new passage.
+        if let target, let attached = ai.attachments.first, attached.text == result {
+            aiSelectionTarget = PinnedSelection(context: target, conversation: ai.conversationToken, attachmentID: attached.id)
         }
         focusRequest += 1
     }
@@ -402,7 +410,8 @@ extension LauncherModel {
         guard !ai.isGenerating, let response = ai.latestResponse else { return false }
         switch ai.action {
         case .proofread: return response.text == ai.lastSource
-        case .actionItems: return response.checklistItems.isEmpty
+        // A follow-up's reply is free-form text: only an extraction can find nothing.
+        case .actionItems: return !ai.repliesToRevision(response) && response.checklistItems.isEmpty
         default: return false
         }
     }
@@ -820,6 +829,14 @@ extension LauncherModel {
         announceForVoiceOver([entry.title, entry.shortcut?.spoken].compactMap { $0 }.joined(separator: ", "))
     }
 
+    /// ⌘↩ in ⌘K runs the entry bound to ⌘↩ where you are, whatever row is highlighted or
+    /// filtered. In AI nothing is: ⌘↩ adds a line there, and pasting into another app takes
+    /// choosing Paste explicitly.
+    func performCommandReturnAction() {
+        guard let entry = actionEntries.first(where: { $0.shortcut == .commandReturn }) else { return }
+        performAction(entry)
+    }
+
     func performActionSelection() {
         let entries = filteredActionEntries
         guard entries.indices.contains(actionSelection) else { return }
@@ -1168,6 +1185,13 @@ extension LauncherModel {
                         id: "removeAttachment", title: "Remove Attachment", symbol: "xmark.circle", group: .organize
                     ) { [weak self] in self?.ai.removeAttachment(attachment.id) })
             }
+        }
+        if pendingNewSelection != nil, ai.action != .chat, !ai.isGenerating {
+            entries.append(
+                ActionEntry(
+                    id: "useNewSelection", title: "Use New Selection as Passage", symbol: "character.cursor.ibeam",
+                    group: .organize
+                ) { [weak self] in self?.usePendingSelection() })
         }
         if ai.action != .chat, ai.command == nil, !ai.isGenerating, ai.lastCompletedResult != nil {
             entries.append(

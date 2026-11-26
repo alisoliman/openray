@@ -194,7 +194,7 @@ private struct GlobalShortcutButtons: View {
                     }
                     .keyboardShortcut("n")
                     Button("Cycle Filter") { model.cycleClipboardFilter() }.keyboardShortcut("p")
-                    Button("Stop") { model.ai.cancel() }.keyboardShortcut(".")
+                    Button("Stop") { model.performStopShortcut() }.keyboardShortcut(".")
                     ForEach(1...8, id: \.self) { number in
                         let key = Character("\(number)")
                         if !claimed.contains(key) {

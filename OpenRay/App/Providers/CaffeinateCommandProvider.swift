@@ -69,12 +69,11 @@ final class CaffeinateCommandProvider: CommandProvider, MenuBarExtraProviding {
     // MARK: Scope
 
     /// Minutes typed into the scope's field, when that's all it holds.
+    /// A whole number with at most one unit after it: "45", "45m", "45 min", "45 minutes".
     static func typedMinutes(_ query: String) -> Int? {
         let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        let digits = trimmed.replacingOccurrences(of: "minutes", with: "").replacingOccurrences(of: "min", with: "")
-            .replacingOccurrences(of: "m", with: "").trimmingCharacters(in: .whitespaces)
-        guard !digits.isEmpty, digits.allSatisfy(\.isNumber) else { return nil }
-        return Int(digits)
+        guard let match = trimmed.wholeMatch(of: /(\d{1,5})\s*(m|min|mins|minute|minutes)?/) else { return nil }
+        return Int(match.1)
     }
 
     static func title(for duration: CaffeinateDuration) -> String {
@@ -224,8 +223,11 @@ final class CaffeinateCommandProvider: CommandProvider, MenuBarExtraProviding {
         var entries: [ActionEntry] = []
         if model.caffeinate.isActive, ref.id != Self.stopRowID {
             entries.append(
-                ActionEntry(id: "caffeinate.stopAction", title: "Stop Caffeinate", symbol: "stop.circle", group: .item) {
-                    [weak self, weak model] in
+                // ⌘. is the launcher's own Stop key; in this scope it stops Caffeinate.
+                ActionEntry(
+                    id: "caffeinate.stopAction", title: "Stop Caffeinate", symbol: "stop.circle", shortcut: .command("."),
+                    group: .item
+                ) { [weak self, weak model] in
                     guard let self, let model else { return }
                     self.perform(item, ref: ProvidedRef(provider: self.id, id: Self.stopRowID), in: model)
                 })

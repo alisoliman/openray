@@ -28,6 +28,8 @@ struct SystemCaffeinatePowerAssertions: CaffeinatePowerAssertions {
     }
 
     func release(_ id: UInt32) throws {
+        // Inert launches can't create one; the release still refuses, as every live adapter does.
+        try SideEffectGuard.check("changing the Mac's sleep settings")
         let result = IOPMAssertionRelease(id)
         guard result == kIOReturnSuccess else {
             throw CaffeinatePowerError(operation: "stop", code: result)

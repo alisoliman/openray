@@ -252,7 +252,7 @@ struct AIChatWindowView: View {
                 }
                 AIComposerInput(
                     text: Bindable(chat).draft, focusRequest: focusRequest, submit: send,
-                    onFocusChange: { composerFocused = $0 })
+                    onFocusChange: { composerFocused = $0 }, sessionIdentity: { chat.conversationToken.uuidString })
                     .frame(minHeight: 38, maxHeight: 140)
             }
             HStack(spacing: 6) {

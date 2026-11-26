@@ -669,6 +669,21 @@ extension LauncherModel {
         return beginArguments(for: command, initial: rest)
     }
 
+    // MARK: - Stop
+
+    /// ⌘.: stops a reply being written, or, in the Caffeinate list, Caffeinate (main #11's key).
+    func performStopShortcut() {
+        if destination == .search, section.providedScope?.id == CaffeinateCommandProvider.scope.id, caffeinate.isActive {
+            if caffeinate.stop() {
+                toast("Caffeinate is off")
+            } else {
+                feedback = .error(caffeinate.errorMessage ?? "Caffeinate couldn't stop. Try again.")
+            }
+            return
+        }
+        ai.cancel()
+    }
+
     // MARK: - Window keys
 
     /// ⌘Esc: back to an empty Everything in one step, keeping the window open.

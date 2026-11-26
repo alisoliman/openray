@@ -93,6 +93,8 @@ private struct PomodoroMenuSection: View {
         Button("Open Pomodoro") { model.panel?.show(section: .provided(PomodoroCommandProvider.scope)) }
             .menuShortcut(model.store.database.binding(for: PomodoroCommandProvider.openID)?.shortcut)
         Text("Today: \(pomodoro.completedToday)/\(pomodoro.configuration.dailyGoal) sessions · \(pomodoro.focusMinutesToday) min")
+        // A start that couldn't be saved says why, even with the timer's own menu bar item hidden.
+        if let error = pomodoro.errorMessage { Text(error) }
     }
 }
 

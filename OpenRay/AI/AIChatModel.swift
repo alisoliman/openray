@@ -119,6 +119,74 @@ final class AIChatModel {
         var request: String
         var context: AIWritingContext
     }
+
+    /// A writing command's work, put away while another command or chat is on screen, so opening
+    /// the command again brings it back (main #12 kept one session per tool). Writing runs keep no
+    /// model session (the engine resets after each), so the visible state is all there is.
+    struct WritingSnapshot {
+        var action: AIAction
+        var conversationToken: UUID
+        var draft: String
+        var instruction: String
+        var lastInstruction: String
+        var attachments: [AIAttachment]
+        var messages: [ChatMessage]
+        var lastSource: String?
+        var lastAttachment: AIAttachment?
+        var acceptedRevisions: [String]
+        var failedRevision: RevisionTurn?
+        var revisionTurns: [UUID: RevisionTurn]
+        var errorMessage: String?
+
+        var hasWork: Bool {
+            !draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                || !instruction.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || !attachments.isEmpty
+                || !messages.isEmpty
+        }
+    }
+
+    /// The writing command on screen, for putting away. Nil for chat, AI Commands and while a
+    /// reply is being written.
+    func writingSnapshot() -> WritingSnapshot? {
+        guard action != .chat, command == nil, !isGenerating else { return nil }
+        return WritingSnapshot(
+            action: action, conversationToken: conversationToken, draft: draft, instruction: instruction,
+            lastInstruction: lastInstruction, attachments: attachments, messages: messages, lastSource: lastSource,
+            lastAttachment: lastAttachment, acceptedRevisions: acceptedRevisions, failedRevision: failedRevision,
+            revisionTurns: revisionTurns, errorMessage: errorMessage)
+    }
+
+    /// Brings a put-away writing command back exactly as it was.
+    func restoreWriting(_ snapshot: WritingSnapshot) {
+        guard !isGenerating else { return }
+        newConversation(action: snapshot.action)
+        conversationToken = snapshot.conversationToken
+        draft = snapshot.draft
+        instruction = snapshot.instruction
+        lastInstruction = snapshot.lastInstruction
+        attachments = snapshot.attachments
+        messages = snapshot.messages
+        lastSource = snapshot.lastSource
+        lastAttachment = snapshot.lastAttachment
+        acceptedRevisions = snapshot.acceptedRevisions
+        failedRevision = snapshot.failedRevision
+        revisionTurns = snapshot.revisionTurns
+        errorMessage = snapshot.errorMessage
+        updateDiff()
+        engine.prepare(for: snapshot.action)
+    }
+
+    /// Whether a reply answers a follow-up. Those are free-form text, even for Extract Action
+    /// Items, so they're never read as a checklist.
+    func repliesToRevision(_ message: ChatMessage) -> Bool {
+        guard let index = messages.firstIndex(where: { $0.id == message.id }),
+            let request = messages[..<index].last(where: { $0.role == .user })
+        else { return false }
+        return revisionTurns[request.id] != nil
+    }
+
+    /// Unsent text, a passage not yet run, or any result or failure on screen.
+    var hasWritingWork: Bool { writingSnapshot()?.hasWork ?? false }
     private(set) var attachments: [AIAttachment] = []
     private(set) var messages: [ChatMessage] = []
     private(set) var action: AIAction = .chat

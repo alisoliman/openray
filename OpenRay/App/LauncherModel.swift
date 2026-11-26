@@ -197,11 +197,28 @@ final class LauncherModel {
     /// replaced is gone.
     @ObservationIgnored var insertedAIResult: (conversation: UUID, text: String)?
 
+    /// Writing commands put away with their work while another command, chat or an AI Command is
+    /// on screen. Opening the command again brings its work back.
+    @ObservationIgnored var writingStash: [AIAction: StashedWriting] = [:]
+    /// A selection that differs from the passage the writing command on screen is working on.
+    /// It's offered, never applied on its own, so unsent or finished work is never discarded.
+    var pendingNewSelection: SelectedTextContext?
+    /// Set when a timer scope was opened from AI, so Back returns to the AI work it left.
+    @ObservationIgnored var scopeReturnsToAI = false
+    /// Scopes that are detours from AI: Back from them returns to AI (main #10/#11).
+    nonisolated static let aiDetourProviders: Set<String> = ["pomodoro", "caffeinate"]
+
+    struct StashedWriting {
+        var snapshot: AIChatModel.WritingSnapshot
+        var pin: PinnedSelection?
+    }
+
+    /// A selection a result may replace, bound to the passage the person chose: the attachment
+    /// that carried it, in this conversation. Another source with the same text never matches.
     struct PinnedSelection {
         var context: SelectedTextContext
         var conversation: UUID
-        /// The passage the conversation works on, which the target's selection supplied.
-        var passage: String
+        var attachmentID: AIAttachment.ID
     }
 
     /// Defaults follow `SideEffectGuard`: a normal launch uses the library on disk and the system
@@ -685,6 +702,7 @@ final class LauncherModel {
         section = .home
         scopeReturnQuery = nil
         aiReturn = nil
+        scopeReturnsToAI = false
         if !query.isEmpty { query = "" }
         feedback = nil
         selectedID = nil
@@ -741,6 +759,8 @@ final class LauncherModel {
     // MARK: - Navigation
 
     func navigate(to section: LauncherSection) {
+        scopeReturnsToAI =
+            destination == .ai && section.providedScope.map { Self.aiDetourProviders.contains($0.provider) } == true
         if section != .home, self.section == .home, destination == .search, argumentLink == nil {
             scopeReturnQuery = query
         }
@@ -759,8 +779,21 @@ final class LauncherModel {
         focusRequest += 1
     }
 
-    /// Leaves the current scope and restores the query from before it.
+    /// Leaves the current scope and restores the query from before it, or the AI work a timer
+    /// was opened from.
     func leaveScope() {
+        if scopeReturnsToAI {
+            scopeReturnsToAI = false
+            argumentLink = nil
+            argumentSession = nil
+            section = .home
+            if !query.isEmpty { query = "" }
+            destination = .ai
+            feedback = nil
+            confirmation = nil
+            focusRequest += 1
+            return
+        }
         let restored = scopeReturnQuery ?? ""
         scopeReturnQuery = nil
         destination = .search
@@ -783,6 +816,7 @@ final class LauncherModel {
     ) {
         // Slice 7: agents, tools and saved chats connect on first use.
         _ = aiHub
+        pendingNewSelection = nil
         if let command {
             // An AI Command runs at once on the text it rendered (Slice 7).
             if destination == .search { aiReturn = (section, query) }
@@ -795,12 +829,14 @@ final class LauncherModel {
             feedback =
                 ai.isGenerating ? .warning("Stop the current response or wait for it to finish before running another command.") : nil
             if !ai.isGenerating {
+                stashWritingSession()
                 ai.start(command)
                 // A command that replaces the selection it read gets that selection as its target.
                 if command.output == .replace, let source = command.source, let selection = lastCapturedSelection,
-                    selection.text == source
+                    selection.text == source, let attachment = ai.lastAttachment
                 {
-                    aiSelectionTarget = PinnedSelection(context: selection, conversation: ai.conversationToken, passage: source)
+                    aiSelectionTarget = PinnedSelection(
+                        context: selection, conversation: ai.conversationToken, attachmentID: attachment.id)
                 }
             }
             focusRequest += 1
@@ -809,11 +845,25 @@ final class LauncherModel {
         let switchingWhileBusy = ai.isGenerating && (ai.action != action || ai.command != nil)
         if destination == .search { aiReturn = (section, query) }
         var sendPrompt = true
-        // Reset before open(_:), so the engine is prepared for the new run.
+        var refusedPassage = false
+        // Reset before open(_:), so the engine is prepared for the new run. Writing work is put
+        // away or resumed, never dropped (main #12/#13).
         if !ai.isGenerating {
-            if action != .chat, attachment == nil {
-                ai.newConversation(action: action)
-            } else if action == .chat, prompt?.isEmpty == false || attachment != nil {
+            if action != .chat, let attachment {
+                // An explicit passage replaces the command's work only once it's known to fit.
+                if attachment.text.count > AIChatModel.inputLimit {
+                    refusedPassage = true
+                    resumeWriting(action)
+                } else {
+                    if ai.action != action || ai.command != nil { stashWritingSession() }
+                    ai.newConversation(action: action)
+                }
+            } else if action != .chat {
+                resumeWriting(action)
+            } else if ai.action != .chat || ai.command != nil {
+                stashWritingSession()
+            }
+            if action == .chat, prompt?.isEmpty == false || attachment != nil {
                 // Esc puts back the query that opened AI, which is the chat's first question.
                 let firstQuestion =
                     ai.action == .chat ? ai.messages.first { $0.role == .user }.map { $0.displayText ?? $0.text } : nil
@@ -837,10 +887,12 @@ final class LauncherModel {
             switchingWhileBusy
             ? .warning("Stop the current response or wait for it to finish before switching AI commands.") : nil
         guard !switchingWhileBusy else { return }
-        if let attachment {
+        if refusedPassage {
+            ai.report(Self.passageTooLong)
+        } else if let attachment {
             ai.attach(attachment)
-        } else if action != .chat, ai.attachments.isEmpty, ai.messages.isEmpty {
-            attachSelectionFromPreviousApp()
+        } else if action != .chat {
+            if ai.hasWritingWork { offerNewSelection() } else { attachSelectionFromPreviousApp() }
         }
         if sendPrompt, let prompt, !prompt.isEmpty, action == .chat {
             // Without AI the question waits in the composer; it is never sent on its own later.
@@ -860,6 +912,8 @@ final class LauncherModel {
                 text: try selectionReader(), application: previousApplication,
                 sourceName: previousApplicationName ?? "your app", validateForPaste: {})
         }
+        // Another app's text: a launch inert by its own rule, or by an injected one, never reads it.
+        try sideEffects.check("reading the selection in another app")
         guard windows.hasPermission else {
             throw LibraryValidationError(
                 "Accessibility access is required to read selected text. You can paste text manually instead.")
@@ -872,25 +926,117 @@ final class LauncherModel {
         selectionContextReader = selection.map { selection in { selection } }
     }
 
-    /// Writing commands pick up the selected text from the app you came from.
+    static let passageTooLong =
+        "That passage is longer than \(AIChatModel.inputLimit.formatted()) characters. Choose a shorter one; your current work is kept."
+
+    /// Whether a selection may be read without being asked: always in a normal launch, and in
+    /// tests only through their stand-ins.
+    private var readsSelectionImplicitly: Bool {
+        clipboard.usesGeneralPasteboard || selectionReader != nil || selectionContextReader != nil
+    }
+
+    /// Writing commands pick up the selected text from the app you came from. Choosing it again
+    /// over a result starts a new passage, once the selection is known to fit.
     func attachSelectionFromPreviousApp(reportErrors: Bool = false) {
-        guard clipboard.usesGeneralPasteboard || reportErrors || selectionReader != nil || selectionContextReader != nil
-        else { return }
+        guard readsSelectionImplicitly || reportErrors else { return }
         do {
             let selection = try captureSelection()
-            let appName = selection.application?.localizedName ?? (selectionContextReader == nil ? previousApplicationName : selection.sourceName)
-            ai.attach(AIAttachment(source: .selection, text: selection.text, appName: appName))
-            // A writing result goes back where its passage came from, wherever you are by then.
-            if ai.action != .chat, ai.attachments.first?.source == .selection, ai.attachments.first?.text == selection.text {
-                aiSelectionTarget = PinnedSelection(context: selection, conversation: ai.conversationToken, passage: selection.text)
+            if ai.action != .chat, !ai.messages.isEmpty {
+                guard selection.text.count <= AIChatModel.inputLimit else {
+                    ai.report(Self.passageTooLong)
+                    return
+                }
+                ai.newConversation(action: ai.action)
             }
+            attachSelection(selection)
         } catch {
             if reportErrors { feedback = .error(error.localizedDescription) }
         }
     }
 
+    /// Attaches a captured selection and, for a writing command, pins it as where the result goes.
+    private func attachSelection(_ selection: SelectedTextContext) {
+        let appName =
+            selection.application?.localizedName ?? (selectionContextReader == nil ? previousApplicationName : selection.sourceName)
+        ai.attach(AIAttachment(source: .selection, text: selection.text, appName: appName))
+        // A writing result goes back where its passage came from, wherever you are by then.
+        if ai.action != .chat, let attached = ai.attachments.first, attached.source == .selection,
+            attached.text == selection.text
+        {
+            aiSelectionTarget = PinnedSelection(context: selection, conversation: ai.conversationToken, attachmentID: attached.id)
+        }
+    }
+
+    /// Puts the writing command on screen away with its work, so opening it again brings it back.
+    /// A result already inserted, with nothing typed, isn't work any more.
+    func stashWritingSession() {
+        guard let snapshot = ai.writingSnapshot(), snapshot.hasWork, !writingResultWasUsed else { return }
+        let pin = aiSelectionTarget.flatMap { $0.conversation == ai.conversationToken ? $0 : nil }
+        writingStash[snapshot.action] = StashedWriting(snapshot: snapshot, pin: pin)
+    }
+
+    /// Opens a writing command without losing work: the command on screen is put away when another
+    /// takes its place, and a put-away command comes back as it was.
+    private func resumeWriting(_ action: AIAction) {
+        if ai.action != action || ai.command != nil {
+            stashWritingSession()
+            if let stashed = writingStash.removeValue(forKey: action) {
+                ai.restoreWriting(stashed.snapshot)
+                aiSelectionTarget = stashed.pin
+            } else {
+                ai.newConversation(action: action)
+            }
+        }
+        if writingResultWasUsed { ai.newConversation(action: action) }
+    }
+
+    /// The result on screen was inserted into its app and nothing else was typed since.
+    var writingResultWasUsed: Bool {
+        guard let inserted = insertedAIResult, inserted.conversation == ai.conversationToken,
+            ai.messages.last?.role == .assistant, ai.messages.last?.text == inserted.text,
+            ai.draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+            ai.instruction.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        else { return false }
+        return true
+    }
+
+    /// Offers a selection that differs from the passage being worked on; it never replaces the
+    /// work on its own (main #13's “Use as new passage”).
+    private func offerNewSelection() {
+        guard readsSelectionImplicitly, let selection = try? captureSelection() else { return }
+        let current = ai.attachments.first?.text ?? ai.lastSource ?? ai.draft
+        guard selection.text != current else { return }
+        pendingNewSelection = selection
+    }
+
+    /// Replaces the writing command's work with the offered selection, once it's known to fit.
+    func usePendingSelection() {
+        guard let selection = pendingNewSelection, ai.action != .chat, !ai.isGenerating else { return }
+        guard selection.text.count <= AIChatModel.inputLimit else {
+            ai.report(Self.passageTooLong)
+            return
+        }
+        pendingNewSelection = nil
+        ai.newConversation(action: ai.action)
+        attachSelection(selection)
+        focusRequest += 1
+    }
+
     func attachClipboardToAI() {
         if let text = clipboard.readText(), !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            // A clipboard passage has nothing to replace, even when its text matches the selection.
+            if ai.action != .chat {
+                aiSelectionTarget = nil
+                // Over a result it's a new passage, once it's known to fit.
+                if !ai.messages.isEmpty {
+                    guard text.count <= AIChatModel.inputLimit else {
+                        ai.report(Self.passageTooLong)
+                        focusRequest += 1
+                        return
+                    }
+                    ai.newConversation(action: ai.action)
+                }
+            }
             ai.attach(AIAttachment(source: .clipboard, text: text))
         } else {
             feedback = .info("There's no text on the clipboard.")
@@ -901,6 +1047,7 @@ final class LauncherModel {
     func leaveAI() {
         let destinationReturn = aiReturn
         aiReturn = nil
+        pendingNewSelection = nil
         showsAttachmentPreview = false
         destination = .search
         feedback = nil

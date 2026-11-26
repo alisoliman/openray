@@ -420,36 +420,54 @@ final class ClipboardService {
 enum SyntheticInput {
     static let marker: Int64 = 0x4F52_4159
 
+    /// What a paste reads and does on the Mac. The live one is guarded; tests pass a fake, so the
+    /// order of checks is tested without touching another app.
+    struct PasteEnvironment {
+        var checkAllowed: @MainActor () throws -> Void = { try SideEffectGuard.check("pasting into other apps") }
+        var isTrusted: @MainActor () -> Bool = { AXIsProcessTrusted() }
+        var activate: @MainActor (NSRunningApplication) -> Void = { $0.activate() }
+        var frontmostProcess: @MainActor () -> pid_t? = { NSWorkspace.shared.frontmostApplication?.processIdentifier }
+        var changeCount: @MainActor () -> Int = { NSPasteboard.general.changeCount }
+        var secureInput: @MainActor () -> Bool = { IsSecureEventInputEnabled() }
+        var pause: @MainActor () async throws -> Void = { try await Task.sleep(for: .milliseconds(25)) }
+        var postPaste: @MainActor (pid_t) throws -> Void = {
+            try SyntheticInput.key(CGKeyCode(kVK_ANSI_V), flags: .maskCommand, toProcess: $0)
+        }
+
+        static var live: PasteEnvironment { PasteEnvironment() }
+    }
+
     /// `validateTarget` runs last, right before ⌘V, so a writing result never replaces text that
-    /// changed after its selection was captured (`SelectedTextContext.validateForPaste`).
+    /// changed after its selection was captured (`SelectedTextContext.validateForPaste`). If it
+    /// throws, no key is sent.
     static func paste(
         into application: NSRunningApplication, expectedChangeCount: Int,
-        validateTarget: () throws -> Void = {}
+        validateTarget: () throws -> Void = {}, environment: PasteEnvironment = .live
     ) async throws {
-        try SideEffectGuard.check("pasting into other apps")
-        guard AXIsProcessTrusted() else {
+        try environment.checkAllowed()
+        guard environment.isTrusted() else {
             throw LibraryValidationError(
                 "Copied to the clipboard. Enable Accessibility in Settings for direct paste, or press ⌘V in your app.")
         }
-        application.activate()
+        environment.activate(application)
+        let pid = application.processIdentifier
         for _ in 0..<20 {
-            if NSWorkspace.shared.frontmostApplication?.processIdentifier == application.processIdentifier { break }
-            try await Task.sleep(for: .milliseconds(25))
+            if environment.frontmostProcess() == pid { break }
+            try await environment.pause()
         }
-        guard NSWorkspace.shared.frontmostApplication?.processIdentifier == application.processIdentifier,
-            NSPasteboard.general.changeCount == expectedChangeCount,
-            !IsSecureEventInputEnabled()
-        else {
+        func stillTargeted() -> Bool {
+            environment.frontmostProcess() == pid && environment.changeCount() == expectedChangeCount
+                && !environment.secureInput()
+        }
+        guard stillTargeted() else {
             throw LibraryValidationError("The target app or clipboard changed. Your text is copied; paste it with ⌘V.")
         }
         try validateTarget()
         // The validation can take a moment over Accessibility; check again right before the key.
-        guard NSWorkspace.shared.frontmostApplication?.processIdentifier == application.processIdentifier,
-            NSPasteboard.general.changeCount == expectedChangeCount, !IsSecureEventInputEnabled()
-        else {
+        guard stillTargeted() else {
             throw LibraryValidationError("The target app or clipboard changed. Your text is copied; paste it with ⌘V.")
         }
-        try key(CGKeyCode(kVK_ANSI_V), flags: .maskCommand, toProcess: application.processIdentifier)
+        try environment.postPaste(pid)
     }
 
     /// Posts one key press to `pid` only. Every synthetic key event OpenRay sends

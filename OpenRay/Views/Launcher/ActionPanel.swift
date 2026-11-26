@@ -18,7 +18,7 @@ struct ActionPanel: View {
                     focusRequest: focus,
                     submit: model.performActionSelection, move: model.moveActionSelection,
                     // Esc closes the top layer, which is ⌘/ when it's open over this panel.
-                    cancel: model.goBack, paste: performCommandReturnEntry,
+                    cancel: model.goBack, paste: model.performCommandReturnAction,
                     moveHorizontally: model.moveActionSelectionHorizontally, tertiary: model.performTertiary,
                     fontSize: 13, accessibilityLabel: "Search actions", identifier: "actions.search")
             }
@@ -62,12 +62,6 @@ struct ActionPanel: View {
         .onAppear { focus += 1 }
         .accessibilityElement(children: .contain)
         .accessibilityLabel("Actions")
-    }
-
-    /// ⌘↩ runs the entry labelled ⌘↩, whatever row is highlighted or filtered.
-    private func performCommandReturnEntry() {
-        guard let entry = model.actionEntries.first(where: { $0.id == "paste" }) else { return }
-        model.performAction(entry)
     }
 
     private func row(_ entry: ActionEntry, selected: Bool) -> some View {

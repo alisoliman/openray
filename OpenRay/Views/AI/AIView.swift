@@ -11,6 +11,17 @@ struct AIView: View {
         VStack(spacing: 0) {
             header
             Hairline()
+            if let selection = model.pendingNewSelection, model.ai.action != .chat, !model.ai.isGenerating {
+                // main #13: a new selection never replaces work on its own.
+                InlineNotice(
+                    .info, symbol: "character.cursor.ibeam", title: "New selection from \(selection.sourceName)",
+                    detail: "Your current work stays until you choose to replace it."
+                ) {
+                    Button("Use as New Passage") { model.usePendingSelection() }.buttonStyle(.orSecondary)
+                        .accessibilityIdentifier("ai.useNewSelection")
+                }
+                .padding(.horizontal, 14).padding(.top, 10)
+            }
             Group {
                 if !model.ai.isReady {
                     AIUnavailableView(model: model)
@@ -675,10 +686,11 @@ private struct TransformBody: View {
                     }
                     .frame(maxHeight: .infinity)
                 }
-            } else if model.ai.action == .actionItems {
+            } else if model.ai.action == .actionItems, !model.ai.repliesToRevision(response) {
                 ActionItemsList(message: response)
             } else {
-                Text(model.ai.command?.title ?? "Summary").font(OR.Font.headline).foregroundStyle(OR.Color.text)
+                Text(model.ai.command?.title ?? (model.ai.action == .summarize ? "Summary" : "Result"))
+                    .font(OR.Font.headline).foregroundStyle(OR.Color.text)
                 ScrollView {
                     AIMessageText(message: response).font(OR.Font.reading).lineSpacing(8).foregroundStyle(OR.Color.text)
                         .frame(maxWidth: .infinity, alignment: .topLeading)
