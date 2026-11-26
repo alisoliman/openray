@@ -95,8 +95,8 @@ struct ResultsList: View {
             .padding(.vertical, 4)
         case .calculator:
             ForEach(group.items) { item in
-                if case .calculation(let calculation) = item.action {
-                    CalculatorCard(model: model, calculation: calculation, selected: item.id == selectedID)
+                if let calculation = item.calculatorAnswer(in: model) {
+                    CalculatorCard(model: model, item: item, calculation: calculation, selected: item.id == selectedID)
                         .id(Self.rowID(group: group.id, item: item.id)).padding(.top, 2).padding(.bottom, 6)
                 }
             }
@@ -561,6 +561,8 @@ struct MiniScreen: View {
 
 struct CalculatorCard: View {
     let model: LauncherModel
+    /// The row the card stands for: clicking performs it, as ↩ does.
+    var item: LauncherItem
     let calculation: Calculation
     var selected: Bool
 
@@ -569,11 +571,18 @@ struct CalculatorCard: View {
             HStack(alignment: .center, spacing: 12) {
                 side(
                     value: calculation.conversion.map { "\($0.source.value) \($0.source.symbol)" } ?? calculation.expression,
-                    unit: calculation.conversion?.source.name ?? "Expression", emphasized: false)
+                    unit: calculation.conversion?.source.name ?? calculation.inputLabel ?? "Expression", emphasized: false)
                 Image(systemName: "arrow.right").font(.system(size: 12, weight: .semibold))
                     .foregroundStyle(OR.Color.text2)
                     .frame(width: 28, height: 28).background(OR.Color.fill2, in: .circle)
-                side(value: calculation.result, unit: calculation.conversion?.target.name ?? "Result", emphasized: true)
+                side(
+                    value: calculation.result,
+                    unit: calculation.conversion?.target.name ?? calculation.resultLabel ?? "Result", emphasized: true)
+            }
+            if let source = sourceNote {
+                Text(source).font(OR.Font.caption).foregroundStyle(OR.Color.text2)
+                    .lineLimit(1).truncationMode(.middle)
+                    .padding(.top, 10)
             }
             if let conversion = calculation.conversion, !conversion.related.isEmpty {
                 Hairline().padding(.top, 14)
@@ -605,10 +614,13 @@ struct CalculatorCard: View {
             }
         }
         .contentShape(.rect)
-        .onTapGesture { model.perform(LauncherItem(id: "calculation", title: calculation.result, subtitle: "", symbol: "equal", kind: .calculator, badge: "Calculator", action: .calculation(calculation))) }
+        .onTapGesture {
+            model.selectedID = item.id
+            model.perform(item)
+        }
         .accessibilityElement(children: .combine)
         .accessibilityLabel("\(calculation.expression) equals \(calculation.result)")
-        .accessibilityHint("Return copies \(calculation.value)")
+        .accessibilityHint("\(model.primaryTitle(for: item)): \(calculation.value)")
         .accessibilityAddTraits(.isButton)
         .accessibilityIdentifier("result.calculation")
         // Combining hides the chips, so each related unit is also an action.
@@ -619,6 +631,15 @@ struct CalculatorCard: View {
                 }
             }
         }
+    }
+
+    /// Where a currency answer's rate comes from, or a date's day: the calculation's detail,
+    /// without the trailing key hint. Plain arithmetic and unit conversions need none.
+    private var sourceNote: String? {
+        guard [.currency, .date, .duration, .time].contains(calculation.kind) else { return nil }
+        let parts = calculation.detail.components(separatedBy: " · ").filter { !$0.hasPrefix("Return to") }
+        let note = parts.filter { $0 != "Currency" }.joined(separator: " · ")
+        return note.isEmpty ? nil : note
     }
 
     private func label(_ quantity: Calculation.Quantity) -> String { "\(quantity.value) \(quantity.symbol)" }
@@ -637,6 +658,7 @@ struct CalculatorCard: View {
                 .lineLimit(1).minimumScaleFactor(0.5)
                 .textSelection(.enabled)
             Text(unit).font(OR.Font.callout).foregroundStyle(OR.Color.text2)
+                .lineLimit(1).truncationMode(.tail)
         }
         .frame(maxWidth: .infinity)
     }

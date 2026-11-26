@@ -87,15 +87,9 @@ extension LauncherModel {
             store.recordUse(of: item.id)
             openSettings()
         case .quicklink(let link, let argument):
-            if link.needsQuery && argument.isEmpty {
-                beginArgument(link)
-            } else {
-                openQuicklink(link, query: argument)
-            }
-        case .clipboard(let entry):
-            if copy(entry) { store.recordUse(of: item.id) }
-        case .snippet(let snippet):
-            if copy(snippet.expanded(), label: snippet.name) { store.recordUse(of: item.id) }
+            performQuicklink(link, argument: argument)
+        case .clipboard, .snippet:
+            performContent(item)
         case .calculation(let calculation): copy(calculation.value, label: calculation.value)
         case .note(let note):
             editor = .note(note)
@@ -151,10 +145,10 @@ extension LauncherModel {
         perform(favorites[number - 1])
     }
 
-    func openQuicklink(_ link: Quicklink, query: String) {
-        do { open(try link.resolvedURL(query: query), itemID: "quicklink.\(link.id)") } catch {
-            feedback = .error(error.localizedDescription)
-        }
+    /// One typed term fills the first argument; placeholder values are read now.
+    @discardableResult
+    func openQuicklink(_ link: Quicklink, query: String) -> Task<Void, Never>? {
+        openQuicklink(link) { try link.resolution(query: query, values: $0) }
     }
 
     /// Checks the launch's side-effect rule before an executor runs. Inert launches (the test host,
@@ -229,14 +223,16 @@ extension LauncherModel {
         }
         guard item.supportsPaste, mayWriteClipboard else { return }
         switch item.action {
-        case .clipboard(let entry): finishPaste(copied: clipboard.copy(entry), label: entry.title)
+        case .clipboard, .snippet:
+            // ⌘↩ does what ↩ doesn't, so the two keys never both copy.
+            performSecondaryContent(item)
+            return
         case .file(let url):
             let entry = ClipboardEntry(content: .files([url]), sourceName: "OpenRay")
             finishPaste(copied: clipboard.copy(entry), label: url.lastPathComponent)
         default:
             if let text = item.copyText { paste(text, label: item.title) }
         }
-        if case .clipboard = item.action { store.recordUse(of: item.id) }
     }
 
     func paste(_ text: String, label: String? = nil) {
@@ -250,7 +246,7 @@ extension LauncherModel {
         paste(text, label: item.title)
     }
 
-    private func finishPaste(copied: Bool, label: String) {
+    func finishPaste(copied: Bool, label: String) {
         guard copied else {
             feedback = .error(clipboard.lastCopyError ?? "Couldn't copy the content.")
             return
@@ -341,6 +337,7 @@ extension LauncherModel {
         case .window(let layout):
             accessibilityAllowed ? "Apply \(layout.title)" : "Enable Accessibility"
         case .provided(let ref): registry.primaryTitle(for: item, ref: ref, in: self)
+        case .clipboard, .snippet: contentPrimaryAction == .paste ? pasteTitle("Paste to") : item.primaryActionTitle
         default: item.primaryActionTitle
         }
     }
@@ -352,6 +349,10 @@ extension LauncherModel {
         if case .provided(let ref) = item.action { return registry.secondaryTitle(for: item, ref: ref, in: self) }
         guard item.supportsPaste else { return nil }
         if case .quicklink(let link, let argument) = item.action, link.needsQuery && argument.isEmpty { return nil }
+        switch item.action {
+        case .clipboard, .snippet: if contentPrimaryAction == .paste { return "Copy" }
+        default: break
+        }
         let noun: String
         switch item.action {
         case .file: noun = "Paste File to"
@@ -382,6 +383,7 @@ extension LauncherModel {
     /// folders, and the default app for files and other links such as mailto.
     /// A {query} link is resolved with a sample term, so mailto:{query} names Mail too.
     func openerName(for link: Quicklink) -> String {
+        if let application = link.openWith { return application.name }
         guard let url = try? link.resolvedURL(query: link.needsQuery ? "x" : "") else { return defaultBrowserName }
         switch url.scheme?.lowercased() {
         case "http", "https": return defaultBrowserName
@@ -620,7 +622,7 @@ extension LauncherModel {
             $0.preferences.clipboardPaused = false
             $0.preferences.clipboardImagesEnabled = choices.images
             $0.preferences.clipboardFilesEnabled = choices.files
-            $0.preferences.clipboardRetentionDays = choices.days
+            $0.preferences.setClipboardRetention(days: choices.days)
             $0.preferences.clipboardLimit = choices.limit
         }) {
             applyPreferences()
@@ -744,6 +746,7 @@ extension LauncherModel {
                             self?.openAI(.chat, attachment: attachment)
                         })
                 }
+                entries += clipboardEntryActions(for: item, entry: entry)
                 entries.append(
                     ActionEntry(
                         id: "pin", title: entry.isPinned ? "Unpin" : "Pin to Top", symbol: entry.isPinned ? "pin.slash" : "pin",
@@ -1065,7 +1068,8 @@ extension LauncherModel {
     func returnIsInert(for item: LauncherItem) -> Bool {
         guard let link = argumentLink, item.id == "argument.\(link.id)", case .quicklink(_, let argument) = item.action
         else { return false }
-        return argument.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        // A blank term runs with the field's default; only a required field waits for one.
+        return argument.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && quicklinkArgumentIsRequired(link)
     }
 
     /// A source is still streaming, so an empty list isn't the final answer yet.
