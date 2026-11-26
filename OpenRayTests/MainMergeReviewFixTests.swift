@@ -80,6 +80,57 @@ struct MainMergeReviewFixTests {
         #expect(posted.pids == [me.processIdentifier])
     }
 
+    @Test func onlyANonEmptyRangeAsLongAsTheTextCanBeReplaced() {
+        #expect(SelectedTextContext.isUsable(NSRange(location: 3, length: 5), for: "Hello"))
+        #expect(!SelectedTextContext.isUsable(NSRange(location: 3, length: 0), for: "Hello"))
+        #expect(!SelectedTextContext.isUsable(NSRange(location: 3, length: 4), for: "Hello"))
+        #expect(!SelectedTextContext.isUsable(NSRange(location: NSNotFound, length: 5), for: "Hello"))
+        #expect(!SelectedTextContext.isUsable(nil, for: "Hello"))
+        // UTF-16, as Accessibility counts: an emoji is two units.
+        #expect(SelectedTextContext.isUsable(NSRange(location: 0, length: 3), for: "a🍎"))
+        var caret = selection("Hello", source: "Notes")
+        caret.range = NSRange(location: 7, length: 0)
+        #expect(!caret.canReplace)
+        #expect(throws: LibraryValidationError.self) {
+            try SelectedTextContext.verifyUnchanged(
+                capturedText: "Hello", capturedRange: NSRange(location: 7, length: 0), appIsRunning: true,
+                sameElement: true, currentText: "Hello", currentRange: NSRange(location: 7, length: 0), sourceName: "Notes")
+        }
+    }
+
+    @Test func theLastCheckRereadsFocusRangeTextAndTheFrontmostApp() throws {
+        let range = NSRange(location: 4, length: 5)
+        let reads = ProbeScript()
+        let probe = SelectedTextContext.Probe(
+            frontmostProcess: { reads.frontmost },
+            focusIsOriginal: { reads.nextFocus() },
+            text: { reads.text },
+            range: { reads.range })
+        func validate() throws {
+            try SelectedTextContext.validate(
+                capturedText: "Hello", capturedRange: range, process: 42, appIsRunning: true, sourceName: "Notes",
+                probe: probe)
+        }
+        reads.reset(range: range)
+        try validate()
+        // Focus moved while the text and range were being read.
+        reads.reset(range: range, focus: [true, false])
+        #expect(throws: LibraryValidationError.self) { try validate() }
+        // Another app came to the front.
+        reads.reset(range: range, frontmost: 7)
+        #expect(throws: LibraryValidationError.self) { try validate() }
+        // Any value that can't be read refuses.
+        reads.reset(range: range, focus: [nil, true])
+        #expect(throws: LibraryValidationError.self) { try validate() }
+        reads.reset(range: range, text: nil)
+        #expect(throws: LibraryValidationError.self) { try validate() }
+        reads.reset(range: nil)
+        #expect(throws: LibraryValidationError.self) { try validate() }
+        // The same text at another place in the field.
+        reads.reset(range: NSRange(location: 20, length: 5))
+        #expect(throws: LibraryValidationError.self) { try validate() }
+    }
+
     // MARK: 3. The target belongs to the source that was chosen
 
     @Test func aClipboardPassageWithTheSameTextNeverInheritsTheSelectionsTarget() async {
@@ -231,6 +282,87 @@ struct MainMergeReviewFixTests {
         #expect(model.ai.messages.count == 2)
     }
 
+    @Test func quickFixNeverRunsAResumedPassageFromAnotherApp() {
+        let engine = TestAIEngine()
+        let model = model(engine: engine)
+        defer { model.stop() }
+        // An unsent passage selected in app A.
+        model.setCapturedSelection(selection("Same text", source: "App A"))
+        model.openAI(.rewrite)
+        // Quick Fix from app B, where the same words are selected.
+        var other = selection("Same text", source: "App B")
+        other.range = NSRange(location: 10, length: 9)
+        model.setCapturedSelection(other)
+        AICommandProvider().run(commandID: "ai.rewrite", arguments: [:], in: model, startsWritingCommands: true)
+        #expect(engine.prompts.isEmpty)
+        #expect(!model.ai.isGenerating)
+        #expect(model.aiReplaceTarget?.sourceName == "App A")
+        // Same text, but another app and place: offered, never applied on its own.
+        #expect(model.pendingNewSelection?.sourceName == "App B")
+    }
+
+    @Test func quickFixRunsASelectionItJustCaptured() async {
+        let engine = TestAIEngine()
+        let model = model(engine: engine)
+        defer { model.stop() }
+        model.setCapturedSelection(selection("Fresh passage"))
+        AICommandProvider().run(commandID: "ai.rewrite", arguments: [:], in: model, startsWritingCommands: true)
+        await model.ai.waitForResponse()
+        #expect(engine.prompts == ["Fresh passage"])
+        // The very same selection again (app, element, range, text) isn't offered as new.
+        model.openAI(.rewrite)
+        #expect(model.pendingNewSelection == nil)
+    }
+
+    @Test func reopeningWhileAReplyIsWrittenNeverChangesItsPassageOrTarget() async {
+        let engine = TestAIEngine()
+        engine.delay = .milliseconds(50)
+        let model = model(engine: engine)
+        defer { model.stop() }
+        model.setCapturedSelection(selection("Passage A", source: "App A"))
+        model.openAI(.rewrite)
+        model.submitAI()
+        #expect(model.ai.isGenerating)
+
+        model.setCapturedSelection(selection("Passage B", source: "App B"))
+        model.openAI(.rewrite)
+        #expect(model.ai.attachments.map(\.text) == ["Passage A"])
+        #expect(model.aiReplaceTarget?.sourceName == "App A")
+        #expect(model.pendingNewSelection == nil)
+        model.openAI(.rewrite, attachment: AIAttachment(source: .clipboard, text: "Passage C"))
+        #expect(model.ai.attachments.map(\.text) == ["Passage A"])
+        _ = model.clipboard.copy("Passage D")
+        model.attachClipboardToAI()
+        model.attachSelectionFromPreviousApp(reportErrors: true)
+        #expect(model.ai.attachments.map(\.text) == ["Passage A"])
+        #expect(model.aiReplaceTarget?.sourceName == "App A")
+
+        await model.ai.waitForResponse()
+        #expect(model.ai.lastSource == "Passage A")
+        #expect(model.aiAcceptTitle == "Replace in App A")
+    }
+
+    @Test func sendingAFileToAIChatPutsUnsentWritingWorkAway() async throws {
+        let model = model()
+        defer { model.stop() }
+        let folder = FileManager.default.temporaryDirectory.appending(path: "OpenRaySendToAI-\(UUID())")
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: folder) }
+        let file = folder.appending(path: "notes.txt")
+        try Data("Meeting notes".utf8).write(to: file)
+
+        model.setCapturedSelection(selection("A passage"))
+        model.openAI(.rewrite)
+        model.ai.instruction = "Keep it short"
+        await model.sendFileToAI(file).value
+        #expect(model.ai.action == .chat)
+
+        model.openAI(.rewrite)
+        #expect(model.ai.attachments.first?.text == "A passage")
+        #expect(model.ai.instruction == "Keep it short")
+        #expect(model.aiReplaceTarget?.text == "A passage")
+    }
+
     // MARK: 5. A changed Files query drops what can't be matched afresh
 
     @Test func aChangedQueryDropsContentOnlyMatchesAndUnmatchableRows() async {
@@ -258,6 +390,29 @@ struct MainMergeReviewFixTests {
         await service.waitForResults()
         // Root search (names only) is another mode: nothing carries over.
         service.search("budget")
+        #expect(service.results.isEmpty)
+    }
+
+    @Test func turningContentSearchOffWithTheSameQueryDropsContentRows() async {
+        let metadata = ReviewStubQuery()
+        var queries = [metadata, metadata]
+        let home = FileManager.default.temporaryDirectory.appending(path: "OpenRayReview-\(UUID())")
+        let service = FileSearchService(home: home, queryFactory: { queries.removeFirst() }, debounce: .zero)
+        defer { service.stop() }
+        let setting = ContentSetting()
+        service.options = {
+            var options = FileSearchOptions()
+            options.matchesContent = setting.on
+            return options
+        }
+        service.search("budget", showRecent: true)
+        await service.waitForPendingSearch()
+        metadata.finish(with: ["notes.txt", "budget-plan.txt"], in: home)
+        await service.waitForResults()
+        #expect(service.results.contains { $0.matchedContent })
+        // Settings › Files turns content search off; the Files scope asks the same query again.
+        setting.on = false
+        service.search("budget", showRecent: true)
         #expect(service.results.isEmpty)
     }
 
@@ -372,6 +527,29 @@ struct MainMergeReviewFixTests {
         defer { model.stop() }
         #expect(throws: SideEffectGuard.Blocked.self) { try model.captureSelection() }
     }
+}
+
+@MainActor
+private final class ContentSetting {
+    var on = true
+}
+
+/// Scripted reads for `SelectedTextContext.Probe`.
+@MainActor
+private final class ProbeScript {
+    var frontmost: pid_t? = 42
+    var focus: [Bool?] = [true, true]
+    var text: String? = "Hello"
+    var range: NSRange?
+
+    func reset(range: NSRange?, focus: [Bool?] = [true, true], frontmost: pid_t? = 42, text: String? = "Hello") {
+        self.range = range
+        self.focus = focus
+        self.frontmost = frontmost
+        self.text = text
+    }
+
+    func nextFocus() -> Bool? { focus.isEmpty ? nil : focus.removeFirst() }
 }
 
 @MainActor
