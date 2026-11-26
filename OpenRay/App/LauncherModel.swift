@@ -99,6 +99,9 @@ final class LauncherModel {
     let windows = WindowManager()
     @ObservationIgnored let clipboard: ClipboardService
     @ObservationIgnored let snippets: SnippetExpander
+    // Slice 2: quicklinks open through the guarded opener, which is inert in tests and verification.
+    @ObservationIgnored var quicklinkOpener: any QuicklinkOpening = QuicklinkOpeners.makeDefault()
+    @ObservationIgnored var applicationResolver: any ApplicationResolving = WorkspaceApplicationResolver()
     @ObservationIgnored let hotKey: GlobalHotKey
     /// A hotkey registry passed in by a test, backed by a fake. It may register while the
     /// pasteboard is isolated; the real Carbon one never does.
@@ -163,7 +166,8 @@ final class LauncherModel {
         switch section {
         case .home:
             items = commandItems + applicationItems + quicklinkItems + snippetItems + noteItems + savedFileItems
-            items += clipboardItems.filter { store.database.favoriteIDs.contains($0.id) }
+            let clipboardInSearch = store.database.preferences.showsClipboardInRootSearch
+            items += clipboardItems.filter { clipboardInSearch || store.database.favoriteIDs.contains($0.id) }
             items += registry.rootItems(for: query.trimmingCharacters(in: .whitespacesAndNewlines), in: self)
             if query.count >= 2 { items += fileItems }
             items += providedLiveItemsInOrder

@@ -7,7 +7,7 @@ extension SettingsPane {
         id: "clipboard", title: "Clipboard",
         subtitle: "What OpenRay keeps from your clipboard, and for how long.",
         kind: .clipboard, symbol: "list.clipboard",
-        keywords: "history capture pause retention days entries exclude apps password delete storage images files"
+        keywords: "history capture pause retention days months unlimited entries exclude apps password delete storage images files search everything"
     ) { model, _ in AnyView(ClipboardPane(model: model)) }
 }
 
@@ -52,12 +52,11 @@ struct ClipboardPane: View {
                 .disabled(isOff)
                 LabeledContent {
                     HStack {
-                        Picker("Days", selection: model.preference(\.clipboardRetentionDays)) {
-                            Text("1 day").tag(1)
-                            Text("7 days").tag(7)
-                            Text("30 days").tag(30)
+                        Picker("Days", selection: retentionBinding) {
+                            ForEach(ClipboardRetention.allCases) { Text($0.title).tag($0) }
                         }
                         .labelsHidden().fixedSize()
+                        .accessibilityIdentifier("settings.clipboard.retention")
                         Picker("Entries", selection: model.preference(\.clipboardLimit)) {
                             ForEach([50, 100, 250, 500], id: \.self) { Text("\($0) entries").tag($0) }
                         }
@@ -69,6 +68,13 @@ struct ClipboardPane: View {
                 }
                 // Retention still prunes saved history while capture is off.
                 .disabled(isOff && entries.isEmpty)
+                Toggle(isOn: model.optionalPreference(\.clipboardInRootSearch)) {
+                    SettingRowLabel(
+                        title: "Show in Everything search",
+                        detail: "Clipboard entries appear among apps and commands when they match. Favorites always do.")
+                }
+                .settingsSwitch()
+                .accessibilityIdentifier("settings.clipboard.rootSearch")
                 if let note = model.clipboard.accessMessage {
                     Label(note, systemImage: "hand.raised.fill").font(.system(size: 12)).foregroundStyle(OR.Color.warning)
                 }
@@ -100,6 +106,24 @@ struct ClipboardPane: View {
             Text(turnOffMessage(entries))
         }
         .onChange(of: preferences.clipboardEnabled) { model.clipboard.refreshAccessStatus() }
+    }
+
+    /// The explicit choice, or the saved day count for libraries from before it. Older
+    /// builds read the day count, so it's kept in step: unlimited saves the longest it allows.
+    private var retentionBinding: Binding<ClipboardRetention> {
+        Binding(
+            get: {
+                let preferences = model.store.database.preferences
+                return preferences.clipboardRetention ?? ClipboardRetention(days: preferences.clipboardRetentionDays)
+            },
+            set: { retention in
+                if model.store.update({
+                    $0.preferences.clipboardRetention = retention
+                    $0.preferences.clipboardRetentionDays = retention.days ?? 365
+                }) {
+                    model.applyPreferences()
+                }
+            })
     }
 
     /// Reads the stored Paused state, so pruning or deleting history while paused doesn't show Off.

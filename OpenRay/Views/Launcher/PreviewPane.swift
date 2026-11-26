@@ -140,14 +140,25 @@ struct PreviewPane: View {
             var rows = [("Copied from", entry.sourceName), ("Copied", Self.relativeDay(entry.copiedAt))]
             if case .image(let image) = entry.content {
                 rows.append(("Size", ByteCountFormatter.string(fromByteCount: Int64(image.byteCount), countStyle: .file) + " PNG"))
+                if let text = entry.recognizedText, !text.isEmpty {
+                    rows.append(("Text", String(text.replacingOccurrences(of: "\n", with: " ").prefix(80))))
+                }
+            }
+            let formats = ClipboardPayload.formats(for: entry).filter { $0 == .rtf || $0 == .html }
+            if !formats.isEmpty {
+                rows.append(("Formats", (["Plain"] + formats.map { $0 == .rtf ? "RTF" : "HTML" }).joined(separator: ", ")))
             }
             rows.append(("Expires", expiry(entry)))
             return rows
         case .snippet(let snippet):
-            return [
+            var rows = [
                 ("Keyword", snippet.keyword.isEmpty ? "None" : snippet.keyword),
                 ("Expands as you type", expansion(of: snippet)),
             ]
+            let arguments = snippet.template.arguments
+            if !arguments.isEmpty { rows.append(("Asks for", arguments.map(\.title).joined(separator: ", "))) }
+            if !snippet.tagList.isEmpty { rows.append(("Tags", snippet.tagList.joined(separator: ", "))) }
+            return rows
         case .note(let note):
             return [("Edited", Self.relativeDay(note.modifiedAt)), ("Words", note.wordCount.formatted())]
         case .quicklink(let link, _):
