@@ -34,5 +34,8 @@ enum CommandProviders {
         ScriptCommandProvider.registration,
         DeepLinkRouter.registration,
         LibraryArchiveProvider.registration,
+        // main: pomodoro, caffeinate
+        PomodoroCommandProvider.registration,
+        CaffeinateCommandProvider.registration,
     ]
 }

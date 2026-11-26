@@ -9,6 +9,22 @@ struct AIWritingResult {
     var text: String
 }
 
+/// main #13: a follow-up may change the format or tone of any writing result, so revisions use
+/// their own schema rather than the initial operation's.
+@Generable
+struct AIRevisionResult {
+    @Guide(
+        description:
+            "A brief list of the latest revision request's requirements, including requested tone, language, format, and sentence or word count. The latest request overrides conflicting earlier requirements."
+    )
+    var requirements: [String]
+    @Guide(
+        description:
+            "The complete revised text satisfying every listed requirement. Return the text only, without a preface or explanation."
+    )
+    var text: String
+}
+
 @Generable
 struct AIProofreadingResult {
     // Text only. A separate "needs corrections" flag generated before the text was
@@ -375,6 +391,33 @@ final class FoundationModelEngine: AIEngine {
             // Writing commands transform each passage independently. Only chat
             // carries conversational context into the next request.
             if action != .chat { reset() }
+        } catch {
+            reset()
+            throw Self.mapped(error)
+        }
+    }
+
+    func streamRevision(
+        _ request: String, context: AIWritingContext, action: AIAction,
+        onSnapshot: @escaping @MainActor (AIResponseSnapshot) -> Void
+    ) async throws {
+        guard availability.isAvailable else { throw AIServiceError.unavailable(availability) }
+        if session == nil || ledger.action != action {
+            session = LanguageModelSession(instructions: action.instructions)
+            ledger = AISessionLedger(exists: true, action: action)
+        }
+        guard let session else { throw AIServiceError.unavailable(.unavailable) }
+        do {
+            let stream = session.streamResponse(
+                to: Prompt(context.revisionPrompt(for: request)), generating: AIRevisionResult.self,
+                options: GenerationOptions(samplingMode: .greedy, maximumResponseTokens: 1_500))
+            for try await snapshot in stream {
+                try Task.checkCancellation()
+                if let text = snapshot.content.text { onSnapshot(AIResponseSnapshot(text: text)) }
+            }
+            try Task.checkCancellation()
+            // Each revision carries its context; replaying generated schemas would only fill the window.
+            reset()
         } catch {
             reset()
             throw Self.mapped(error)

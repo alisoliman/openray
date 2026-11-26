@@ -85,6 +85,19 @@ struct SettingsWindowTests {
         #expect(SettingsSearch.wordPrefixScore("export login", in: SettingsPane.library.keywords) == nil)
     }
 
+    @Test func mainsPomodoroAndCaffeinatePanesAreListedAndFoundByTitleAndKeywords() {
+        // main: pomodoro, caffeinate. Their panes follow the slices', in this order.
+        let mine: [SettingsPane] = [.pomodoro, .caffeinate]
+        #expect(SettingsPane.primary.filter(mine.contains) == mine)
+        #expect(SettingsPane(rawValue: "pomodoro") == .pomodoro)
+        #expect(SettingsPane(rawValue: "caffeinate") == .caffeinate)
+        // Focus lists "pomodoro" as a keyword, but Pomodoro's own title wins.
+        #expect(SettingsSearch.bestPane(for: "pomodoro") == .pomodoro)
+        #expect(SettingsSearch.bestPane(for: "caffeinate") == .caffeinate)
+        #expect(SettingsSearch.bestPane(for: "daily goal") == .pomodoro)
+        #expect(SettingsSearch.bestPane(for: "awake") == .caffeinate)
+    }
+
     @Test func sidebarSearchKeepsShortcutsForMatchingCommandsOnly() {
         let commands = ["Left Half", "Clipboard History cb"]
         #expect(SettingsSearch.score(.shortcuts, query: "left") == nil)

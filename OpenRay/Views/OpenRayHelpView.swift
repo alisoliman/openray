@@ -49,7 +49,11 @@ struct OpenRayHelpView: View {
                         shortcut(["⌘", "S"], "Save an editor")
                         shortcut(["⌘", ","], "Settings")
                         shortcut(["esc"], "Close the top layer: actions, editor, scope, then the search")
+                        shortcut(["⌘", "["], "Go back one step, even when Esc is set to close the window")
                     }
+                    paragraph(
+                        "In AI the keys follow the conversation: Return sends, ⇧Return or ⌘Return adds a line, and Return on an empty field uses a finished writing result.")
+                        .foregroundStyle(OR.Color.text2)
                 }
 
                 section("Make everyday work reusable", kind: .snippet, symbol: "curlybraces") {
@@ -66,18 +70,36 @@ struct OpenRayHelpView: View {
                         "Window Management shows each layout as a picture. Layouts apply to the window you came from, named in the field. They need Accessibility.")
                 }
 
+                section("Focus with Pomodoro", kind: .command, symbol: "timer") {
+                    paragraph(
+                        "Search Start Pomodoro to start or resume the current phase, or Pomodoro to see the timer, today's sessions and focus minutes, and your recent sessions. Pause, skip a break or reset the cycle from the list or ⌘K. The menu bar shows the countdown while a phase runs; closing the launcher leaves it running.")
+                    paragraph(
+                        "The default rhythm is 25 minutes of focus, 5-minute breaks and a 15-minute break after four sessions, with a goal of eight a day. Settings → Pomodoro changes them, starts breaks automatically and turns the chime on or off. Only completed focus sessions count. Timer and history are saved in your library, and a phase that ended while OpenRay was closed completes when it next runs.")
+                    paragraph(
+                        "Pomodoro paces your work and counts sessions. Focus hides distracting apps for a session. They're separate, and you can run both at once.")
+                }
+
+                section("Keep your Mac awake", kind: .system, symbol: "cup.and.saucer") {
+                    paragraph(
+                        "Start Caffeinate keeps your Mac and its display awake until you stop it; Stop Caffeinate and Toggle Caffeinate act at once and close the launcher. Caffeinate lists 10 minutes to 12 hours, and typing a number keeps it awake for that many minutes (1–1,440). Choosing a new length starts it from now.")
+                    paragraph(
+                        "It uses a macOS power assertion while OpenRay runs. Quitting stops it, and sessions aren't resumed after a relaunch. Closing the lid or choosing Sleep still puts the Mac to sleep. A cup shows in the menu bar while it's on.")
+                }
+
                 section("Work with AI", kind: .ai, symbol: nil) {
                     paragraph(
-                        "Press Tab on any search to ask AI. Writing commands such as Fix Spelling & Grammar pick up the text you selected in another app, show what changed, and ⌘↩ replaces the selection.")
+                        "Press Tab on any search to ask AI. Writing commands such as Fix Spelling & Grammar pick up the text you selected in another app and show what changed. Press Return on the empty field to replace the selection in its app; OpenRay checks the selection is unchanged first, and copies the result instead if it isn't.")
                     paragraph(
-                        "In chat, Return adds a line and ⌘↩ sends. Attach the clipboard or your selection explicitly. Requests are limited to 6,000 characters.")
+                        "After a result, type a follow-up such as Make it warmer and press Return to refine it. Try Again (⌘R) repeats the last request with the context it had, and Use Result as New Passage in ⌘K starts over from the result.")
+                    paragraph(
+                        "In chat, Return sends and ⇧Return or ⌘Return adds a line. Attach the clipboard or your selection explicitly. Requests are limited to 6,000 characters.")
                     paragraph(
                         "AI runs on this Mac with Apple Intelligence and never falls back to the cloud. It needs an eligible Mac, Apple Intelligence turned on, a supported language and the model downloaded. Review what it writes; it can't browse for live information.")
                 }
 
                 section("Your data and permissions", kind: .permission, symbol: "lock.fill") {
                     paragraph(
-                        "No account, analytics, ads or cloud sync. Your library, favorites, recent items and clipboard history are stored in ~/Library/Application Support/OpenRay, readable only by your account but not encrypted by OpenRay. Back up library.json and ClipboardImages together.")
+                        "No account, analytics, ads or cloud sync. Your library, favorites, recent items, Pomodoro timer and sessions, and clipboard history are stored in ~/Library/Application Support/OpenRay, readable only by your account but not encrypted by OpenRay. Back up library.json and ClipboardImages together.")
                     paragraph(
                         "Clipboard history and keyword expansion start off. Known password managers, content marked confidential, anything copied during Secure Input and apps you exclude are never saved. Other sensitive text can be, so pause capture from the menu bar or the action bar when you need to.")
                     paragraph(

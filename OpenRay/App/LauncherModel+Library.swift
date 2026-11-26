@@ -104,8 +104,13 @@ extension LauncherModel {
             values.snippets = Dictionary(
                 database.snippets.map { ($0.name, $0.referenceSource()) }, uniquingKeysWith: { first, _ in first })
         }
-        if plan.requirements.selection, clipboard.usesGeneralPasteboard || selectionReader != nil {
-            values.selection = try? selectionReader?() ?? windows.selectedText(in: previousApplication)
+        if plan.requirements.selection,
+            clipboard.usesGeneralPasteboard || selectionReader != nil || selectionContextReader != nil
+        {
+            // The same capture writing commands use; an AI Command that replaces it pins it.
+            let selection = try? captureSelection()
+            lastCapturedSelection = selection
+            values.selection = selection?.text
         }
         return values
     }

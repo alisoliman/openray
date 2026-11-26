@@ -79,8 +79,9 @@ struct ShortcutsOverlayTests {
         #expect(keys(overlay.everywhereRows, for: "Leave AI") == ["esc"])
         #expect(!overlay.everywhereRows.contains { $0.0 == "Clear Search" || $0.0 == "Leave Scope" })
         #expect(!overlay.localRows.contains { $0.0 == "Leave" })
-        #expect(keys(overlay.localRows, for: AIAction.proofread.runTitle) == ["⌘", "↩"])
-        #expect(keys(overlay.localRows, for: "New Line") == ["↩"])
+        // Owner decision (main #12/#13 inside AI): ↩ runs, ⇧↩ and ⌘↩ add a line.
+        #expect(keys(overlay.localRows, for: AIAction.proofread.runTitle) == ["↩"])
+        #expect(overlay.localRows.filter { $0.0 == "New Line" }.map(\.1) == [["⇧", "↩"], ["⌘", "↩"]])
 
         // Nothing has run yet, so there's nothing to try again.
         #expect(keys(overlay.localRows, for: "Try Again") == nil)

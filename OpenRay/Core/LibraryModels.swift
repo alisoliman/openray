@@ -274,6 +274,7 @@ struct UsageRecord: Codable, Equatable, Sendable {
 struct LibraryDatabase: Codable, Equatable, Sendable {
     // Version 4 is OpenRay 2.0. Version 5 adds the collections the parity slices fill in.
     // A build opens libraries newer than it understands read-only.
+    // main's builds also wrote a version 4 (version 3 plus `pomodoro`); version 5 reads both.
     static let currentSchemaVersion = 5
     var schemaVersion = LibraryDatabase.currentSchemaVersion
     var preferences = AppPreferences()
@@ -310,6 +311,10 @@ struct LibraryDatabase: Codable, Equatable, Sendable {
     /// Per-command settings: command id → key → value. Any slice can store small values here
     /// without a schema change, e.g. `commandPreferences["system.sleep", default: [:]]["confirm"] = "false"`.
     var commandPreferences: [String: [String: String]] = [:]
+    // main: pomodoro, caffeinate
+    /// Pomodoro's configuration, timer and completed sessions. main's version 4 wrote it under the
+    /// same key, so its libraries keep their timer and history. Caffeinate stores nothing.
+    var pomodoro = PomodoroData()
 
     static let defaultFavorites = ["ai.chat", "section.clipboard", "section.files", "section.notes", "section.snippets"]
 
@@ -319,6 +324,8 @@ struct LibraryDatabase: Codable, Equatable, Sendable {
         // Schema 5.
         case aiCommands, agents, disabledCommandIDs, fallbackOrder, scriptDirectories, windowLayouts,
             focusCategories, emojiUsage, calculatorHistory, commandPreferences
+        // main: pomodoro, caffeinate
+        case pomodoro
     }
 
     var orderedFavoriteIDs: [String] {
@@ -377,6 +384,8 @@ struct LibraryDatabase: Codable, Equatable, Sendable {
             try container.decodeIfPresent([CalculatorHistoryRecord].self, forKey: .calculatorHistory) ?? []
         commandPreferences =
             try container.decodeIfPresent([String: [String: String]].self, forKey: .commandPreferences) ?? [:]
+        // main: pomodoro, caffeinate
+        pomodoro = try container.decodeIfPresent(PomodoroData.self, forKey: .pomodoro) ?? PomodoroData()
     }
 
     func binding(for targetID: String) -> CommandBinding? {
@@ -433,6 +442,7 @@ struct LibraryDatabase: Codable, Equatable, Sendable {
         guard clipboard.allSatisfy(\.isValid) else {
             throw LibraryValidationError("The library contains invalid clipboard content.")
         }
+        try pomodoro.validate()
     }
 }
 

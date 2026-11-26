@@ -237,10 +237,19 @@ final class GlobalHotKey {
 
 @MainActor
 final class CarbonHotKeyBackend: GlobalHotKeyBackend {
+    typealias RegisterHotKey = (UInt32, UInt32, EventHotKeyID, OptionBits, inout EventHotKeyRef?) -> OSStatus
+
     private static let signature: OSType = 0x4F52_4159
+    /// Nil registers with Carbon, which an inert launch never does. Tests inject a stand-in
+    /// that never reaches the system, so it runs even while inert.
+    private let registerHotKey: RegisterHotKey?
     private var references: [UInt32: EventHotKeyRef] = [:]
     private var handler: EventHandlerRef?
     private var action: ((UInt32) -> Void)?
+
+    init(registerHotKey: RegisterHotKey? = nil) {
+        self.registerHotKey = registerHotKey
+    }
 
     func installHandler(_ action: @escaping (UInt32) -> Void) throws {
         self.action = action
@@ -270,11 +279,17 @@ final class CarbonHotKeyBackend: GlobalHotKeyBackend {
 
     func register(_ shortcut: CommandShortcut, identifier: UInt32) throws {
         // Global shortcuts reach every app; inert launches never register them.
-        try SideEffectGuard.check("registering global shortcuts")
+        if registerHotKey == nil { try SideEffectGuard.check("registering global shortcuts") }
+        let registerHotKey =
+            self.registerHotKey ?? { keyCode, modifiers, identifier, options, reference in
+                RegisterEventHotKey(keyCode, modifiers, identifier, GetApplicationEventTarget(), options, &reference)
+            }
         var reference: EventHotKeyRef?
-        let status = RegisterEventHotKey(
+        // Shared registrations notify every listening app and can make multiple
+        // launcher copies compete for focus. Report a conflict instead.
+        let status = registerHotKey(
             shortcut.keyCode, shortcut.modifiers.carbonFlags,
-            EventHotKeyID(signature: Self.signature, id: identifier), GetApplicationEventTarget(), 0, &reference)
+            EventHotKeyID(signature: Self.signature, id: identifier), OptionBits(kEventHotKeyExclusive), &reference)
         guard status == noErr, let reference else {
             throw LibraryValidationError(
                 "macOS could not register \(shortcut.title); another app may use it (\(status)).")

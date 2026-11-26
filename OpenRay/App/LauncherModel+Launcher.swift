@@ -21,9 +21,11 @@ struct ArgumentSession {
     func value(at index: Int) -> String { specs.indices.contains(index) ? values[specs[index].name] ?? "" : "" }
 }
 
-/// A launcher key that isn't text editing: ⌘Esc, ⌘W, and ⌃J/⌃K with Vim navigation on.
+/// A launcher key that isn't text editing: ⌘Esc, ⌘W, ⌘[ and ⌃J/⌃K with Vim navigation on.
 enum LauncherKeyCommand: Equatable {
     case popToRoot, closeWindow, moveDown, moveUp
+    /// ⌘[ (main #12): one step back, whatever Esc is set to do.
+    case back
 
     /// The command for a key press, from its hardware key code and modifiers. Pure, so it's
     /// tested without events.
@@ -31,6 +33,7 @@ enum LauncherKeyCommand: Equatable {
         switch (keyCode, modifiers) {
         case (53, .command): .popToRoot
         case (13, .command): .closeWindow
+        case (33, .command): .back
         case (38, .control) where vim: .moveDown
         case (40, .control) where vim: .moveUp
         default: nil
@@ -695,6 +698,13 @@ extension LauncherModel {
             popToRoot()
         case .closeWindow:
             panel?.dismiss()
+        case .back:
+            guard onboarding == nil else { return false }
+            // Back never hides the launcher: on an empty Everything there's nowhere to go.
+            let atRoot =
+                destination == .search && section == .home && query.isEmpty && confirmation == nil && !showShortcuts
+                && !showActions && argumentSession == nil && argumentLink == nil && !showsAttachmentPreview && editor == nil
+            if !atRoot { goBack() }
         case .moveDown, .moveUp:
             let offset = command == .moveDown ? 1 : -1
             if showActions {

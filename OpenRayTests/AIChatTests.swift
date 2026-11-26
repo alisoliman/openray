@@ -188,7 +188,9 @@ struct AIChatTests {
             store: LibraryStore(fileURL: nil), ai: AIChatModel(engine: engine), pasteboard: NSPasteboard.withUniqueName())
     }
 
-    @Test func commandReturnOnAWritingResultPastesInsteadOfRunningAgain() async {
+    /// Owner decision (main #12/#13 inside AI): ↩ on the empty field uses the result; it never
+    /// runs the command again.
+    @Test func returnOnAWritingResultUsesItInsteadOfRunningAgain() async {
         let engine = TestAIEngine()
         engine.snapshots = ["The bus arrives at noon."]
         let model = launcher(engine)
@@ -199,10 +201,11 @@ struct AIChatTests {
         await model.ai.waitForResponse()
         #expect(model.ai.latestResponse != nil)
         #expect(model.ai.canSend)
-        AIView(model: model).commandReturn()
+        AIView.submitFromField(model)
         await model.ai.waitForResponse()
         #expect(model.ai.messages.filter { $0.role == .user }.count == 1)
         #expect(engine.prompts.count == 1)
+        #expect(model.clipboard.readText() == "The bus arrives at noon.")
     }
 
     /// Lets a slow test engine deliver its first snapshot.

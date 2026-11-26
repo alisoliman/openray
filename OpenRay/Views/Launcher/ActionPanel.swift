@@ -312,16 +312,18 @@ struct ShortcutsOverlay: View {
         }
     }
 
-    /// Mirrors the AI action bar: what ↩ and ⌘↩ do depends on the result and attachments.
+    /// Mirrors the AI action bar. Keys follow main #12/#13 inside AI (an owner decision): ↩
+    /// sends, or with an empty field uses the result; ⌘↩ and ⇧↩ add a line in a composer.
     /// While a response is being written, Stop is the only command that runs.
     private var aiRows: [(String, [String])] {
         let ai = model.ai
         guard ai.availability.isAvailable else { return [] }
         var rows: [(String, [String])] = []
+        let newLine: [(String, [String])] = [("New Line", ["⇧", "↩"]), ("New Line", ["⌘", "↩"])]
         if ai.action == .chat {
             // The composer still takes text while a reply is written.
-            if !ai.isGenerating { rows.append(("Send", ["⌘", "↩"])) }
-            rows.append(("New Line", ["↩"]))
+            if !ai.isGenerating { rows.append(("Send", ["↩"])) }
+            rows += newLine
             if !ai.attachments.isEmpty { rows.append(("Remove Attachment", ["⌫"])) }
             if ai.isGenerating { return rows + [("Stop", ["⌘", "."])] }
             if !ai.messages.isEmpty { rows.append(("New Chat", ["⌘", "N"])) }
@@ -330,15 +332,20 @@ struct ShortcutsOverlay: View {
             return rows
         }
         if ai.isGenerating { return [("Stop", ["⌘", "."])] }
-        if ai.latestResponse != nil {
-            rows.append(("Copy result", ["↩"]))
-            if !model.aiResultIsUnchanged { rows.append(("Replace or paste", ["⌘", "↩"])) }
+        if ai.messages.last?.role == .assistant {
+            if ai.isRevising {
+                rows.append(("Update Result", ["↩"]))
+            } else if model.canAcceptAIResponse {
+                rows.append((model.aiAcceptTitle, ["↩"]))
+            } else if model.aiResultIsUnchanged {
+                rows.append(("Done", ["↩"]))
+            }
             if showsDiffModes {
                 rows += [("Show changes", ["⌘", "1"]), ("Show result", ["⌘", "2"]), ("Show original", ["⌘", "3"])]
             }
         } else {
-            rows.append((ai.action.runTitle, ai.attachments.isEmpty ? ["⌘", "↩"] : ["↩"]))
-            if ai.attachments.isEmpty { rows.append(("New Line", ["↩"])) }
+            rows.append((ai.action.runTitle, ["↩"]))
+            if ai.attachments.isEmpty { rows += newLine }
         }
         if ai.canRetry { rows.append(("Try Again", ["⌘", "R"])) }
         rows.append(("Start over", ["⌘", "N"]))
@@ -366,6 +373,8 @@ struct ShortcutsOverlay: View {
             rows.append(("Jump Between Sections", ["⌘", "↑", "↓"]))
             rows.append(("Back to Everything", ["⌘", "esc"]))
         }
+        // main #12: Back that works whatever Esc is set to do.
+        rows.append(("Go Back", ["⌘", "["]))
         rows.append(("Close Window", ["⌘", "W"]))
         rows.append(("Settings", ["⌘", ","]))
         return rows

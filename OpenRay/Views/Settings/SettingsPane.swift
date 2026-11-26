@@ -77,6 +77,9 @@ extension SettingsPane {
         .menuBar,
         // Slice 8: scripts
         .scripts,
+        // main: pomodoro, caffeinate
+        .pomodoro,
+        .caffeinate,
     ]
 
     static let secondary: [SettingsPane] = [.permissions, .library, .about]

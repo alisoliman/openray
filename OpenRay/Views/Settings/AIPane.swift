@@ -61,6 +61,9 @@ struct AIPane: View {
                 IconRow(
                     "Clipboard, files, notes and the screen reach the model when you attach or @-mention them. An agent you give tools can also read your notes, clipboard history, snippets, quicklinks and file names without a mention.",
                     symbol: "paperclip")
+                IconRow(
+                    "A writing command uses the text selected in the app you opened OpenRay from. The selection and where it came from stay in memory, so the result can replace it after OpenRay checks it hasn't changed.",
+                    symbol: "character.cursor.ibeam")
                 IconRow("Chats in the launcher are kept in memory. Chats in the AI Chat window are saved on this Mac.", symbol: "note.text")
             }
         }

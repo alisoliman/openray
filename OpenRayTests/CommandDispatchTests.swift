@@ -64,6 +64,31 @@ struct CommandDispatchTests {
         #expect(!CuratedCommand.supports("clipboard.any", registrations: legacy))
     }
 
+    @Test func mainsPomodoroAndCaffeinateCommandsJoinTheCatalogUnderTheIDsMainSaved() {
+        let model = model()
+        defer { model.stop() }
+        // main appended these to the curated list; here the providers' namespaces accept them, so
+        // bindings, favorites and usage saved by main's builds keep working.
+        let ids = [
+            "pomodoro.open", "pomodoro.start", "caffeinate.open", "caffeinate.start", "caffeinate.stop",
+            "caffeinate.toggle",
+        ]
+        #expect(CuratedCommand.targetIDs.count == 20)
+        let bindable = model.bindableCommands.map(\.id)
+        for id in ids {
+            #expect(CuratedCommand.supports(id))
+            #expect(bindable.contains(id))
+        }
+        #expect(bindable.filter(ids.contains) == ids)
+        // An alias runs them from any scope.
+        #expect(model.store.saveCommandBinding(CommandBinding(targetID: "pomodoro.open", alias: "pom")))
+        model.navigate(to: .snippets)
+        model.query = "pom"
+        #expect(model.results.map(\.id) == ["pomodoro.open"])
+        model.performSelected()
+        #expect(model.section.providedScope?.id == PomodoroCommandProvider.scope.id)
+    }
+
     @Test func boundInvocationUsesSharedDispatchAndRemovedBindingsCannotRun() {
         let model = model()
         defer { model.stop() }

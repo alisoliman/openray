@@ -260,6 +260,9 @@ final class FocusedSecureSearchField: FocusedSearchField {
     }
 }
 
+/// The AI composers. Keys follow main #12/#13 (an owner decision for the AI view): ↩ sends,
+/// ⌘↩ and ⇧↩ insert a new line, a held ↩ never sends twice, Tab and ⇧Tab move focus, and an
+/// input method's composition always gets its keys first.
 struct AIComposerInput: NSViewRepresentable {
     @Binding var text: String
     var focusRequest: Int
@@ -268,6 +271,8 @@ struct AIComposerInput: NSViewRepresentable {
     var fontSize: CGFloat = 13.5
     /// Reports whether the editor holds the keyboard, so the focus ring follows real focus.
     var onFocusChange: (Bool) -> Void = { _ in }
+    /// Changes when the composer starts on another conversation, so undo can't reach into it.
+    var sessionIdentity: () -> String = { "composer" }
 
     func makeCoordinator() -> Coordinator { Coordinator(parent: self) }
 
@@ -308,6 +313,9 @@ struct AIComposerInput: NSViewRepresentable {
         editor.onFocusChange = { [weak coordinator = context.coordinator] focused in
             DispatchQueue.main.async { coordinator?.parent.onFocusChange(focused) }
         }
+        editor.prepareForInput = { [weak editor, weak coordinator = context.coordinator] in
+            if let editor { coordinator?.synchronizeEditor(editor) }
+        }
         scroll.documentView = editor
         return scroll
     }
@@ -315,12 +323,7 @@ struct AIComposerInput: NSViewRepresentable {
     func updateNSView(_ scroll: NSScrollView, context: Context) {
         context.coordinator.parent = self
         guard let editor = scroll.documentView as? FocusedComposerTextView else { return }
-        if editor.string != text {
-            editor.string = text
-            let end = NSRange(location: text.utf16.count, length: 0)
-            editor.setSelectedRange(end)
-            editor.scrollRangeToVisible(end)
-        }
+        context.coordinator.synchronizeEditor(editor)
         if editor.focusRequest != focusRequest {
             editor.focusRequest = focusRequest
             editor.focusIfNeeded()
@@ -330,7 +333,58 @@ struct AIComposerInput: NSViewRepresentable {
     @MainActor
     final class Coordinator: NSObject, NSTextViewDelegate {
         var parent: AIComposerInput
-        init(parent: AIComposerInput) { self.parent = parent }
+        private var sessionID: String
+        private weak var editor: NSTextView?
+        private weak var observedUndoManager: UndoManager?
+
+        init(parent: AIComposerInput) {
+            self.parent = parent
+            sessionID = parent.sessionIdentity()
+        }
+
+        /// Puts the model's draft into the editor before the next key, never during a composition.
+        /// A new conversation, or a draft replaced from outside, starts a fresh undo history.
+        func synchronizeEditor(_ editor: NSTextView) {
+            self.editor = editor
+            observeUndoManager(editor.undoManager)
+            guard !editor.hasMarkedText(), (editor as? FocusedComposerTextView)?.isHandlingMarkedText != true else {
+                return
+            }
+            let identity = parent.sessionIdentity()
+            let text = parent.text
+            if sessionID != identity || editor.string != text {
+                // Undo ranges belong to the previous conversation or imported passage.
+                editor.breakUndoCoalescing()
+                editor.undoManager?.removeAllActions()
+                sessionID = identity
+            }
+            if editor.string != text {
+                editor.string = text
+                let end = NSRange(location: text.utf16.count, length: 0)
+                editor.setSelectedRange(end)
+                editor.scrollRangeToVisible(end)
+            }
+        }
+
+        private func observeUndoManager(_ manager: UndoManager?) {
+            guard observedUndoManager !== manager else { return }
+            let center = NotificationCenter.default
+            center.removeObserver(self, name: .NSUndoManagerDidUndoChange, object: nil)
+            center.removeObserver(self, name: .NSUndoManagerDidRedoChange, object: nil)
+            observedUndoManager = manager
+            if let manager {
+                for name in [Notification.Name.NSUndoManagerDidUndoChange, .NSUndoManagerDidRedoChange] {
+                    center.addObserver(self, selector: #selector(historyChanged(_:)), name: name, object: manager)
+                }
+            }
+        }
+
+        /// NSTextView can apply undo without calling textDidChange; publish it before a later
+        /// SwiftUI update restores the old draft.
+        @objc private func historyChanged(_ notification: Notification) {
+            guard let editor else { return }
+            parent.text = editor.string
+        }
 
         func textDidChange(_ notification: Notification) {
             guard let editor = notification.object as? NSTextView else { return }
@@ -338,10 +392,26 @@ struct AIComposerInput: NSViewRepresentable {
         }
 
         func textView(_ textView: NSTextView, doCommandBy commandSelector: Selector) -> Bool {
-            if commandSelector == #selector(NSResponder.insertNewline(_:)),
-                NSApp.currentEvent?.modifierFlags.contains(.command) == true
-            {
+            guard !textView.hasMarkedText(), (textView as? FocusedComposerTextView)?.isHandlingMarkedText != true else {
+                return false
+            }
+            if commandSelector == #selector(NSResponder.insertTab(_:)) {
+                guard (NSApp.currentEvent?.modifierFlags ?? []).intersection([.command, .control, .option]).isEmpty
+                else { return false }
+                textView.window?.selectNextKeyView(textView)
+                return true
+            }
+            if commandSelector == #selector(NSResponder.insertBacktab(_:)) {
+                guard (NSApp.currentEvent?.modifierFlags ?? []).intersection([.command, .control, .option]).isEmpty
+                else { return false }
+                textView.window?.selectPreviousKeyView(textView)
+                return true
+            }
+            if commandSelector == #selector(NSResponder.insertNewline(_:)) {
                 parent.submit()
+                // Submission may clear or replace the draft before SwiftUI renders. Publish it to
+                // the live editor before another key or undo.
+                synchronizeEditor(textView)
                 return true
             }
             if commandSelector == #selector(NSResponder.deleteBackward(_:)), textView.string.isEmpty {
@@ -364,6 +434,46 @@ struct AIComposerInput: NSViewRepresentable {
 final class FocusedComposerTextView: NSTextView {
     var focusRequest = -1
     var onFocusChange: ((Bool) -> Void)?
+    /// Brings the model's draft in before a key is handled.
+    var prepareForInput: (() -> Void)?
+    /// True while a key that arrived during an input method's composition is being handled.
+    private(set) var isHandlingMarkedText = false
+
+    override func keyDown(with event: NSEvent) {
+        isHandlingMarkedText = hasMarkedText()
+        defer { isHandlingMarkedText = false }
+        prepareForInput?()
+        if handleReturn(event) { return }
+        super.keyDown(with: event)
+    }
+
+    override func performKeyEquivalent(with event: NSEvent) -> Bool {
+        prepareForInput?()
+        if window?.firstResponder === self, event.modifierFlags.contains(.command), handleReturn(event) { return true }
+        return super.performKeyEquivalent(with: event)
+    }
+
+    /// ↩ sends once per press; ⌘↩ and ⇧↩ insert a new line through the normal typing path, so
+    /// selection replacement and undo behave as typed. Returns whether it handled the key.
+    func handleReturn(_ event: NSEvent) -> Bool {
+        guard event.type == .keyDown, event.keyCode == 36 || event.keyCode == 76, !hasMarkedText(), !isHandlingMarkedText
+        else { return false }
+        let modifiers = event.modifierFlags.intersection([.command, .control, .option, .shift])
+        if modifiers == .command || modifiers == .shift {
+            insertText("\n", replacementRange: selectedRange())
+        } else if modifiers.isEmpty {
+            // A held ↩ must not send and then go on to accept the result.
+            if !event.isARepeat { doCommand(by: #selector(NSResponder.insertNewline(_:))) }
+        } else {
+            return false
+        }
+        return true
+    }
+
+    override func insertText(_ insertString: Any, replacementRange: NSRange) {
+        prepareForInput?()
+        super.insertText(insertString, replacementRange: replacementRange)
+    }
 
     override func becomeFirstResponder() -> Bool {
         let became = super.becomeFirstResponder()

@@ -62,6 +62,11 @@ final class FileSearchService: NSObject {
     @ObservationIgnored private var activeQuery: (query: FileQuery, options: FileSearchOptions)?
     /// The browsed folder's rows for one filter and sort, kept until the results change.
     @ObservationIgnored private var orderedListing: (filter: String, sort: FileSortOrder, rows: [FileSearchResult])?
+    /// Builds Spotlight queries. Nil asks Spotlight itself, which an inert launch never does; tests
+    /// inject a stub query, which never reads the index, so it runs even while inert.
+    @ObservationIgnored private let queryFactory: (@MainActor () -> NSMetadataQuery)?
+    /// How long typing settles before Spotlight is asked.
+    @ObservationIgnored private let debounce: Duration
 
     /// Folders bigger than this list their first entries only.
     nonisolated static let folderLimit = 2_000
@@ -74,11 +79,14 @@ final class FileSearchService: NSObject {
 
     init(
         home: URL = FileManager.default.homeDirectoryForCurrentUser, folders: any FolderReading = LiveFolderReader(),
-        sideEffects: SideEffectGuard = .current
+        sideEffects: SideEffectGuard = .current, queryFactory: (@MainActor () -> NSMetadataQuery)? = nil,
+        debounce: Duration = .milliseconds(180)
     ) {
         self.home = home
         self.folders = folders
         self.sideEffects = SideEffectGuard.atLeastCurrent(sideEffects)
+        self.queryFactory = queryFactory
+        self.debounce = debounce
     }
 
     func search(_ text: String, showRecent: Bool = false, scope: FileSearchScope = .home) {
@@ -105,13 +113,20 @@ final class FileSearchService: NSObject {
         isSearching = true
         let request = UUID()
         generation = request
+        let delay = debounce
         pendingSearch = Task { [weak self] in
-            do { try await Task.sleep(for: .milliseconds(180)) } catch { return }
+            do { try await Task.sleep(for: delay) } catch { return }
             guard let self, !Task.isCancelled, self.generation == request else { return }
             // Files asks with `showRecent`; root search matches names only, so its Top Hit stays a name match.
             self.startQuery(text, scope: scope, matchingContent: showRecent)
         }
     }
+
+    /// Waits for the debounce and the query's start. Tests use it with an injected query.
+    func waitForPendingSearch() async { await pendingSearch?.value }
+
+    /// Waits for the latest answer to be filtered into `results`.
+    func waitForResults() async { await filtering?.value }
 
     func stop() {
         pendingSearch?.cancel()
@@ -187,7 +202,7 @@ final class FileSearchService: NSObject {
     // MARK: Spotlight
 
     private func startQuery(_ text: String, scope: FileSearchScope, matchingContent: Bool) {
-        guard !sideEffects.isInert else {
+        guard !sideEffects.isInert || queryFactory != nil else {
             // Tests and isolated verification never read the real Spotlight index.
             results = []
             isSearching = false
@@ -196,7 +211,7 @@ final class FileSearchService: NSObject {
         var options = self.options()
         options.matchesContent = options.matchesContent && matchingContent
         let parsed = FileQuery.parse(text)
-        let query = NSMetadataQuery()
+        let query = queryFactory?() ?? NSMetadataQuery()
         query.searchScopes =
             scope == .home ? FileSearchPolicy.searchRoots(home: home, options: options).map(\.path) : [scope.url.path]
         let library = home.path + "/Library/"

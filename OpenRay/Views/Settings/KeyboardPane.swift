@@ -56,6 +56,7 @@ struct KeyboardPane: View {
                     ForEach(EscapeBehavior.allCases) { Text($0.title).tag($0) }
                 }
                 .neutralMenus()
+                LabeledContent("Go back one step") { KeyCaps(["⌘", "["], size: .small) }
                 LabeledContent("Back to Everything") { KeyCaps(["⌘", "esc"], size: .small) }
                 LabeledContent("Close the window") { KeyCaps(["⌘", "W"], size: .small) }
                 LabeledContent("Jump between sections") { KeyCaps(["⌘", "↑", "↓"], size: .small) }

@@ -53,6 +53,10 @@ private struct MenuBarContent: View {
         Button("Notes") { NotesCenter.shared.model(for: model.store).toggle() }
             .menuShortcut(model.store.database.binding(for: NotesCommandProvider.toggleID)?.shortcut)
         Divider()
+        // main: pomodoro, caffeinate. Their menu bar extras show while they run; these start them.
+        PomodoroMenuSection(model: model)
+        Menu("Caffeinate") { MenuBarItemsView(items: CaffeinateCommandProvider.menuItems(in: model)) }
+        Divider()
         if preferences.clipboardEnabled {
             Text("Clipboard capture is on")
             Button("Pause Capture", systemImage: "pause.fill") { model.setClipboardCapture(false) }
@@ -69,6 +73,46 @@ private struct MenuBarContent: View {
         Divider()
         Button("Quit OpenRay") { NSApp.terminate(nil) }
             .keyboardShortcut("q")
+    }
+}
+
+/// main #10's Pomodoro entries in OpenRay's menu: start, pause or resume, and today's progress.
+private struct PomodoroMenuSection: View {
+    let model: LauncherModel
+
+    var body: some View {
+        let pomodoro = model.pomodoro
+        let state = pomodoro.state
+        Button(state.status == .running ? "Pause Pomodoro" : (state.status == .paused ? "Resume Pomodoro" : "Start Pomodoro")) {
+            if pomodoro.state.status == .running { pomodoro.pause() } else { pomodoro.start() }
+        }
+        .menuShortcut(
+            model.store.database.binding(for: PomodoroCommandProvider.startID)?.shortcut.flatMap {
+                state.status == .running ? nil : $0
+            })
+        Button("Open Pomodoro") { model.panel?.show(section: .provided(PomodoroCommandProvider.scope)) }
+            .menuShortcut(model.store.database.binding(for: PomodoroCommandProvider.openID)?.shortcut)
+        Text("Today: \(pomodoro.completedToday)/\(pomodoro.configuration.dailyGoal) sessions · \(pomodoro.focusMinutesToday) min")
+    }
+}
+
+/// A provider's menu bar items drawn in OpenRay's SwiftUI menu, so both menus say the same.
+struct MenuBarItemsView: View {
+    let items: [MenuBarExtraItem]
+
+    var body: some View {
+        ForEach(items) { item in
+            switch item.role {
+            case .separator: Divider()
+            case .section, .label: Text(item.title)
+            case .action:
+                if item.children.isEmpty {
+                    Button(item.title) { item.perform?() }.disabled(!item.isEnabled || item.perform == nil)
+                } else {
+                    Menu(item.title) { MenuBarItemsView(items: item.children) }
+                }
+            }
+        }
     }
 }
 

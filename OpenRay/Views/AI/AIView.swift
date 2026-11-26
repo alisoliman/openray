@@ -30,26 +30,16 @@ struct AIView: View {
         .onChange(of: model.ai.isGenerating) { _, generating in
             if generating, let style = model.feedback?.style, style == .error || style == .warning { model.feedback = nil }
         }
-        .background {
-            Button("Send") { commandReturn() }
-                .keyboardShortcut(.return, modifiers: .command)
-                .frame(width: 0, height: 0).opacity(0).accessibilityHidden(true)
-        }
     }
 
-    /// ⌘↩ sends in chat. In writing commands it runs, then replaces or pastes the result;
-    /// running again is Try Again (⌘R). Inside ⌘K it runs the entry labelled ⌘↩.
-    func commandReturn() {
-        guard model.confirmation == nil else { return }
-        if model.showActions {
-            if let entry = model.actionEntries.first(where: { $0.id == "paste" }) { model.performAction(entry) }
-            return
+    /// ↩ from the one-line instruction field. ⌘↩ and ⇧↩ insert a new line in AI (an owner
+    /// decision taken from main #12/#13), which a one-line field has no room for, and a held ↩
+    /// never sends and then accepts.
+    static func submitFromField(_ model: LauncherModel) {
+        if let event = NSApp.currentEvent, event.type == .keyDown {
+            guard !event.isARepeat, event.modifierFlags.intersection([.command, .shift]).isEmpty else { return }
         }
-        if model.ai.action != .chat, model.ai.latestResponse != nil, !model.ai.isGenerating {
-            model.pasteAIResponse()
-        } else if model.ai.canSend {
-            model.ai.send()
-        }
+        model.submitAI()
     }
 
     // MARK: Header
@@ -59,16 +49,21 @@ struct AIView: View {
             ScopeToken(
                 kind: .ai, symbol: model.ai.symbol, title: model.ai.title,
                 onRemove: { model.leaveAI() })
-            if model.ai.action != .chat, model.ai.availability.isAvailable, let attachment = model.ai.attachments.first {
+            if model.ai.action != .chat, model.ai.availability.isAvailable,
+                model.ai.attachments.first != nil || model.ai.writingContext != nil
+            {
                 LauncherSearchInput(
-                    text: Bindable(model.ai).instruction, placeholder: "Add an instruction (optional)",
+                    text: Bindable(model.ai).instruction, placeholder: instructionPlaceholder,
                     focusRequest: model.focusRequest,
-                    submit: { runOrCopy() }, move: { _ in }, cancel: model.goBack, paste: model.pasteSelected,
+                    submit: { Self.submitFromField(model) }, move: { _ in }, cancel: model.goBack, paste: {},
                     deleteOnEmpty: {
                         model.leaveAI()
                         return true
-                    }, fontSize: 15, accessibilityLabel: "Instruction", identifier: "ai.instruction")
+                    }, fontSize: 15, accessibilityLabel: model.ai.writingContext == nil ? "Instruction" : "Ask for changes",
+                    identifier: "ai.instruction")
                     .frame(maxWidth: .infinity)
+            }
+            if model.ai.action != .chat, model.ai.availability.isAvailable, let attachment = model.ai.attachments.first {
                 AttachmentChip(attachment.summary, onRemove: { model.ai.removeAttachment(attachment.id) }) {
                     attachmentIcon(attachment)
                 }
@@ -82,7 +77,7 @@ struct AIView: View {
                 .accessibilityAction { model.showsAttachmentPreview = true }
                 .accessibilityAction(named: "Show Attached Text") { model.showsAttachmentPreview = true }
                 .accessibilityAction(named: "Remove Attachment") { model.ai.removeAttachment(attachment.id) }
-            } else {
+            } else if model.ai.action == .chat || model.ai.writingContext == nil || !model.ai.availability.isAvailable {
                 Spacer(minLength: 0)
                 if model.ai.availability.isAvailable {
                     if model.ai.action == .chat, model.ai.command == nil {
@@ -155,12 +150,12 @@ struct AIView: View {
         }
     }
 
-    private func runOrCopy() {
-        if model.ai.latestResponse != nil, !model.ai.isGenerating, model.ai.action != .chat {
-            if let text = model.ai.latestResponse?.text { model.copy(text) }
-        } else {
-            model.ai.send()
-        }
+    /// Before a result: an optional instruction. After one: a follow-up, or ↩ to use the result.
+    private var instructionPlaceholder: String {
+        guard model.ai.writingContext != nil else { return "Add an instruction (optional)" }
+        return model.canAcceptAIResponse
+            ? "Ask for changes, or press Return to \(model.aiReplacesSource ? "replace the selection" : "copy the result")"
+            : "Ask for changes"
     }
 
     // MARK: Bar
@@ -199,31 +194,37 @@ struct AIView: View {
             ActionBarButton(title: "Stop", keys: ["⌘", "."]) { model.ai.cancel() }
                 .disabled(model.ai.isCancelling)
         } else if model.ai.action == .chat {
-            ActionBarButton(title: "Send", keys: ["⌘", "↩"]) { model.ai.send() }
+            ActionBarButton(title: "Send", keys: ["↩"]) { model.ai.send() }
                 .disabled(!model.ai.canSend)
                 .accessibilityIdentifier("ai.send")
             ActionBarDivider()
             ActionBarButton(title: "Actions", keys: ["⌘", "K"], style: .ghost, isOn: model.showActions) {
                 model.showActions.toggle()
             }
-        } else if model.ai.latestResponse != nil {
-            ActionBarButton(title: "Copy", keys: ["↩"]) {
-                if let text = model.ai.latestResponse?.text { model.copy(text) }
-            }
-            if !model.aiResultIsUnchanged {
-                ActionBarButton(
-                    title: model.aiPasteTitle, keys: ["⌘", "↩"], style: model.aiReplacesSource ? .accent : .ghost
-                ) { model.pasteAIResponse() }
+        } else if model.ai.messages.last?.role == .assistant {
+            // ↩ follows the field: a follow-up updates the result, an empty field uses it.
+            if model.ai.isRevising {
+                ActionBarButton(title: "Update", keys: ["↩"], style: .accent) { model.ai.send() }
+                    .disabled(!model.ai.canSend)
+                    .accessibilityIdentifier("ai.send")
+            } else if model.canAcceptAIResponse {
+                ActionBarButton(title: model.aiAcceptTitle, keys: ["↩"], style: model.aiReplacesSource ? .accent : .primary) {
+                    model.acceptAIResponse()
+                }
+                .accessibilityIdentifier("ai.accept")
+            } else if model.aiResultIsUnchanged {
+                ActionBarButton(title: "Done", keys: ["↩"]) { model.leaveAI() }
+            } else if model.ai.latestResponse == nil {
+                ActionBarButton(title: "Try Again", keys: ["↩"]) { model.ai.retry() }
             }
             ActionBarDivider()
             ActionBarButton(title: "Actions", keys: ["⌘", "K"], style: .ghost, isOn: model.showActions) {
                 model.showActions.toggle()
             }
         } else {
-            ActionBarButton(
-                title: model.ai.runTitle, keys: model.ai.attachments.isEmpty ? ["⌘", "↩"] : ["↩"], style: .accent
-            ) { model.ai.send() }
-            .disabled(!model.ai.canSend)
+            ActionBarButton(title: model.ai.runTitle, keys: ["↩"], style: .accent) { model.ai.send() }
+                .disabled(!model.ai.canSend)
+                .accessibilityIdentifier("ai.send")
         }
     }
 }
@@ -380,7 +381,7 @@ struct ChatMessageView: View {
                     Label("Stopped", systemImage: "stop.circle").labelStyle(TightLabelStyle())
                         .font(OR.Font.caption).foregroundStyle(OR.Color.text2)
                 }
-                // Every finished reply keeps its actions. ⌘K and ⌘↩ stay bound to the latest one.
+                // Every finished reply keeps its actions. ⌘K stays bound to the latest one.
                 if !message.text.isEmpty, !(isLatest && chat.isGenerating) {
                     HStack(spacing: 4) {
                         responseButton("Copy", "doc.on.doc", emphasized: true) { actions.copy(message) }
@@ -435,7 +436,7 @@ private struct ChatComposer: View {
                         .padding(.top, 2).allowsHitTesting(false).accessibilityHidden(true)
                 }
                 AIComposerInput(
-                    text: Bindable(model.ai).draft, focusRequest: model.focusRequest, submit: model.ai.send,
+                    text: Bindable(model.ai).draft, focusRequest: model.focusRequest, submit: model.submitAI,
                     deleteOnEmpty: {
                         // ⌫ removes the last attachment first, then leaves AI.
                         if let attachment = model.ai.attachments.last {
@@ -444,7 +445,7 @@ private struct ChatComposer: View {
                             model.leaveAI()
                         }
                         return true
-                    }, onFocusChange: { focused = $0 })
+                    }, onFocusChange: { focused = $0 }, sessionIdentity: { model.ai.conversationToken.uuidString })
                     .frame(minHeight: 38, maxHeight: 96)
                     .fixedSize(horizontal: false, vertical: true)
                     .frame(height: composerHeight)
@@ -507,7 +508,7 @@ private struct ChatComposer: View {
         .buttonStyle(.plain)
         .disabled(!model.ai.isGenerating && !model.ai.canSend)
         .accessibilityLabel(model.ai.isGenerating ? "Stop" : "Send message")
-        .accessibilityHint(model.ai.isGenerating ? "Command Period" : "Command Return")
+        .accessibilityHint(model.ai.isGenerating ? "Command Period" : "Return")
     }
 
     private func addButton(_ title: String, _ symbol: String, action: @escaping () -> Void) -> some View {
@@ -562,11 +563,10 @@ private struct TransformBody: View {
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
         .background {
-            if model.ai.latestResponse != nil, !model.ai.isGenerating {
-                Button("Copy") {
-                    if let text = model.ai.latestResponse?.text { model.copy(text) }
-                }
-                .keyboardShortcut(.defaultAction).hidden()
+            // ↩ with no field focused does what the action bar's first button says.
+            if model.ai.messages.last?.role == .assistant, !model.ai.isGenerating {
+                Button("Use Result") { AIView.submitFromField(model) }
+                    .keyboardShortcut(.defaultAction).hidden()
             }
         }
     }
@@ -620,11 +620,12 @@ private struct TransformBody: View {
                         .allowsHitTesting(false).accessibilityHidden(true)
                 }
                 AIComposerInput(
-                    text: Bindable(model.ai).draft, focusRequest: model.focusRequest, submit: model.ai.send,
+                    text: Bindable(model.ai).draft, focusRequest: model.focusRequest, submit: model.submitAI,
                     deleteOnEmpty: {
                         model.leaveAI()
                         return true
-                    }, fontSize: 14, onFocusChange: { pasteFocused = $0 })
+                    }, fontSize: 14, onFocusChange: { pasteFocused = $0 },
+                    sessionIdentity: { model.ai.conversationToken.uuidString })
             }
             .padding(14)
             .frame(maxHeight: .infinity)
@@ -637,6 +638,12 @@ private struct TransformBody: View {
                     model.focusRequest += 1
                 }
                 .buttonStyle(.orSecondary)
+                if !model.accessibilityAllowed {
+                    // main #12/#13: without Accessibility, selected text can't come in on its own.
+                    Button("Turn On Selected-Text Access…") { model.openSettings(.permissions) }
+                        .buttonStyle(.orGhost)
+                        .accessibilityIdentifier("ai.selectionAccess")
+                }
                 Spacer()
                 if model.ai.pendingCharacterCount > AIChatModel.inputLimit * 8 / 10 {
                     Text("\(model.ai.pendingCharacterCount.formatted()) / \(AIChatModel.inputLimit.formatted())")

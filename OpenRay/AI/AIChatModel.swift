@@ -102,8 +102,23 @@ final class AIChatModel {
     /// in parts to fit the model's window when it's sent.
     static let condensableLimit = 400_000
     var draft = ""
-    /// An optional extra instruction for writing commands.
+    /// An optional extra instruction for writing commands. Once a result is on screen it's the
+    /// follow-up field (main #13): its text revises the result, and it empties after each run.
     var instruction = ""
+    /// The instruction the latest writing run used, for Try Again.
+    private(set) var lastInstruction = ""
+    /// main #13: follow-ups already applied to the current writing result, oldest first.
+    private(set) var acceptedRevisions: [String] = []
+    /// A follow-up whose reply failed before writing anything. Try Again sends it again.
+    private(set) var failedRevision: RevisionTurn?
+    /// Revision turns by their user message, so Try Again repeats one with the context it had.
+    @ObservationIgnored private var revisionTurns: [UUID: RevisionTurn] = [:]
+
+    /// One follow-up and the result it revises.
+    struct RevisionTurn: Equatable {
+        var request: String
+        var context: AIWritingContext
+    }
     private(set) var attachments: [AIAttachment] = []
     private(set) var messages: [ChatMessage] = []
     private(set) var action: AIAction = .chat
@@ -205,7 +220,28 @@ final class AIChatModel {
     }
 
     var canSend: Bool {
-        availability.isAvailable && !isGenerating && !isReadOnly && hasPendingInput && pendingCharacterCount <= Self.inputLimit
+        guard availability.isAvailable, !isGenerating, !isReadOnly else { return false }
+        if isRevising { return instruction.count <= Self.inputLimit }
+        return hasPendingInput && pendingCharacterCount <= Self.inputLimit
+    }
+
+    /// The latest finished writing result, never a stopped one.
+    var lastCompletedResult: String? {
+        guard action != .chat else { return nil }
+        return messages.last { $0.role == .assistant && !$0.isPartial && !$0.text.isEmpty }?.text
+    }
+
+    /// What a follow-up revises: the original passage, the latest finished result and the
+    /// follow-ups so far. Nil in chat, for AI Commands, and before the first result.
+    var writingContext: AIWritingContext? {
+        guard action != .chat, command == nil, !isGenerating, let source = lastSource, let result = lastCompletedResult
+        else { return nil }
+        return AIWritingContext(originalPassage: source, currentResult: result, acceptedRevisions: acceptedRevisions)
+    }
+
+    /// Whether sending now revises the current result with the follow-up field's text.
+    var isRevising: Bool {
+        writingContext != nil && !instruction.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     }
 
     /// The latest assistant reply. A stopped writing result never counts, so it can't be copied
@@ -236,6 +272,10 @@ final class AIChatModel {
         errorMessage = nil
         draft = ""
         instruction = ""
+        lastInstruction = ""
+        acceptedRevisions = []
+        failedRevision = nil
+        revisionTurns = [:]
         attachments = []
         lastSource = nil
         lastAttachment = nil
@@ -346,6 +386,11 @@ final class AIChatModel {
             if switched.remainder.isEmpty, !attachments.contains(where: \.hasContent) { return }
         }
         guard canSend else { return }
+        if isRevising, let context = writingContext {
+            let request = instruction.trimmingCharacters(in: .whitespacesAndNewlines)
+            revise(RevisionTurn(request: request, context: context))
+            return
+        }
         let typed = draft.trimmingCharacters(in: .whitespacesAndNewlines)
         // Writing operations need the exact passage, including surrounding layout.
         // canSend already rejects whitespace-only drafts without modifying them.
@@ -372,12 +417,32 @@ final class AIChatModel {
         lastSource = action == .chat ? nil : prompt
         lastAttachment = action == .chat ? nil : attachments.first
         draft = ""
-        if action == .chat { attachments = [] }
+        if action == .chat {
+            attachments = []
+        } else {
+            // A new run on the passage: earlier follow-ups no longer apply, and the field is free
+            // for the next one.
+            lastInstruction = instruction
+            self.instruction = ""
+            acceptedRevisions = []
+            failedRevision = nil
+        }
         errorMessage = nil
         let message = ChatMessage(role: .user, text: prompt, displayText: display, attachmentLabels: labels)
         if let turn { turnRequests[message.id] = turn }
         messages.append(message)
         run(prompt, instruction: instruction)
+    }
+
+    /// Sends a follow-up that revises the current writing result (main #13).
+    private func revise(_ turn: RevisionTurn) {
+        instruction = ""
+        failedRevision = nil
+        errorMessage = nil
+        let message = ChatMessage(role: .user, text: turn.request)
+        revisionTurns[message.id] = turn
+        messages.append(message)
+        run(turn.request, instruction: "", revision: turn)
     }
 
     /// Attachments are marked as reference data, apart from the question, so the model
@@ -408,18 +473,27 @@ final class AIChatModel {
     /// Generates the latest response again from the same input. If the new run produces
     /// nothing, the previous response comes back.
     func retry() {
-        guard !isGenerating, !isReadOnly, let index = messages.lastIndex(where: { $0.role == .user }) else { return }
+        guard !isGenerating, !isReadOnly else { return }
+        // A follow-up that failed before writing anything left the previous result on screen.
+        if let failed = failedRevision, messages.last?.role == .assistant {
+            if instruction.trimmingCharacters(in: .whitespacesAndNewlines) == failed.request { instruction = "" }
+            engine.reset()
+            revise(failed)
+            return
+        }
+        guard let index = messages.lastIndex(where: { $0.role == .user }) else { return }
         let prompt = messages[index].text
+        let revision = revisionTurns[messages[index].id]
         let previous = Array(messages[(index + 1)...])
         messages.removeSubrange((index + 1)...)
         errorMessage = nil
         if action == .chat { engine.discardLastExchange() } else { engine.reset() }
-        run(
-            prompt, instruction: action == .chat ? "" : instruction.trimmingCharacters(in: .whitespacesAndNewlines),
-            restoring: previous)
+        run(prompt, instruction: action == .chat ? "" : lastInstruction, restoring: previous, revision: revision)
     }
 
-    private func run(_ prompt: String, instruction: String, restoring previous: [ChatMessage] = []) {
+    private func run(
+        _ prompt: String, instruction: String, restoring previous: [ChatMessage] = [], revision: RevisionTurn? = nil
+    ) {
         isGenerating = true
         isCancelling = false
         diffMode = .changes
@@ -444,7 +518,10 @@ final class AIChatModel {
                 self.messages[index].actionItems = snapshot.actionItems
             }
             do {
-                if let command {
+                if let revision {
+                    try await self.engine.streamRevision(
+                        revision.request, context: revision.context, action: action, onSnapshot: apply)
+                } else if let command {
                     try await self.generate(command, prompt: prompt, onSnapshot: apply)
                 } else if action == .chat {
                     try await self.generateChat(prompt, userMessageID: userMessageID, onSnapshot: apply)
@@ -453,6 +530,9 @@ final class AIChatModel {
                 }
                 if let index = self.messages.firstIndex(where: { $0.id == response.id }) {
                     self.messages[index].isPartial = false
+                    if let revision, !self.messages[index].text.isEmpty {
+                        self.acceptedRevisions = revision.context.acceptedRevisions + [revision.request]
+                    }
                     if self.messages[index].text.isEmpty {
                         self.messages.remove(at: index)
                         if action == .chat, !previous.isEmpty {
@@ -464,7 +544,7 @@ final class AIChatModel {
                         } else {
                             self.errorMessage = "The model returned an empty response. Try a more specific request."
                         }
-                        self.recoverFromEmptyRun(prompt: prompt, action: action, restoring: previous)
+                        self.recoverFromEmptyRun(prompt: prompt, action: action, restoring: previous, revision: revision)
                     }
                 }
             } catch {
@@ -474,13 +554,16 @@ final class AIChatModel {
                     self.errorMessage =
                         self.stoppedReason.map { "\($0) The next message starts a fresh session." }
                         ?? "Response stopped. The next message starts a fresh session."
+                } else if revision != nil, error as? AIServiceError == .contextFull {
+                    self.errorMessage =
+                        "This revision reached the model’s context limit. Your passage and result are kept. Shorten your request, or use the result as a new passage."
                 } else {
                     self.errorMessage = error.localizedDescription
                 }
                 // Incomplete responses keep their explicit “Stopped” label.
                 if self.messages.contains(where: { $0.id == response.id && $0.text.isEmpty }) {
                     self.messages.removeAll { $0.id == response.id }
-                    self.recoverFromEmptyRun(prompt: prompt, action: action, restoring: previous)
+                    self.recoverFromEmptyRun(prompt: prompt, action: action, restoring: previous, revision: revision)
                 }
                 self.refreshAvailability()
             }
@@ -621,12 +704,24 @@ final class AIChatModel {
 
     /// A run that produced no text leaves things as they were: Try Again brings back the
     /// previous response, and a typed writing passage returns to the field instead of vanishing.
-    private func recoverFromEmptyRun(prompt: String, action: AIAction, restoring previous: [ChatMessage]) {
+    private func recoverFromEmptyRun(
+        prompt: String, action: AIAction, restoring previous: [ChatMessage], revision: RevisionTurn? = nil
+    ) {
         if !previous.isEmpty {
             messages.append(contentsOf: previous)
+        } else if let revision {
+            // The previous result stays on screen, never replaced by default; the follow-up waits in
+            // its field unless a newer one was typed meanwhile, and Try Again sends it again.
+            if messages.last?.role == .user { messages.removeLast() }
+            failedRevision = revision
+            if instruction.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { instruction = revision.request }
         } else if action != .chat, command == nil, lastAttachment == nil, draft.isEmpty {
             draft = prompt
             if messages.last?.role == .user { messages.removeLast() }
+        }
+        // A failed first run gives its instruction back, unless another was typed meanwhile.
+        if revision == nil, action != .chat, command == nil, previous.isEmpty, instruction.isEmpty {
+            instruction = lastInstruction
         }
     }
 

@@ -129,6 +129,13 @@ final class LauncherModel {
     let files = FileSearchService()
     let ai: AIChatModel
     let windows = WindowManager()
+    // main: pomodoro, caffeinate
+    /// The Pomodoro timer. Its state lives in the library, so it keeps running while the panel is hidden.
+    let pomodoro: PomodoroService
+    /// Keeps the Mac awake. Owned for the whole launch; quitting releases it.
+    let caffeinate: CaffeinateService
+    /// Caffeinate's pending duration controls, kept across navigation and hiding until submitted.
+    let caffeinateDraft = CaffeinateDraft()
     @ObservationIgnored let clipboard: ClipboardService
     @ObservationIgnored let snippets: SnippetExpander
     // Slice 2: quicklinks open through the guarded opener, which is inert in tests and verification.
@@ -176,6 +183,26 @@ final class LauncherModel {
     @ObservationIgnored private var browserName: String?
     /// Stands in for the Accessibility read of the selected text. Tests set it.
     @ObservationIgnored var selectionReader: (() throws -> String)?
+    /// Stands in for the whole selection capture, target included. Tests set it with
+    /// `setCapturedSelection(_:)`.
+    @ObservationIgnored var selectionContextReader: (() throws -> SelectedTextContext)?
+    /// The selection `{selection}` last read, so an AI Command that replaces it can pin it.
+    @ObservationIgnored var lastCapturedSelection: SelectedTextContext?
+    /// The selection a writing result replaces (main #13): pinned to its conversation and its
+    /// passage, never to whichever app happens to be in front later.
+    var aiSelectionTarget: PinnedSelection?
+    /// True while an accepted result is being pasted into its app.
+    var isPastingAIResponse = false
+    /// The result last inserted, by conversation. It's never inserted twice: the selection it
+    /// replaced is gone.
+    @ObservationIgnored var insertedAIResult: (conversation: UUID, text: String)?
+
+    struct PinnedSelection {
+        var context: SelectedTextContext
+        var conversation: UUID
+        /// The passage the conversation works on, which the target's selection supplied.
+        var passage: String
+    }
 
     /// Defaults follow `SideEffectGuard`: a normal launch uses the library on disk and the system
     /// clipboard; the test host and verification mode get an in-memory library and a private,
@@ -183,7 +210,8 @@ final class LauncherModel {
     init(
         store: LibraryStore? = nil, ai: AIChatModel = AIChatModel(), pasteboard: NSPasteboard? = nil,
         registry: CommandRegistry = CommandRegistry(), hotKey: GlobalHotKey? = nil, hyperKey: HyperKey? = nil,
-        sideEffects: SideEffectGuard = .current
+        sideEffects: SideEffectGuard = .current, caffeinate: CaffeinateService? = nil,
+        pomodoroSound: (() -> Void)? = nil
     ) {
         // An injected live guard never makes an inert process (tests, verification) act for real.
         let sideEffects = sideEffects.effective
@@ -197,6 +225,9 @@ final class LauncherModel {
         self.hotKey = hotKey ?? GlobalHotKey()
         usesInjectedHotKey = hotKey != nil
         self.ai = ai
+        // The real assertion and chime check the side-effect guard themselves; tests pass fakes.
+        self.caffeinate = caffeinate ?? CaffeinateService()
+        pomodoro = PomodoroService(store: store, playCompletionSound: pomodoroSound ?? PomodoroService.playSystemSound)
         clipboard = ClipboardService(store: store, pasteboard: pasteboard)
         snippets = SnippetExpander(store: store)
         // {clipboard} in expanded snippets reads through the service, which skips excluded copies.
@@ -580,6 +611,7 @@ final class LauncherModel {
         guard !isStarted else { return }
         isStarted = true
         applyPreferences()
+        pomodoro.startMonitoring()
         await applications.refresh()
         // Apps can hold hotkeys, so register them once the catalog is known.
         commandCatalogDidChange()
@@ -601,6 +633,9 @@ final class LauncherModel {
         cancelProvidedLiveItems()
         hyperKey.stop()
         ai.cancel()
+        pomodoro.stopMonitoring()
+        // Keeping the Mac awake ends with the launcher, as it does when OpenRay quits.
+        caffeinate.shutdown()
     }
 
     func applyPreferences() {
@@ -617,12 +652,17 @@ final class LauncherModel {
         let delay = store.database.preferences.popToRootDelay.interval
         let remembered =
             delay != 0 && (lastHiddenAt.map { hidden in delay.map { Date().timeIntervalSince(hidden) <= $0 } ?? true } ?? true)
-        if !remembered, draft?.isDirty != true, onboarding == nil {
+        // A reply still being written is never hidden behind Home (main #12): you come back to it.
+        let writing = destination == .ai && ai.isGenerating
+        if !remembered, draft?.isDirty != true, onboarding == nil, !writing {
             resetToHome()
         } else if !query.isEmpty {
             selectsQueryOnFocus = true
         }
         if section == .windows { refreshTargetWindow() }
+        // A phase or a timed session may have ended while the panel was hidden.
+        pomodoro.refresh()
+        caffeinate.refresh()
     }
 
     func panelDidHide() {
@@ -754,7 +794,15 @@ final class LauncherModel {
             confirmation = nil
             feedback =
                 ai.isGenerating ? .warning("Stop the current response or wait for it to finish before running another command.") : nil
-            if !ai.isGenerating { ai.start(command) }
+            if !ai.isGenerating {
+                ai.start(command)
+                // A command that replaces the selection it read gets that selection as its target.
+                if command.output == .replace, let source = command.source, let selection = lastCapturedSelection,
+                    selection.text == source
+                {
+                    aiSelectionTarget = PinnedSelection(context: selection, conversation: ai.conversationToken, passage: source)
+                }
+            }
             focusRequest += 1
             return
         }
@@ -802,12 +850,40 @@ final class LauncherModel {
         focusRequest += 1
     }
 
+    /// The selection in the app OpenRay was opened from, with its app, element and range, so a
+    /// result can later replace exactly it. One mechanism for writing commands, `{selection}`
+    /// and AI Commands (main #13's `SelectedTextContext`). Secure fields and Secure Input refuse.
+    func captureSelection() throws -> SelectedTextContext {
+        if let selectionContextReader { return try selectionContextReader() }
+        if let selectionReader {
+            return SelectedTextContext(
+                text: try selectionReader(), application: previousApplication,
+                sourceName: previousApplicationName ?? "your app", validateForPaste: {})
+        }
+        guard windows.hasPermission else {
+            throw LibraryValidationError(
+                "Accessibility access is required to read selected text. You can paste text manually instead.")
+        }
+        return try SelectedTextContext.capture(from: previousApplication)
+    }
+
+    /// Tests: what the next selection read returns. Nil goes back to reading the app.
+    func setCapturedSelection(_ selection: SelectedTextContext?) {
+        selectionContextReader = selection.map { selection in { selection } }
+    }
+
     /// Writing commands pick up the selected text from the app you came from.
     func attachSelectionFromPreviousApp(reportErrors: Bool = false) {
-        guard clipboard.usesGeneralPasteboard || reportErrors || selectionReader != nil else { return }
+        guard clipboard.usesGeneralPasteboard || reportErrors || selectionReader != nil || selectionContextReader != nil
+        else { return }
         do {
-            let text = try selectionReader?() ?? windows.selectedText(in: previousApplication)
-            ai.attach(AIAttachment(source: .selection, text: text, appName: previousApplicationName))
+            let selection = try captureSelection()
+            let appName = selection.application?.localizedName ?? (selectionContextReader == nil ? previousApplicationName : selection.sourceName)
+            ai.attach(AIAttachment(source: .selection, text: selection.text, appName: appName))
+            // A writing result goes back where its passage came from, wherever you are by then.
+            if ai.action != .chat, ai.attachments.first?.source == .selection, ai.attachments.first?.text == selection.text {
+                aiSelectionTarget = PinnedSelection(context: selection, conversation: ai.conversationToken, passage: selection.text)
+            }
         } catch {
             if reportErrors { feedback = .error(error.localizedDescription) }
         }
