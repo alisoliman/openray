@@ -5,9 +5,10 @@ import AppKit
 struct LauncherDismissal: Sendable {
     var dismiss: @MainActor @Sendable (LauncherModel, _ restoreFocus: Bool) -> Void
 
-    /// Whether closing may activate the app OpenRay opened over.
+    /// Whether closing may activate the app OpenRay opened over: never while this guard or the
+    /// process is inert.
     static func restoresFocus(_ requested: Bool, sideEffects: SideEffectGuard) -> Bool {
-        requested && !sideEffects.isInert
+        requested && !sideEffects.effective.isInert
     }
 
     static func live(sideEffects: SideEffectGuard = .current) -> LauncherDismissal {
@@ -31,7 +32,7 @@ struct ExternalOpener: Sendable {
         workspace: @escaping @MainActor @Sendable (URL) -> Bool = { NSWorkspace.shared.open($0) }
     ) -> ExternalOpener {
         ExternalOpener { url in
-            guard !sideEffects.isInert else { return false }
+            guard !sideEffects.effective.isInert else { return false }
             return workspace(url)
         }
     }

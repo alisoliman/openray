@@ -51,7 +51,8 @@ struct SideEffectGuardTests {
             arguments: [executable, "--open-settings", "permissions", "--first-run"], environment: [:],
             xcTestLoaded: false)
         #expect(sideEffects.mode == .live)
-        #expect((try? sideEffects.check("anything")) != nil)
+        // Classified live, but this process is the test host: the stricter rule applies.
+        #expect(throws: SideEffectGuard.Blocked(what: "anything", mode: .testHost)) { try sideEffects.check("anything") }
     }
 
     @Test func thisProcessIsTheInertTestHost() {
@@ -79,9 +80,9 @@ struct SideEffectGuardTests {
         #expect((try? sideEffects.checkWrite(toPasteboardNamed: verification)) != nil)
     }
 
-    @Test func liveLaunchesMayWriteTheGeneralPasteboard() {
-        #expect(SideEffectGuard(mode: .live).mayWrite(toPasteboardNamed: .general))
-        // The current process is the test host.
+    @Test func anInjectedLiveGuardCannotWriteTheGeneralPasteboardFromTheTestHost() {
+        #expect(!SideEffectGuard(mode: .live).mayWrite(toPasteboardNamed: .general))
+        #expect(SideEffectGuard(mode: .live).effective.isTestHost)
         #expect(!SideEffectGuard.mayWrite(toPasteboardNamed: .general))
     }
 

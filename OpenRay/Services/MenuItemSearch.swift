@@ -428,7 +428,8 @@ enum MenuSearchEnvironment {
     /// Accessibility in a normal launch; an inert source in the test host and in
     /// isolated verification mode.
     static func makeSource(sideEffects: SideEffectGuard = .current) -> any MenuTreeSource {
-        sideEffects.isInert ? InertMenuTreeSource(sideEffects: sideEffects) : AXMenuTreeSource(sideEffects: sideEffects)
+        let rule = sideEffects.effective
+        return rule.isInert ? InertMenuTreeSource(sideEffects: rule) : AXMenuTreeSource(sideEffects: rule)
     }
 }
 

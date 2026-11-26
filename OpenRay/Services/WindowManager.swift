@@ -168,12 +168,13 @@ enum WindowSystemEnvironment {
     /// Accessibility in a normal launch; an inert system in the test host and in
     /// isolated verification mode.
     static func makeSystem(sideEffects: SideEffectGuard = .current) -> any WindowSystem {
-        sideEffects.isInert ? InertWindowSystem(sideEffects: sideEffects) : AXWindowSystem(sideEffects: sideEffects)
+        let rule = sideEffects.effective
+        return rule.isInert ? InertWindowSystem(sideEffects: rule) : AXWindowSystem(sideEffects: rule)
     }
 
     /// The window server's on-screen list in a normal launch; empty in inert launches.
     static func makeListing(sideEffects: SideEffectGuard = .current) -> any WindowServerListing {
-        sideEffects.isInert ? InertWindowServerListing() : CGWindowServerListing()
+        sideEffects.effective.isInert ? InertWindowServerListing() : CGWindowServerListing()
     }
 }
 
@@ -226,7 +227,7 @@ final class AXWindowSystem: WindowSystem {
     var ownPID: pid_t { ProcessInfo.processInfo.processIdentifier }
 
     func requestTrust() {
-        guard !sideEffects.isInert else { return }
+        guard !sideEffects.effective.isInert else { return }
         let options = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true] as CFDictionary
         _ = AXIsProcessTrustedWithOptions(options)
     }

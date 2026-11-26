@@ -248,7 +248,7 @@ protocol WindowSnapshotSource: Sendable {
 extension WindowSystemEnvironment {
     /// Accessibility in a normal launch; nothing in inert launches.
     static func makeSnapshotSource(sideEffects: SideEffectGuard = .current) -> any WindowSnapshotSource {
-        sideEffects.isInert ? InertWindowSnapshotSource() : AXWindowSnapshotSource()
+        sideEffects.effective.isInert ? InertWindowSnapshotSource() : AXWindowSnapshotSource()
     }
 }
 

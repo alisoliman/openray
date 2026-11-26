@@ -188,7 +188,8 @@ struct SystemCommand: Identifiable, Sendable {
             limitation: "Restarts Finder to apply the change."),
         .init(
             .hideOtherApps, "Hide Other Apps", "Hide every app except the one you were using",
-            symbol: "eye.slash.fill", keywords: "hide all apps except frontmost others", group: .apps),
+            symbol: "eye.slash.fill", keywords: "hide all apps except frontmost others", group: .apps,
+            confirmation: .init(title: "Hide every app except the one you were using?", button: "Hide Others")),
         .init(
             .unhideAllApps, "Unhide All Apps", "Show every hidden app again", symbol: "eye",
             keywords: "unhide show hidden apps", group: .apps),
@@ -228,8 +229,12 @@ struct SystemCommand: Identifiable, Sendable {
     /// The confirmation to show for this run. Quit Others names the app it keeps.
     func confirmation(for context: SystemCommandContext) -> Confirmation? {
         guard var confirmation else { return nil }
-        if id == .quitAllAppsExceptFrontmost, let keep = context.foregroundApplication {
-            confirmation.title = "Quit every app except \(keep.name)?"
+        if let keep = context.foregroundApplication {
+            switch id {
+            case .quitAllAppsExceptFrontmost: confirmation.title = "Quit every app except \(keep.name)?"
+            case .hideOtherApps: confirmation.title = "Hide every app except \(keep.name)?"
+            default: break
+            }
         }
         return confirmation
     }
@@ -474,7 +479,8 @@ enum SystemActionEnvironment {
     /// isolated verification mode.
     @MainActor
     static func makeDefault(sideEffects: SideEffectGuard = .current) -> any SystemActionPerforming {
-        sideEffects.isInert ? InertSystemActions(sideEffects: sideEffects) : LiveSystemActions(sideEffects: sideEffects)
+        let rule = sideEffects.effective
+        return rule.isInert ? InertSystemActions(sideEffects: rule) : LiveSystemActions(sideEffects: rule)
     }
 }
 

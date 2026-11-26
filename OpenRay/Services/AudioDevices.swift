@@ -426,7 +426,8 @@ final class CoreAudioDevices: AudioDeviceControlling {
 enum AudioDeviceEnvironment {
     /// Core Audio in a normal launch; no devices and no changes in inert launches.
     static func makeDefault(sideEffects: SideEffectGuard = .current) -> any AudioDeviceControlling {
-        sideEffects.isInert ? InertAudioDevices(sideEffects: sideEffects) : CoreAudioDevices(sideEffects: sideEffects)
+        let rule = sideEffects.effective
+        return rule.isInert ? InertAudioDevices(sideEffects: rule) : CoreAudioDevices(sideEffects: rule)
     }
 }
 
