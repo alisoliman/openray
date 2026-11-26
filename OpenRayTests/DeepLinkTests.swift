@@ -25,6 +25,9 @@ final class LinkTargetProvider: CommandProvider {
                 confirmation: asksFirst ? CommandConfirmation(question: "Greet?", detail: "", confirmTitle: "Greet") : nil),
             CommandDescriptor(
                 id: "linktest.plain", title: "Plain Command", subtitle: "", kind: .command, symbol: "circle", mode: .noView),
+            CommandDescriptor(
+                id: "linktest.secret", title: "Use Token", subtitle: "", kind: .command, symbol: "key",
+                arguments: [ArgumentSpec(name: "token", placeholder: "Token", type: .password)], mode: .noView),
         ]
     }
 
@@ -33,20 +36,33 @@ final class LinkTargetProvider: CommandProvider {
     }
 }
 
+/// Approves or refuses as the test says, in place of the live key-event check.
+@MainActor
+final class FakeApprovalGate: DeepLinkApprovalGate {
+    var allows = true
+    var now: TimeInterval = 100
+    var asked: [TimeInterval] = []
+    func mayApprove(presentedAt: TimeInterval, in model: LauncherModel) -> Bool {
+        asked.append(presentedAt)
+        return allows
+    }
+}
+
 @Suite("Deeplinks")
 @MainActor
 struct DeepLinkTests {
-    let safari = DeepLinkSource(bundleID: "com.example.browser", name: "Browser")
+    let browser = DeepLinkSource(bundleID: "com.example.browser", name: "Browser")
 
-    func harness() -> (LauncherModel, DeepLinkRouter, LinkTargetProvider, NSPasteboard) {
+    func harness(extra: [any CommandProvider] = []) -> (LauncherModel, DeepLinkRouter, LinkTargetProvider, NSPasteboard, FakeApprovalGate) {
         let target = LinkTargetProvider()
         let router = DeepLinkRouter()
-        router.now = { Date(timeIntervalSince1970: 1_000) }
+        let gate = FakeApprovalGate()
+        router.gate = gate
         let pasteboard = NSPasteboard.withUniqueName()
         let model = LauncherModel(
             store: LibraryStore(fileURL: nil), ai: AIChatModel(engine: TestAIEngine()),
-            pasteboard: pasteboard, registry: CommandRegistry(providers: [target, router]))
-        return (model, router, target, pasteboard)
+            pasteboard: pasteboard, registry: CommandRegistry(providers: [target, router] + extra))
+        return (model, router, target, pasteboard, gate)
     }
 
     func isAsked(_ outcome: DeepLinkOutcome) -> Bool {
@@ -59,10 +75,10 @@ struct DeepLinkTests {
         return nil
     }
 
-    /// Moves the router's clock past the decision delay.
-    func later(_ router: DeepLinkRouter, by seconds: TimeInterval = 1) {
-        let base = router.pending?.receivedAt ?? .now
-        router.now = { base.addingTimeInterval(seconds) }
+    /// Answers the question on screen with ↩, as `LauncherPanel` does.
+    func pressReturn(_ model: LauncherModel) {
+        guard let confirmation = model.confirmation else { return }
+        model.confirm(confirmation)
     }
 
     // MARK: Parsing
@@ -96,12 +112,16 @@ struct DeepLinkTests {
         #expect(try DeepLink.parse(URL(string: "openray://focus/start?duration=1h")!) == .focus(goal: nil, duration: .seconds(3_600)))
     }
 
-    @Test("Bad links are refused with a reason")
+    @Test("Bad links are refused with a reason, and huge durations never crash")
     func parseFailures() {
         for text in [
             "https://commands/x", "openray://commands/", "openray://unknown/thing",
             "openray://commands/x?arguments=not-json", "openray://commands/x?arguments=%7B%22a%22%3A%5B1%5D%7D",
+            "openray://commands/x?arguments=%7B%22a%22%3A%22b%5Cu0000c%22%7D", "openray://commands/x?fallbackText=a%00b",
             "openray://focus/stop", "openray://focus/start?duration=soon",
+            "openray://focus/start?duration=9223372036854775807", "openray://focus/start?duration=1441",
+            "openray://focus/start?duration=0", "openray://focus/start?duration=48h",
+            "openray://focus/start?duration=99999999999999999999d",
         ] {
             #expect(throws: DeepLink.Failure.self, "\(text)") { try DeepLink.parse(URL(string: text)!) }
         }
@@ -120,9 +140,11 @@ struct DeepLinkTests {
 
     @Test("Every root command has Copy Deeplink; content rows don't")
     func copyDeeplink() throws {
-        let (model, _, _, pasteboard) = harness()
+        let (model, _, _, pasteboard, _) = harness()
         for id in ["section.files", "ai.chat", "settings", "window.leftHalf", "linktest.greet"] {
             let item = try #require(model.commandItems.first { $0.id == id }, "\(id)")
+            let entries = model.actions(for: item).map(\.id)
+            #expect(entries.contains("deeplinkTrust"), "\(id)")
             let entry = try #require(model.actions(for: item).first { $0.id == "copyDeeplink" }, "\(id)")
             entry.perform()
             #expect(model.feedback?.style == .success)
@@ -137,136 +159,223 @@ struct DeepLinkTests {
         #expect(DeepLink.url(for: fallback) == nil)
     }
 
-    // MARK: Confirmation
+    // MARK: The question
 
-    @Test("A link always asks first, showing the command, its source and arguments")
+    @Test("A link always asks first, as a question bound to it, with passwords and the query hidden")
     func asks() throws {
-        let (model, router, target, _) = harness()
+        let (model, router, target, _, _) = harness()
         let url = DeepLink.url(forCommandID: "linktest.greet", arguments: ["name": "Ada", "token": "s3cret"])!
-        let outcome = router.handle(url, source: safari, in: model)
-        #expect(isAsked(outcome))
+        #expect(isAsked(router.handle(url, source: browser, in: model)))
         let request = try #require(router.pending)
         #expect(request.title == "Greet Someone")
         #expect(target.runs.isEmpty)
         #expect(model.section.providedScope?.id == DeepLinkRouter.confirmScope.id)
-        #expect(model.results.map(\.id) == ["deeplink.run", "deeplink.always", "deeplink.cancel"])
-        let preview = try #require(router.preview(for: model.results[0], ref: ProvidedRef(provider: "deeplink", id: "run"), in: model))
+        #expect(model.results.map(\.id) == ["deeplink.question", "deeplink.cancel"])
+        guard case .provided(let question)? = model.confirmation else {
+            Issue.record("Expected the link's question")
+            return
+        }
+        #expect(question.id == "deeplink.\(request.id.uuidString)")
+        #expect(question.question.contains("Greet Someone"))
+        #expect(!question.detail.contains("s3cret"))
+        #expect(question.detail.contains("Browser"))
+        let preview = try #require(router.preview(for: model.results[0], ref: ProvidedRef(provider: "deeplink", id: "ask"), in: model))
         let metadata = Dictionary(uniqueKeysWithValues: preview.metadata.map { ($0.label, $0.value) })
         #expect(metadata["Command"] == "Greet Someone")
-        #expect(metadata["From"] == "Browser")
+        #expect(metadata["Asked by"] == "Browser")
         #expect(metadata["Name"] == "Ada")
         #expect(metadata["Token"] == "••••••")
+        #expect(metadata["Link"] == "openray://commands/linktest.greet")
+        #expect(!preview.metadata.contains { $0.value.contains("s3cret") })
     }
 
-    @Test("Return right after the question appears doesn't answer it")
-    func decisionDelay() {
-        let (model, router, target, _) = harness()
-        router.handle(DeepLink.url(forCommandID: "linktest.plain")!, source: safari, in: model)
-        router.answer(.run, in: model)
+    @Test("Fallback text filling a password argument is masked too, and runs as that argument")
+    func fallbackPassword() throws {
+        let (model, router, target, _, _) = harness()
+        router.handle(URL(string: "openray://commands/linktest.secret?fallbackText=hunter2")!, source: browser, in: model)
+        let request = try #require(router.pending)
+        #expect(request.arguments == ["token": "hunter2"])
+        #expect(request.fallbackFillsArgument)
+        #expect(request.displayedArguments.map(\.label) == ["Token"])
+        #expect(request.displayedArguments.map(\.value) == ["••••••"])
+        guard case .provided(let question)? = model.confirmation else {
+            Issue.record("Expected the link's question")
+            return
+        }
+        #expect(!question.detail.contains("hunter2"))
+        let preview = try #require(router.preview(for: model.results[0], ref: ProvidedRef(provider: "deeplink", id: "ask"), in: model))
+        #expect(!preview.metadata.contains { $0.value.contains("hunter2") })
+        pressReturn(model)
+        #expect(target.runs == [["token": "hunter2"]])
+    }
+
+    @Test("The answer needs the gate: a held or early Return, or a covered panel, doesn't run")
+    func gate() {
+        let (model, router, target, _, gate) = harness()
+        router.handle(DeepLink.url(forCommandID: "linktest.plain")!, source: browser, in: model)
+        gate.allows = false
+        pressReturn(model)
         #expect(target.runs.isEmpty)
         #expect(router.pending != nil)
-        later(router)
-        router.answer(.run, in: model)
+        #expect(model.confirmation != nil, "The question stays up")
+        gate.allows = true
+        pressReturn(model)
         #expect(target.runs.count == 1)
         #expect(router.pending == nil)
         #expect(model.section == .home)
+        #expect(gate.asked.count == 2)
+    }
+
+    @Test("A newer link replaces the question; the old answer can't run either command")
+    func superseded() throws {
+        let (model, router, target, _, _) = harness()
+        router.handle(DeepLink.url(forCommandID: "linktest.plain")!, source: browser, in: model)
+        let first = try #require(model.confirmation)
+        router.handle(DeepLink.url(forCommandID: "linktest.greet", arguments: ["name": "Eve"])!, source: browser, in: model)
+        // An answer bound to the first question arrives late.
+        model.confirm(first)
+        #expect(target.runs.isEmpty)
+        #expect(router.pending?.commandID == "linktest.greet")
+    }
+
+    @Test("Esc dismisses the question; ↩ on its row asks again rather than running")
+    func dismissedQuestion() {
+        let (model, router, target, _, _) = harness()
+        router.handle(DeepLink.url(forCommandID: "linktest.plain")!, source: browser, in: model)
+        model.goBack()
+        #expect(model.confirmation == nil)
+        model.perform(model.results[0])
+        #expect(target.runs.isEmpty)
+        #expect(model.confirmation != nil)
+        pressReturn(model)
+        #expect(target.runs.count == 1)
     }
 
     @Test("Approving runs the command with the link's arguments; fallback text fills the first one")
     func runsWithArguments() {
-        let (model, router, target, _) = harness()
-        router.handle(DeepLink.url(forCommandID: "linktest.greet", arguments: ["name": "Ada"])!, source: safari, in: model)
-        later(router)
-        model.perform(model.results[0])
+        let (model, router, target, _, _) = harness()
+        router.handle(DeepLink.url(forCommandID: "linktest.greet", arguments: ["name": "Ada"])!, source: browser, in: model)
+        pressReturn(model)
         #expect(target.runs == [["name": "Ada"]])
-        let url = URL(string: "openray://commands/linktest.greet?fallbackText=Grace")!
-        router.handle(url, source: safari, in: model)
-        later(router)
-        router.answer(.run, in: model)
+        router.handle(URL(string: "openray://commands/linktest.greet?fallbackText=Grace")!, source: browser, in: model)
+        pressReturn(model)
         #expect(target.runs.last == ["name": "Grace"])
     }
 
     @Test("Don't Run drops the link and nothing runs")
     func cancel() {
-        let (model, router, target, _) = harness()
-        router.handle(DeepLink.url(forCommandID: "linktest.plain")!, source: safari, in: model)
-        later(router)
-        router.answer(.cancel, in: model)
+        let (model, router, target, _, _) = harness()
+        router.handle(DeepLink.url(forCommandID: "linktest.plain")!, source: browser, in: model)
+        model.goBack()
+        model.perform(model.results[1])
         #expect(target.runs.isEmpty)
         #expect(router.pending == nil)
         #expect(model.section == .home)
     }
 
-    @Test("Always Allow trusts that command from that app only")
-    func alwaysAllow() {
-        let (model, router, target, _) = harness()
+    // MARK: Trust
+
+    @Test("Only the command's own ⌘K lets links run it without asking, on this Mac, from any app")
+    func trustFromCommand() throws {
+        let (model, router, target, _, _) = harness()
         let url = DeepLink.url(forCommandID: "linktest.plain")!
-        router.handle(url, source: safari, in: model)
-        later(router)
-        router.answer(.alwaysAllow, in: model)
-        #expect(target.runs.count == 1)
-        #expect(router.trustedSources(for: "linktest.plain", in: model) == ["com.example.browser"])
-        // The same app's next link runs without asking.
-        #expect(router.handle(url, source: safari, in: model) == .ran(commandID: "linktest.plain"))
-        #expect(target.runs.count == 2)
-        // Another app, or the same app for another command, still asks.
-        let other = DeepLinkSource(bundleID: "com.example.other", name: "Other")
-        #expect(isAsked(router.handle(url, source: other, in: model)))
-        #expect(isAsked(router.handle(DeepLink.url(forCommandID: "linktest.greet")!, source: safari, in: model)))
-        #expect(target.runs.count == 2)
-        router.setTrusted(false, bundleID: "com.example.browser", for: "linktest.plain", in: model)
+        #expect(isAsked(router.handle(url, source: browser, in: model)))
+        router.cancel(in: model)
+        let item = try #require(model.commandItems.first { $0.id == "linktest.plain" })
+        let allow = try #require(model.actions(for: item).first { $0.id == "deeplinkTrust" })
+        #expect(allow.title == "Run from Links Without Asking")
+        allow.perform()
+        #expect(LocalApprovalStore.for(model.store).linksRunWithoutAsking("linktest.plain"))
+        // Kept beside the library on this Mac, never in the library itself.
         #expect(model.store.database.commandPreferences["linktest.plain"] == nil)
+        #expect(router.handle(url, source: .unknown, in: model) == .ran(commandID: "linktest.plain"))
+        #expect(target.runs.count == 1)
+        // Other commands still ask.
+        #expect(isAsked(router.handle(DeepLink.url(forCommandID: "linktest.greet")!, source: browser, in: model)))
+        router.cancel(in: model)
+        let revoke = try #require(model.actions(for: item).first { $0.id == "deeplinkTrust" })
+        #expect(revoke.title == "Ask Before Running from Links")
+        revoke.perform()
+        #expect(isAsked(router.handle(url, source: browser, in: model)))
     }
 
-    @Test("A link from an unknown app can't be always allowed")
-    func unknownSource() {
-        let (model, router, _, _) = harness()
-        router.handle(DeepLink.url(forCommandID: "linktest.plain")!, source: .unknown, in: model)
-        #expect(model.results.map(\.id) == ["deeplink.run", "deeplink.cancel"])
-        #expect(!router.isTrusted(.unknown, for: "linktest.plain", in: model))
+    @Test("A grant an older build stored in the library is ignored")
+    func legacyGrantIgnored() {
+        let (model, router, _, _, _) = harness()
+        model.store.update { $0.commandPreferences["linktest.plain"] = [DeepLinkRouter.legacyTrustKey: "com.example.browser"] }
+        #expect(isAsked(router.handle(DeepLink.url(forCommandID: "linktest.plain")!, source: browser, in: model)))
     }
 
     @Test("A command's own confirmation still asks after the link is approved")
     func commandConfirmationStillAsks() throws {
-        let (model, router, target, _) = harness()
+        let (model, router, target, _, _) = harness()
         target.asksFirst = true
-        router.handle(DeepLink.url(forCommandID: "linktest.greet", arguments: ["name": "Ada"])!, source: safari, in: model)
-        later(router)
-        router.answer(.run, in: model)
+        router.handle(DeepLink.url(forCommandID: "linktest.greet", arguments: ["name": "Ada"])!, source: browser, in: model)
+        pressReturn(model)
         #expect(target.runs.isEmpty)
         let confirmation = try #require(model.confirmation)
+        #expect(confirmation.question == "Greet?")
         model.confirm(confirmation)
         #expect(target.runs == [["name": "Ada"]])
     }
 
     @Test("Unknown, disabled and focus links explain why they can't run")
     func failures() {
-        let (model, router, target, _) = harness()
-        let unknown = failure(router.handle(URL(string: "openray://commands/nope.nothing")!, source: safari, in: model))
+        let (model, router, target, _, _) = harness()
+        let unknown = failure(router.handle(URL(string: "openray://commands/nope.nothing")!, source: browser, in: model))
         #expect(unknown?.contains("isn't available") == true)
         #expect(model.feedback?.style == .error)
         model.store.update { $0.disabledCommandIDs.insert("linktest.plain") }
-        let disabled = failure(router.handle(DeepLink.url(forCommandID: "linktest.plain")!, source: safari, in: model))
+        let disabled = failure(router.handle(DeepLink.url(forCommandID: "linktest.plain")!, source: browser, in: model))
         #expect(disabled?.contains("turned off") == true)
-        #expect(failure(router.handle(URL(string: "openray://focus/start?goal=x")!, source: safari, in: model)) != nil)
-        #expect(failure(router.handle(URL(string: "openray://nope")!, source: safari, in: model)) != nil)
+        #expect(failure(router.handle(URL(string: "openray://focus/start?goal=x")!, source: browser, in: model)) != nil)
+        #expect(failure(router.handle(URL(string: "openray://nope")!, source: browser, in: model)) != nil)
         #expect(target.runs.isEmpty)
+    }
+
+    @Test("A command turned off while its question is up doesn't run")
+    func disabledWhileAsking() {
+        let (model, router, target, _, _) = harness()
+        router.handle(DeepLink.url(forCommandID: "linktest.plain")!, source: browser, in: model)
+        model.store.update { $0.disabledCommandIDs.insert("linktest.plain") }
+        pressReturn(model)
+        #expect(target.runs.isEmpty)
+        #expect(model.feedback?.style == .error)
     }
 
     @Test("Built-in commands open from links, and fallback text fills the scope's search")
     func builtIns() {
-        let (model, router, _, _) = harness()
-        router.handle(URL(string: "openray://commands/section.snippets?fallbackText=sig")!, source: safari, in: model)
-        later(router)
-        router.answer(.run, in: model)
+        let (model, router, _, _, _) = harness()
+        router.handle(URL(string: "openray://commands/section.snippets?fallbackText=sig")!, source: browser, in: model)
+        pressReturn(model)
         #expect(model.section == .snippets)
         #expect(model.query == "sig")
     }
 
-    @Test("Links reach the router through the delegate's entry point")
-    func staticEntry() {
-        let (model, router, _, _) = harness()
-        DeepLinkRouter.open([DeepLink.url(forCommandID: "linktest.plain")!], source: safari, in: model)
-        #expect(router.pending?.commandID == "linktest.plain")
+    @Test("Links macOS delivers are ignored while OpenRay is inert")
+    func inertEntry() {
+        let (model, router, target, _, _) = harness()
+        DeepLinkRouter.open([DeepLink.url(forCommandID: "linktest.plain")!], source: browser, in: model)
+        #expect(router.pending == nil)
+        #expect(target.runs.isEmpty)
+        #expect(model.feedback?.text.contains("isolated") == true)
+    }
+
+    @Test("A script link that arrives before the folders are read waits for them")
+    func scriptLinkWaits() async throws {
+        let folder = try ScriptFolder()
+        let file = try folder.script("hello.sh", title: "Hello Script", body: "echo hi")
+        let scripts = ScriptCommandProvider(
+            catalog: ScriptCatalog(), runner: ScriptRunner(launcher: CannedScriptLauncher(
+                execution: ScriptExecution(termination: .exited(0), output: "", duration: .zero))),
+            presenter: RecordingScriptPresenter(), refreshesAutomatically: false)
+        let (model, router, _, _, _) = harness(extra: [scripts])
+        let record = folder.record
+        model.store.update { $0.scriptDirectories = [record] }
+        #expect(LocalApprovalStore.for(model.store).approve(record))
+        let url = try #require(DeepLink.url(forCommandID: ScriptCommand.id(for: file)))
+        #expect(router.handle(url, source: browser, in: model) == .waiting)
+        for _ in 0..<50 where router.pending == nil { try await Task.sleep(for: .milliseconds(50)) }
+        #expect(router.pending?.title == "Hello Script")
     }
 }

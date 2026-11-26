@@ -2,8 +2,8 @@ import AppKit
 import SwiftUI
 
 // openray:// links. A link names a command and, optionally, its arguments and the text to
-// prefill; OpenRay always asks before running it, unless the person chose to always allow
-// that command from the app that sent the link.
+// prefill. OpenRay always asks before running it, unless the person set that command, from its
+// own ⌘K on this Mac, to run from links without asking. That setting never travels in archives.
 //
 //   openray://commands/<command-id>?arguments=<url-encoded JSON object>&fallbackText=<text>
 //   openray://scripts/<script hash or id>
@@ -40,6 +40,7 @@ enum DeepLink {
         var query: [String: String] = [:]
         for item in components.queryItems ?? [] where query[item.name] == nil { query[item.name] = item.value ?? "" }
         let fallbackText = query["fallbackText"].flatMap { $0.isEmpty ? nil : $0 }
+        if fallbackText?.contains("\0") == true { throw Failure("The link's text contains a NUL character.") }
         let background = query["launchType"]?.lowercased() == "background"
 
         func command(_ id: String) throws -> DeepLinkRoute {
@@ -76,7 +77,10 @@ enum DeepLink {
         var values: [String: String] = [:]
         for (key, value) in object {
             switch value {
-            case let text as String: values[key] = text
+            case let text as String:
+                // C strings end at NUL, so a script would receive less than the link shows.
+                guard !text.contains("\0") else { throw Failure("The link's argument “\(key)” contains a NUL character.") }
+                values[key] = text
             case let number as NSNumber: values[key] = number.stringValue
             case is NSNull: continue
             default: throw Failure("The link's argument “\(key)” isn't text.")
@@ -85,12 +89,20 @@ enum DeepLink {
         return values
     }
 
-    /// Minutes as a number (`25`), or a number and unit (`90s`, `25m`, `1h`).
+    /// The longest duration a link may ask for.
+    static let maximumDuration: Duration = .seconds(24 * 3_600)
+
+    /// Minutes as a number (`25`), or a number and unit (`90s`, `25m`, `1h`), up to a day.
     static func duration(_ text: String?) throws -> Duration? {
         guard let text = text?.trimmingCharacters(in: .whitespaces), !text.isEmpty else { return nil }
-        if let minutes = Int(text), minutes > 0 { return .seconds(minutes * 60) }
-        if let parsed = ScriptMetadataParser.parseRefreshTime(text) { return parsed }
-        throw Failure("The link's duration “\(text)” isn't a number of minutes.")
+        let invalid = Failure("The link's duration “\(text.truncatedForFeedback)” isn't between a minute and a day.")
+        if let minutes = Int(text) {
+            guard (1...1_440).contains(minutes) else { throw invalid }
+            return .seconds(minutes * 60)
+        }
+        guard text.count <= 12, let parsed = ScriptMetadataParser.parseRefreshTime(text) else { throw invalid }
+        guard parsed <= maximumDuration else { throw invalid }
+        return parsed
     }
 
     /// The link that runs a command.
@@ -119,7 +131,8 @@ enum DeepLink {
     }
 }
 
-/// The app a link came from, when macOS says.
+/// The app a link came from, when macOS says. Shown so the person knows who's asking; it never
+/// authorizes anything, since a bundle identifier doesn't prove which code sent the link.
 struct DeepLinkSource: Hashable, Sendable {
     var bundleID: String?
     var name: String
@@ -146,11 +159,43 @@ struct DeepLinkRequest: Identifiable, Equatable {
     var url: URL
     var commandID: String
     var title: String
+    /// The values the command will receive: the link's arguments, with its fallback text in the
+    /// first argument when that one has none. Shown and run from this one place.
     var arguments: [String: String]
+    /// The command's declared arguments, for labels and for masking passwords.
+    var specs: [ArgumentSpec]
     var fallbackText: String?
+    /// True when the fallback text became the first argument's value.
+    var fallbackFillsArgument = false
     var source: DeepLinkSource
     var background: Bool
-    var receivedAt: Date
+    /// When the question appeared, in seconds since the Mac started, the clock key events use.
+    var presentedAt: TimeInterval = 0
+
+    /// The link without its query, which can hold argument values.
+    var displayLink: String {
+        var components = URLComponents(url: url, resolvingAgainstBaseURL: false)
+        components?.query = nil
+        components?.fragment = nil
+        return components?.string ?? "\(DeepLink.scheme)://"
+    }
+
+    /// The arguments as the question shows them: declared ones first, in order, with passwords masked.
+    var displayedArguments: [(label: String, value: String)] {
+        var rows: [(label: String, value: String)] = []
+        for spec in specs {
+            guard let value = arguments[spec.name] else { continue }
+            rows.append((spec.placeholder.isEmpty ? spec.name : spec.placeholder, spec.type == .password ? "••••••" : value))
+        }
+        let declared = Set(specs.map(\.name))
+        for name in arguments.keys.sorted() where !declared.contains(name) {
+            rows.append((name, arguments[name] ?? ""))
+        }
+        if let fallbackText, !fallbackFillsArgument { rows.append(("Text", fallbackText)) }
+        return rows
+    }
+
+    static func == (lhs: DeepLinkRequest, rhs: DeepLinkRequest) -> Bool { lhs.id == rhs.id }
 }
 
 /// What handling a link did.
@@ -158,25 +203,57 @@ enum DeepLinkOutcome: Equatable {
     case asked(DeepLinkRequest)
     case ran(commandID: String)
     case failed(String)
+    /// The link names a script, and the script folders haven't been read yet. It's handled after.
+    case waiting
 }
 
-/// Receives links, asks about them in its own scope, and runs what the person approves.
+/// Decides whether the event being handled may approve a link's question.
+@MainActor
+protocol DeepLinkApprovalGate {
+    /// Now, on the clock `presentedAt` uses.
+    var now: TimeInterval { get }
+    func mayApprove(presentedAt: TimeInterval, in model: LauncherModel) -> Bool
+}
+
+/// The live gate: a fresh Return (never a held one) or a click, at least half a second after
+/// the question appeared, while the launcher is the key window, on screen and not covered by
+/// ⌘K or the shortcuts overlay. A keystroke meant for another app can't answer it.
+struct LiveDeepLinkApprovalGate: DeepLinkApprovalGate {
+    static let minimumDelay: TimeInterval = 0.5
+
+    var now: TimeInterval { ProcessInfo.processInfo.systemUptime }
+
+    func mayApprove(presentedAt: TimeInterval, in model: LauncherModel) -> Bool {
+        guard let event = NSApp.currentEvent, event.timestamp - presentedAt >= Self.minimumDelay else { return false }
+        switch event.type {
+        case .keyDown:
+            guard !event.isARepeat, [36, 76].contains(event.keyCode) else { return false }
+        case .leftMouseDown, .leftMouseUp:
+            break
+        default:
+            return false
+        }
+        guard model.panel?.isVisible == true, NSApp.isActive,
+            NSApp.keyWindow?.identifier?.rawValue == "OpenRayLauncher",
+            !model.showShortcuts, !model.showActions
+        else { return false }
+        return true
+    }
+}
+
+/// Receives links, asks about them, and runs what the person approves.
 @MainActor
 final class DeepLinkRouter: CommandProvider {
     nonisolated static let registration = CommandProviderRegistration(id: "deeplink") { DeepLinkRouter() }
-    /// `commandPreferences[commandID][trustKey]`: bundle ids, comma-separated, whose links run that command without asking.
-    nonisolated static let trustKey = "allowLinksFrom"
-    /// A Return pressed this soon after the question appears doesn't answer it, so a keystroke
-    /// meant for another app can't approve a link that opened the panel under it.
-    static let decisionDelay: TimeInterval = 0.5
+    /// An older build kept a per-app grant here. Imports strip it; nothing reads it.
+    nonisolated static let legacyTrustKey = "allowLinksFrom"
 
     static let confirmScope = ProvidedScope(
         id: "deeplink.confirm", provider: "deeplink", title: "Open Link", symbol: "link", kind: .command,
         placeholder: "Run this command?", itemNoun: "choice", showsPreview: true, ranksItems: false)
 
     private(set) var pending: DeepLinkRequest?
-    /// The clock decisions are measured with. Tests replace it.
-    var now: () -> Date = { .now }
+    var gate: any DeepLinkApprovalGate = LiveDeepLinkApprovalGate()
 
     var id: String { Self.registration.id }
 
@@ -187,9 +264,14 @@ final class DeepLinkRouter: CommandProvider {
     // MARK: Receiving
 
     /// The delegate's entry point. Links that arrive before the panel exists wait a moment.
+    /// Inert launches (tests, verification) never act on links macOS delivers.
     static func open(_ urls: [URL], source: DeepLinkSource, in model: LauncherModel, attempt: Int = 0) {
         guard let router = model.registry.provider(id: registration.id) as? DeepLinkRouter else { return }
-        if model.panel == nil, !SideEffectGuard.isInert, attempt < 20 {
+        guard !SideEffectGuard.isInert else {
+            model.feedback = .info("Links don't run in this isolated instance of OpenRay.")
+            return
+        }
+        if model.panel == nil, attempt < 20 {
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
                 MainActor.assumeIsolated { open(urls, source: source, in: model, attempt: attempt + 1) }
             }
@@ -198,7 +280,8 @@ final class DeepLinkRouter: CommandProvider {
         for url in urls { router.handle(url, source: source, in: model) }
     }
 
-    /// Parses a link and either asks about it, runs it (when always allowed), or explains why it can't.
+    /// Parses a link and asks about it, runs it (when its command runs from links without
+    /// asking), or explains why it can't.
     @discardableResult
     func handle(_ url: URL, source: DeepLinkSource, in model: LauncherModel) -> DeepLinkOutcome {
         let route: DeepLinkRoute
@@ -209,21 +292,60 @@ final class DeepLinkRouter: CommandProvider {
             return fail("Focus sessions aren't available in this version of OpenRay yet.", in: model)
         case .command(let commandID, let arguments, let fallbackText, let background):
             guard let item = Self.commandItem(withID: commandID, in: model) else {
+                if let scripts = Self.scriptCatalogStillLoading(for: commandID, in: model) {
+                    scripts.whenLoaded { [weak self, weak model] in
+                        guard let self, let model else { return }
+                        self.handle(url, source: source, in: model)
+                    }
+                    return .waiting
+                }
                 return fail("The link's command “\(commandID.truncatedForFeedback)” isn't available.", in: model)
             }
             guard !model.store.database.disabledCommandIDs.contains(commandID) else {
                 return fail("“\(item.title.truncatedForFeedback)” is turned off in Settings.", in: model)
             }
+            let specs = Self.argumentSpecs(of: item, in: model)
+            var values = arguments
+            var filled = false
+            if let text = fallbackText, let first = specs.first, values[first.name] == nil {
+                values[first.name] = text
+                filled = true
+            }
             let request = DeepLinkRequest(
-                url: url, commandID: commandID, title: item.title, arguments: arguments, fallbackText: fallbackText,
-                source: source, background: background, receivedAt: now())
-            if isTrusted(source, for: commandID, in: model) {
+                url: url, commandID: commandID, title: item.title, arguments: values, specs: specs,
+                fallbackText: fallbackText, fallbackFillsArgument: filled, source: source, background: background)
+            if LocalApprovalStore.for(model.store).linksRunWithoutAsking(commandID) {
                 run(request, item: item, in: model)
                 return .ran(commandID: commandID)
             }
-            pending = request
-            show(.provided(Self.confirmScope), in: model)
-            return .asked(request)
+            return .asked(ask(request, in: model))
+        }
+    }
+
+    /// Shows the question. A newer link replaces an older one still waiting; the older one's
+    /// answer can't run the newer command, because each question is bound to its own request.
+    private func ask(_ request: DeepLinkRequest, in model: LauncherModel) -> DeepLinkRequest {
+        var request = request
+        show(.provided(Self.confirmScope), in: model)
+        request.presentedAt = gate.now
+        pending = request
+        model.selectedID = "deeplink.question"
+        model.confirmation = .provided(confirmation(for: request, in: model))
+        return request
+    }
+
+    private func confirmation(for request: DeepLinkRequest, in model: LauncherModel) -> ProvidedConfirmation {
+        var detail = "Asked by \(request.source.name)."
+        let shown = request.displayedArguments.map { "\($0.label): \($0.value)" }
+        if !shown.isEmpty { detail += " " + shown.joined(separator: " · ") }
+        return ProvidedConfirmation(
+            id: "deeplink.\(request.id.uuidString)",
+            CommandConfirmation(
+                question: "Run “\(request.title.truncatedForFeedback)” from a link?", detail: detail, confirmTitle: "Run",
+                symbol: "link")
+        ) { [weak self, weak model] in
+            guard let self, let model else { return }
+            self.approve(request.id, in: model)
         }
     }
 
@@ -249,79 +371,48 @@ final class DeepLinkRouter: CommandProvider {
         return item
     }
 
-    // MARK: Trust
-
-    func trustedSources(for commandID: String, in model: LauncherModel) -> [String] {
-        (model.store.database.commandPreferences[commandID]?[Self.trustKey] ?? "")
-            .split(separator: ",").map(String.init).filter { !$0.isEmpty }
+    static func argumentSpecs(of item: LauncherItem, in model: LauncherModel) -> [ArgumentSpec] {
+        guard case .provided(let ref) = item.action else { return [] }
+        return model.registry.descriptor(for: ref, in: model)?.arguments ?? []
     }
 
-    func isTrusted(_ source: DeepLinkSource, for commandID: String, in model: LauncherModel) -> Bool {
-        guard let bundleID = source.bundleID else { return false }
-        return trustedSources(for: commandID, in: model).contains(bundleID)
-    }
-
-    @discardableResult
-    func setTrusted(_ trusted: Bool, bundleID: String, for commandID: String, in model: LauncherModel) -> Bool {
-        var sources = trustedSources(for: commandID, in: model).filter { $0 != bundleID }
-        if trusted { sources.append(bundleID) }
-        return model.store.update { database in
-            var preferences = database.commandPreferences[commandID] ?? [:]
-            preferences[Self.trustKey] = sources.isEmpty ? nil : sources.joined(separator: ",")
-            database.commandPreferences[commandID] = preferences.isEmpty ? nil : preferences
-        }
+    /// The script catalog, when the link names a script and the first scan of its folders
+    /// hasn't finished (at launch, a link can arrive first).
+    private static func scriptCatalogStillLoading(for commandID: String, in model: LauncherModel) -> ScriptCatalog? {
+        guard commandID.hasPrefix(ScriptCommand.idPrefix),
+            let scripts = model.registry.provider(id: ScriptCommandProvider.registration.id) as? ScriptCommandProvider,
+            !scripts.catalog.hasLoaded
+        else { return nil }
+        scripts.synchronize(with: model)
+        return scripts.catalog.hasLoaded ? nil : scripts.catalog
     }
 
     // MARK: Answering
 
-    enum Choice: String { case run, alwaysAllow, cancel }
-
     func scopeItems(_ scope: ProvidedScope, query: String, in model: LauncherModel) -> [LauncherItem] {
         guard scope.id == Self.confirmScope.id, let request = pending else { return [] }
         let title = request.title.truncatedForFeedback
-        var rows = [
+        return [
             LauncherItem(
-                id: "deeplink.run", title: "Run “\(title)”", subtitle: "Asked by \(request.source.name)",
-                symbol: "play", kind: .command, badge: "Run Once",
-                action: .provided(ProvidedRef(provider: id, id: Choice.run.rawValue, primaryTitle: "Run Command", traits: [])))
-        ]
-        if request.source.bundleID != nil {
-            rows.append(
-                LauncherItem(
-                    id: "deeplink.always", title: "Always Allow from \(request.source.name)",
-                    subtitle: "Run now, and run “\(title)” from \(request.source.name) without asking",
-                    symbol: "checkmark.shield", kind: .command, badge: "Allow",
-                    action: .provided(
-                        ProvidedRef(provider: id, id: Choice.alwaysAllow.rawValue, primaryTitle: "Run and Always Allow", traits: []))))
-        }
-        rows.append(
+                id: "deeplink.question", title: "Run “\(title)”?", subtitle: "Asked by \(request.source.name)",
+                symbol: "link", kind: .command, badge: "Link",
+                action: .provided(ProvidedRef(provider: id, id: "ask", primaryTitle: "Review", traits: []))),
             LauncherItem(
                 id: "deeplink.cancel", title: "Don't Run", subtitle: "Ignore this link", symbol: "xmark", kind: .command,
                 badge: "Cancel",
-                action: .provided(ProvidedRef(provider: id, id: Choice.cancel.rawValue, primaryTitle: "Don't Run", traits: []))))
-        return rows
+                action: .provided(ProvidedRef(provider: id, id: "cancel", primaryTitle: "Don't Run", traits: []))),
+        ]
     }
 
     func preview(for item: LauncherItem, ref: ProvidedRef, in model: LauncherModel) -> ProvidedPreview? {
         guard let request = pending else { return nil }
-        var metadata: [(label: String, value: String)] = [
-            ("Command", request.title), ("From", request.source.name),
-        ]
-        let specs = Self.commandItem(withID: request.commandID, in: model).flatMap { item -> [ArgumentSpec]? in
-            guard case .provided(let ref) = item.action else { return nil }
-            return model.registry.descriptor(for: ref, in: model)?.arguments
-        } ?? []
-        for name in request.arguments.keys.sorted() {
-            let spec = specs.first { $0.name == name }
-            let value = spec?.type == .password ? "••••••" : request.arguments[name] ?? ""
-            metadata.append((spec?.placeholder.isEmpty == false ? spec!.placeholder : name, value))
-        }
-        if let text = request.fallbackText { metadata.append(("Text", text)) }
-        metadata.append(("Link", request.url.absoluteString))
+        var metadata: [(label: String, value: String)] = [("Command", request.title), ("Asked by", request.source.name)]
+        metadata += request.displayedArguments
+        metadata.append(("Link", request.displayLink))
         let content = VStack(alignment: .leading, spacing: 8) {
             Image(systemName: "link.circle.fill").font(.system(size: 34)).foregroundStyle(OR.Color.accent)
             Text("\(request.source.name) wants to run “\(request.title)”.").font(OR.Font.headline)
-            Text("Links can run commands. Run only what you expected to open.")
+            Text("Links can run commands. Run only what you expected to open. To let this command run from links without asking, use its ⌘K menu.")
                 .font(OR.Font.callout).foregroundStyle(OR.Color.text2)
         }
         return ProvidedPreview(content: AnyView(content), metadata: metadata)
@@ -330,50 +421,47 @@ final class DeepLinkRouter: CommandProvider {
     func primaryTitle(for item: LauncherItem, ref: ProvidedRef, in model: LauncherModel) -> String? { ref.primaryTitle }
 
     func perform(_ item: LauncherItem, ref: ProvidedRef, in model: LauncherModel) {
-        guard let choice = Choice(rawValue: ref.id) else { return }
-        answer(choice, in: model)
+        switch ref.id {
+        case "cancel": cancel(in: model)
+        default:
+            // The question was dismissed with esc; ↩ on the row asks it again, and the answer
+            // still needs a fresh key press.
+            guard let request = pending else { return model.leaveScope() }
+            _ = ask(request, in: model)
+        }
     }
 
-    /// Runs, always allows and runs, or drops the pending link.
-    func answer(_ choice: Choice, in model: LauncherModel) {
-        guard let request = pending else {
-            model.leaveScope()
-            return
-        }
-        if choice != .cancel, now().timeIntervalSince(request.receivedAt) < Self.decisionDelay {
-            model.feedback = .info("Press Return again to run “\(request.title.truncatedForFeedback)”.")
+    /// Drops the pending link.
+    func cancel(in model: LauncherModel) {
+        pending = nil
+        model.confirmation = nil
+        model.leaveScope()
+    }
+
+    /// The question's ↩. It runs only the request it was asked for, and only when the gate allows.
+    func approve(_ requestID: UUID, in model: LauncherModel) {
+        guard let request = pending, request.id == requestID else { return }
+        guard gate.mayApprove(presentedAt: request.presentedAt, in: model) else {
+            // `confirm` already cleared the question; put it back as it was.
+            model.confirmation = .provided(confirmation(for: request, in: model))
             return
         }
         pending = nil
-        switch choice {
-        case .cancel:
-            model.leaveScope()
-        case .run, .alwaysAllow:
-            guard let item = Self.commandItem(withID: request.commandID, in: model) else {
-                _ = fail("The link's command isn't available anymore.", in: model)
-                return
-            }
-            if choice == .alwaysAllow, let bundleID = request.source.bundleID,
-                !setTrusted(true, bundleID: bundleID, for: request.commandID, in: model)
-            {
-                model.feedback = .error(model.store.errorMessage ?? "Couldn't save the change.")
-                return
-            }
-            model.navigate(to: .home)
-            run(request, item: item, in: model)
+        guard let item = Self.commandItem(withID: request.commandID, in: model),
+            !model.store.database.disabledCommandIDs.contains(request.commandID)
+        else {
+            _ = fail("The link's command isn't available anymore.", in: model)
+            return
         }
+        model.navigate(to: .home)
+        run(request, item: item, in: model)
     }
 
-    /// Runs a command with the link's arguments. The command's own confirmation, if any, still asks.
+    /// Runs a command with the request's arguments. The command's own confirmation, if any, still asks.
     private func run(_ request: DeepLinkRequest, item: LauncherItem, in model: LauncherModel) {
         var item = item
         if case .provided(var ref) = item.action {
-            var arguments = request.arguments
-            let specs = model.registry.descriptor(for: ref, in: model)?.arguments ?? []
-            if let text = request.fallbackText, let first = specs.first, arguments[first.name] == nil {
-                arguments[first.name] = text
-            }
-            ref.arguments = arguments
+            ref.arguments = request.arguments
             item.action = .provided(ref)
         }
         let quiet = request.background && model.runsWithoutPanel(item)
@@ -396,13 +484,28 @@ final class DeepLinkRouter: CommandProvider {
 }
 
 extension LauncherModel {
-    /// ⌘K's Copy Deeplink, for root commands.
+    /// ⌘K's Copy Deeplink for root commands, and the switch that lets links run the command
+    /// without asking. That switch is this Mac's alone and never travels in archives.
     func deepLinkActions(for item: LauncherItem) -> [ActionEntry] {
         guard let url = DeepLink.url(for: item) else { return [] }
+        let approvals = LocalApprovalStore.for(store)
+        let trusted = approvals.linksRunWithoutAsking(item.id)
         return [
             ActionEntry(id: "copyDeeplink", title: "Copy Deeplink", symbol: "link", group: .organize) { [weak self] in
                 self?.copy(url.absoluteString, label: "Deeplink to \(item.title)")
-            }
+            },
+            ActionEntry(
+                id: "deeplinkTrust", title: trusted ? "Ask Before Running from Links" : "Run from Links Without Asking",
+                symbol: trusted ? "lock" : "lock.open", group: .organize
+            ) { [weak self] in
+                guard let self else { return }
+                if approvals.setLinksRunWithoutAsking(!trusted, for: item.id) {
+                    self.toast(trusted ? "Links to “\(item.title.truncatedForFeedback)” will ask first"
+                        : "Links can run “\(item.title.truncatedForFeedback)” without asking")
+                } else {
+                    self.feedback = .error(approvals.errorMessage ?? "Couldn't save the change.")
+                }
+            },
         ]
     }
 }
