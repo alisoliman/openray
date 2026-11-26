@@ -112,6 +112,7 @@ struct TranslationServiceTests {
         let engine = FakeEngine()
         let service = TranslationService(engine: engine, detector: detector)
         let outcome = try await service.translate(request("hello", to: "german"))
+        service.remember(outcome)
         #expect(outcome.translatedText == "HELLO")
         #expect(outcome.source.id == "en-US")
         #expect(outcome.target.id == "de")
@@ -124,10 +125,13 @@ struct TranslationServiceTests {
         let service = TranslationService(engine: engine, detector: detector)
         // English is the default last source.
         let first = try await service.translate(request("hallo", to: "german"))
+        service.remember(first)
         #expect(first.isReversed)
         #expect(first.target.id == "en-US")
-        // French becomes the last source, so German text now goes to French.
-        _ = try await service.translate(request("bonjour", to: "german"))
+        // French becomes the last source once remembered, so German text now goes to French.
+        let french = try await service.translate(request("bonjour", to: "german"))
+        #expect(service.lastSource.id == "en-US")
+        service.remember(french)
         #expect(service.lastSource.id == "fr")
         let second = try await service.translate(request("guten tag", to: "german"))
         #expect(second.target.id == "fr")

@@ -4,109 +4,248 @@ import Testing
 
 @testable import OpenRay
 
-/// Answers instantly with an uppercased "translation" and records directions.
-private actor TranslationCalls {
+/// Holds each translation until the test releases its text, and records directions.
+private actor TranslationGate {
     var directions: [String] = []
-    func append(_ direction: String) { directions.append(direction) }
+    var held: Set<String> = []
+    private var waiting: [String: [CheckedContinuation<Void, Never>]] = [:]
+
+    func hold(_ text: String) { held.insert(text) }
+
+    func pass(_ text: String, direction: String) async {
+        directions.append(direction)
+        guard held.contains(text) else { return }
+        await withCheckedContinuation { waiting[text, default: []].append($0) }
+    }
+
+    func release(_ text: String) {
+        held.remove(text)
+        for continuation in waiting.removeValue(forKey: text) ?? [] { continuation.resume() }
+    }
+
+    func isWaiting(_ text: String) -> Bool { waiting[text] != nil }
 }
 
-private struct UppercasingEngine: TranslationEngine {
+private struct GatedEngine: TranslationEngine {
     var availability: TranslationAvailability = .installed
-    let calls = TranslationCalls()
+    let gate = TranslationGate()
 
     func availability(from source: Locale.Language, to target: Locale.Language) async -> TranslationAvailability {
         availability
     }
 
     func translate(_ text: String, from source: Locale.Language, to target: Locale.Language) async throws -> String {
-        await calls.append("\(source.minimalIdentifier)>\(target.minimalIdentifier)")
+        await gate.pass(text, direction: "\(source.minimalIdentifier)>\(target.minimalIdentifier)")
         return text.uppercased()
     }
 }
 
-private struct EnglishDetector: LanguageDetecting {
-    func dominantLanguage(of text: String) -> Locale.Language? { Locale.Language(identifier: "en") }
+/// Detects by text; unknown text has no language.
+private struct MappedDetector: LanguageDetecting {
+    var languages: [String: String] = [
+        "hello": "en", "good night": "en", "bonjour": "fr", "hallo": "de", "ciao": "it",
+    ]
+
+    func dominantLanguage(of text: String) -> Locale.Language? {
+        languages[text].map(Locale.Language.init(identifier:))
+    }
 }
 
 @MainActor
 struct TranslatorProviderTests {
-    private func setUp(_ availability: TranslationAvailability = .installed, extra: [any CommandProvider] = [])
-        -> (TranslatorProvider, LauncherModel, UppercasingEngine)
-    {
-        let engine = UppercasingEngine(availability: availability)
-        let provider = TranslatorProvider(service: TranslationService(engine: engine, detector: EnglishDetector()))
+    private func setUp(
+        _ availability: TranslationAvailability = .installed, extra: [any CommandProvider] = [],
+        downloads: TranslationDownloads = TranslationDownloads(sideEffects: SideEffectGuard(mode: .live))
+    ) -> (TranslatorProvider, LauncherModel, GatedEngine) {
+        let engine = GatedEngine(availability: availability)
+        let provider = TranslatorProvider(
+            service: TranslationService(engine: engine, detector: MappedDetector()), downloads: downloads)
         let model = LauncherModel(
             store: LibraryStore(fileURL: nil), ai: AIChatModel(engine: TestAIEngine()),
             pasteboard: NSPasteboard.withUniqueName(), registry: CommandRegistry(providers: [provider] + extra))
         return (provider, model, engine)
     }
 
-    private func waitUntil(_ condition: () -> Bool) async throws {
+    private func waitUntil(_ condition: () async -> Bool) async throws {
         for _ in 0..<400 {
-            if condition() { return }
+            if await condition() { return }
             try await Task.sleep(for: .milliseconds(5))
         }
         Issue.record("Timed out waiting for a condition")
     }
 
+    private func type(_ model: LauncherModel, _ text: String) {
+        model.query = text
+        model.files.stop()
+    }
+
+    // MARK: Root search
+
     @Test func inlinePhrasesRankBelowMatchingTitles() throws {
         let (_, model, _) = setUp(extra: [TitledCommandsProvider(titles: ["Hello in German Lessons"])])
         defer { model.stop() }
-        model.query = "hello in german"
-        model.files.stop()
+        type(model, "hello in german")
         #expect(model.selectedItem?.title == "Hello in German Lessons")
-        let inline = try #require(model.results.first { $0.id == "translate.inline" })
+        let inline = try #require(model.results.first { $0.id == "translation.inline" })
         #expect(inline.title == "Translate “hello” to German")
-        guard case .provided(let ref) = inline.action else {
-            Issue.record("The inline row is a provider row")
-            return
-        }
-        #expect(ref.rank == TranslatorProvider.inlineRank)
+        guard case .provided(let ref) = inline.action else { return }
+        #expect(ref.rank == TranslatorProvider.answerRank)
     }
 
     @Test func rootSearchTranslatesAsALiveRow() async throws {
         let (_, model, engine) = setUp()
         defer { model.stop() }
-        model.query = "hello in german"
-        model.files.stop()
+        type(model, "hello in german")
         try await waitUntil { model.groups.contains { $0.id == "live.translate" } }
         let row = try #require(model.groups.first { $0.id == "live.translate" }?.items.first)
         #expect(row.title == "HELLO")
-        #expect(row.subtitle.contains("English → German"))
-        #expect(await engine.calls.directions == ["en>de"])
+        #expect(row.subtitle.contains("English (detected) → German"))
+        #expect(await engine.gate.directions == ["en>de"])
         #expect(model.groups.first?.id != "live.translate")
     }
 
     @Test func theInlineRowOpensTheScopePrefilled() async throws {
         let (_, model, _) = setUp()
         defer { model.stop() }
-        model.query = "good night in french"
-        model.files.stop()
-        let inline = try #require(model.results.first { $0.id == "translate.inline" })
+        type(model, "good night in french")
+        let inline = try #require(model.results.first { $0.id == "translation.inline" })
         model.perform(inline)
         #expect(model.section.providedScope?.id == TranslatorProvider.scope.id)
-        #expect(model.section.providedScope?.arguments["target"] == "fr")
+        #expect(model.section.providedScope?.arguments == ["target": "fr"])
         #expect(model.query == "good night")
-        try await waitUntil { model.results.contains { $0.id == "translate.result" } }
-        let row = try #require(model.results.first { $0.id == "translate.result" })
-        #expect(row.title == "GOOD NIGHT")
+        try await waitUntil { model.results.contains { $0.id == "translation.result" } }
+        let row = try #require(model.results.first { $0.id == "translation.result" })
+        #expect(model.groups.first?.items.first?.id == "translation.result")
         model.selectedID = row.id
         model.performSelected()
         #expect(model.feedback?.text.contains("GOOD NIGHT") == true)
         #expect(model.store.database.commandPreferences["translate"]?["lastSource"] == "en-US")
     }
 
-    @Test func missingModelsOfferADownload() async throws {
-        let (provider, model, _) = setUp(.needsDownload)
+    // MARK: Source and target
+
+    @Test func languageRowsArePresentInEveryState() async throws {
+        let (provider, model, _) = setUp()
+        defer { model.stop() }
+        provider.open(text: "", arguments: ["target": "de"], in: model)
+        #expect(model.groups.last?.id == "translation.languages")
+        #expect(model.results.map(\.title) == ["Translate to German", "From: Detect Language"])
+        type(model, "qwerty")
+        try await waitUntil { model.results.contains { $0.id == "translation.unavailable" } }
+        #expect(model.results.contains { $0.id == "translation.target" })
+        let failure = try #require(model.results.first { $0.id == "translation.unavailable" })
+        let ids = model.actions(for: failure).map(\.id)
+        #expect(ids.contains("translate.pickTarget") && ids.contains("translate.pickSource"))
+    }
+
+    @Test func changingTheTargetKeepsDetection() async throws {
+        let (provider, model, engine) = setUp()
+        defer { model.stop() }
+        provider.open(text: "bonjour", arguments: ["target": "de"], in: model)
+        try await waitUntil { model.results.contains { $0.id == "translation.result" } }
+        let row = try #require(model.results.first { $0.id == "translation.result" })
+        try #require(model.actions(for: row).first { $0.id == "translate.pickTarget" }).perform()
+        #expect(model.section.providedScope?.arguments["pick"] == "target")
+        #expect(model.section.providedScope?.arguments["source"] == nil)
+        type(model, "ital")
+        model.perform(try #require(model.results.first))
+        #expect(model.section.providedScope?.arguments == ["target": "it"])
+        #expect(model.query == "bonjour")
+        try await waitUntil { await engine.gate.directions.count == 2 }
+        #expect(await engine.gate.directions == ["fr>de", "fr>it"])
+        // Detected French typed later still detects, instead of being read as English.
+        type(model, "hallo")
+        try await waitUntil { await engine.gate.directions.count == 3 }
+        #expect(await engine.gate.directions.last == "de>it")
+    }
+
+    @Test func anUndetectableTextOffersTheSourcePicker() async throws {
+        let (provider, model, engine) = setUp()
+        defer { model.stop() }
+        provider.open(text: "qwerty", arguments: ["target": "de"], in: model)
+        try await waitUntil { model.results.contains { $0.id == "translation.unavailable" } }
+        let failure = try #require(model.results.first { $0.id == "translation.unavailable" })
+        model.perform(failure)
+        #expect(model.section.providedScope?.id == TranslatorProvider.languagesScope.id)
+        #expect(model.section.providedScope?.arguments["pick"] == "source")
+        #expect(model.results.first?.title == "Detect Language")
+        type(model, "french")
+        model.perform(try #require(model.results.first))
+        #expect(model.section.providedScope?.arguments == ["target": "de", "source": "fr"])
+        #expect(model.query == "qwerty")
+        try await waitUntil { await engine.gate.directions == ["fr>de"] }
+        #expect(model.results.first { $0.id == "translation.source" }?.title == "From French")
+    }
+
+    // MARK: Downloads
+
+    @Test func consentBelongsToOnePairAndOneRequest() async throws {
+        let downloads = TranslationDownloads(sideEffects: SideEffectGuard(mode: .live))
+        let (provider, model, _) = setUp(.needsDownload, downloads: downloads)
         defer { model.stop() }
         provider.open(text: "hello", arguments: ["target": "ja"], in: model)
-        try await waitUntil { model.results.contains { $0.id == "translate.download" } }
-        let row = try #require(model.results.first { $0.id == "translate.download" })
-        #expect(row.title.contains("Japanese"))
-        #expect(provider.downloads.configuration == nil)
-        model.selectedID = row.id
+        try await waitUntil { model.results.contains { $0.id == "translation.download" } }
+        #expect(downloads.request == nil)
+        model.selectedID = "translation.download"
         model.performSelected()
-        #expect(provider.downloads.configuration?.target?.minimalIdentifier == "ja")
+        let japanese = TranslationDownloads.pairKey(source: "en-US", target: "ja")
+        let french = TranslationDownloads.pairKey(source: "en-US", target: "fr")
+        let declined = try #require(downloads.requestID(for: japanese))
+        #expect(downloads.configuration(for: japanese) != nil)
+        #expect(downloads.configuration(for: french) == nil)
+        downloads.finish(id: declined, succeeded: false, message: "Declined")
+        #expect(downloads.request == nil)
+        #expect(downloads.status(for: japanese) == "Declined")
+
+        // Another pair's preview never reopens the declined request.
+        provider.open(text: "hello", arguments: ["target": "fr"], in: model)
+        try await waitUntil { model.results.contains { $0.id == "translation.download" } }
+        #expect(downloads.configuration(for: french) == nil)
+        model.selectedID = "translation.download"
+        model.performSelected()
+        let current = try #require(downloads.requestID(for: french))
+        // A late answer for the old request changes nothing.
+        downloads.finish(id: declined, succeeded: true, message: "Late")
+        #expect(downloads.requestID(for: french) == current)
+        #expect(downloads.status(for: japanese) == "Declined")
+        // Typing other text cancels the request.
+        type(model, "good night")
+        try await waitUntil { downloads.request == nil }
+    }
+
+    @Test func aRootDownloadRowKeepsTheExplicitSource() async throws {
+        let (_, model, _) = setUp(.needsDownload)
+        defer { model.stop() }
+        type(model, "translate hallo from german to english")
+        try await waitUntil { model.groups.contains { $0.id == "live.translate" } }
+        let row = try #require(model.groups.first { $0.id == "live.translate" }?.items.first)
+        #expect(row.id == "translation.download")
+        model.perform(row)
+        #expect(model.section.providedScope?.id == TranslatorProvider.scope.id)
+        #expect(model.section.providedScope?.arguments == ["target": "en-US", "source": "de"])
+        #expect(model.query == "hallo")
+    }
+
+    // MARK: Cancellation
+
+    @Test func aCancelledTranslationNeverChangesTheRememberedSource() async throws {
+        let (provider, model, engine) = setUp()
+        defer { model.stop() }
+        await engine.gate.hold("bonjour")
+        await engine.gate.hold("ciao")
+        provider.open(text: "bonjour", arguments: ["target": "de"], in: model)
+        try await waitUntil { await engine.gate.isWaiting("bonjour") }
+        type(model, "ciao")
+        try await waitUntil { await engine.gate.isWaiting("ciao") }
+        await engine.gate.release("ciao")
+        try await waitUntil { model.results.contains { $0.title == "CIAO" } }
+        #expect(provider.service.lastSource.id == "it")
+        // The French request was cancelled when the text changed; finishing late changes nothing.
+        await engine.gate.release("bonjour")
+        try await Task.sleep(for: .milliseconds(50))
+        #expect(provider.service.lastSource.id == "it")
+        #expect(model.store.database.commandPreferences["translate"]?["lastSource"] == "it")
+        #expect(model.results.contains { $0.title == "BONJOUR" } == false)
     }
 
     @Test func languagesCanBeChosenAndRemembered() throws {
@@ -114,11 +253,8 @@ struct TranslatorProviderTests {
         defer { model.stop() }
         provider.setDefaultTarget(try #require(TranslationLanguages.named("italian")), in: model)
         #expect(provider.defaultTarget(in: model).id == "it")
-        var scope = TranslatorProvider.languagesScope
-        scope.arguments = ["text": "hello"]
-        model.navigate(to: .provided(scope))
-        model.query = "span"
-        model.files.stop()
+        provider.choose("target", text: "hello", arguments: [:], in: model)
+        type(model, "span")
         let spanish = try #require(model.results.first)
         #expect(spanish.title == "Spanish")
         model.perform(spanish)

@@ -209,18 +209,27 @@ protocol TranslationEngine: Sendable {
 }
 
 /// Apple's Translation framework with installed models only, so it never downloads
-/// or prompts by itself.
+/// or prompts by itself. Inert in the test host and in verification mode.
 struct AppleTranslationEngine: TranslationEngine {
+    var sideEffects: SideEffectGuard = .current
+
+    /// The engine for this launch: Apple's, or an inert one when side effects are off.
+    static func standard(_ sideEffects: SideEffectGuard = .current) -> any TranslationEngine {
+        sideEffects.isInert ? InertTranslationEngine() : AppleTranslationEngine(sideEffects: sideEffects)
+    }
+
     func availability(from source: Locale.Language, to target: Locale.Language) async -> TranslationAvailability {
+        guard !sideEffects.isInert else { return .unsupported }
         switch await LanguageAvailability().status(from: source, to: target) {
-        case .installed: .installed
-        case .supported: .needsDownload
-        case .unsupported: .unsupported
-        @unknown default: .unsupported
+        case .installed: return .installed
+        case .supported: return .needsDownload
+        case .unsupported: return .unsupported
+        @unknown default: return .unsupported
         }
     }
 
     func translate(_ text: String, from source: Locale.Language, to target: Locale.Language) async throws -> String {
+        try sideEffects.check("translating with Apple Translation")
         let session = TranslationSession(installedSource: source, target: target)
         do {
             return try await session.translate(text).targetText
@@ -234,6 +243,17 @@ struct AppleTranslationEngine: TranslationEngine {
     }
 }
 
+/// Translates nothing, for the test host and verification mode.
+struct InertTranslationEngine: TranslationEngine {
+    func availability(from source: Locale.Language, to target: Locale.Language) async -> TranslationAvailability {
+        .unsupported
+    }
+
+    func translate(_ text: String, from source: Locale.Language, to target: Locale.Language) async throws -> String {
+        throw TranslationFailure.unsupportedPair
+    }
+}
+
 // MARK: - Service
 
 struct TranslationOutcome: Equatable, Sendable {
@@ -244,6 +264,8 @@ struct TranslationOutcome: Equatable, Sendable {
     /// The text was already in the target, so it went the other way, to the last
     /// source language. Shown as "(Auto)".
     var isReversed: Bool
+    /// The source came from detection rather than the person's choice.
+    var sourceWasDetected = false
 }
 
 /// Decides directions and runs translations: detects the source, reverses when the
@@ -257,7 +279,7 @@ final class TranslationService {
     @ObservationIgnored private let engine: any TranslationEngine
     @ObservationIgnored private let detector: any LanguageDetecting
 
-    init(engine: any TranslationEngine = AppleTranslationEngine(), detector: any LanguageDetecting = NaturalLanguageDetector()) {
+    init(engine: any TranslationEngine = AppleTranslationEngine.standard(), detector: any LanguageDetecting = NaturalLanguageDetector()) {
         self.engine = engine
         self.detector = detector
     }
@@ -295,7 +317,11 @@ final class TranslationService {
         return (source, fallback, true)
     }
 
+    /// Translates without remembering anything: the caller calls `remember(_:)` once it has
+    /// checked that the result is still wanted, so a cancelled request can't change where
+    /// later same-language text goes. Throws `CancellationError` when cancelled first.
     func translate(_ request: TranslationRequest, fixedTarget: Bool = false) async throws -> TranslationOutcome {
+        try Task.checkCancellation()
         let route = try plan(request, fixedTarget: fixedTarget)
         switch await engine.availability(from: route.source.language, to: route.target.language) {
         case .installed: break
@@ -303,11 +329,16 @@ final class TranslationService {
             throw TranslationFailure.needsDownload(source: route.source.id, target: route.target.id)
         case .unsupported: throw TranslationFailure.unsupportedPair
         }
+        try Task.checkCancellation()
         let text = try await engine.translate(request.text, from: route.source.language, to: route.target.language)
-        if !route.reversed { lastSource = route.source }
         return TranslationOutcome(
             sourceText: request.text, translatedText: text, source: route.source, target: route.target,
-            isReversed: route.reversed)
+            isReversed: route.reversed, sourceWasDetected: request.source == nil)
+    }
+
+    /// Makes an outcome's source the language that same-language text goes to next.
+    func remember(_ outcome: TranslationOutcome) {
+        if !outcome.isReversed { lastSource = outcome.source }
     }
 
     private static func sameLanguage(_ a: TranslationLanguage, _ b: TranslationLanguage) -> Bool {
