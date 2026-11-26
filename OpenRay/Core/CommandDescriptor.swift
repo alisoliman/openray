@@ -65,6 +65,9 @@ struct CommandConfirmation: Hashable, Sendable {
     /// The ↩ button's title: “Shut Down”.
     var confirmTitle: String
     var symbol = "exclamationmark.triangle"
+    /// Shut Down, Restart, Empty Trash and the like: the approve button is drawn in the danger
+    /// style, and Return approves only while the prompt is on screen.
+    var isDestructive = false
 }
 
 /// The payload of `LauncherItem.Action.provided`: which provider owns a row, and what the
@@ -87,6 +90,9 @@ struct ProvidedRef: Hashable, Sendable {
         static let edit = Traits(rawValue: 1 << 4)
         /// Dimmed in lists. The subtitle should say why.
         static let unavailable = Traits(rawValue: 1 << 5)
+        /// Set by `CommandDescriptor.item(provider:)`: the row stands for a catalog command, so
+        /// ↩ re-resolves the command and refuses when it no longer exists.
+        static let descriptor = Traits(rawValue: 1 << 6)
     }
 
     /// The owning provider's registration id.
@@ -166,7 +172,7 @@ struct CommandProviderRegistration: Sendable {
 extension CommandDescriptor {
     /// The command's row: a favorite-able command whose ↩ goes to its provider.
     func item(provider: String) -> LauncherItem {
-        var traits: ProvidedRef.Traits = [.command, .favorite]
+        var traits: ProvidedRef.Traits = [.command, .favorite, .descriptor]
         if isUnavailable { traits.insert(.unavailable) }
         return LauncherItem(
             id: id, title: title, subtitle: subtitle, symbol: symbol, kind: kind, badge: badge,

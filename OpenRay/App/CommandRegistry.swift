@@ -19,13 +19,29 @@ enum ProvidedDeletion {
     case store(@MainActor () -> Bool)
 }
 
+/// Whether a row a provider deleted from its own store is really gone. See
+/// `CommandProvider.presence(ofItemWithID:in:)`.
+enum ProvidedItemPresence: Sendable {
+    /// The row still exists: its deletion didn't happen, so Favorites and Recent keep it.
+    case present
+    /// The provider knows the row is gone: its data has loaded and the row isn't in it.
+    case gone
+    /// The provider can't tell yet, for example before its data has loaded. Asked again later.
+    case unknown
+}
+
 /// A question asked in the action bar before something runs. ↩ calls `perform`; esc cancels.
 struct ProvidedConfirmation {
     var id: String
+    /// This instance's identity. Asking the same question again makes a new one, so an approval
+    /// meant for an earlier prompt can't answer it.
+    let token = UUID()
     var question: String
     var detail: String
     var confirmTitle: String
     var symbol = "exclamationmark.triangle"
+    /// Drawn in the danger style; Return approves only while the prompt is on screen.
+    var isDestructive = false
     var perform: @MainActor () -> Void
 
     init(id: String, _ text: CommandConfirmation, perform: @escaping @MainActor () -> Void) {
@@ -34,8 +50,18 @@ struct ProvidedConfirmation {
         detail = text.detail
         confirmTitle = text.confirmTitle
         symbol = text.symbol
+        isDestructive = text.isDestructive
         self.perform = perform
     }
+}
+
+/// A fallback the person can choose in Settings, described without a search.
+struct FallbackCandidate: Identifiable, Equatable, Sendable {
+    /// The fallback row's id, `fallback.` included.
+    var id: String
+    var title: String
+    var symbol: String
+    var kind: Kind
 }
 
 /// What an empty provided scope says.
@@ -64,6 +90,8 @@ struct GridTileRenderer {
 protocol CommandProvider: AnyObject {
     /// Matches the registration's id.
     var id: String { get }
+    /// The heading Settings › Commands lists this provider's commands under. Defaults to the id.
+    var title: String { get }
 
     /// The commands this provider offers. Each becomes a root-search row that can be a favorite,
     /// a recent, and the target of an alias or hotkey (if the registration accepts its id).
@@ -75,6 +103,13 @@ protocol CommandProvider: AnyObject {
 
     /// Rebuilds a row from its item id, so favorites and recents of non-command rows still show.
     func item(withID id: String, in model: LauncherModel) -> LauncherItem?
+
+    /// Whether a row deleted with `ProvidedDeletion.store` is really gone, for cleanup an earlier
+    /// session recorded but couldn't finish. Say `.gone` only when you know. `.unknown` keeps the
+    /// record, and the launcher asks again at the next launch and `commandCatalogDidChange()`. The
+    /// default is `.present` when `item(withID:)` rebuilds the row, otherwise `.unknown`, so a
+    /// provider that deletes from its own store should implement this.
+    func presence(ofItemWithID id: String, in model: LauncherModel) -> ProvidedItemPresence
 
     /// The rows of one of this provider's scopes. Ranked by the shared matcher unless the scope
     /// sets `ranksItems = false`. `scope.arguments` holds the opening command's argument values.
@@ -102,6 +137,11 @@ protocol CommandProvider: AnyObject {
     /// Rows offered under “Use … with” when root search has a query. Their ids must start with
     /// `fallback.`; the registry adds the prefix when it's missing.
     func fallbackItems(for query: String, in model: LauncherModel) -> [LauncherItem]
+
+    /// The fallbacks this provider can offer, described for Settings › Commands, whatever is typed.
+    /// The default describes the rows `fallbackItems` returns for a placeholder search; override it
+    /// when your rows depend on the query. Ids match the rows' (`fallback.` is added when missing).
+    func fallbackDescriptors(in model: LauncherModel) -> [FallbackCandidate]
 
     /// ↩ on one of this provider's rows. Commands with `mode: .view(scope)` never get here: the
     /// registry opens their scope. Arguments arrive resolved: defaults applied, text trimmed.
@@ -134,8 +174,14 @@ protocol CommandProvider: AnyObject {
 }
 
 extension CommandProvider {
+    var title: String {
+        id.split(separator: ".").map { $0.prefix(1).uppercased() + $0.dropFirst() }.joined(separator: " ")
+    }
     func rootItems(for query: String, in model: LauncherModel) -> [LauncherItem] { [] }
     func item(withID id: String, in model: LauncherModel) -> LauncherItem? { nil }
+    func presence(ofItemWithID id: String, in model: LauncherModel) -> ProvidedItemPresence {
+        item(withID: id, in: model) == nil ? .unknown : .present
+    }
     func scopeItems(_ scope: ProvidedScope, query: String, in model: LauncherModel) -> [LauncherItem] { [] }
     func scopeGroups(_ scope: ProvidedScope, items: [LauncherItem], in model: LauncherModel) -> [LauncherResultGroup]? {
         nil
@@ -147,6 +193,11 @@ extension CommandProvider {
     var liveGroupTitle: String { "Results" }
     func liveItems(for query: String, scope: ProvidedScope?, in model: LauncherModel) async -> [LauncherItem] { [] }
     func fallbackItems(for query: String, in model: LauncherModel) -> [LauncherItem] { [] }
+    func fallbackDescriptors(in model: LauncherModel) -> [FallbackCandidate] {
+        fallbackItems(for: "…", in: model).map {
+            FallbackCandidate(id: $0.id, title: $0.title, symbol: $0.symbol, kind: $0.kind)
+        }
+    }
     func perform(_ item: LauncherItem, ref: ProvidedRef, in model: LauncherModel) {}
     func primaryTitle(for item: LauncherItem, ref: ProvidedRef, in model: LauncherModel) -> String? { nil }
     func primarySymbol(for item: LauncherItem, ref: ProvidedRef, in model: LauncherModel) -> String? { nil }
@@ -210,6 +261,12 @@ final class CommandRegistry {
     }
 
     /// A row by item id: a command first, then whatever a provider rebuilds.
+    /// Whether a row `provider` deleted from its own store is gone. `.unknown` while that
+    /// provider isn't registered.
+    func presence(ofItemWithID id: String, provider providerID: String, in model: LauncherModel) -> ProvidedItemPresence {
+        provider(id: providerID)?.presence(ofItemWithID: id, in: model) ?? .unknown
+    }
+
     func item(withID id: String, in model: LauncherModel) -> LauncherItem? {
         for provider in providers {
             if let descriptor = provider.commands(in: model).first(where: { $0.id == id }) {
@@ -228,7 +285,12 @@ final class CommandRegistry {
     /// group appears only with rows, so an empty scope shows its empty state.
     func scopeGroups(_ scope: ProvidedScope, items: [LauncherItem], in model: LauncherModel) -> [LauncherResultGroup] {
         if let groups = provider(id: scope.provider)?.scopeGroups(scope, items: items, in: model) {
-            return groups.filter { !$0.items.isEmpty || $0.isLoading }
+            // Provider grids never fall through to the window layout tiles.
+            return groups.filter { !$0.items.isEmpty || $0.isLoading }.map { group in
+                var group = group
+                if group.style == .grid, group.tile == nil { group.tile = .standard }
+                return group
+            }
         }
         var group = LauncherResultGroup(id: scope.id, title: nil, style: scope.style, items: items)
         if scope.style == .grid {
@@ -249,6 +311,14 @@ final class CommandRegistry {
             var item = item
             if !item.id.hasPrefix("fallback.") { item.id = "fallback." + item.id }
             return item
+        }
+    }
+
+    func fallbackDescriptors(in model: LauncherModel) -> [FallbackCandidate] {
+        providers.flatMap { $0.fallbackDescriptors(in: model) }.map { candidate in
+            var candidate = candidate
+            if !candidate.id.hasPrefix("fallback.") { candidate.id = "fallback." + candidate.id }
+            return candidate
         }
     }
 
@@ -275,7 +345,17 @@ final class CommandRegistry {
             return
         }
         guard let descriptor = provider.commands(in: model).first(where: { $0.id == ref.id }) else {
+            // A command row from an older snapshot (⌘K, a favorite) whose command is gone must not
+            // run, and above all must not skip a confirmation it would have asked.
+            guard !ref.has(.descriptor) else {
+                model.feedback = .error("“\(item.title.truncatedForFeedback)” is no longer available.")
+                return
+            }
             provider.perform(item, ref: ref, in: model)
+            return
+        }
+        guard model.isCommandEnabled(descriptor.id) else {
+            model.feedback = .warning("“\(item.title.truncatedForFeedback)” is turned off. Turn it on in Settings › Commands.")
             return
         }
         var resolved = ref
@@ -305,8 +385,26 @@ final class CommandRegistry {
             }
         }
         if let question = descriptor.confirmation {
+            // Approval re-checks the catalog: the command must still exist and still ask the same question.
+            let approve: @MainActor () -> Void = { [weak self, weak model] in
+                guard let self, let model else { return }
+                let current = self.provider(id: ref.provider)?.commands(in: model).first { $0.id == ref.id }
+                guard let current else {
+                    model.feedback = .error("“\(item.title.truncatedForFeedback)” is no longer available.")
+                    return
+                }
+                guard model.isCommandEnabled(current.id) else {
+                    model.feedback = .warning("“\(item.title.truncatedForFeedback)” was turned off.")
+                    return
+                }
+                guard current.confirmation == question else {
+                    model.feedback = .warning("“\(item.title.truncatedForFeedback)” changed. Run it again to confirm.")
+                    return
+                }
+                run()
+            }
             model.selectedID = item.id
-            model.confirmation = .provided(ProvidedConfirmation(id: descriptor.id, question, perform: run))
+            model.presentConfirmation(.provided(ProvidedConfirmation(id: descriptor.id, question, perform: approve)))
         } else {
             run()
         }

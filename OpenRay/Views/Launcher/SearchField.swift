@@ -41,26 +41,39 @@ struct SearchFieldBar: View {
     var body: some View {
         HStack(spacing: 10) {
             leading
-            LauncherSearchInput(
-                text: $model.query, placeholder: placeholder,
-                focusRequest: model.focusRequest, submit: model.performSelected,
-                move: model.moveSelection, cancel: model.goBack, paste: model.pasteSelected,
-                tab: model.handleTab, deleteOnEmpty: model.deleteBackwardOnEmptyField,
-                moveHorizontally: { model.arrowsMoveSelection ? model.moveSelectionHorizontally($0) : false },
-                selectsAllOnFocus: model.selectsQueryOnFocus,
-                didSelectAll: { model.selectsQueryOnFocus = false },
-                readOnly: model.showsClipboardOptIn
-            )
-            .frame(maxWidth: .infinity)
+            if let session = model.argumentSession {
+                ArgumentFieldsRow(model: model, session: session)
+            } else {
+                queryField
+            }
             accessories
         }
-        .padding(.leading, model.section == .home && model.argumentLink == nil ? 18 : 14)
+        .padding(.leading, model.section == .home && model.argumentLink == nil && model.argumentSession == nil ? 18 : 14)
         .padding(.trailing, 14)
         .frame(height: OR.Metric.field)
     }
 
+    private var queryField: some View {
+        LauncherSearchInput(
+            text: $model.query, placeholder: placeholder,
+            focusRequest: model.focusRequest, submit: model.performSelected,
+            move: model.moveSelection, cancel: model.escape, paste: model.pasteSelected,
+            tab: model.handleTab, deleteOnEmpty: model.deleteBackwardOnEmptyField,
+            moveHorizontally: { model.arrowsMoveSelection ? model.moveSelectionHorizontally($0) : false },
+            jump: model.jumpSection, tertiary: model.performTertiary,
+            selectsAllOnFocus: model.selectsQueryOnFocus,
+            didSelectAll: { model.selectsQueryOnFocus = false },
+            readOnly: model.showsClipboardOptIn, fontSize: OR.scaled(20)
+        )
+        .frame(maxWidth: .infinity)
+    }
+
     @ViewBuilder private var leading: some View {
-        if let link = model.argumentLink {
+        if let session = model.argumentSession {
+            ScopeToken(
+                kind: session.item.kind, symbol: session.item.symbol, title: session.item.title, style: .argument,
+                onRemove: model.cancelArguments)
+        } else if let link = model.argumentLink {
             ScopeToken(
                 kind: .quicklink, symbol: "link", title: link.name, style: .argument,
                 onRemove: { model.clearArgument(restoreKeyword: true) })
@@ -99,6 +112,12 @@ struct SearchFieldBar: View {
                 }
             }
             switch model.section {
+            case _ where model.argumentSession != nil:
+                HStack(spacing: 7) {
+                    Text("Run").foregroundStyle(OR.Color.text2)
+                    KeyCaps(["↩"])
+                }
+                .font(OR.Font.callout)
             case _ where model.argumentLink != nil:
                 if !model.query.isEmpty {
                     HStack(spacing: 7) {
@@ -262,5 +281,46 @@ struct BreadcrumbBar: View {
         }
         .padding(.horizontal, 14)
         .frame(height: OR.Metric.field)
+    }
+}
+
+/// The inline argument fields that replace the query while a command takes its arguments: Tab
+/// and ⇧Tab move between them, ↩ runs, esc or ⌫ in the first empty field closes them.
+struct ArgumentFieldsRow: View {
+    @Bindable var model: LauncherModel
+    let session: ArgumentSession
+
+    var body: some View {
+        HStack(spacing: 6) {
+            ForEach(Array(session.specs.enumerated()), id: \.element.name) { index, spec in
+                ArgumentFieldWell(isFocused: session.focus == index) { field(spec, at: index) }
+            }
+            Spacer(minLength: 0)
+        }
+        .frame(maxWidth: .infinity)
+    }
+
+    private func field(_ spec: ArgumentSpec, at index: Int) -> some View {
+        let options: [ArgumentSpec.Option]? = if case .dropdown(let options) = spec.type { options } else { nil }
+        let text = Binding<String>(
+            get: {
+                let value = model.argumentSession?.value(at: index) ?? ""
+                return options.map { options in options.first { $0.value == value }?.title ?? "" } ?? value
+            },
+            set: { if options == nil { model.setArgumentValue($0, at: index) } })
+        let focused = session.focus == index
+        return LauncherSearchInput(
+            text: text, placeholder: spec.placeholder + (spec.isOptional ? " (optional)" : ""),
+            focusRequest: focused ? session.focusToken : -1,
+            submit: model.submitArguments,
+            move: { offset in if options != nil { model.cycleArgumentOption(offset, at: index) } },
+            cancel: model.goBack, paste: model.submitArguments,
+            tab: { model.moveArgumentFocus(1) }, deleteOnEmpty: model.deleteBackwardInArguments,
+            moveHorizontally: { options != nil ? model.cycleArgumentOption($0, at: index) : false },
+            backtab: { model.moveArgumentFocus(-1) },
+            autoFocus: focused, secure: spec.type == .password, onFocus: { model.argumentFieldDidFocus(index) },
+            readOnly: options != nil,
+            fontSize: OR.scaled(15), accessibilityLabel: spec.placeholder + (spec.isOptional ? ", optional" : ""),
+            identifier: "argument.\(spec.name)")
     }
 }

@@ -9,8 +9,9 @@ final class LauncherPanel: NSPanel {
     /// only holds the shadow, so a click there closes the panel.
     var panelRect: (() -> CGRect)?
     var onClickOutside: (() -> Void)?
-    /// Return confirms a pending action-bar confirmation, even from a text editor.
-    var confirmAction: (() -> Bool)?
+    /// Return confirms a pending action-bar confirmation, even from a text editor. It gets
+    /// whether the key is an autorepeat, which never confirms, and returns whether it handled the key.
+    var confirmAction: ((_ isRepeat: Bool) -> Bool)?
     /// The file Quick Look previews. Quick Look finds its controller through the
     /// responder chain, which ends at this window, so the panel controls it.
     var quickLook: QuickLookPreview? {
@@ -25,6 +26,9 @@ final class LauncherPanel: NSPanel {
         }
     }
     var onQuickLookEnd: (() -> Void)?
+    /// Launcher keys that aren't text editing (⌘Esc, ⌘W, Vim ⌃J/⌃K), by key code and modifiers.
+    /// Returns whether the key was used.
+    var keyCommand: ((UInt16, ShortcutModifiers) -> Bool)?
 
     override var canBecomeKey: Bool { true }
     override var canBecomeMain: Bool { true }
@@ -39,9 +43,14 @@ final class LauncherPanel: NSPanel {
 
     override func sendEvent(_ event: NSEvent) {
         if handleEscapeKey(event) { return }
+        if event.type == .keyDown, attachedSheet == nil, !((firstResponder as? NSTextView)?.hasMarkedText() ?? false),
+            keyCommand?(event.keyCode, Self.modifiers(of: event)) == true
+        {
+            return
+        }
         if event.type == .keyDown, [36, 76].contains(event.keyCode),
             event.modifierFlags.intersection([.command, .control, .option, .shift]).isEmpty,
-            !((firstResponder as? NSTextView)?.hasMarkedText() ?? false), confirmAction?() == true
+            !((firstResponder as? NSTextView)?.hasMarkedText() ?? false), confirmAction?(event.isARepeat) == true
         {
             return
         }
@@ -60,6 +69,15 @@ final class LauncherPanel: NSPanel {
             return
         }
         super.sendEvent(event)
+    }
+
+    static func modifiers(of event: NSEvent) -> ShortcutModifiers {
+        var modifiers: ShortcutModifiers = []
+        if event.modifierFlags.contains(.command) { modifiers.insert(.command) }
+        if event.modifierFlags.contains(.control) { modifiers.insert(.control) }
+        if event.modifierFlags.contains(.option) { modifiers.insert(.option) }
+        if event.modifierFlags.contains(.shift) { modifiers.insert(.shift) }
+        return modifiers
     }
 
     static func firstTextInput(in view: NSView?) -> NSView? {
@@ -148,6 +166,17 @@ final class LauncherPanelController: NSObject, NSWindowDelegate {
 
     var isVisible: Bool { window?.isVisible == true }
 
+    /// Visible, fully faded in and key: what a prompt needs before it can be approved.
+    var isSurfaceVisible: Bool {
+        guard let window else { return false }
+        return window.isVisible && window.alphaValue >= 1 && window.isKeyWindow && window.occlusionState.contains(.visible)
+    }
+
+    /// When the panel last started revealing itself or took key, while it's visible and key; nil
+    /// otherwise. Prompt approval counts its exposure from here, so the reveal itself never counts.
+    var surfaceVisibleSince: Date? { isSurfaceVisible ? revealedAt : nil }
+    private var revealedAt: Date?
+
     func toggle() {
         if window?.isVisible == true { dismiss() } else { show() }
     }
@@ -158,6 +187,8 @@ final class LauncherPanelController: NSObject, NSWindowDelegate {
             model.previousApplication = front
             model.targetWindow = nil
         }
+        // The interface size applies as the panel appears, before anything is drawn or placed.
+        if window?.isVisible != true { applyInterfaceSize() }
         if window == nil { createWindow() }
         guard let window else { return }
         let wasVisible = window.isVisible
@@ -186,8 +217,10 @@ final class LauncherPanelController: NSObject, NSWindowDelegate {
         model.resumeSearch()
         model.focusRequest += 1
         if !wasVisible {
-            DispatchQueue.main.async { [model] in
+            revealedAt = nil
+            DispatchQueue.main.async { [weak self, model] in
                 window.alphaValue = 1
+                self?.revealedAt = Date()
                 let reduceMotion = NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
                 withAnimation(OR.Motion.resolve(OR.Motion.panel, reduceMotion: reduceMotion)) { model.isPresented = true }
             }
@@ -196,12 +229,13 @@ final class LauncherPanelController: NSObject, NSWindowDelegate {
 
     func dismiss(restoreFocus: Bool = true) {
         guard let window, window.isVisible else { return }
+        revealedAt = nil
         model.panelDidHide()
         window.orderOut(nil)
         if isQuickLookVisible { QLPreviewPanel.shared().orderOut(nil) }
         model.files.stop()
-        // Inert launches (tests, isolated verification) never activate another app.
-        if restoreFocus, !SideEffectGuard.isInert { model.previousApplication?.activate() }
+        // Activating another app is a side effect inert launches never take.
+        if restoreFocus, !model.sideEffects.isInert { model.previousApplication?.activate() }
     }
 
     /// Previews a file in the shared Quick Look panel above the launcher, or closes it.
@@ -239,10 +273,10 @@ final class LauncherPanelController: NSObject, NSWindowDelegate {
         }
     }
 
-    /// The upper third of the screen under the pointer, with a fixed top edge.
+    /// The upper third of the chosen screen, with a fixed top edge: the screen with the
+    /// pointer, the one with the active window, or the primary one.
     private func position(_ window: NSWindow) {
-        let screen = NSScreen.screens.first(where: { $0.frame.contains(NSEvent.mouseLocation) }) ?? NSScreen.main
-        guard let frame = screen?.visibleFrame else { return }
+        guard let frame = Self.screen(for: model.store.database.preferences.screen)?.visibleFrame else { return }
         let size = PanelGeometry.windowSize
         let panelTop = frame.maxY - max(40, frame.height * 0.13)
         window.setFrame(
@@ -253,6 +287,53 @@ final class LauncherPanelController: NSObject, NSWindowDelegate {
             display: false)
     }
 
+    /// Sets the design tokens' scale from Settings › General › Interface size, and rebuilds the
+    /// panel's views when it changed, so every font and length takes it.
+    private func applyInterfaceSize() {
+        let scale = model.store.database.preferences.size.scale
+        guard OR.interfaceScale != scale else { return }
+        OR.interfaceScale = scale
+        guard let window else { return }
+        let size = PanelGeometry.windowSize
+        let host = NSHostingView(rootView: LauncherRootView(model: model))
+        host.sizingOptions = []
+        host.frame = NSRect(origin: .zero, size: size)
+        window.setContentSize(size)
+        window.contentView = host
+    }
+
+    static func screen(for choice: LauncherScreen) -> NSScreen? {
+        let pointer = NSScreen.screens.first { $0.frame.contains(NSEvent.mouseLocation) } ?? NSScreen.main
+        switch choice {
+        case .mouse:
+            return pointer
+        case .primary:
+            return NSScreen.screens.first ?? pointer
+        case .focusedWindow:
+            guard let frame = frontmostWindowFrame() else { return pointer }
+            let center = CGPoint(x: frame.midX, y: frame.midY)
+            return NSScreen.screens.first { $0.frame.contains(center) } ?? pointer
+        }
+    }
+
+    /// The frontmost app's front window, in AppKit screen coordinates. Window bounds need no
+    /// permission; titles aren't read.
+    private static func frontmostWindowFrame() -> CGRect? {
+        guard let app = NSWorkspace.shared.frontmostApplication,
+            let windows = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID)
+                as? [[String: Any]],
+            let info = windows.first(where: {
+                ($0[kCGWindowOwnerPID as String] as? pid_t) == app.processIdentifier
+                    && ($0[kCGWindowLayer as String] as? Int) == 0
+            }),
+            let bounds = info[kCGWindowBounds as String] as? NSDictionary,
+            let rect = CGRect(dictionaryRepresentation: bounds)
+        else { return nil }
+        // Quartz measures from the top of the primary screen; AppKit from its bottom.
+        let primaryHeight = NSScreen.screens.first?.frame.height ?? 0
+        return CGRect(x: rect.minX, y: primaryHeight - rect.maxY, width: rect.width, height: rect.height)
+    }
+
     func applyAppearance() {
         let appearance: NSAppearance? =
             switch model.store.database.preferences.appearance {
@@ -261,6 +342,12 @@ final class LauncherPanelController: NSObject, NSWindowDelegate {
             case .dark: NSAppearance(named: .darkAqua)
             }
         window?.appearance = appearance
+    }
+
+    /// Taking key back from a sheet or Quick Look restarts prompt exposure: what was on top may
+    /// have covered the prompt.
+    func windowDidBecomeKey(_ notification: Notification) {
+        if revealedAt != nil { revealedAt = Date() }
     }
 
     func windowDidResignKey(_ notification: Notification) {
@@ -305,12 +392,19 @@ final class LauncherPanelController: NSObject, NSWindowDelegate {
         panel.hasShadow = false
         panel.isMovableByWindowBackground = false
         panel.animationBehavior = .none
-        panel.onCancel = { [weak model] in model?.goBack() }
+        panel.onCancel = { [weak model] in model?.escape() }
         panel.delegate = self
         panel.escapeAction = { [weak model] in
             guard let model else { return false }
-            model.goBack()
+            model.escape()
             return true
+        }
+        panel.keyCommand = { [weak model] keyCode, modifiers in
+            guard let model,
+                let command = LauncherKeyCommand.command(
+                    keyCode: keyCode, modifiers: modifiers, vim: model.store.database.preferences.usesVimNavigation)
+            else { return false }
+            return model.handle(command)
         }
         panel.panelRect = { [weak model] in
             guard let model else { return .zero }
@@ -324,10 +418,8 @@ final class LauncherPanelController: NSObject, NSWindowDelegate {
         // The margin belongs to whatever is behind it, so focus goes back to that app.
         panel.onClickOutside = { [weak self] in self?.dismiss() }
         panel.onQuickLookEnd = { [weak self] in self?.quickLookDidEnd() }
-        panel.confirmAction = { [weak model] in
-            guard let model, let confirmation = model.confirmation else { return false }
-            model.confirm(confirmation)
-            return true
+        panel.confirmAction = { [weak model] isRepeat in
+            model?.confirmFromReturn(isRepeat: isRepeat) ?? false
         }
         let host = NSHostingView(rootView: LauncherRootView(model: model))
         host.sizingOptions = []
@@ -496,8 +588,15 @@ final class HelpWindowController: AuxiliaryWindowController {
 }
 
 enum RuntimeMode {
-    @MainActor static func launchPasteboard(arguments: [String]) -> NSPasteboard {
-        guard arguments.contains("--verification-pasteboard") else { return .general }
+    /// The pasteboard a launch uses: a named verification pasteboard when one is given, a
+    /// private one in any other inert launch (the test host, `--in-memory-library`), and the
+    /// system clipboard only in a normal launch.
+    @MainActor static func launchPasteboard(
+        arguments: [String], sideEffects: SideEffectGuard = .current
+    ) -> NSPasteboard {
+        guard arguments.contains("--verification-pasteboard") else {
+            return sideEffects.isInert ? NSPasteboard.withUniqueName() : .general
+        }
         if let name = verificationPasteboardName(arguments: arguments) { return NSPasteboard(name: name) }
         // Invalid verification arguments must never fall back to the user's clipboard.
         return NSPasteboard.withUniqueName()
@@ -530,7 +629,7 @@ enum RuntimeMode {
     }
 
     static var usesInMemoryLibrary: Bool {
-        isTestHost || ProcessInfo.processInfo.arguments.contains("--in-memory-library")
+        isTestHost || SideEffectGuard.isInert || ProcessInfo.processInfo.arguments.contains("--in-memory-library")
             || ProcessInfo.processInfo.arguments.contains("--verification-pasteboard")
     }
 }

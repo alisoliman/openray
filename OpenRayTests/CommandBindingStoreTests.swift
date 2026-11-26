@@ -169,11 +169,12 @@ struct CommandBindingStoreTests {
             !store.saveCommandBinding(
                 CommandBinding(
                     targetID: "section.clipboard", shortcut: CommandShortcut(keyCode: 49, modifiers: [.command]))))
-        // System and window commands are bindable through their providers' namespaces (and
-        // destructive ones confirm, even from a hotkey); content and unknown targets are not.
-        for target in ["clipboard.any", "snippet.any", "file.any", "app.unknown", "section.home"] {
-            #expect(!store.saveCommandBinding(CommandBinding(targetID: target, alias: "unsafe")))
-            #expect(!store.saveCommandBinding(CommandBinding(targetID: target)))
+        // Without a registration that accepts them. Later slices register some of these namespaces.
+        CuratedCommand.$registrations.withValue([AIWritingCommandProvider.registration]) {
+            for target in ["system.lock", "system.sleep", "system.emptyTrash", "app.unknown", "section.home"] {
+                #expect(!store.saveCommandBinding(CommandBinding(targetID: target, alias: "unsafe")))
+                #expect(!store.saveCommandBinding(CommandBinding(targetID: target)))
+            }
         }
         #expect(store.database == before)
         #expect(try Data(contentsOf: url) == original)

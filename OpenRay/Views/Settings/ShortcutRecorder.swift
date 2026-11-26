@@ -13,6 +13,8 @@ struct ShortcutRecorderControl: View {
     var onStart: () -> Void
     var onStop: () -> Void
     var onRecord: (NSEvent) -> Void
+    /// A modifier gesture recorded (⌥⌘, Right ⌘, ⌘ ⌘). Nil records keys only.
+    var onRecordGesture: ((CommandShortcut) -> Void)? = nil
     var onClear: (() -> Void)?
     @State private var hovering = false
 
@@ -62,13 +64,15 @@ struct ShortcutRecorderControl: View {
         .buttonStyle(.plain)
         .onHover { hovering = $0 }
         .background {
-            if isRecording { CommandShortcutCapture(capture: onRecord, cancel: onStop) }
+            if isRecording { CommandShortcutCapture(capture: onRecord, captureGesture: onRecordGesture, cancel: onStop) }
         }
         .fixedSize(horizontal: false, vertical: true)
         .accessibilityLabel("Shortcut for \(title)")
         .accessibilityValue(shortcut.map { KeyShortcut($0).spoken } ?? "None")
         .accessibilityHint(
-            isRecording ? "Press a key combination, Delete to remove, or Escape to cancel" : "Records a new shortcut")
+            isRecording
+                ? "Press a key combination, tap modifier keys, Delete to remove, or Escape to cancel"
+                : "Records a new shortcut")
         // The clear button sits inside this button's label, where VoiceOver can't reach it.
         .accessibilityActions {
             if let onClear, shortcut != nil, !isRecording {
@@ -82,11 +86,13 @@ struct ShortcutRecorderControl: View {
 /// It exists only while recording, and is removed before invoking callbacks.
 struct CommandShortcutCapture: NSViewRepresentable {
     var capture: (NSEvent) -> Void
+    var captureGesture: ((CommandShortcut) -> Void)? = nil
     var cancel: () -> Void
 
     func makeNSView(context: Context) -> CommandShortcutCaptureView {
         let view = CommandShortcutCaptureView()
         view.capture = capture
+        view.captureGesture = captureGesture
         view.cancel = cancel
         view.setAccessibilityElement(false)
         return view
@@ -94,6 +100,7 @@ struct CommandShortcutCapture: NSViewRepresentable {
 
     func updateNSView(_ view: CommandShortcutCaptureView, context: Context) {
         view.capture = capture
+        view.captureGesture = captureGesture
         view.cancel = cancel
     }
 
@@ -102,10 +109,46 @@ struct CommandShortcutCapture: NSViewRepresentable {
     }
 }
 
+/// Where the recorder's local event monitor comes from. AppKit's in a normal launch; in the test
+/// host and verification mode an inert one that installs nothing, so no real key is consumed.
+@MainActor
+protocol LocalEventMonitoring {
+    func add(_ mask: NSEvent.EventTypeMask, handler: @escaping (NSEvent) -> NSEvent?) -> Any?
+    func remove(_ monitor: Any)
+}
+
+struct AppKitLocalEventMonitoring: LocalEventMonitoring {
+    /// Installs nothing, and returns nil, while the process is inert, whatever guard chose it.
+    func add(_ mask: NSEvent.EventTypeMask, handler: @escaping (NSEvent) -> NSEvent?) -> Any? {
+        guard (try? SideEffectGuard.check("watching keys to record a shortcut")) != nil else { return nil }
+        return NSEvent.addLocalMonitorForEvents(matching: mask, handler: handler)
+    }
+
+    func remove(_ monitor: Any) { NSEvent.removeMonitor(monitor) }
+}
+
+/// Records that monitoring started without watching anything.
+struct InertLocalEventMonitoring: LocalEventMonitoring {
+    func add(_ mask: NSEvent.EventTypeMask, handler: @escaping (NSEvent) -> NSEvent?) -> Any? { NSObject() }
+    func remove(_ monitor: Any) {}
+}
+
+extension SideEffectGuard {
+    /// The recorder's monitor for this launch: inert when this guard or the process is.
+    @MainActor var localEventMonitoring: any LocalEventMonitoring {
+        effective.isInert ? InertLocalEventMonitoring() : AppKitLocalEventMonitoring()
+    }
+}
+
 final class CommandShortcutCaptureView: NSView {
+    /// Inert in the test host and verification mode.
+    var monitoring: any LocalEventMonitoring = SideEffectGuard.current.localEventMonitoring
     var capture: ((NSEvent) -> Void)?
+    var captureGesture: ((CommandShortcut) -> Void)?
     var cancel: (() -> Void)?
     private var monitor: Any?
+    private var gestures = ShortcutRecordingSession()
+    private var pendingTimeout: DispatchWorkItem?
 
     var isMonitoring: Bool { monitor != nil }
 
@@ -115,7 +158,8 @@ final class CommandShortcutCaptureView: NSView {
         guard let window else { return }
         NotificationCenter.default.addObserver(
             self, selector: #selector(windowResignedKey), name: NSWindow.didResignKeyNotification, object: window)
-        monitor = NSEvent.addLocalMonitorForEvents(matching: [.keyDown, .leftMouseDown, .rightMouseDown]) {
+        gestures = ShortcutRecordingSession()
+        monitor = monitoring.add([.keyDown, .flagsChanged, .leftMouseDown, .rightMouseDown]) {
             [weak self] event in
             let consumed = MainActor.assumeIsolated {
                 guard let self, self.window?.isKeyWindow == true else { return false }
@@ -128,6 +172,11 @@ final class CommandShortcutCaptureView: NSView {
     /// Routes one event while recording, in the key window. Returns true when it's consumed.
     func handle(_ event: NSEvent) -> Bool {
         guard let window else { return false }
+        if event.type == .flagsChanged {
+            guard captureGesture != nil, event.window === window else { return false }
+            handleGesture(gestures.handle(NSEventModifierSource.input(for: event)))
+            return false
+        }
         guard event.type == .keyDown, event.window === window else {
             // A click on the recorder itself only stops recording. Consuming it keeps the
             // button from seeing the click and starting a new recording on mouse-up.
@@ -146,8 +195,32 @@ final class CommandShortcutCaptureView: NSView {
         return true
     }
 
+    /// A single tap waits briefly for a second one before it counts as one side of a modifier.
+    private func handleGesture(_ outcome: ShortcutRecordingSession.Outcome) {
+        pendingTimeout?.cancel()
+        switch outcome {
+        case .shortcut(let shortcut):
+            stopMonitoring()
+            captureGesture?(shortcut)
+        case .pending:
+            let work = DispatchWorkItem { [weak self] in
+                MainActor.assumeIsolated {
+                    guard let self, let shortcut = self.gestures.timeout() else { return }
+                    self.stopMonitoring()
+                    self.captureGesture?(shortcut)
+                }
+            }
+            pendingTimeout = work
+            DispatchQueue.main.asyncAfter(deadline: .now() + ModifierGestureDetector.doubleTapInterval + 0.05, execute: work)
+        case .ignored:
+            break
+        }
+    }
+
     func stopMonitoring() {
-        if let monitor { NSEvent.removeMonitor(monitor) }
+        pendingTimeout?.cancel()
+        pendingTimeout = nil
+        if let monitor { monitoring.remove(monitor) }
         monitor = nil
         NotificationCenter.default.removeObserver(self, name: NSWindow.didResignKeyNotification, object: nil)
     }
@@ -157,6 +230,58 @@ final class CommandShortcutCaptureView: NSView {
     private func cancelCapture() {
         stopMonitoring()
         cancel?()
+    }
+}
+
+/// Records a modifier gesture from modifier changes: two or more modifiers pressed and
+/// released together, one modifier tapped twice, or one side of a modifier tapped once. Pure,
+/// so recording is tested with synthetic values.
+struct ShortcutRecordingSession {
+    enum Outcome: Equatable {
+        case shortcut(CommandShortcut)
+        /// One modifier was tapped; a second tap would make it a double tap.
+        case pending
+        case ignored
+    }
+
+    private var held: ModifierSides = []
+    private var peak: ModifierSides = []
+    private var pressedAt: TimeInterval = 0
+    private var lastTap: (key: ModifierSides, time: TimeInterval)?
+
+    mutating func handle(_ input: ModifierInput) -> Outcome {
+        guard case .flags(let now, let time) = input else {
+            lastTap = nil
+            return .ignored
+        }
+        defer { held = now }
+        if held.isEmpty, !now.isEmpty {
+            peak = now
+            pressedAt = time
+            return .ignored
+        }
+        peak.formUnion(now)
+        guard now.isEmpty, !held.isEmpty, time - pressedAt <= ModifierGestureDetector.maximumHold else {
+            return .ignored
+        }
+        if peak.count >= 2 {
+            lastTap = nil
+            // Several modifiers together: either side of each counts.
+            return .shortcut(.modifiersOnly(peak.modifiers))
+        }
+        if let last = lastTap, last.key == peak, time - last.time <= ModifierGestureDetector.doubleTapInterval {
+            lastTap = nil
+            return .shortcut(.doubleTap(peak.modifiers))
+        }
+        lastTap = (peak, time)
+        return .pending
+    }
+
+    /// No second tap came: the single tap records that side of the modifier, such as Right ⌘.
+    mutating func timeout() -> CommandShortcut? {
+        guard let last = lastTap else { return nil }
+        lastTap = nil
+        return .modifiersOnly(last.key.modifiers, sides: last.key)
     }
 }
 

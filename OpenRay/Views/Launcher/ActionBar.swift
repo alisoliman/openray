@@ -5,10 +5,18 @@ import SwiftUI
 struct ActionBar<Context: View, Actions: View>: View {
     var feedback: Feedback?
     var confirmation: ActionConfirmation?
+    /// The model's `confirmationInstanceID`. A bar that doesn't pass it can't approve a prompt
+    /// that loses something, because the instance it reports never matches.
+    var confirmationInstance: String? = nil
     @ViewBuilder var context: Context
     @ViewBuilder var actions: Actions
     var onCancelConfirmation: () -> Void = {}
     var onConfirm: () -> Void = {}
+    /// Reports the prompt this bar is showing, once it's drawn and not covered. Prompts that need
+    /// visible approval can be approved only after this.
+    var onConfirmationShown: ((String) -> Void)? = nil
+    /// The approve button, with the id of the prompt it showed; replaces `onConfirm` when set.
+    var onApprove: ((String) -> Void)? = nil
     /// False for a bar drawn over another one, so VoiceOver hears each toast once.
     var announces = true
     @Environment(\.actionBarIsCovered) private var isCovered
@@ -24,6 +32,10 @@ struct ActionBar<Context: View, Actions: View>: View {
                             .lineLimit(1)
                     }
                     .transition(.opacity)
+                    // A covered bar reports nothing until it's uncovered. The report starts the
+                    // prompt's exposure; the model waits out its fade-in and the panel's reveal.
+                    .onAppear { reportShown(confirmation) }
+                    .onChange(of: "\(confirmationInstance ?? confirmation.id)/\(isCovered)") { reportShown(confirmation) }
                 } else if let feedback {
                     ToastLabel(feedback: feedback).transition(.opacity)
                 } else {
@@ -44,7 +56,11 @@ struct ActionBar<Context: View, Actions: View>: View {
 
             if let confirmation {
                 ActionBarButton(title: "Cancel", keys: ["esc"], style: .ghost, action: onCancelConfirmation)
-                ActionBarButton(title: confirmation.confirmTitle, keys: ["↩"], style: .danger, action: onConfirm)
+                ActionBarButton(
+                    title: confirmation.confirmTitle, keys: ["↩"], style: confirmation.isDestructive ? .danger : .accent
+                ) {
+                    if let onApprove { onApprove(confirmationInstance ?? confirmation.id) } else { onConfirm() }
+                }
             } else {
                 actions
             }
@@ -59,6 +75,13 @@ struct ActionBar<Context: View, Actions: View>: View {
         .opacity(isCovered ? 0 : 1)
         .animation(OR.Motion.quick, value: isCovered)
         .allowsHitTesting(!isCovered)
+    }
+}
+
+extension ActionBar {
+    fileprivate func reportShown(_ confirmation: ActionConfirmation) {
+        guard !isCovered else { return }
+        onConfirmationShown?(confirmationInstance ?? confirmation.id)
     }
 }
 
@@ -180,11 +203,12 @@ struct SearchActionBar: View {
 
     var body: some View {
         ActionBar(
-            feedback: model.feedback ?? storeFeedback, confirmation: model.confirmation,
+            feedback: model.feedback ?? storeFeedback, confirmation: model.confirmation, confirmationInstance: model.confirmationInstanceID,
             context: { context },
             actions: { actions },
             onCancelConfirmation: { model.confirmation = nil },
-            onConfirm: { if let confirmation = model.confirmation { model.confirm(confirmation) } })
+            onConfirm: { if let confirmation = model.confirmation { model.confirm(confirmation) } },
+            onConfirmationShown: model.confirmationDidAppear, onApprove: model.approveConfirmation)
     }
 
     /// The read-only library error stays here. An inactive launcher shortcut is a Home notice instead.
@@ -251,14 +275,16 @@ struct SearchActionBar: View {
         case .calculator:
             Text("Arithmetic and conversions")
         default:
-            if model.isQueryBlank {
-                Text("\(resultCount.formatted()) item\(resultCount == 1 ? "" : "s")")
-            } else if resultCount == 0, isSearching {
-                Text("Searching…")
-            } else {
-                Text("\(resultCount.formatted()) result\(resultCount == 1 ? "" : "s")")
-            }
+            Text(Self.countStatus(resultCount: resultCount, isSearching: isSearching, isQueryBlank: model.isQueryBlank))
         }
+    }
+
+    /// A scope's count. A pending search outranks it, so an empty scope that's still loading
+    /// never says “0 items”.
+    static func countStatus(resultCount: Int, isSearching: Bool, isQueryBlank: Bool) -> String {
+        if resultCount == 0, isSearching { return "Searching…" }
+        let noun = isQueryBlank ? "item" : "result"
+        return "\(resultCount.formatted()) \(noun)\(resultCount == 1 ? "" : "s")"
     }
 
     /// While ⌘K is open, the bar names only the item and the open Actions button.

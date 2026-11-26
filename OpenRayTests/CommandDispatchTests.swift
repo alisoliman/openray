@@ -31,12 +31,13 @@ struct CommandDispatchTests {
         #expect(model.results.map(\.id) == ["section.notes"])
     }
 
-    @Test func aliasMatchingIsExactAndActionsKeepTheirExistingRouting() {
+    @Test func aliasPrefixesRankFirstExactAliasesWinAndActionsKeepTheirRouting() {
         let model = model()
         defer { model.stop() }
         #expect(model.store.saveCommandBinding(CommandBinding(targetID: "section.clipboard", alias: "zzclip")))
+        // A prefix of an alias ranks its command first; only the exact alias makes it the sole result.
         model.query = "zzcli"
-        #expect(model.results.isEmpty)
+        #expect(model.results.first?.id == "section.clipboard")
         model.query = "zzclip"
         model.showActions = true
         model.performSelected()
@@ -53,13 +54,14 @@ struct CommandDispatchTests {
         // The original twenty lead in their order; registered providers may add more after them.
         #expect(Array(model.bindableCommands.map(\.id).prefix(CuratedCommand.targetIDs.count)) == CuratedCommand.targetIDs)
         #expect(CuratedCommand.targetIDs.count == 20)
+        // Only the legacy registrations: later slices may make more ids bindable through their own.
+        let legacy = [AIWritingCommandProvider.registration]
         for action in AIAction.allCases where action != .chat {
-            #expect(CuratedCommand.supports("ai.\(action.id)"))
+            #expect(CuratedCommand.supports("ai.\(action.id)", registrations: legacy))
         }
-        // Every window command is bindable through WindowCommandProvider's `window.` namespace.
-        #expect(CuratedCommand.supports("window.nextDisplay"))
-        #expect(!CuratedCommand.supports("quicklink.any"))
-        #expect(!CuratedCommand.supports("clipboard.any"))
+        #expect(!CuratedCommand.supports("window.nextDisplay", registrations: legacy))
+        #expect(!CuratedCommand.supports("quicklink.any", registrations: legacy))
+        #expect(!CuratedCommand.supports("clipboard.any", registrations: legacy))
     }
 
     @Test func boundInvocationUsesSharedDispatchAndRemovedBindingsCannotRun() {

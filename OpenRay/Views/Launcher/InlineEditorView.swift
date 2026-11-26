@@ -39,11 +39,12 @@ struct InlineEditorView: View {
 
     @ViewBuilder private var bar: some View {
         ActionBar(
-            feedback: model.feedback ?? draft.saveError.map { .error($0) }, confirmation: model.confirmation,
+            feedback: model.feedback ?? draft.saveError.map { .error($0) }, confirmation: model.confirmation, confirmationInstance: model.confirmationInstanceID,
             context: { context },
             actions: { actions },
             onCancelConfirmation: { model.confirmation = nil },
-            onConfirm: { if let confirmation = model.confirmation { model.confirm(confirmation) } })
+            onConfirm: { if let confirmation = model.confirmation { model.confirm(confirmation) } },
+            onConfirmationShown: model.confirmationDidAppear, onApprove: model.approveConfirmation)
     }
 
     @ViewBuilder private var context: some View {
@@ -87,11 +88,11 @@ struct InlineEditorView: View {
         }
     }
 
+    /// Opens exactly the link the preview shows, in its Open With app, through the
+    /// guarded opener, which is inert in tests and verification.
     private func testQuicklink() {
-        let link = Quicklink(name: draft.name, template: draft.content, keyword: draft.keyword)
-        if let url = try? link.resolvedURL(query: link.needsQuery ? "swift concurrency" : "") {
-            NSWorkspace.shared.open(url)
-        }
+        guard let test = draft.quicklinkTest else { return }
+        model.testQuicklink(test.url, openWith: test.openWith)
     }
 
     private func pasteNote() {
