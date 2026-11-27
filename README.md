@@ -54,11 +54,13 @@ Irreversible commands (Empty Trash, Shut Down, Restart, Log Out, Quit All, Quit 
 
 ### Rewrite text where you are working
 
-1. Select text in another app, press **⌥ Space**, and choose **Improve Writing** or another writing command. With Accessibility on, the selection is attached; add an instruction if you like, then press **Return**.
+1. Select text in another app and run **Improve Writing** or another writing command, from **⌥ Space**, an alias, a hotkey or a favorite. It runs at once on the selection, and the result streams in under the command's name. Apps that don't share their selection over Accessibility are read by copying it, with your clipboard put back exactly; with nothing selected, OpenRay says so and offers the clipboard or typing.
 2. Type a follow-up such as “Make it warmer” and press **Return** to refine the result. Each follow-up carries the original passage, the current result and your earlier requests.
-3. With the field empty, press **Return** to replace the original selection in its app. OpenRay first checks that the same text is still selected in the same place; if it changed, the result is copied instead. A result goes back where its passage came from, even if you used another app in between.
+3. With the field empty, press **Return** to paste the result over your selection: OpenRay closes, brings the app forward and, if the same text field is still focused and Secure Input is off, pastes, then puts your previous clipboard back and confirms with a short message such as **Improved**. If it can't paste, the result stays on the clipboard to paste with **⌘V**.
 
-**Try Again (⌘R)** repeats the last request with the context it had; a follow-up that failed waits in the field and never lets an older result be used by default. **Use Result as New Passage** in **⌘K** starts a fresh run from the result, keeping where it goes back to. After an insertion, select the inserted text and reopen OpenRay before replacing it again. **New Chat** or a different passage releases the target. Ask never imports a selection on its own.
+**⌘Return** copies the result instead and **⌥Return** pastes it with its formatting. **⌘R** regenerates it with other wording and **⇧⌘R** more freely. **⌘K** has **Show Original** and **Show Changes**; Fix Spelling & Grammar marks its changes as it opens (**Settings → Apple Intelligence → Writing commands**). Each new selection starts a new run, and **⌘[** and **⌘]** go back and forth between runs, so nothing is lost; reopening OpenRay soon after returns to the last result. **⌘J** continues a result in the AI Chat window. A stopped or failed run is never pasted.
+
+**Quick Fix** runs Fix Spelling & Grammar (or the command you choose) in place, with no window, on the selection or, with **Prefer selection** off or nothing selected, the whole text field. It and AI Commands set to **Replace Selection** replace text only after checking it's exactly as it was; otherwise the result is copied.
 
 ## Keyboard shortcuts
 
@@ -66,8 +68,8 @@ Irreversible commands (Empty Trash, Shut Down, Restart, Log Out, Quit All, Quit 
 | --- | --- |
 | **⌥ Space** | Show or hide OpenRay; configurable in Settings. |
 | **↑ / ↓**, **← / →** | Select a result; arrows move in two dimensions in the favorites strip and the windows grid. |
-| **Return** | Open, run, or copy the selected result. The action bar always names what Return does. In AI: send, or with an empty field use a finished writing result. |
-| **⌘Return** | Send the result into the app you came from, such as **Paste to Mail**. In AI: add a new line, as **⇧Return** does. |
+| **Return** | Open, run, or copy the selected result. The action bar always names what Return does. In AI: send, or with an empty field paste a finished writing result back into its app. |
+| **⌘Return** | Send the result into the app you came from, such as **Paste to Mail**. On a writing result: copy it. In chat: add a new line, as **⇧Return** does. |
 | **Tab** | Enter the selected command's scope, start a quicklink's search term, or ask AI with the current search. |
 | **Delete** on an empty field | Leave the current scope or quicklink search term. |
 | **⌘K** | Search every action for the selection; each shows its own shortcut. |
@@ -79,7 +81,7 @@ Irreversible commands (Empty Trash, Shut Down, Restart, Log Out, Quit All, Quit 
 | **Escape** | Close exactly one layer: a confirmation, actions, an editor, AI, a scope, the search, then the launcher. |
 | **⌘[** | Go back one step, even when Escape is set to close the window. |
 
-In AI, the keys follow the conversation (an owner decision taken from the September writing review): **Return** sends, **⇧Return** or **⌘Return** adds a new line, and **Return** on an empty field uses a finished writing result. Use **Stop** or **⌘.** to cancel a response; a stopped or partial result is never used by default.
+In AI chat, **Return** sends and **⇧Return** or **⌘Return** adds a new line. On a writing result, the keys follow Raycast: **Return** pastes it (or copies it, with **Settings → General → Return on clipboard items, snippets and results** set to copy), **⌘Return** does the other, **⌥Return** pastes it formatted, **⌘R** and **⇧⌘R** regenerate it, **⌘J** continues it in chat, **⌘N** starts a new one and **⌘[** / **⌘]** move between runs. Use **Stop** or **⌘.** to cancel a response; a stopped or partial result is never used by default.
 
 ### Command aliases and hotkeys
 

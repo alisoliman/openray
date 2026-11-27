@@ -50,6 +50,7 @@ struct AIPane: View {
             }
             AIModelSection(model: model)
             AIChatSettingsSection(model: model)
+            AIWritingSettingsSection(model: model)
             AICommandsSettingsSection(model: model)
             AIToolsSettingsSection(model: model)
             Section("Privacy") {
@@ -62,7 +63,7 @@ struct AIPane: View {
                     "Clipboard, files, notes and the screen reach the model when you attach or @-mention them. An agent you give tools can also read your notes, clipboard history, snippets, quicklinks and file names without a mention.",
                     symbol: "paperclip")
                 IconRow(
-                    "A writing command uses the text selected in the app you opened OpenRay from. The selection and where it came from stay in memory, so the result can replace it after OpenRay checks it hasn't changed.",
+                    "A writing command uses the text selected in the app you opened OpenRay from: through Accessibility, or, when an app doesn't share it, by copying it and putting your clipboard back. Pasting a result borrows the clipboard the same way. The selection and where it came from stay in memory.",
                     symbol: "character.cursor.ibeam")
                 IconRow("Chats in the launcher are kept in memory. Chats in the AI Chat window are saved on this Mac.", symbol: "note.text")
             }
@@ -176,6 +177,47 @@ private struct AIChatSettingsSection: View {
     }
 }
 
+/// How writing results show and go back (work items 4 and 6): which commands mark their
+/// changes, and what Return does.
+private struct AIWritingSettingsSection: View {
+    let model: LauncherModel
+
+    /// The commands whose results rewrite the selected text, so their changes can be marked.
+    /// Summaries, action items and answers aren't rewrites; marking them would mark everything.
+    static let highlightableCommands: [(id: String, title: String)] =
+        [AIAction.rewrite, .proofread, .shorten].map { (AIWritingCommandProvider.commandID(for: $0), $0.title) }
+        + [(AICommand.changeTone.id, AICommand.changeTone.name)]
+
+    var body: some View {
+        let hub = model.aiHub
+        Section {
+            ForEach(Self.highlightableCommands, id: \.id) { command in
+                Toggle(
+                    isOn: Binding(
+                        get: { hub.settings.highlightsChanges(for: command.id) },
+                        set: { on in hub.updateSettings { $0.setHighlightsChanges(on, for: command.id) } })
+                ) {
+                    SettingRowLabel(title: command.title, detail: nil)
+                }
+                .settingsSwitch()
+            }
+            LabeledContent {
+                Text(model.aiPrimaryPastes ? "Paste Response" : "Copy Response").foregroundStyle(.secondary)
+            } label: {
+                SettingRowLabel(
+                    title: "Return on a result",
+                    detail:
+                        "Pastes the result over your selection in the app you came from and puts your clipboard back. ⌘Return copies it instead. Choose Copy to Clipboard for “Return on clipboard items, snippets and results” in General to swap them.")
+            }
+        } header: {
+            Text("Writing commands")
+        } footer: {
+            Text("Marked changes show insertions in green and a red line where text was removed. Show Changes and Show Original are in ⌘K on any result.")
+                .font(.system(size: 11.5)).foregroundStyle(.secondary)
+        }
+    }
+}
+
 /// Quick Fix and custom AI Commands.
 private struct AICommandsSettingsSection: View {
     let model: LauncherModel
@@ -190,6 +232,16 @@ private struct AICommandsSettingsSection: View {
                 ForEach(hub.quickFixChoices, id: \.id) { Text($0.title).tag($0.id) }
             }
             .neutralMenus()
+            Toggle(
+                isOn: Binding(
+                    get: { hub.settings.quickFixPrefersSelection },
+                    set: { on in hub.updateSettings { $0.quickFixPrefersSelection = on } })
+            ) {
+                SettingRowLabel(
+                    title: "Prefer selection",
+                    detail: "Quick Fix works on the selected text. Off, or with nothing selected, it works on the whole text field.")
+            }
+            .settingsSwitch()
             if let quickFix = model.bindableCommands.first(where: { $0.id == AICommandProvider.quickFixID }) {
                 CommandBindingRow(model: model, command: quickFix)
             }
@@ -210,7 +262,7 @@ private struct AICommandsSettingsSection: View {
         } header: {
             Text("AI Commands")
         } footer: {
-            Text("Quick Fix runs a command on the text selected in any app. Give it a shortcut above.")
+            Text("Quick Fix replaces text in place in any app, with no window, after checking the text hasn't changed. Give it a shortcut above. An AI Command set to Replace Selection works the same way.")
                 .font(.system(size: 11.5)).foregroundStyle(.secondary)
         }
     }
