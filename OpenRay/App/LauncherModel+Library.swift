@@ -92,9 +92,14 @@ extension LauncherModel {
 
     /// The values one run of `plan` needs, read now: the current clipboard through
     /// the capture privacy checks, history while capture is on, the selection in the
-    /// app you came from when the plan uses it, snippets and the calculator.
-    func placeholderValues(for plan: PlaceholderPlan) -> PlaceholderValues {
+    /// app you came from when the plan uses it, snippets and the calculator. `selection` is one
+    /// already read for this run, such as by the ⌘C fallback or Quick Fix; with `readsSelection`
+    /// false, none is read here.
+    func placeholderValues(
+        for plan: PlaceholderPlan, selection: SelectedTextContext? = nil, readsSelection: Bool = true
+    ) -> PlaceholderValues {
         let database = store.database
+        lastCapturedSelection = nil
         // A quicklink sends the clipboard elsewhere, so a copy not yet attributed to an app counts as excluded.
         let strict = plan.context == .quicklink
         var values = PlaceholderValues.snapshot(library: database, requirements: plan.requirements) { [clipboard] in
@@ -104,7 +109,10 @@ extension LauncherModel {
             values.snippets = Dictionary(
                 database.snippets.map { ($0.name, $0.referenceSource()) }, uniquingKeysWith: { first, _ in first })
         }
-        if plan.requirements.selection,
+        if plan.requirements.selection, let selection {
+            lastCapturedSelection = selection
+            values.selection = selection.text
+        } else if plan.requirements.selection, readsSelection,
             clipboard.usesGeneralPasteboard || selectionReader != nil || selectionContextReader != nil
         {
             // The same capture writing commands use; an AI Command that replaces it pins it.

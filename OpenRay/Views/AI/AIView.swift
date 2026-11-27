@@ -11,17 +11,6 @@ struct AIView: View {
         VStack(spacing: 0) {
             header
             Hairline()
-            if let selection = model.pendingNewSelection, model.ai.action != .chat, !model.ai.isGenerating {
-                // main #13: a new selection never replaces work on its own.
-                InlineNotice(
-                    .info, symbol: "character.cursor.ibeam", title: "New selection from \(selection.sourceName)",
-                    detail: "Your current work stays until you choose to replace it."
-                ) {
-                    Button("Use as New Passage") { model.usePendingSelection() }.buttonStyle(.orSecondary)
-                        .accessibilityIdentifier("ai.useNewSelection")
-                }
-                .padding(.horizontal, 14).padding(.top, 10)
-            }
             Group {
                 if !model.ai.isReady {
                     AIUnavailableView(model: model)
@@ -32,6 +21,9 @@ struct AIView: View {
                 }
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
+            if model.ai.isReady, model.ai.action != .chat, !model.ai.messages.isEmpty {
+                FollowUpComposer(model: model)
+            }
             bar
         }
         .overlay(alignment: .topTrailing) { attachmentPreview }
@@ -43,9 +35,9 @@ struct AIView: View {
         }
     }
 
-    /// ↩ from the one-line instruction field. ⌘↩ and ⇧↩ insert a new line in AI (an owner
-    /// decision taken from main #12/#13), which a one-line field has no room for, and a held ↩
-    /// never sends and then accepts.
+    /// ↩ from the one-line follow-up field. ⌘↩ and ⌥↩ reach the field's own paste and tertiary
+    /// actions (Copy, Paste Formatted); ⇧↩ does nothing in a one-line field, and a held ↩ never
+    /// sends and then pastes.
     static func submitFromField(_ model: LauncherModel) {
         if let event = NSApp.currentEvent, event.type == .keyDown {
             guard !event.isARepeat, event.modifierFlags.intersection([.command, .shift]).isEmpty else { return }
@@ -55,68 +47,40 @@ struct AIView: View {
 
     // MARK: Header
 
+    /// The command's name, and where Raycast names the model, “On-device” (work item 4).
     @ViewBuilder private var header: some View {
         HStack(spacing: 10) {
             ScopeToken(
                 kind: .ai, symbol: model.ai.symbol, title: model.ai.title,
                 onRemove: { model.leaveAI() })
-            if model.ai.action != .chat, model.ai.availability.isAvailable,
-                model.ai.attachments.first != nil || model.ai.writingContext != nil
-            {
-                LauncherSearchInput(
-                    text: Bindable(model.ai).instruction, placeholder: instructionPlaceholder,
-                    focusRequest: model.focusRequest,
-                    submit: { Self.submitFromField(model) }, move: { _ in }, cancel: model.goBack, paste: {},
-                    deleteOnEmpty: {
-                        model.leaveAI()
-                        return true
-                    }, fontSize: 15, accessibilityLabel: model.ai.writingContext == nil ? "Instruction" : "Ask for changes",
-                    identifier: "ai.instruction")
-                    .frame(maxWidth: .infinity)
-            }
-            if model.ai.action != .chat, model.ai.availability.isAvailable, let attachment = model.ai.attachments.first {
-                AttachmentChip(attachment.summary, onRemove: { model.ai.removeAttachment(attachment.id) }) {
-                    attachmentIcon(attachment)
+            Spacer(minLength: 0)
+            if model.ai.availability.isAvailable {
+                if model.ai.action == .chat, model.ai.command == nil {
+                    AgentMenu(chat: model.ai, agents: model.aiHub.agents) { model.focusRequest += 1 }
                 }
-                // The chip opens the full text; its xmark still takes its own clicks.
-                .contentShape(.rect)
-                .onTapGesture { model.showsAttachmentPreview.toggle() }
-                .help(attachment.text.prefix(400) + (attachment.text.count > 400 ? "…" : ""))
-                .accessibilityElement(children: .ignore)
-                .accessibilityLabel(attachment.summary)
-                .accessibilityAddTraits(.isButton)
-                .accessibilityAction { model.showsAttachmentPreview = true }
-                .accessibilityAction(named: "Show Attached Text") { model.showsAttachmentPreview = true }
-                .accessibilityAction(named: "Remove Attachment") { model.ai.removeAttachment(attachment.id) }
-            } else if model.ai.action == .chat || model.ai.writingContext == nil || !model.ai.availability.isAvailable {
-                Spacer(minLength: 0)
-                if model.ai.availability.isAvailable {
-                    if model.ai.action == .chat, model.ai.command == nil {
-                        AgentMenu(chat: model.ai, agents: model.aiHub.agents) { model.focusRequest += 1 }
-                    }
-                    HStack(spacing: 6) {
-                        Circle().fill(OR.Color.success).frame(width: 6, height: 6)
-                        Text("On this Mac")
-                    }
-                    .font(.system(size: 12, weight: .medium)).foregroundStyle(OR.Color.text2)
-                    .padding(.horizontal, 9).frame(height: 24)
-                    .background(OR.Color.fill1, in: .capsule)
-                    .help("Apple's on-device model. Nothing is sent to a server.")
-                    if model.ai.action == .chat {
-                        Button {
-                            model.ai.newConversation()
-                            model.focusRequest += 1
-                        } label: {
-                            HStack(spacing: 6) {
-                                Image(systemName: "square.and.pencil").font(.system(size: 12))
-                                Text("New Chat")
-                                KeyCaps(["⌘", "N"], size: .small)
-                            }
+                HStack(spacing: 6) {
+                    Circle().fill(OR.Color.success).frame(width: 6, height: 6)
+                    Text(model.ai.action == .chat ? "On this Mac" : modelName)
+                }
+                .font(.system(size: 12, weight: .medium)).foregroundStyle(OR.Color.text2)
+                .padding(.horizontal, 9).frame(height: 24)
+                .background(OR.Color.fill1, in: .capsule)
+                .help(
+                    modelName == "On-device"
+                        ? "Apple's on-device model. Nothing is sent to a server." : "Apple's Private Cloud Compute model.")
+                if model.ai.action == .chat {
+                    Button {
+                        model.newAIConversation()
+                    } label: {
+                        HStack(spacing: 6) {
+                            Image(systemName: "square.and.pencil").font(.system(size: 12))
+                            Text("New Chat")
+                            KeyCaps(["⌘", "N"], size: .small)
                         }
-                        .buttonStyle(.orGhost)
-                        .accessibilityHint(KeyShortcut(["⌘", "N"]).spoken)
-                        .disabled(model.ai.isGenerating || model.ai.messages.isEmpty)
                     }
+                    .buttonStyle(.orGhost)
+                    .accessibilityHint(KeyShortcut(["⌘", "N"]).spoken)
+                    .disabled(model.ai.isGenerating || model.ai.messages.isEmpty)
                 }
             }
         }
@@ -130,6 +94,12 @@ struct AIView: View {
         .onChange(of: model.showActions || model.showShortcuts) { _, covered in
             if covered { model.showsAttachmentPreview = false }
         }
+    }
+
+    /// The model a writing run uses: writing commands always run on this Mac; an AI Command uses
+    /// the larger model when it's turned on and answering.
+    private var modelName: String {
+        model.ai.command != nil && model.aiHub.effectiveModel == .privateCloud ? "Private Cloud Compute" : "On-device"
     }
 
     /// The attached text in full, drawn inside the panel like ⌘K. A native popover
@@ -153,28 +123,13 @@ struct AIView: View {
         .animation(OR.Motion.resolve(OR.Motion.quick, reduceMotion: reduceMotion), value: model.showsAttachmentPreview)
     }
 
-    @ViewBuilder private func attachmentIcon(_ attachment: AIAttachment) -> some View {
-        if attachment.source == .selection, let url = model.previousApplication?.bundleURL {
-            WorkspaceIcon(url: url, size: 16)
-        } else {
-            Image(systemName: attachment.source.symbol).font(.system(size: 12))
-        }
-    }
-
-    /// Before a result: an optional instruction. After one: a follow-up, or ↩ to use the result.
-    private var instructionPlaceholder: String {
-        guard model.ai.writingContext != nil else { return "Add an instruction (optional)" }
-        return model.canAcceptAIResponse
-            ? "Ask for changes, or press Return to \(model.aiReplacesSource ? "replace the selection" : "copy the result")"
-            : "Ask for changes"
-    }
-
     // MARK: Bar
 
     @ViewBuilder private var bar: some View {
         let feedback: Feedback? =
             model.feedback ?? model.ai.errorMessage.map { .error($0) }
             ?? (model.ai.isGenerating ? .working(model.ai.isCancelling ? "Stopping…" : "Writing on this Mac…") : nil)
+            ?? model.readingSelectionFrom.map { .working("Reading the selection in \($0)…") }
         ActionBar(
             feedback: feedback, confirmation: model.confirmation, confirmationInstance: model.confirmationInstanceID,
             context: { context },
@@ -213,16 +168,19 @@ struct AIView: View {
                 model.showActions.toggle()
             }
         } else if model.ai.messages.last?.role == .assistant {
-            // ↩ follows the field: a follow-up updates the result, an empty field uses it.
+            // ↩ follows the field: a follow-up asks for changes, an empty field uses the result.
             if model.ai.isRevising {
-                ActionBarButton(title: "Update", keys: ["↩"], style: .accent) { model.ai.send() }
+                ActionBarButton(title: "Ask", keys: ["↩"], style: .accent) { model.ai.send() }
                     .disabled(!model.ai.canSend)
                     .accessibilityIdentifier("ai.send")
             } else if model.canAcceptAIResponse {
-                ActionBarButton(title: model.aiAcceptTitle, keys: ["↩"], style: model.aiReplacesSource ? .accent : .primary) {
+                ActionBarButton(title: model.aiAcceptTitle, keys: ["↩"], style: .accent) {
                     model.acceptAIResponse()
                 }
                 .accessibilityIdentifier("ai.accept")
+                ActionBarButton(title: model.aiSecondaryTitle, keys: ["⌘", "↩"], style: .ghost) {
+                    model.performAISecondary()
+                }
             } else if model.aiResultIsUnchanged {
                 ActionBarButton(title: "Done", keys: ["↩"]) { model.leaveAI() }
             } else if model.ai.latestResponse == nil {
@@ -232,10 +190,14 @@ struct AIView: View {
             ActionBarButton(title: "Actions", keys: ["⌘", "K"], style: .ghost, isOn: model.showActions) {
                 model.showActions.toggle()
             }
-        } else {
+        } else if model.readingSelectionFrom == nil {
             ActionBarButton(title: model.ai.runTitle, keys: ["↩"], style: .accent) { model.ai.send() }
                 .disabled(!model.ai.canSend)
                 .accessibilityIdentifier("ai.send")
+            ActionBarDivider()
+            ActionBarButton(title: "Actions", keys: ["⌘", "K"], style: .ghost, isOn: model.showActions) {
+                model.showActions.toggle()
+            }
         }
     }
 }
@@ -561,11 +523,11 @@ private struct TransformBody: View {
     @State private var pasteFocused = false
 
     var body: some View {
-        // Only a reply that ends the conversation counts, so a failed re-run never shows the old diff.
-        let response = model.ai.messages.last.flatMap { $0.role == .assistant ? $0 : nil }
         Group {
-            if let response, let source = model.ai.lastSource {
-                result(response: response, source: source)
+            if !model.ai.messages.isEmpty {
+                WritingTranscript(model: model)
+            } else if let app = model.readingSelectionFrom {
+                reading(app)
             } else if let attachment = model.ai.attachments.first {
                 ready(attachment)
             } else {
@@ -578,8 +540,22 @@ private struct TransformBody: View {
             if model.ai.messages.last?.role == .assistant, !model.ai.isGenerating {
                 Button("Use Result") { AIView.submitFromField(model) }
                     .keyboardShortcut(.defaultAction).hidden()
+            } else if model.ai.messages.isEmpty, !model.ai.attachments.isEmpty {
+                // A passage waiting to run has no field of its own.
+                Button("Run") { model.submitAI() }
+                    .keyboardShortcut(.defaultAction).hidden()
             }
         }
+    }
+
+    /// The ⌘C fallback is waiting for the app's copy (work item 2).
+    private func reading(_ app: String) -> some View {
+        VStack(spacing: 10) {
+            Spinner(size: 18, lineWidth: 2)
+            Text("Reading the selection in \(app)…").font(OR.Font.body).foregroundStyle(OR.Color.text2)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .accessibilityElement(children: .combine)
     }
 
     private func ready(_ attachment: AIAttachment) -> some View {
@@ -621,9 +597,16 @@ private struct TransformBody: View {
         .padding(.horizontal, 28).padding(.vertical, 18)
     }
 
+    /// Nothing was captured: why, then the clipboard, the selection again, or typing.
     private var pasteInput: some View {
         VStack(alignment: .leading, spacing: 10) {
-            Text(model.ai.subtitle).font(OR.Font.body).foregroundStyle(OR.Color.text2)
+            if let notice = model.selectionNotice {
+                InlineNotice(
+                    .info, symbol: "character.cursor.ibeam", title: notice,
+                    detail: "Use the clipboard, or paste or type the text below.")
+            } else {
+                Text(model.ai.subtitle).font(OR.Font.body).foregroundStyle(OR.Color.text2)
+            }
             ZStack(alignment: .topLeading) {
                 if model.ai.draft.isEmpty {
                     Text("Paste or type the text to \(model.ai.runTitle.lowercased())")
@@ -665,100 +648,214 @@ private struct TransformBody: View {
         }
         .padding(.horizontal, 28).padding(.vertical, 18)
     }
+}
 
-    @ViewBuilder private func result(response: ChatMessage, source: String) -> some View {
-        VStack(alignment: .leading, spacing: 14) {
-            if response.isPartial && !model.ai.isGenerating {
-                stopped(response)
-            } else if model.ai.showsDiff {
-                if let diff = model.ai.lastDiff, !model.ai.isGenerating {
-                    if model.ai.action == .proofread && diff.isUnchanged {
-                        unchanged(source)
-                    } else {
-                        changes(diff, response: response, source: source)
+/// A writing run, result first (work item 4): the command as a pill where the passage would be,
+/// follow-ups as you typed them, and each response as clean text that streams in. The latest one
+/// shows its changes inline when its command's highlight setting is on, or ⌘K asks for them.
+private struct WritingTranscript: View {
+    @Bindable var model: LauncherModel
+
+    var body: some View {
+        let messages = model.ai.messages
+        ScrollViewReader { proxy in
+            ScrollView {
+                VStack(alignment: .leading, spacing: 16) {
+                    ForEach(messages) { message in
+                        if message.role == .user {
+                            if message.id == messages.first?.id {
+                                commandPill
+                            } else {
+                                followUp(message)
+                            }
+                        } else if message.id == messages.last?.id {
+                            latest(message)
+                        } else {
+                            AIMessageText(message: message).equatable()
+                                .font(OR.Font.reading).lineSpacing(8).foregroundStyle(OR.Color.text2)
+                                .textSelection(.enabled)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                        }
                     }
-                } else {
-                    // The diff is built once, when the result is final. Until then the text streams in as is.
-                    Text(model.ai.isGenerating ? "Working…" : "Result").font(OR.Font.headline).foregroundStyle(OR.Color.text)
-                    ScrollView {
-                        Text(response.text).font(OR.Font.reading).lineSpacing(9).foregroundStyle(OR.Color.text)
-                            .frame(maxWidth: .infinity, alignment: .topLeading)
-                    }
-                    .frame(maxHeight: .infinity)
+                    Color.clear.frame(height: 1).id("writing.end")
                 }
-            } else if model.ai.action == .actionItems, !model.ai.repliesToRevision(response) {
-                ActionItemsList(message: response)
-            } else {
-                Text(model.ai.command?.title ?? (model.ai.action == .summarize ? "Summary" : "Result"))
-                    .font(OR.Font.headline).foregroundStyle(OR.Color.text)
-                ScrollView {
-                    AIMessageText(message: response).font(OR.Font.reading).lineSpacing(8).foregroundStyle(OR.Color.text)
-                        .frame(maxWidth: .infinity, alignment: .topLeading)
-                        .textSelection(.enabled)
-                }
-                .frame(maxHeight: .infinity)
+                .padding(.horizontal, 24).padding(.top, 18).padding(.bottom, 12)
             }
+            .onChange(of: messages.last?.text) { proxy.scrollTo("writing.end", anchor: .bottom) }
+            .onChange(of: messages.count) { proxy.scrollTo("writing.end", anchor: .bottom) }
         }
-        .padding(.horizontal, 28).padding(.top, 18).padding(.bottom, 14)
     }
 
-    /// A stopped writing result is never copied or replaced. Its text stays visible, read-only.
-    @ViewBuilder private func stopped(_ response: ChatMessage) -> some View {
-        InlineNotice(
-            .warning, symbol: "exclamationmark.triangle", title: "Stopped before finishing.",
-            detail: "Nothing will be replaced."
-        ) {
-            Button("Try Again") { model.ai.retry() }.buttonStyle(.orSecondary)
+    /// The run's user turn: the command's icon and name, not the selected text. A click shows
+    /// the passage it ran on.
+    private var commandPill: some View {
+        HStack(spacing: 7) {
+            Image(systemName: model.ai.symbol).font(.system(size: 12, weight: .semibold)).foregroundStyle(OR.Color.text2)
+            Text(model.ai.title).font(OR.Font.calloutEmphasis).foregroundStyle(OR.Color.text)
         }
-        ScrollView {
-            Text(response.text).font(OR.Font.reading).lineSpacing(9).foregroundStyle(OR.Color.text2)
-                .frame(maxWidth: .infinity, alignment: .topLeading)
-        }
-        .frame(maxHeight: .infinity)
+        .padding(.horizontal, 12).frame(height: 30)
+        .background(OR.Color.fill2, in: .capsule)
+        .contentShape(.capsule)
+        .onTapGesture { if model.ai.attachments.first != nil { model.showsAttachmentPreview.toggle() } }
+        .frame(maxWidth: .infinity, alignment: .trailing)
+        .accessibilityElement(children: .combine)
+        .accessibilityAddTraits(model.ai.attachments.first != nil ? .isButton : [])
+        .accessibilityHint(model.ai.attachments.first?.title ?? "")
+        .accessibilityAction(named: "Show Original") { model.showsAttachmentPreview = true }
     }
 
-    @ViewBuilder private func unchanged(_ source: String) -> some View {
-        InlineNotice(
-            .success, symbol: "checkmark.circle.fill", title: "No corrections needed.",
-            detail: "Your text is already correct, so nothing will be replaced."
-        ) {
-            Button("Done") { model.leaveAI() }.buttonStyle(.orSecondary)
-        }
-        Text(source).font(OR.Font.reading).lineSpacing(9).foregroundStyle(OR.Color.text2)
+    private func followUp(_ message: ChatMessage) -> some View {
+        Text(message.displayText ?? message.text).font(OR.Font.body).lineSpacing(3).foregroundStyle(OR.Color.text)
             .textSelection(.enabled)
+            .padding(.horizontal, 13).padding(.vertical, 9)
+            .background(
+                OR.Color.fill2,
+                in: UnevenRoundedRectangle(
+                    topLeadingRadius: 14, bottomLeadingRadius: 14, bottomTrailingRadius: 5, topTrailingRadius: 14,
+                    style: .continuous))
+            .frame(maxWidth: 520, alignment: .trailing)
+            .frame(maxWidth: .infinity, alignment: .trailing)
+            .accessibilityLabel("You: \(message.displayText ?? message.text)")
     }
 
-    @ViewBuilder private func changes(_ diff: WordDiff, response: ChatMessage, source: String) -> some View {
-        HStack {
-            Text(diffTitle(diff)).font(OR.Font.headline).foregroundStyle(OR.Color.text)
-            Spacer()
-            SegmentedPicker(
-                options: [(AIDiffMode.changes, "Changes"), (.result, "Result"), (.original, "Original")],
-                selection: Bindable(model.ai).diffMode, accessibilityLabel: "Show")
-        }
-        ScrollView {
-            Group {
-                switch model.ai.diffMode {
-                case .changes: Text(DiffText.attributed(diff)).accessibilityLabel(DiffText.spoken(diff))
-                case .result: Text(response.text)
-                case .original: Text(source)
-                }
+    @ViewBuilder private func latest(_ response: ChatMessage) -> some View {
+        let ai = model.ai
+        if response.text.isEmpty && ai.isGenerating {
+            // Marks where the result will appear. The action bar says “Writing on this Mac…”.
+            Spinner(size: 14, lineWidth: 1.75).frame(height: 20)
+        } else if response.isPartial && !ai.isGenerating {
+            // A stopped result is never pasted. Its text stays visible, read-only.
+            InlineNotice(
+                .warning, symbol: "exclamationmark.triangle", title: "Stopped before finishing.",
+                detail: "Nothing will be pasted."
+            ) {
+                Button("Try Again") { ai.retry() }.buttonStyle(.orSecondary)
             }
-            .font(OR.Font.reading).lineSpacing(9).foregroundStyle(OR.Color.text)
-            .frame(maxWidth: .infinity, alignment: .topLeading)
-            .textSelection(.enabled)
-        }
-        .frame(maxHeight: .infinity)
-        if model.ai.action == .proofread {
-            Label("Only spelling, grammar and punctuation were changed. Names, tone and line breaks are kept.", systemImage: "info.circle")
+            Text(response.text).font(OR.Font.reading).lineSpacing(8).foregroundStyle(OR.Color.text2)
+                .frame(maxWidth: .infinity, alignment: .leading)
+        } else if ai.diffMode == .original, let source = ai.lastSource, !ai.isGenerating {
+            Label("Original", systemImage: "doc.plaintext").labelStyle(TightLabelStyle())
+                .font(OR.Font.caption).foregroundStyle(OR.Color.text2)
+            Text(source).font(OR.Font.reading).lineSpacing(8).foregroundStyle(OR.Color.text)
+                .textSelection(.enabled).frame(maxWidth: .infinity, alignment: .leading)
+        } else if ai.action == .proofread, model.aiResultIsUnchanged {
+            InlineNotice(
+                .success, symbol: "checkmark.circle.fill", title: "No corrections needed.",
+                detail: "Your text is already correct, so there's nothing to paste."
+            ) {
+                Button("Done") { model.leaveAI() }.buttonStyle(.orSecondary)
+            }
+            Text(response.text).font(OR.Font.reading).lineSpacing(8).foregroundStyle(OR.Color.text2)
+                .textSelection(.enabled).frame(maxWidth: .infinity, alignment: .leading)
+        } else if ai.action == .actionItems, ai.command == nil, !ai.repliesToRevision(response) {
+            ActionItemsList(message: response)
+        } else if ai.diffMode == .changes, let diff = ai.lastDiff, !ai.isGenerating {
+            InlineChanges.text(diff)
+                .font(OR.Font.reading).lineSpacing(8).foregroundStyle(OR.Color.text)
+                .textRenderer(InlineChanges.Renderer())
+                .textSelection(.enabled)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .accessibilityLabel(DiffText.spoken(diff))
+            if ai.action == .proofread {
+                Label(
+                    "\(diff.changeCount) correction\(diff.changeCount == 1 ? "" : "s"). Only spelling, grammar and punctuation were changed.",
+                    systemImage: "info.circle"
+                )
                 .labelStyle(TightLabelStyle()).font(OR.Font.callout).foregroundStyle(OR.Color.text2)
+            }
+        } else if ai.showsDiff {
+            // A rewrite is plain text: what's pasted is exactly what's shown.
+            Text(response.text).font(OR.Font.reading).lineSpacing(8).foregroundStyle(OR.Color.text)
+                .textSelection(.enabled).frame(maxWidth: .infinity, alignment: .leading)
+        } else {
+            AIMessageText(message: response).equatable()
+                .font(OR.Font.reading).lineSpacing(8).foregroundStyle(OR.Color.text)
+                .textSelection(.enabled).frame(maxWidth: .infinity, alignment: .leading)
         }
     }
+}
 
-    private func diffTitle(_ diff: WordDiff) -> String {
-        let count = diff.changeCount
-        let noun = model.ai.action == .proofread ? "correction" : "change"
-        return "\(count) \(noun)\(count == 1 ? "" : "s")"
+/// The footer of a writing run: the follow-up field (“shorter”, “more formal”). Its ↩ asks for
+/// changes, or on an empty field does what the action bar's first button says; ⌘↩ and ⌥↩ reach
+/// Copy and Paste Formatted from here too.
+private struct FollowUpComposer: View {
+    @Bindable var model: LauncherModel
+
+    var body: some View {
+        HStack(spacing: 8) {
+            Image(systemName: "text.bubble").font(.system(size: 12)).foregroundStyle(OR.Color.text3)
+                .accessibilityHidden(true)
+            if model.ai.command == nil {
+                LauncherSearchInput(
+                    text: Bindable(model.ai).instruction, placeholder: "Ask for changes, such as shorter or more formal",
+                    focusRequest: model.focusRequest,
+                    submit: { AIView.submitFromField(model) }, move: { _ in }, cancel: model.goBack,
+                    paste: { model.performAISecondary() },
+                    tertiary: { model.pasteWritingResult(formatted: true) },
+                    fontSize: 13.5, accessibilityLabel: "Ask for changes", identifier: "ai.instruction")
+                    .frame(maxWidth: .infinity)
+            } else {
+                // AI Commands take follow-ups in chat.
+                Text("Continue in Chat to ask for changes").font(.system(size: 13)).foregroundStyle(OR.Color.text3)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                KeyCaps(["⌘", "J"], size: .small)
+            }
+        }
+        .padding(.horizontal, 12).frame(height: 36)
+        .background(OR.Color.fill1, in: .rect(cornerRadius: OR.Radius.control, style: .continuous))
+        .overlay {
+            RoundedRectangle(cornerRadius: OR.Radius.control, style: .continuous).strokeBorder(OR.Color.separator)
+        }
+        .padding(.horizontal, 14).padding(.bottom, 10)
+    }
+}
+
+/// Raycast-style change marks on a result (work item 4): insertions in green on a light green
+/// rounded background; deletions aren't shown, only a thin translucent red bar where text went.
+enum InlineChanges {
+    struct Mark: TextAttribute {
+        enum Kind: Hashable { case insertion, deletion }
+        var kind: Kind
+    }
+
+    /// The result with its marks. Deletions leave a hair space for their bar.
+    static func text(_ diff: WordDiff) -> Text {
+        var result = Text(verbatim: "")
+        for segment in diff.segments {
+            let piece: Text
+            switch segment {
+            case .same(let text):
+                piece = Text(verbatim: text)
+            case .added(let text):
+                piece = Text(verbatim: text).foregroundStyle(OR.Color.success).customAttribute(Mark(kind: .insertion))
+            case .removed:
+                piece = Text(verbatim: "\u{200A}").customAttribute(Mark(kind: .deletion))
+            }
+            result = Text("\(result)\(piece)")
+        }
+        return result
+    }
+
+    /// Draws the marks behind the runs that carry them.
+    struct Renderer: TextRenderer {
+        func draw(layout: Text.Layout, in context: inout GraphicsContext) {
+            for line in layout {
+                for run in line {
+                    if let mark = run[Mark.self] {
+                        let bounds = run.typographicBounds.rect
+                        switch mark.kind {
+                        case .insertion:
+                            let rect = bounds.insetBy(dx: -2, dy: -1)
+                            context.fill(Path(roundedRect: rect, cornerRadius: 4), with: .color(OR.Color.diffAdd))
+                        case .deletion:
+                            let bar = CGRect(x: bounds.midX - 1, y: bounds.minY, width: 2, height: bounds.height)
+                            context.fill(Path(roundedRect: bar, cornerRadius: 1), with: .color(OR.Color.danger.opacity(0.45)))
+                        }
+                    }
+                    context.draw(run)
+                }
+            }
+        }
     }
 }
 

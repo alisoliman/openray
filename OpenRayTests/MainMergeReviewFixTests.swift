@@ -38,16 +38,18 @@ struct MainMergeReviewFixTests {
         #expect(throws: LibraryValidationError.self) { try verify(captured: range, current: range, text: "Hullo") }
     }
 
-    @Test func aSelectionWithoutARangeIsReadAndCopiedButNeverReplaced() async {
+    @Test func aSelectionWithoutARangeIsPastedOnReturnButNeverReplacedUnattended() async {
         let model = model()
         defer { model.stop() }
         model.setCapturedSelection(selection("Unranged passage", ranged: false))
         model.openAI(.rewrite)
         #expect(model.ai.attachments.first?.text == "Unranged passage")
-        #expect(model.aiReplaceTarget == nil)
-        model.submitAI()
+        // ↵ is explicit, so it pastes over the selection without the range (owner decision);
+        // the unattended paths still need it.
+        #expect(model.aiReplaceTarget?.text == "Unranged passage")
+        #expect(model.aiReplaceTarget?.canReplace == false)
         await model.ai.waitForResponse()
-        #expect(model.aiAcceptTitle == "Copy Result")
+        #expect(model.aiAcceptTitle == "Paste Response")
         model.submitAI()
         #expect(model.clipboard.readText() == "A helpful reply.")
     }
@@ -139,14 +141,14 @@ struct MainMergeReviewFixTests {
         model.setCapturedSelection(selection("Same text"))
         model.openAI(.rewrite)
         #expect(model.aiReplaceTarget != nil)
+        await model.ai.waitForResponse()
         _ = model.clipboard.copy("Same text")
         model.attachClipboardToAI()
         #expect(model.ai.attachments.first?.source == .clipboard)
         #expect(model.aiReplaceTarget == nil)
-        model.submitAI()
         await model.ai.waitForResponse()
-        #expect(model.aiAcceptTitle == "Copy Result")
-        #expect(!model.aiReplacesSource)
+        #expect(model.ai.lastSource == "Same text")
+        #expect(model.aiReplaceTarget == nil)
     }
 
     @Test func aTypedPassageWithTheSameTextNeverInheritsTheSelectionsTarget() async throws {
@@ -154,26 +156,28 @@ struct MainMergeReviewFixTests {
         defer { model.stop() }
         model.setCapturedSelection(selection("Same text"))
         model.openAI(.rewrite)
-        let attachment = try #require(model.ai.attachments.first)
-        model.ai.removeAttachment(attachment.id)
+        await model.ai.waitForResponse()
+        #expect(model.aiReplaceTarget != nil)
+        // ⌘N: an empty run; the one before stays in history.
+        model.newAIConversation()
+        #expect(model.ai.attachments.isEmpty)
         model.ai.draft = "Same text"
         #expect(model.aiReplaceTarget == nil)
         model.submitAI()
         await model.ai.waitForResponse()
         #expect(model.ai.lastSource == "Same text")
         #expect(model.aiReplaceTarget == nil)
-        #expect(model.aiAcceptTitle == "Copy Result")
+        #expect(model.writingRuns.count == 1)
     }
 
-    // MARK: 4. Writing work survives reopening and detours
+    // MARK: 4. Writing work survives reopening and detours: a new selection wins, earlier runs stay in history
 
-    @Test func reopeningAfterBackToEverythingKeepsTheResultAndTheUnsentFollowUp() async throws {
+    @Test func aNewSelectionStartsANewRunAndTheUnsentFollowUpWaitsInHistory() async throws {
         let model = model()
         defer { model.stop() }
         #expect(model.store.update { $0.preferences.popToRoot = .immediately })
         model.setCapturedSelection(selection("First passage"))
         model.openAI(.rewrite)
-        model.submitAI()
         await model.ai.waitForResponse()
         model.ai.instruction = "Make it warmer"
         model.panelDidHide()
@@ -182,61 +186,83 @@ struct MainMergeReviewFixTests {
 
         model.setCapturedSelection(selection("Second passage"))
         model.openAI(.rewrite)
-        #expect(model.ai.messages.count == 2)
-        #expect(model.ai.instruction == "Make it warmer")
-        #expect(model.ai.attachments.first?.text == "First passage")
-        #expect(model.pendingNewSelection?.text == "Second passage")
-        #expect(model.actions(for: nil).contains { $0.id == "useNewSelection" })
-
-        model.usePendingSelection()
-        #expect(model.ai.messages.isEmpty)
         #expect(model.ai.attachments.first?.text == "Second passage")
+        #expect(model.ai.instruction.isEmpty)
         #expect(model.aiReplaceTarget?.text == "Second passage")
+        await model.ai.waitForResponse()
+        #expect(model.canShowPreviousRun)
+        #expect(model.actions(for: nil).contains { $0.id == "previousRun" })
+
+        // ⌘[ brings the first run back as it was, follow-up and target included.
+        #expect(model.handle(.back))
+        #expect(model.ai.attachments.first?.text == "First passage")
+        #expect(model.ai.instruction == "Make it warmer")
+        #expect(model.ai.messages.count == 2)
+        #expect(model.aiReplaceTarget?.text == "First passage")
+        #expect(model.destination == .ai)
+        // ⌘] goes forward again.
+        #expect(model.canShowNextRun)
+        #expect(model.handle(.forward))
+        #expect(model.ai.attachments.first?.text == "Second passage")
+        #expect(!model.canShowNextRun)
     }
 
-    @Test func anOversizedNewSelectionIsRefusedBeforeItReplacesAnything() async {
+    @Test func anOversizedNewSelectionIsRefusedAndTheResultStaysInHistory() async {
         let model = model()
         defer { model.stop() }
         model.setCapturedSelection(selection("A passage"))
         model.openAI(.rewrite)
-        model.submitAI()
         await model.ai.waitForResponse()
         model.setCapturedSelection(selection(String(repeating: "a", count: AIChatModel.inputLimit + 1)))
         model.openAI(.rewrite)
-        model.usePendingSelection()
         #expect(model.ai.errorMessage?.contains("longer than") == true)
+        #expect(model.ai.messages.isEmpty)
+        #expect(model.ai.attachments.isEmpty)
+        model.showWritingRun(-1)
         #expect(model.ai.messages.count == 2)
         #expect(model.ai.attachments.first?.text == "A passage")
     }
 
-    @Test func switchingCommandsOrToChatPutsWorkAwayAndBringsItBack() {
+    @Test func switchingCommandsOrToChatPutsWorkInHistory() async {
         let model = model()
         defer { model.stop() }
         model.setCapturedSelection(selection("Passage A"))
         model.openAI(.rewrite)
+        await model.ai.waitForResponse()
         model.ai.instruction = "Make it formal"
 
         model.setCapturedSelection(selection("Passage B"))
         model.openAI(.summarize)
         #expect(model.ai.action == .summarize)
         #expect(model.ai.attachments.first?.text == "Passage B")
+        await model.ai.waitForResponse()
         model.openAI()
         #expect(model.ai.action == .chat)
 
+        // Nothing selected now: an empty run, with both earlier runs a ⌘[ away.
+        model.selectionContextReader = { throw SelectionReadError.nothingSelected(app: "Notes") }
+        model.selectionCopyReader = { _ in throw SelectionReadError.nothingSelected(app: "Notes") }
         model.openAI(.rewrite)
+        await model.selectionCaptureTask?.value
+        #expect(model.ai.action == .rewrite)
+        #expect(model.ai.attachments.isEmpty)
+        #expect(model.selectionNotice == "Nothing selected in Notes.")
+        model.showWritingRun(-1)
+        #expect(model.ai.action == .summarize)
+        #expect(model.ai.attachments.first?.text == "Passage B")
+        model.showWritingRun(-1)
         #expect(model.ai.action == .rewrite)
         #expect(model.ai.attachments.first?.text == "Passage A")
         #expect(model.ai.instruction == "Make it formal")
         #expect(model.aiReplaceTarget?.text == "Passage A")
-        model.openAI(.summarize)
-        #expect(model.ai.attachments.first?.text == "Passage B")
     }
 
-    @Test func aTimerOpenedFromAIGoesBackToTheWorkItLeft() throws {
+    @Test func aTimerOpenedFromAIGoesBackToTheWorkItLeft() async throws {
         let model = model()
         defer { model.stop() }
         model.setCapturedSelection(selection("A passage"))
         model.openAI(.rewrite)
+        await model.ai.waitForResponse()
         model.ai.instruction = "Keep it short"
         let pomodoro = try #require(model.bindableCommands.first { $0.id == PomodoroCommandProvider.openID })
         model.perform(pomodoro)
@@ -251,67 +277,41 @@ struct MainMergeReviewFixTests {
         #expect(model.section == .home)
     }
 
-    @Test func anInsertedResultIsNotWorkSoANewSelectionStartsFresh() async throws {
-        let model = model()
-        defer { model.stop() }
-        model.setCapturedSelection(selection("First passage"))
-        model.openAI(.rewrite)
-        model.submitAI()
-        await model.ai.waitForResponse()
-        let text = try #require(model.ai.messages.last?.text)
-        model.insertedAIResult = (model.ai.conversationToken, text)
-        model.setCapturedSelection(selection("Second passage"))
-        model.openAI(.rewrite)
-        #expect(model.ai.messages.isEmpty)
-        #expect(model.ai.attachments.first?.text == "Second passage")
-        #expect(model.pendingNewSelection == nil)
-    }
-
-    @Test func aHotkeyRunNeverResendsResumedWork() async {
+    @Test func aHotkeyRunOnASelectionAlwaysStartsANewRun() async {
         let engine = TestAIEngine()
         let model = model(engine: engine)
         defer { model.stop() }
         model.setCapturedSelection(selection("A passage"))
         model.openAI(.rewrite)
-        model.submitAI()
         await model.ai.waitForResponse()
         let provider = AICommandProvider()
-        provider.run(commandID: "ai.rewrite", arguments: [:], in: model, startsWritingCommands: true)
+        provider.run(commandID: "ai.rewrite", arguments: [:], in: model)
         await model.ai.waitForResponse()
-        #expect(engine.prompts.count == 1)
+        #expect(engine.prompts == ["A passage", "A passage"])
         #expect(model.ai.messages.count == 2)
+        #expect(model.writingRuns.count == 1)
     }
 
-    @Test func quickFixNeverRunsAResumedPassageFromAnotherApp() {
+    @Test func aNewSelectionFromAnotherAppRunsOnItNeverOnTheResumedPassage() async {
         let engine = TestAIEngine()
         let model = model(engine: engine)
         defer { model.stop() }
-        // An unsent passage selected in app A.
-        model.setCapturedSelection(selection("Same text", source: "App A"))
+        // Unsent work on a passage selected in app A: nothing could run it.
+        model.selectionContextReader = { throw SelectionReadError.nothingSelected(app: "App A") }
+        model.selectionCopyReader = { _ in throw SelectionReadError.nothingSelected(app: "App A") }
         model.openAI(.rewrite)
-        // Quick Fix from app B, where the same words are selected.
+        await model.selectionCaptureTask?.value
+        model.ai.draft = "Same text"
+        // The command from app B, where the same words are selected.
         var other = selection("Same text", source: "App B")
         other.range = NSRange(location: 10, length: 9)
         model.setCapturedSelection(other)
-        AICommandProvider().run(commandID: "ai.rewrite", arguments: [:], in: model, startsWritingCommands: true)
-        #expect(engine.prompts.isEmpty)
-        #expect(!model.ai.isGenerating)
-        #expect(model.aiReplaceTarget?.sourceName == "App A")
-        // Same text, but another app and place: offered, never applied on its own.
-        #expect(model.pendingNewSelection?.sourceName == "App B")
-    }
-
-    @Test func quickFixRunsASelectionItJustCaptured() async {
-        let engine = TestAIEngine()
-        let model = model(engine: engine)
-        defer { model.stop() }
-        model.setCapturedSelection(selection("Fresh passage"))
-        AICommandProvider().run(commandID: "ai.rewrite", arguments: [:], in: model, startsWritingCommands: true)
+        AICommandProvider().run(commandID: "ai.rewrite", arguments: [:], in: model)
         await model.ai.waitForResponse()
-        #expect(engine.prompts == ["Fresh passage"])
-        // The very same selection again (app, element, range, text) isn't offered as new.
-        model.openAI(.rewrite)
-        #expect(model.pendingNewSelection == nil)
+        #expect(engine.prompts == ["Same text"])
+        #expect(model.aiReplaceTarget?.sourceName == "App B")
+        // The typed passage is kept in history, not sent.
+        #expect(model.writingRuns.first?.snapshot.draft == "Same text")
     }
 
     @Test func reopeningWhileAReplyIsWrittenNeverChangesItsPassageOrTarget() async {
@@ -321,14 +321,12 @@ struct MainMergeReviewFixTests {
         defer { model.stop() }
         model.setCapturedSelection(selection("Passage A", source: "App A"))
         model.openAI(.rewrite)
-        model.submitAI()
         #expect(model.ai.isGenerating)
 
         model.setCapturedSelection(selection("Passage B", source: "App B"))
         model.openAI(.rewrite)
         #expect(model.ai.attachments.map(\.text) == ["Passage A"])
         #expect(model.aiReplaceTarget?.sourceName == "App A")
-        #expect(model.pendingNewSelection == nil)
         model.openAI(.rewrite, attachment: AIAttachment(source: .clipboard, text: "Passage C"))
         #expect(model.ai.attachments.map(\.text) == ["Passage A"])
         _ = model.clipboard.copy("Passage D")
@@ -336,13 +334,15 @@ struct MainMergeReviewFixTests {
         model.attachSelectionFromPreviousApp(reportErrors: true)
         #expect(model.ai.attachments.map(\.text) == ["Passage A"])
         #expect(model.aiReplaceTarget?.sourceName == "App A")
+        // ⌘[ waits for the reply too.
+        #expect(!model.canShowPreviousRun)
 
         await model.ai.waitForResponse()
         #expect(model.ai.lastSource == "Passage A")
-        #expect(model.aiAcceptTitle == "Replace in App A")
+        #expect(model.aiReplaceTarget?.sourceName == "App A")
     }
 
-    @Test func sendingAFileToAIChatPutsUnsentWritingWorkAway() async throws {
+    @Test func sendingAFileToAIChatPutsWritingWorkInHistory() async throws {
         let model = model()
         defer { model.stop() }
         let folder = FileManager.default.temporaryDirectory.appending(path: "OpenRaySendToAI-\(UUID())")
@@ -353,14 +353,14 @@ struct MainMergeReviewFixTests {
 
         model.setCapturedSelection(selection("A passage"))
         model.openAI(.rewrite)
+        await model.ai.waitForResponse()
         model.ai.instruction = "Keep it short"
         await model.sendFileToAI(file).value
         #expect(model.ai.action == .chat)
-
-        model.openAI(.rewrite)
-        #expect(model.ai.attachments.first?.text == "A passage")
-        #expect(model.ai.instruction == "Keep it short")
-        #expect(model.aiReplaceTarget?.text == "A passage")
+        let run = try #require(model.writingRuns.last)
+        #expect(run.snapshot.attachments.first?.text == "A passage")
+        #expect(run.snapshot.instruction == "Keep it short")
+        #expect(run.pin?.context.text == "A passage")
     }
 
     // MARK: 5. A changed Files query drops what can't be matched afresh
@@ -418,24 +418,21 @@ struct MainMergeReviewFixTests {
 
     // MARK: 6. ⌘↩ in ⌘K runs only what's bound to it
 
-    @Test func commandReturnInAIActionsNeverPastes() async {
+    @Test func commandReturnOnAWritingResultDoesWhatReturnDoesnt() async {
         let model = model()
         defer { model.stop() }
+        // An explicit passage runs at once.
         model.openAI(.rewrite, attachment: AIAttachment(source: .clipboard, text: "A passage"))
-        model.submitAI()
         await model.ai.waitForResponse()
         model.showActions = true
-        #expect(model.actionEntries.contains { $0.id == "paste" })
-        #expect(!model.actionEntries.contains { $0.shortcut == .commandReturn })
-        model.performCommandReturnAction()
-        #expect(model.clipboard.readText() == nil)
+        // ↵ pastes, so ⌘↵ copies (work item 5), whatever row is highlighted or filtered.
+        let bound = model.actionEntries.first { $0.shortcut == .commandReturn }
+        #expect(bound?.title == "Copy Response")
+        #expect(!model.actionEntries.contains { $0.id == "paste" })
         model.actionFilter = "zzz"
         model.performCommandReturnAction()
-        #expect(model.clipboard.readText() == nil)
-        // Choosing Paste is still possible.
-        model.actionFilter = ""
-        if let paste = model.actionEntries.first(where: { $0.id == "paste" }) { model.performAction(paste) }
         #expect(model.clipboard.readText() == "A helpful reply.")
+        #expect(model.feedback?.text == "Copied “A helpful reply.”")
     }
 
     @Test func commandReturnInLauncherActionsRunsTheBoundSecondaryAction() throws {
@@ -482,7 +479,6 @@ struct MainMergeReviewFixTests {
         let model = model(engine: engine)
         defer { model.stop() }
         model.openAI(.actionItems, attachment: AIAttachment(source: .clipboard, text: "Lee will book the room."))
-        model.submitAI()
         await model.ai.waitForResponse()
         #expect(!model.aiResultIsUnchanged)
         engine.snapshots = ["Lee will book the room tomorrow."]

@@ -306,8 +306,8 @@ struct ShortcutsOverlay: View {
         }
     }
 
-    /// Mirrors the AI action bar. Keys follow main #12/#13 inside AI (an owner decision): ↩
-    /// sends, or with an empty field uses the result; ⌘↩ and ⇧↩ add a line in a composer.
+    /// Mirrors the AI action bar. In chat ↩ sends and ⌘↩ and ⇧↩ add a line in the composer; a
+    /// writing run's rows come from `LauncherModel.aiWritingShortcutRows` (↩ pastes, ⌘↩ copies).
     /// While a response is being written, Stop is the only command that runs.
     private var aiRows: [(String, [String])] {
         let ai = model.ai
@@ -325,34 +325,7 @@ struct ShortcutsOverlay: View {
             if ai.latestResponse != nil { rows.append(("Save as Note", ["⌘", "S"])) }
             return rows
         }
-        if ai.isGenerating { return [("Stop", ["⌘", "."])] }
-        if ai.messages.last?.role == .assistant {
-            if ai.isRevising {
-                rows.append(("Update Result", ["↩"]))
-            } else if model.canAcceptAIResponse {
-                rows.append((model.aiAcceptTitle, ["↩"]))
-            } else if model.aiResultIsUnchanged {
-                rows.append(("Done", ["↩"]))
-            }
-            if showsDiffModes {
-                rows += [("Show changes", ["⌘", "1"]), ("Show result", ["⌘", "2"]), ("Show original", ["⌘", "3"])]
-            }
-        } else {
-            rows.append((ai.action.runTitle, ["↩"]))
-            if ai.attachments.isEmpty { rows += newLine }
-        }
-        if ai.canRetry { rows.append(("Try Again", ["⌘", "R"])) }
-        rows.append(("Start over", ["⌘", "N"]))
-        return rows
-    }
-
-    /// A finished writing result switches its diff views with ⌘1–⌘3 (the same
-    /// test as its ⌘K entries), so those numbers don't open favorites there.
-    private var showsDiffModes: Bool {
-        let ai = model.ai
-        guard model.destination == .ai, ai.action.showsDiff, !ai.isGenerating, let response = ai.latestResponse
-        else { return false }
-        return !response.isPartial && ai.lastSource != nil && !model.aiResultIsUnchanged
+        return model.aiWritingShortcutRows
     }
 
     var everywhereRows: [(String, [String])] {
@@ -362,7 +335,7 @@ struct ShortcutsOverlay: View {
             model.destination == .ai
             ? ("Leave AI", ["esc"]) : model.section == .home ? ("Clear Search", ["esc"]) : ("Leave Scope", ["⌫"])
         var rows = [("Actions", ["⌘", "K"]), leave]
-        if !showsDiffModes { rows.append(("Favorites", ["⌘", "1–8"])) }
+        rows.append(("Favorites", ["⌘", "1–8"]))
         if model.destination == .search {
             rows.append(("Jump Between Sections", ["⌘", "↑", "↓"]))
             rows.append(("Back to Everything", ["⌘", "esc"]))

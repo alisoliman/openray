@@ -162,23 +162,29 @@ struct AICommandTests {
         #expect(model.feedback?.text.contains("Select some text") == true)
     }
 
-    @Test func quickFixRunsTheChosenCommandOnTheSelection() async throws {
+    @Test func quickFixRunsTheChosenCommandInPlaceOnTheSelection() async throws {
         let engine = RecordingAIEngine()
         engine.replies = ["They were late."]
         let model = Slice7Fixtures.launcher(engine: engine, selection: "They was late.")
         defer { model.stop() }
+        model.unattendedChatFactory = { [unowned model] in AIChatModel(engine: engine, hub: model.ai.hub) }
+        model.hud = HUDController(
+            presenter: FakeHUDPresenter(), screenFrame: { CGRect(x: 0, y: 0, width: 1_440, height: 900) },
+            schedule: { _, _ in })
         let quickFix = try #require(model.bindableCommands.first { $0.id == AICommandProvider.quickFixID })
         model.perform(quickFix)
-        await model.ai.waitForResponse()
-        // The default runs Fix Spelling & Grammar at once.
-        #expect(model.ai.action == .proofread)
+        await model.inPlaceTask?.value
+        // The default runs Fix Spelling & Grammar at once, in place, with no window (work item 8).
+        #expect(model.destination == .search)
         #expect(engine.actionPrompts == ["They was late."])
+        // The stand-in selection has no app to go back to, so the result is copied and the HUD says so.
+        #expect(model.clipboard.readText() == "They were late.")
+        #expect(model.hud.current == LauncherModel.copiedHUD)
 
-        model.leaveAI()
         #expect(model.aiHub.updateSettings { $0.quickFixCommandID = AICommand.explainSimply.id })
         model.perform(quickFix)
-        await model.ai.waitForResponse()
-        #expect(model.ai.command?.commandID == AICommand.explainSimply.id)
+        await model.inPlaceTask?.value
+        #expect(engine.requests.last?.profile.id == AICommand.explainSimply.id)
     }
 
     @Test func customCommandsAreRegisteredBindableAndEditableCopiesOfBuiltIns() throws {

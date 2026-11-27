@@ -27,12 +27,16 @@ extension LauncherModel {
         }
         if !ai.isGenerating {
             let hasReply = ai.messages.contains { $0.role == .assistant && !$0.text.isEmpty }
+            // A writing result continues as a chat in the chat window (⌘J, as in Raycast).
+            let continueTitle = ai.action == .chat ? "Continue in Chat Window" : "Continue in Chat"
             entries.append(
                 ActionEntry(
-                    id: "chatWindow", title: hasReply ? "Continue in Chat Window" : "Open Chat Window",
+                    id: "chatWindow", title: hasReply ? continueTitle : "Open Chat Window",
                     symbol: "macwindow.on.rectangle", shortcut: .command("J"), key: "j", modifiers: .command, group: .organize
                 ) { [weak self] in
                     guard let self else { return }
+                    // A writing run stays in the history; the chat window gets a copy.
+                    if hasReply, self.ai.action != .chat { self.commitWritingRun() }
                     // A conversation that couldn't be saved stays here, with the reason shown.
                     if hasReply { self.aiHub.continueInChat() } else { self.aiHub.openChatWindow() }
                 })

@@ -44,9 +44,10 @@ final class AICommandProvider: CommandProvider {
                 mode: .noView, badge: "Command"),
             CommandDescriptor(
                 id: Self.quickFixID, title: "Quick Fix",
-                subtitle: available ? "Runs \(quickFixTitle(in: hub)) on your selection" : "Not available yet", kind: .ai,
-                symbol: "wand.and.stars", keywords: ["AI", "fix", "selection", "grammar", "hotkey"], mode: .ai,
-                badge: "AI command", isUnavailable: !available && !quickFixIsTranslation(in: hub)),
+                subtitle: available ? "Runs \(quickFixTitle(in: hub)) in place on your text" : "Not available yet", kind: .ai,
+                symbol: "wand.and.stars", keywords: ["AI", "fix", "selection", "grammar", "hotkey"],
+                // It replaces text in the app you're in, with no window (work item 8).
+                mode: .noView, badge: "AI command", isUnavailable: !available && !quickFixIsTranslation(in: hub)),
             CommandDescriptor(
                 id: Self.createID, title: "Create AI Command", subtitle: "A prompt you can run on any text", kind: .ai,
                 symbol: "plus.bubble", keywords: ["AI", "new", "prompt", "custom"], mode: .noView, badge: "Command",
@@ -109,10 +110,11 @@ final class AICommandProvider: CommandProvider {
             let target = hub.settings.quickFixCommandID
             // A target that needs a value opens its fields first, then runs on the selection.
             if let targetItem = model.bindableCommands.first(where: { $0.id == target }), model.needsArguments(targetItem) {
+                model.panel?.show()
                 model.beginArguments(for: targetItem)
                 return
             }
-            run(commandID: target, arguments: [:], in: model, startsWritingCommands: true)
+            model.runQuickFix()
         case Self.createID:
             model.store.recordUse(of: item.id)
             hub.requestEditor(.newCommand)
@@ -123,17 +125,27 @@ final class AICommandProvider: CommandProvider {
             // Rows in Search AI Commands carry the command's own id, so the registry fills
             // their arguments through the same fields as a root search does.
             let commandID = ref.payload ?? ref.id
+            // A choice such as Change Tone's tone is asked first, with its default picked, and
+            // the command runs on ↵ in the fields (work item 1). The registry fills defaults into
+            // `ref`, so the row's own values tell whether the fields were shown.
+            let choices = model.argumentSpecs(for: item).filter { if case .dropdown = $0.type { true } else { false } }
+            if case .provided(let row) = item.action, choices.contains(where: { row.arguments[$0.name] == nil }),
+                model.beginArguments(for: item)
+            {
+                return
+            }
             model.store.recordUse(of: commandID)
-            run(commandID: commandID, arguments: ref.arguments, in: model, startsWritingCommands: false)
+            run(commandID: commandID, arguments: ref.arguments, in: model)
         }
     }
 
     /// Runs a command by id: an original writing command, an added built-in or a custom one.
-    /// Placeholders are read now, after the arguments validate.
-    func run(commandID: String, arguments: [String: String], in model: LauncherModel, startsWritingCommands: Bool) {
+    /// Placeholders are read now, after the arguments validate; `{selection}` uses the ⌘C
+    /// fallback when Accessibility sees no selection, so the run can wait for it. A custom
+    /// command set to Replace Selection runs in place with no window.
+    func run(commandID: String, arguments: [String: String], in model: LauncherModel) {
         if let action = AIWritingCommandProvider.writingActions.first(where: { "ai.\($0.id)" == commandID }) {
-            // Only a selection captured by this run goes at once; resumed work waits for the person.
-            model.openAI(action, runsCapturedSelection: startsWritingCommands)
+            model.openAI(action)
             return
         }
         guard let command = model.aiHub.aiCommands.first(where: { $0.id == commandID }) else {
@@ -145,14 +157,46 @@ final class AICommandProvider: CommandProvider {
             model.feedback = .warning(issue.message)
             return
         }
+        let resolved: [PlaceholderArgument.ID: String]
+        do { resolved = try plan.resolveArguments(arguments) } catch {
+            model.feedback = .warning(error.localizedDescription)
+            return
+        }
+        guard plan.requirements.selection, model.readsSelectionImplicitly else {
+            render(command, plan: plan, arguments: resolved, in: model)
+            return
+        }
+        model.resolveSelection { [weak model] result in
+            guard let model else { return }
+            switch result {
+            case .success(let selection):
+                self.render(command, plan: plan, arguments: resolved, selection: selection, in: model)
+            case .failure(let error):
+                self.render(command, plan: plan, arguments: resolved, selectionFailure: error, in: model)
+            }
+        }
+    }
+
+    private func render(
+        _ command: AICommand, plan: PlaceholderPlan, arguments: [PlaceholderArgument.ID: String],
+        selection: SelectedTextContext? = nil,
+        selectionFailure: (any Error)? = nil, in model: LauncherModel
+    ) {
+        var values = model.placeholderValues(for: plan, selection: selection, readsSelection: selectionFailure == nil)
+        values.arguments = arguments
         do {
-            let resolved = try plan.resolveArguments(arguments)
-            var values = model.placeholderValues(for: plan)
-            values.arguments = resolved
             let run = try AICommandRenderer.render(
                 command, plan: plan, values: values, capabilities: model.ai.capabilities,
-                sourceAppName: model.previousApplicationName)
-            model.openAI(command: run)
+                sourceAppName: selection?.sourceName ?? model.previousApplicationName)
+            if run.replacesInPlace, let selection = model.lastCapturedSelection {
+                model.runInPlace(command: run, on: .selection(selection), title: command.name)
+            } else {
+                model.openAI(command: run)
+            }
+        } catch AICommandError.noText where selectionFailure != nil {
+            // Say why there was no selection, such as “Nothing selected in Notes.”
+            model.feedback = .warning(
+                "\(selectionFailure?.localizedDescription ?? "") Select some text, or copy it, then run the command again.")
         } catch {
             model.feedback = .warning(error.localizedDescription)
         }
@@ -242,7 +286,7 @@ final class AICommandProvider: CommandProvider {
     func preview(for item: LauncherItem, ref: ProvidedRef, in model: LauncherModel) -> ProvidedPreview? {
         guard let command = command(for: ref, in: model) else { return nil }
         var metadata: [(label: String, value: String)] = [
-            ("Output", command.output.title), ("Creativity", command.creativity.title),
+            ("Output Behavior", command.output.title), ("Creativity", command.creativity.title),
         ]
         if command.performer != .model { metadata = [("Runs with", "Apple Translation")] }
         if let reasoning = command.reasoning { metadata.append(("Reasoning", reasoning.title)) }

@@ -325,35 +325,35 @@ struct LauncherUXTests {
         let model = model(engine: engine)
         defer { model.stop() }
         model.openAI(.actionItems, attachment: AIAttachment(source: .clipboard, text: "The room is bright."))
-        model.ai.send()
         await model.ai.waitForResponse()
         #expect(model.aiResultIsUnchanged)
         var ids = model.actions(for: nil).map(\.id)
-        #expect(ids.contains("copy") && !ids.contains("paste") && !ids.contains("note"))
+        #expect(!ids.contains("accept") && !ids.contains("secondary") && !ids.contains("note"))
         engine.snapshots = ["- Lee: Book the room"]
         model.ai.retry()
         await model.ai.waitForResponse()
         #expect(!model.aiResultIsUnchanged)
         ids = model.actions(for: nil).map(\.id)
-        #expect(ids.contains("paste") && ids.contains("note"))
+        #expect(ids.contains("accept") && ids.contains("secondary") && ids.contains("note"))
     }
 
-    @Test func writingResultsSwitchViewsAndContinueInChatCarriesTheResult() async throws {
+    @Test func writingResultsSwitchViewsInCommandKAndContinueInChatCarriesTheResult() async throws {
         let engine = TestAIEngine()
         engine.snapshots = ["They were late."]
         let model = model(engine: engine)
         defer { model.stop() }
         model.openAI(.proofread, attachment: AIAttachment(source: .clipboard, text: "They was late."))
-        model.ai.send()
         await model.ai.waitForResponse()
+        // Fix Spelling & Grammar opens on its marked changes; the other views are in ⌘K.
+        #expect(model.ai.diffMode == .changes)
         let entries = model.actions(for: nil)
-        let views = entries.filter { $0.id.hasPrefix("diff.") }.map(\.title)
-        #expect(views == ["Show Changes", "Show Result", "Show Original"])
-        entries.first { $0.id == "diff.2" }?.perform()
-        #expect(model.ai.diffMode == .result)
-        model.performNumber(3)
+        let views = entries.filter { $0.id.hasPrefix("view.") }
+        #expect(views.map(\.title) == ["Show Response", "Show Changes", "Show Original"])
+        #expect(views.allSatisfy { $0.key == nil })
+        views.first { $0.title == "Show Original" }?.perform()
         #expect(model.ai.diffMode == .original)
-        #expect(model.section == .home)
+        views.first { $0.title == "Show Response" }?.perform()
+        #expect(model.ai.diffMode == .result)
         let chat = try #require(model.actions(for: nil).first { $0.id == "chat" })
         chat.perform()
         #expect(model.ai.action == .chat)
