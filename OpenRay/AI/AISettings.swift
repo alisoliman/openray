@@ -9,11 +9,18 @@ struct AISettings: Equatable, Sendable {
     var defaultAgentID: UUID?
     /// The command Quick Fix runs on the selection.
     var quickFixCommandID = "ai.proofread"
+    /// Quick Fix works on the selection when there is one; off, it always takes the whole field.
+    var quickFixPrefersSelection = true
+    /// Commands whose highlight setting differs from its default, by command id.
+    var highlightOverrides: [String: Bool] = [:]
     var toolPermissions: [String: AIToolPermission] = [:]
     var chatRetention: ChatRetention = .forever
     var dictationEnabled = false
     var screenContextEnabled = false
     var chatWindowOnTop = false
+
+    /// Commands whose results show their changes unless turned off: Fix Spelling & Grammar.
+    static let highlightedByDefault: Set<String> = ["ai.proofread"]
 
     init() {}
 
@@ -22,13 +29,26 @@ struct AISettings: Equatable, Sendable {
         model = values["model"].flatMap(AIModelChoice.init(rawValue:)) ?? .onDevice
         defaultAgentID = values["defaultAgent"].flatMap(UUID.init(uuidString:))
         quickFixCommandID = values["quickFix"].flatMap { $0.isEmpty ? nil : $0 } ?? "ai.proofread"
+        quickFixPrefersSelection = values["quickFixSelection"] != "false"
         for (key, value) in values where key.hasPrefix("tool.") {
             if let permission = AIToolPermission(rawValue: value) { toolPermissions[String(key.dropFirst(5))] = permission }
+        }
+        for (key, value) in values where key.hasPrefix("highlight.") && (value == "true" || value == "false") {
+            highlightOverrides[String(key.dropFirst(10))] = value == "true"
         }
         chatRetention = values["retention"].flatMap(ChatRetention.init(rawValue:)) ?? .forever
         dictationEnabled = values["dictation"] == "true"
         screenContextEnabled = values["screenContext"] == "true"
         chatWindowOnTop = values["onTop"] == "true"
+    }
+
+    /// Whether a command's results open with their changes marked inline.
+    func highlightsChanges(for commandID: String) -> Bool {
+        highlightOverrides[commandID] ?? Self.highlightedByDefault.contains(commandID)
+    }
+
+    mutating func setHighlightsChanges(_ highlights: Bool, for commandID: String) {
+        highlightOverrides[commandID] = highlights == Self.highlightedByDefault.contains(commandID) ? nil : highlights
     }
 
     /// Writes every value, dropping keys left at their defaults.
@@ -37,7 +57,12 @@ struct AISettings: Equatable, Sendable {
         if model != .onDevice { values["model"] = model.rawValue }
         if let defaultAgentID { values["defaultAgent"] = defaultAgentID.uuidString }
         if quickFixCommandID != "ai.proofread" { values["quickFix"] = quickFixCommandID }
+        if !quickFixPrefersSelection { values["quickFixSelection"] = "false" }
         for (tool, permission) in toolPermissions where permission != .auto { values["tool.\(tool)"] = permission.rawValue }
+        for (command, highlights) in highlightOverrides
+        where highlights != Self.highlightedByDefault.contains(command) {
+            values["highlight.\(command)"] = highlights ? "true" : "false"
+        }
         if chatRetention != .forever { values["retention"] = chatRetention.rawValue }
         if dictationEnabled { values["dictation"] = "true" }
         if screenContextEnabled { values["screenContext"] = "true" }

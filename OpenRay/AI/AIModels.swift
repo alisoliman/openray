@@ -235,6 +235,16 @@ protocol AIEngine: AnyObject {
         _ request: String, context: AIWritingContext, action: AIAction,
         onSnapshot: @escaping @MainActor (AIResponseSnapshot) -> Void
     ) async throws
+    /// A writing action or revision with other sampling, for Regenerate (⌘R, ⇧⌘R). Defaulted
+    /// below to the standard stream; the prompt and instructions are the same either way.
+    func stream(
+        _ prompt: String, action: AIAction, instruction: String, sampling: AIWritingSampling,
+        onSnapshot: @escaping @MainActor (AIResponseSnapshot) -> Void
+    ) async throws
+    func streamRevision(
+        _ request: String, context: AIWritingContext, action: AIAction, sampling: AIWritingSampling,
+        onSnapshot: @escaping @MainActor (AIResponseSnapshot) -> Void
+    ) async throws
 
     // Slice 7. Every requirement below has a default (`AIRequest.swift`), so an engine that
     // only streams actions keeps working: requests fall back to its action stream.
@@ -313,6 +323,37 @@ extension AIEngine {
         onSnapshot: @escaping @MainActor (AIResponseSnapshot) -> Void
     ) async throws {
         try await stream(prompt, action: action) { onSnapshot(AIResponseSnapshot(text: $0)) }
+    }
+
+    func stream(
+        _ prompt: String, action: AIAction, instruction: String, sampling: AIWritingSampling,
+        onSnapshot: @escaping @MainActor (AIResponseSnapshot) -> Void
+    ) async throws {
+        try await stream(prompt, action: action, instruction: instruction, onSnapshot: onSnapshot)
+    }
+
+    func streamRevision(
+        _ request: String, context: AIWritingContext, action: AIAction, sampling: AIWritingSampling,
+        onSnapshot: @escaping @MainActor (AIResponseSnapshot) -> Void
+    ) async throws {
+        try await streamRevision(request, context: context, action: action, onSnapshot: onSnapshot)
+    }
+}
+
+/// How a writing run samples. Writing runs are greedy, so the same passage gives the same text;
+/// Regenerate asks for another wording (⌘R) or a freer one (⇧⌘R, there being one model).
+enum AIWritingSampling: Equatable, Sendable {
+    case standard
+    case varied
+    case creative
+
+    /// The sampling temperature, or nil for greedy.
+    var temperature: Double? {
+        switch self {
+        case .standard: nil
+        case .varied: 0.7
+        case .creative: 1.0
+        }
     }
 }
 

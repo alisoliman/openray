@@ -120,11 +120,13 @@ final class AIChatModel {
         var context: AIWritingContext
     }
 
-    /// A writing command's work, put away while another command or chat is on screen, so opening
-    /// the command again brings it back (main #12 kept one session per tool). Writing runs keep no
+    /// A writing command's work, put away while another run, command or chat is on screen, so
+    /// ⌘[ and ⌘] can bring it back (main #12 kept one session per tool). Writing runs keep no
     /// model session (the engine resets after each), so the visible state is all there is.
     struct WritingSnapshot {
         var action: AIAction
+        /// The AI Command it ran, for an AI Command's run.
+        var command: AICommandRun?
         var conversationToken: UUID
         var draft: String
         var instruction: String
@@ -137,6 +139,7 @@ final class AIChatModel {
         var failedRevision: RevisionTurn?
         var revisionTurns: [UUID: RevisionTurn]
         var errorMessage: String?
+        var diffMode: AIDiffMode
 
         var hasWork: Bool {
             !draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
@@ -145,21 +148,22 @@ final class AIChatModel {
         }
     }
 
-    /// The writing command on screen, for putting away. Nil for chat, AI Commands and while a
-    /// reply is being written.
+    /// The writing run on screen, writing command or AI Command, for putting away. Nil for chat
+    /// and while a reply is being written.
     func writingSnapshot() -> WritingSnapshot? {
-        guard action != .chat, command == nil, !isGenerating else { return nil }
+        guard action != .chat, !isGenerating else { return nil }
         return WritingSnapshot(
-            action: action, conversationToken: conversationToken, draft: draft, instruction: instruction,
-            lastInstruction: lastInstruction, attachments: attachments, messages: messages, lastSource: lastSource,
-            lastAttachment: lastAttachment, acceptedRevisions: acceptedRevisions, failedRevision: failedRevision,
-            revisionTurns: revisionTurns, errorMessage: errorMessage)
+            action: action, command: command, conversationToken: conversationToken, draft: draft,
+            instruction: instruction, lastInstruction: lastInstruction, attachments: attachments, messages: messages,
+            lastSource: lastSource, lastAttachment: lastAttachment, acceptedRevisions: acceptedRevisions,
+            failedRevision: failedRevision, revisionTurns: revisionTurns, errorMessage: errorMessage, diffMode: diffMode)
     }
 
-    /// Brings a put-away writing command back exactly as it was.
+    /// Brings a put-away writing run back exactly as it was.
     func restoreWriting(_ snapshot: WritingSnapshot) {
         guard !isGenerating else { return }
         newConversation(action: snapshot.action)
+        command = snapshot.command
         conversationToken = snapshot.conversationToken
         draft = snapshot.draft
         instruction = snapshot.instruction
@@ -173,6 +177,7 @@ final class AIChatModel {
         revisionTurns = snapshot.revisionTurns
         errorMessage = snapshot.errorMessage
         updateDiff()
+        diffMode = snapshot.diffMode
         engine.prepare(for: snapshot.action)
     }
 
@@ -199,8 +204,10 @@ final class AIChatModel {
     private(set) var lastAttachment: AIAttachment?
     /// The finished writing result's word diff, computed once rather than on every redraw.
     private(set) var lastDiff: WordDiff?
-    /// Which view of a writing result is showing. ⌘K can change it, so it lives here.
-    var diffMode = AIDiffMode.changes
+    /// Which view of a writing result is showing: the clean result, the same text with its changes
+    /// marked inline, or the original passage. A run starts on its command's highlight setting;
+    /// ⌘K switches.
+    var diffMode = AIDiffMode.result
     /// The AI Command on screen: a custom command or an added built-in. Nil for chat and the
     /// original writing commands, which `action` describes.
     private(set) var command: AICommandRun?
@@ -263,11 +270,17 @@ final class AIChatModel {
     var symbol: String { command?.symbol ?? action.kindSymbol }
     var runTitle: String { command == nil ? action.runTitle : "Run" }
     var subtitle: String { command?.title ?? action.subtitle }
-    /// Writing results with a word diff: the original transforms, and commands that replace a selection.
+    /// The command's id, as bindings and settings know it: `ai.rewrite`, `aicommand.…`.
+    var commandID: String { command?.commandID ?? AIWritingCommandProvider.commandID(for: action) }
+    /// Results that rewrite their passage, so their changes can be marked: the original transforms,
+    /// and commands that replace a selection.
     var showsDiff: Bool {
         guard let command else { return action.showsDiff }
         return command.output == .replace && command.source != nil && command.performer == .model
     }
+    /// Whether a finished result opens with its changes marked: the command's own setting (on
+    /// for Fix Spelling & Grammar, off elsewhere unless turned on).
+    var highlightsChanges: Bool { showsDiff && hub.settings.highlightsChanges(for: commandID) }
 
     /// Ready to run. Translation needs no Apple Intelligence.
     var isReady: Bool {
@@ -348,7 +361,7 @@ final class AIChatModel {
         lastSource = nil
         lastAttachment = nil
         lastDiff = nil
-        diffMode = .changes
+        diffMode = .result
         command = nil
         summary = nil
         summarizedMessageCount = 0
@@ -506,14 +519,14 @@ final class AIChatModel {
     }
 
     /// Sends a follow-up that revises the current writing result (main #13).
-    private func revise(_ turn: RevisionTurn) {
+    private func revise(_ turn: RevisionTurn, sampling: AIWritingSampling = .standard) {
         instruction = ""
         failedRevision = nil
         errorMessage = nil
         let message = ChatMessage(role: .user, text: turn.request)
         revisionTurns[message.id] = turn
         messages.append(message)
-        run(turn.request, instruction: "", revision: turn)
+        run(turn.request, instruction: "", revision: turn, sampling: sampling)
     }
 
     /// Attachments are marked as reference data, apart from the question, so the model
@@ -543,13 +556,17 @@ final class AIChatModel {
 
     /// Generates the latest response again from the same input. If the new run produces
     /// nothing, the previous response comes back.
-    func retry() {
+    func retry() { regenerate(.standard) }
+
+    /// Regenerate (⌘R, ⇧⌘R): the latest response again on a fresh session, sampled rather than
+    /// greedy so the wording changes. `.standard` repeats it as it was, as Try Again does.
+    func regenerate(_ sampling: AIWritingSampling) {
         guard !isGenerating, !isReadOnly else { return }
         // A follow-up that failed before writing anything left the previous result on screen.
         if let failed = failedRevision, messages.last?.role == .assistant {
             if instruction.trimmingCharacters(in: .whitespacesAndNewlines) == failed.request { instruction = "" }
             engine.reset()
-            revise(failed)
+            revise(failed, sampling: sampling)
             return
         }
         guard let index = messages.lastIndex(where: { $0.role == .user }) else { return }
@@ -559,15 +576,18 @@ final class AIChatModel {
         messages.removeSubrange((index + 1)...)
         errorMessage = nil
         if action == .chat { engine.discardLastExchange() } else { engine.reset() }
-        run(prompt, instruction: action == .chat ? "" : lastInstruction, restoring: previous, revision: revision)
+        run(
+            prompt, instruction: action == .chat ? "" : lastInstruction, restoring: previous, revision: revision,
+            sampling: sampling)
     }
 
     private func run(
-        _ prompt: String, instruction: String, restoring previous: [ChatMessage] = [], revision: RevisionTurn? = nil
+        _ prompt: String, instruction: String, restoring previous: [ChatMessage] = [], revision: RevisionTurn? = nil,
+        sampling: AIWritingSampling = .standard
     ) {
         isGenerating = true
         isCancelling = false
-        diffMode = .changes
+        diffMode = .result
         lastDiff = nil
         let userMessageID = messages.last(where: { $0.role == .user })?.id
         let response = ChatMessage(role: .assistant, text: "", isPartial: true)
@@ -591,13 +611,15 @@ final class AIChatModel {
             do {
                 if let revision {
                     try await self.engine.streamRevision(
-                        revision.request, context: revision.context, action: action, onSnapshot: apply)
+                        revision.request, context: revision.context, action: action, sampling: sampling,
+                        onSnapshot: apply)
                 } else if let command {
-                    try await self.generate(command, prompt: prompt, onSnapshot: apply)
+                    try await self.generate(command, prompt: prompt, sampling: sampling, onSnapshot: apply)
                 } else if action == .chat {
                     try await self.generateChat(prompt, userMessageID: userMessageID, onSnapshot: apply)
                 } else {
-                    try await self.engine.stream(prompt, action: action, instruction: instruction, onSnapshot: apply)
+                    try await self.engine.stream(
+                        prompt, action: action, instruction: instruction, sampling: sampling, onSnapshot: apply)
                 }
                 if let index = self.messages.firstIndex(where: { $0.id == response.id }) {
                     self.messages[index].isPartial = false
@@ -639,6 +661,7 @@ final class AIChatModel {
                 self.refreshAvailability()
             }
             self.updateDiff()
+            if self.lastDiff != nil, self.highlightsChanges { self.diffMode = .changes }
         }
     }
 
@@ -682,13 +705,19 @@ final class AIChatModel {
     }
 
     private func generate(
-        _ command: AICommandRun, prompt: String, onSnapshot: @escaping @MainActor (AIResponseSnapshot) -> Void
+        _ command: AICommandRun, prompt: String, sampling: AIWritingSampling = .standard,
+        onSnapshot: @escaping @MainActor (AIResponseSnapshot) -> Void
     ) async throws {
         switch command.performer {
         case .model:
+            var profile = command.profile
+            // Regenerate samples at least as freely as it asks, so the wording can change.
+            if let temperature = sampling.temperature {
+                profile.greedy = false
+                profile.temperature = max(profile.temperature ?? 0, temperature)
+            }
             let request = AIRequest(
-                prompt: prompt, profile: command.profile,
-                fallbackAction: command.output == .replace ? .rewrite : .summarize)
+                prompt: prompt, profile: profile, fallbackAction: command.output == .replace ? .rewrite : .summarize)
             try await engine.stream(request, onSnapshot: onSnapshot)
         case .translation:
             guard let translator = environment.translator, let target = command.targetLanguageID else {

@@ -1,14 +1,16 @@
 import Foundation
 
-/// Where an AI Command's answer goes.
+/// Where an AI Command's answer goes: its Output Behavior. The stored values are Slice 7's.
 enum AICommandOutput: String, CaseIterable, Identifiable, Sendable {
-    /// Shown in the launcher with Copy, Paste and Continue in Chat.
+    /// Open in OpenRay: the answer streams in the launcher, where ↵ pastes it.
     case show
-    /// Replaces the selected text, after a word diff of the changes.
+    /// Replace Selection: a transform of the selected text. A custom command replaces the
+    /// selection in place with no window, after strict checks, and confirms with a HUD; a
+    /// built-in shows its result in the launcher.
     case replace
 
     var id: String { rawValue }
-    var title: String { self == .show ? "Show in OpenRay" : "Replace Selection" }
+    var title: String { self == .show ? "Open in OpenRay" : "Replace Selection" }
 }
 
 /// What produces a command's answer.
@@ -40,6 +42,10 @@ struct AICommand: Identifiable, Hashable, Sendable {
     var duplicatedFrom: String? = nil
 
     var isBuiltIn: Bool { recordID == nil }
+
+    /// Replace Selection with no window: the person's own commands set to replace. Built-ins
+    /// can't be edited, so they always open in OpenRay.
+    var replacesInPlace: Bool { !isBuiltIn && output == .replace }
 
     static let idPrefix = "aicommand."
     static func id(for recordID: UUID) -> String { idPrefix + recordID.uuidString }
@@ -202,6 +208,8 @@ struct AICommandRun: Equatable, Sendable {
     var performer: AICommandPerformer
     /// The translation target, for the Translate command.
     var targetLanguageID: String?
+    /// Replace Selection with no window (`AICommand.replacesInPlace`).
+    var replacesInPlace = false
 }
 
 enum AICommandError: LocalizedError, Equatable {
@@ -237,7 +245,8 @@ enum AICommandRenderer {
             return AICommandRun(
                 commandID: command.id, title: command.name, symbol: command.symbol, prompt: prompt,
                 source: command.output == .replace ? selection : nil, sourceAppName: sourceAppName, output: command.output,
-                profile: command.profile(capabilities: capabilities), performer: .model)
+                profile: command.profile(capabilities: capabilities), performer: .model,
+                replacesInPlace: command.replacesInPlace)
         case .translation(let argument):
             guard let text = selection, !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
                 throw AICommandError.noText
@@ -248,7 +257,7 @@ enum AICommandRenderer {
                 commandID: command.id, title: "Translate to \(language.name)", symbol: command.symbol, prompt: text,
                 source: text, sourceAppName: sourceAppName, output: command.output,
                 profile: command.profile(capabilities: capabilities), performer: command.performer,
-                targetLanguageID: language.id)
+                targetLanguageID: language.id, replacesInPlace: command.replacesInPlace)
         }
     }
 }

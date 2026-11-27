@@ -331,6 +331,23 @@ final class FoundationModelEngine: AIEngine {
         _ prompt: String, action: AIAction, instruction: String,
         onSnapshot: @escaping @MainActor (AIResponseSnapshot) -> Void
     ) async throws {
+        try await stream(prompt, action: action, instruction: instruction, sampling: .standard, onSnapshot: onSnapshot)
+    }
+
+    /// Greedy for a standard run; Regenerate samples instead, so the wording can change.
+    private static func writingOptions(_ sampling: AIWritingSampling, maximumResponseTokens: Int) -> GenerationOptions {
+        guard let temperature = sampling.temperature else {
+            return GenerationOptions(samplingMode: .greedy, maximumResponseTokens: maximumResponseTokens)
+        }
+        return GenerationOptions(
+            samplingMode: .random(probabilityThreshold: 0.9), temperature: temperature,
+            maximumResponseTokens: maximumResponseTokens)
+    }
+
+    func stream(
+        _ prompt: String, action: AIAction, instruction: String, sampling: AIWritingSampling,
+        onSnapshot: @escaping @MainActor (AIResponseSnapshot) -> Void
+    ) async throws {
         guard availability.isAvailable else { throw AIServiceError.unavailable(availability) }
         if session == nil || ledger.action != action {
             session = LanguageModelSession(instructions: action.instructions)
@@ -350,7 +367,7 @@ final class FoundationModelEngine: AIEngine {
             case .proofread:
                 let stream = session.streamResponse(
                     to: request, generating: AIProofreadingResult.self,
-                    options: GenerationOptions(samplingMode: .greedy, maximumResponseTokens: 1_500))
+                    options: Self.writingOptions(sampling, maximumResponseTokens: 1_500))
                 for try await snapshot in stream {
                     try Task.checkCancellation()
                     if let text = snapshot.content.text {
@@ -361,7 +378,7 @@ final class FoundationModelEngine: AIEngine {
             case .actionItems:
                 let stream = session.streamResponse(
                     to: request, generating: AIActionItems.self,
-                    options: GenerationOptions(samplingMode: .greedy, maximumResponseTokens: 900))
+                    options: Self.writingOptions(sampling, maximumResponseTokens: 900))
                 var finalItems: [AIActionItem] = []
                 func send(_ items: [AIActionItem]) {
                     onSnapshot(AIResponseSnapshot(text: AIActionItems.formatted(items), actionItems: items))
@@ -381,7 +398,7 @@ final class FoundationModelEngine: AIEngine {
             default:
                 let stream = session.streamResponse(
                     to: request, generating: AIWritingResult.self,
-                    options: GenerationOptions(samplingMode: .greedy, maximumResponseTokens: 1_500))
+                    options: Self.writingOptions(sampling, maximumResponseTokens: 1_500))
                 for try await snapshot in stream {
                     try Task.checkCancellation()
                     if let text = snapshot.content.text { onSnapshot(AIResponseSnapshot(text: text)) }
@@ -401,6 +418,13 @@ final class FoundationModelEngine: AIEngine {
         _ request: String, context: AIWritingContext, action: AIAction,
         onSnapshot: @escaping @MainActor (AIResponseSnapshot) -> Void
     ) async throws {
+        try await streamRevision(request, context: context, action: action, sampling: .standard, onSnapshot: onSnapshot)
+    }
+
+    func streamRevision(
+        _ request: String, context: AIWritingContext, action: AIAction, sampling: AIWritingSampling,
+        onSnapshot: @escaping @MainActor (AIResponseSnapshot) -> Void
+    ) async throws {
         guard availability.isAvailable else { throw AIServiceError.unavailable(availability) }
         if session == nil || ledger.action != action {
             session = LanguageModelSession(instructions: action.instructions)
@@ -410,7 +434,7 @@ final class FoundationModelEngine: AIEngine {
         do {
             let stream = session.streamResponse(
                 to: Prompt(context.revisionPrompt(for: request)), generating: AIRevisionResult.self,
-                options: GenerationOptions(samplingMode: .greedy, maximumResponseTokens: 1_500))
+                options: Self.writingOptions(sampling, maximumResponseTokens: 1_500))
             for try await snapshot in stream {
                 try Task.checkCancellation()
                 if let text = snapshot.content.text { onSnapshot(AIResponseSnapshot(text: text)) }
