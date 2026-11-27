@@ -106,13 +106,9 @@ extension LauncherModel {
 
     // MARK: - Using a result (work items 5 and 6)
 
-    /// Whether ↵ pastes a writing result (Raycast's default) or copies it: the Primary Action
-    /// preference (Settings › General › Return on clipboard items, snippets and results). Until
-    /// a choice is made there, a result pastes, as the writing flow's goal asks.
-    var aiPrimaryPastes: Bool {
-        if let primaryActionOverride { return primaryActionOverride == .paste }
-        return (store.database.preferences.primaryAction ?? .paste) == .paste
-    }
+    /// Whether ↵ pastes a writing result (the default, as in Raycast) or copies it: Settings ›
+    /// Apple Intelligence › Primary Action. General's Primary Action is for launcher rows only.
+    var aiPrimaryPastes: Bool { aiHub.settings.primaryAction == .paste }
 
     /// What ↵ does with a finished result.
     var aiAcceptTitle: String { aiPrimaryPastes ? "Paste Response" : "Copy Response" }

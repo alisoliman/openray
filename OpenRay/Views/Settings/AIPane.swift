@@ -201,14 +201,17 @@ private struct AIWritingSettingsSection: View {
                 }
                 .settingsSwitch()
             }
-            LabeledContent {
-                Text(model.aiPrimaryPastes ? "Paste Response" : "Copy Response").foregroundStyle(.secondary)
+            Picker(
+                selection: Binding(get: { hub.settings.primaryAction }, set: { action in hub.updateSettings { $0.primaryAction = action } })
+            ) {
+                ForEach(AIPrimaryAction.allCases) { Text($0.title).tag($0) }
             } label: {
                 SettingRowLabel(
-                    title: "Return on a result",
+                    title: "Primary action",
                     detail:
-                        "Pastes the result over your selection in the app you came from and puts your clipboard back. ⌘Return copies it instead. Choose Copy to Clipboard for “Return on clipboard items, snippets and results” in General to swap them.")
+                        "What Return does on a result. Paste Response pastes it over your selection in the app you came from and puts your clipboard back. ⌘Return does the other.")
             }
+            .neutralMenus()
         } header: {
             Text("Writing commands")
         } footer: {

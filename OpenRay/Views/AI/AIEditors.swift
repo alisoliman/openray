@@ -129,8 +129,17 @@ struct AICommandEditor: View {
                     }
                 }
                 Section {
-                    Picker("Output Behavior", selection: $command.output) {
-                        ForEach(AICommandOutput.allCases) { Text($0.title).tag($0) }
+                    Picker(
+                        "Output Behavior",
+                        selection: Binding(
+                            get: { command.behavior },
+                            set: { behavior in
+                                command.behavior = behavior
+                                // Replacing the selection takes the transformed text alone.
+                                if behavior == .replaceSelection { command.output = .replace }
+                            })
+                    ) {
+                        ForEach(AIOutputBehavior.allCases) { Text($0.title).tag($0) }
                     }
                     Picker("Creativity", selection: $command.creativity) {
                         ForEach(AICreativity.allCases) { Text($0.title).tag($0) }
@@ -148,7 +157,7 @@ struct AICommandEditor: View {
                     Text("Output")
                 } footer: {
                     Text(
-                        command.output == .replace
+                        command.behavior == .replaceSelection
                             ? "Replace Selection writes the result over the selected text with no window, once OpenRay checks the selection hasn't changed. If it has, the result is copied instead."
                             : "Open in OpenRay shows the result in the launcher, where Return pastes it into the app you came from."
                     )

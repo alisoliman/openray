@@ -221,7 +221,7 @@ final class AICommandProvider: CommandProvider {
         return (originals + hub.aiCommands).map { command in
             LauncherItem(
                 id: command.id, title: command.name,
-                subtitle: command.isBuiltIn ? "Built-in · \(command.subtitle)" : command.output.title,
+                subtitle: command.isBuiltIn ? "Built-in · \(command.subtitle)" : command.behavior.title,
                 symbol: command.symbol, kind: .ai, badge: command.isBuiltIn ? "Built-in" : "Custom",
                 keywords: command.subtitle,
                 action: .provided(
@@ -295,7 +295,7 @@ final class AICommandProvider: CommandProvider {
     func preview(for item: LauncherItem, ref: ProvidedRef, in model: LauncherModel) -> ProvidedPreview? {
         guard let command = command(for: ref, in: model) else { return nil }
         var metadata: [(label: String, value: String)] = [
-            ("Output Behavior", command.output.title), ("Creativity", command.creativity.title),
+            ("Output Behavior", command.behavior.title), ("Creativity", command.creativity.title),
         ]
         if command.performer != .model { metadata = [("Runs with", "Apple Translation")] }
         if let reasoning = command.reasoning { metadata.append(("Reasoning", reasoning.title)) }

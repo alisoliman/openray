@@ -325,11 +325,32 @@ struct WritingFlowTests {
         #expect(LauncherKeyCommand.command(keyCode: 30, modifiers: .command, vim: false) == .forward)
     }
 
+    @Test func theAIPrimaryActionIsItsOwnSettingApartFromGenerals() {
+        let model = model()
+        defer { model.stop() }
+        // Paste Response unless chosen otherwise; General's Copy is for launcher rows only.
+        #expect(model.store.update { $0.preferences.primaryAction = .copy })
+        #expect(model.contentPrimaryAction == .copy)
+        #expect(model.aiPrimaryPastes)
+        #expect(model.aiAcceptTitle == "Paste Response")
+        #expect(model.store.update { $0.preferences.primaryAction = .paste })
+        #expect(model.aiHub.updateSettings { $0.primaryAction = .copy })
+        #expect(model.contentPrimaryAction == .paste)
+        #expect(!model.aiPrimaryPastes)
+        #expect(model.store.database.commandPreferences["ai"]?["primaryAction"] == "copy")
+        #expect(AIPrimaryAction.allCases.map(\.title) == ["Paste Response", "Copy Response"])
+        // The default isn't written, so libraries without it read Paste Response.
+        #expect(model.aiHub.updateSettings { $0.primaryAction = .paste })
+        #expect(model.store.database.commandPreferences["ai"]?["primaryAction"] == nil)
+        #expect(AISettings(database: LibraryDatabase()).primaryAction == .paste)
+    }
+
     @Test func primaryActionCopySwapsReturnAndCommandReturnAndTheToastPreviewsTheResult() async {
         let model = model()
         defer { model.stop() }
-        model.primaryActionOverride = .copy
+        #expect(model.aiHub.updateSettings { $0.primaryAction = .copy })
         model.setCapturedSelection(selection("A passage"))
+
         model.openAI(.rewrite)
         await model.ai.waitForResponse()
         #expect(model.aiAcceptTitle == "Copy Response")
@@ -436,15 +457,82 @@ struct WritingFlowTests {
 
     // MARK: 7. Output Behavior
 
-    @Test func outputBehaviorUsesRaycastsNamesAndKeepsStoredValues() {
-        #expect(AICommandOutput.show.title == "Open in OpenRay")
-        #expect(AICommandOutput.replace.title == "Replace Selection")
-        #expect(AICommandOutput(rawValue: "show") == .show)
-        #expect(AICommandOutput(rawValue: "replace") == .replace)
-        let record = AICommandRecord(name: "Formal", prompt: "Formal: {selection}", output: "replace")
-        #expect(AICommand(record: record).replacesInPlace)
+    @Test func outputBehaviorUsesRaycastsNamesAndItsOwnStoredValue() throws {
+        #expect(AIOutputBehavior.openInOpenRay.title == "Open in OpenRay")
+        #expect(AIOutputBehavior.replaceSelection.title == "Replace Selection")
+        let replacing = AICommand(record: AICommandRecord(name: "Formal", prompt: "Formal: {selection}", output: "replaceSelection"))
+        #expect(replacing.behavior == .replaceSelection && replacing.replacesInPlace)
+        // Replacing takes the transformed text alone.
+        #expect(replacing.output == .replace)
+        #expect(replacing.record().output == "replaceSelection")
+        var opening = replacing
+        opening.behavior = .openInOpenRay
+        #expect(opening.record().output == "replace")
+        // Built-ins, and copies of them, open in OpenRay.
         #expect(!AICommand.changeTone.replacesInPlace)
-        #expect(!AICommand(record: AICommandRecord(name: "Ask", prompt: "{selection}", output: "show")).replacesInPlace)
+        for builtIn in [AICommand.changeTone, .translate, .writingTemplate(.rewrite), .writingTemplate(.summarize)] {
+            let copy = AICommand(record: builtIn.duplicate())
+            #expect(copy.behavior == .openInOpenRay)
+            #expect(!copy.replacesInPlace)
+        }
+        // Sharing keeps the value, and reads it back whatever its case.
+        let old = AICommand(record: AICommandRecord(name: "Old", prompt: "x", output: "replace"))
+        let exported = try AICommandTransfer.export([replacing, old])
+        let objects = try #require(try JSONSerialization.jsonObject(with: exported) as? [[String: String]])
+        #expect(objects.map { $0["output"] } == ["replaceSelection", "replace"])
+        let imported = try AICommandTransfer.importCommands(
+            from: Data(#"[{"name": "A", "prompt": "x", "output": "ReplaceSelection"}, {"name": "B", "prompt": "y", "output": "replace"}]"#.utf8))
+        #expect(imported.records.map(\.output) == ["replaceSelection", "replace"])
+    }
+
+    /// A library record as v0.2.0 wrote it: `replace` (the editor's default then) meant “show the
+    /// result, then ↵ replaces the selection”.
+    private let v020Record = """
+        {"id":"7C5E2C0A-8E0B-4F7C-9A51-3B8D1A2E4F60","name":"Formal","symbol":"sparkles",
+         "prompt":"Make this formal:\\n\\n{selection}","creativity":"low","guardrail":"permissive",
+         "output":"replace","createdAt":810000000}
+        """
+
+    @Test func aV020ReplaceRecordMigratesToOpenInOpenRayAndKeepsItsTransform() throws {
+        let record = try JSONDecoder().decode(AICommandRecord.self, from: Data(v020Record.utf8))
+        #expect(record.output == "replace")
+        let command = AICommand(record: record)
+        #expect(command.behavior == .openInOpenRay)
+        #expect(!command.replacesInPlace)
+        // The transform it was stays: the result alone, with v0.2.0's instructions.
+        #expect(command.output == .replace)
+        #expect(command.profile(capabilities: []).wantsPlainResult)
+        // Nothing on disk is rewritten, so v0.2.0 still reads it as it did.
+        #expect(command.record(createdAt: record.createdAt ?? .now) == record)
+        // Records without an output, and `show`, open in OpenRay too.
+        #expect(AICommand(record: AICommandRecord(name: "None", prompt: "x")).behavior == .openInOpenRay)
+        #expect(AICommand(record: AICommandRecord(name: "Show", prompt: "x", output: "show")).behavior == .openInOpenRay)
+    }
+
+    @Test func aV020ReplaceCommandOpensInOpenRayWhereReturnPastesOverTheSelection() async throws {
+        let engine = RecordingAIEngine()
+        engine.replies = ["Good morning, team."]
+        let model = Slice7Fixtures.launcher(engine: engine)
+        defer { model.stop() }
+        let app = otherApp
+        _ = installHUD(on: model)
+        let log = installPaste(on: model, front: app)
+        let record = try JSONDecoder().decode(AICommandRecord.self, from: Data(v020Record.utf8))
+        #expect(model.store.update { $0.aiCommands.append(record) })
+        model.commandCatalogDidChange()
+        model.setCapturedSelection(selection("morning team", application: app, strictPasses: true))
+        let row = try #require(model.commandItems.first { $0.id == AICommand.id(for: record.id) })
+        model.perform(row)
+        // A window, not in place.
+        #expect(model.destination == .ai)
+        #expect(model.inPlaceTask == nil)
+        await model.ai.waitForResponse()
+        #expect(model.ai.showsDiff)
+        #expect(model.ai.lastSource == "morning team")
+        #expect(model.aiReplaceTarget?.text == "morning team")
+        model.submitAI()
+        await model.pasteBackTask?.value
+        #expect(log.posted == [app.processIdentifier])
     }
 
     @Test func aReplaceSelectionCommandRunsInPlaceWithNoWindowAndTheStrictCheck() async throws {
@@ -456,7 +544,7 @@ struct WritingFlowTests {
         let hud = installHUD(on: model)
         let log = installPaste(on: model, front: app)
         model.unattendedChatFactory = { [unowned model] in AIChatModel(engine: engine, hub: model.ai.hub) }
-        let record = AICommandRecord(name: "Formal", prompt: "Formal: {selection}", output: "replace")
+        let record = AICommandRecord(name: "Formal", prompt: "Formal: {selection}", output: "replaceSelection")
         #expect(model.store.update { $0.aiCommands.append(record) })
         model.commandCatalogDidChange()
         model.setCapturedSelection(selection("morning team", application: app, strictPasses: true))
@@ -481,7 +569,7 @@ struct WritingFlowTests {
         let engine = RecordingAIEngine()
         let model = Slice7Fixtures.launcher(engine: engine)
         defer { model.stop() }
-        let record = AICommandRecord(name: "Formal", prompt: "Formal: {selection}", output: "replace")
+        let record = AICommandRecord(name: "Formal", prompt: "Formal: {selection}", output: "replaceSelection")
         #expect(model.store.update { $0.aiCommands.append(record) })
         model.commandCatalogDidChange()
         // Copied, so its place is unknown: in place would only ever copy, so it opens instead.

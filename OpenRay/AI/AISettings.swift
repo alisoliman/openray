@@ -1,11 +1,22 @@
 import Foundation
 
+/// What ↵ does on a writing result: its own setting, as Raycast's AI › Quick AI › Primary Action
+/// is. Launcher rows follow General's Primary Action instead.
+enum AIPrimaryAction: String, CaseIterable, Identifiable, Sendable {
+    case paste, copy
+
+    var id: String { rawValue }
+    var title: String { self == .paste ? "Paste Response" : "Copy Response" }
+}
+
 /// AI preferences, kept in `commandPreferences["ai"]` so the library schema doesn't change.
-/// Unknown values fall back to the defaults.
+/// Unknown values fall back to the defaults, and a key that isn't there is its default.
 struct AISettings: Equatable, Sendable {
     static let preferencesKey = "ai"
 
     var model: AIModelChoice = .onDevice
+    /// ↵ on a writing result: Paste Response unless Copy Response was chosen.
+    var primaryAction: AIPrimaryAction = .paste
     var defaultAgentID: UUID?
     /// The command Quick Fix runs on the selection.
     var quickFixCommandID = "ai.proofread"
@@ -30,6 +41,7 @@ struct AISettings: Equatable, Sendable {
         defaultAgentID = values["defaultAgent"].flatMap(UUID.init(uuidString:))
         quickFixCommandID = values["quickFix"].flatMap { $0.isEmpty ? nil : $0 } ?? "ai.proofread"
         quickFixPrefersSelection = values["quickFixSelection"] != "false"
+        primaryAction = values["primaryAction"].flatMap(AIPrimaryAction.init(rawValue:)) ?? .paste
         for (key, value) in values where key.hasPrefix("tool.") {
             if let permission = AIToolPermission(rawValue: value) { toolPermissions[String(key.dropFirst(5))] = permission }
         }
@@ -58,6 +70,7 @@ struct AISettings: Equatable, Sendable {
         if let defaultAgentID { values["defaultAgent"] = defaultAgentID.uuidString }
         if quickFixCommandID != "ai.proofread" { values["quickFix"] = quickFixCommandID }
         if !quickFixPrefersSelection { values["quickFixSelection"] = "false" }
+        if primaryAction != .paste { values["primaryAction"] = primaryAction.rawValue }
         for (tool, permission) in toolPermissions where permission != .auto { values["tool.\(tool)"] = permission.rawValue }
         for (command, highlights) in highlightOverrides
         where highlights != Self.highlightedByDefault.contains(command) {

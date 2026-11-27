@@ -28,7 +28,8 @@ struct AICommandRecord: Codable, Identifiable, Hashable, Sendable {
     var reasoning: String? = nil
     /// `AIGuardrail`: standard or permissive.
     var guardrail: String? = nil
-    /// `AICommandOutput`: show or replace.
+    /// `AICommandOutput` (show or replace, both opening in OpenRay) or `replaceSelection`
+    /// (`AIOutputBehavior`).
     var output: String? = nil
     /// The built-in command this one was duplicated from, such as `ai.rewrite`.
     var duplicatedFrom: String? = nil
