@@ -265,6 +265,8 @@ extension LauncherModel {
         if let unattendedChatFactory { return unattendedChatFactory() }
         let chat = AIChatModel(engine: ai.engine.makeSibling(), hub: ai.hub)
         chat.environment = ai.environment
+        // In-place runs call no tools; the panel chat's broker and its approvals stay its own.
+        chat.environment.toolBroker = nil
         return chat
     }
 
@@ -368,11 +370,13 @@ extension LauncherModel {
             if settings.quickFixPrefersSelection {
                 do {
                     selection = try captureSelection()
-                } catch let error as SelectionReadError where error.allowsCopyFallback {
+                } catch SelectionReadError.nothingSelected, SelectionReadError.notExposed {
+                    // The whole field, unless it has a selection it doesn't share.
                     selection = nil
                 }
             }
-            target = try selection.map(InPlaceTarget.selection) ?? .field(captureFocusedField())
+            target = try selection.map(InPlaceTarget.selection)
+                ?? .field(captureFocusedField(selectionHidden: settings.quickFixPrefersSelection))
         } catch {
             hud.show(HUDMessage(error.localizedDescription, symbol: "exclamationmark.triangle.fill", style: .warning))
             return
@@ -402,12 +406,12 @@ extension LauncherModel {
         }
     }
 
-    /// Quick Fix's whole-field read.
-    func captureFocusedField() throws -> FocusedFieldContext {
+    /// Quick Fix's whole-field read; see `FocusedFieldContext.capture`.
+    func captureFocusedField(selectionHidden refuses: Bool) throws -> FocusedFieldContext {
         if let focusedFieldReader { return try focusedFieldReader() }
         try sideEffects.check("reading the focused field in another app")
         guard windows.hasPermission else { throw SelectionReadError.accessibilityOff }
-        return try FocusedFieldContext.capture(from: previousApplication)
+        return try FocusedFieldContext.capture(from: previousApplication, selectionHidden: refuses)
     }
 
     // MARK: - Shortcuts overlay

@@ -166,7 +166,66 @@ struct WritingCaptureTests {
         #expect(!message.contains("Accessibility"))
         #expect(SelectionReadError.secureInput.allowsCopyFallback == false)
         #expect(SelectionReadError.notExposed(app: "Slack").allowsCopyFallback)
-        #expect(SelectionReadError.nothingSelected(app: "Slack").allowsCopyFallback)
+        // An empty selection Accessibility can see gets no ⌘C: some editors would copy the line.
+        #expect(!SelectionReadError.nothingSelected(app: "Slack").allowsCopyFallback)
+    }
+
+    @Test func aCopyThatLandsAfterTheTimeoutIsStillPutBackAndKeptOutOfHistory() async throws {
+        let store = LibraryStore(fileURL: nil)
+        #expect(store.update { $0.preferences.clipboardEnabled = true })
+        let board = pasteboard(with: mixedContents)
+        let before = PasteboardSnapshot.capture(board)
+        let service = ClipboardService(store: store, pasteboard: board, textRecognizer: nil)
+        var environment = environment()
+        let seen = Recorder()
+        environment.sleep = { _ in
+            seen.polls += 1
+            // Three polls time the copy out; it lands during the watch after them.
+            if seen.polls == 5 {
+                board.clearContents()
+                board.setString("Late words", forType: .string)
+            }
+        }
+        environment.willRestore = { seen.markedTypes = Set(($0.types ?? []).map(\.rawValue)) }
+        await #expect(throws: SelectionReadError.nothingSelected(app: "Editor")) {
+            try await service.readSelectionByCopying(from: self.otherApp, sourceName: "Editor", environment: environment)
+        }
+        await service.poll()
+        let watch = try #require(service.lateCopyWatch)
+        await watch.value
+        #expect(seen.markedTypes.contains("org.nspasteboard.ConcealedType"))
+        #expect(PasteboardSnapshot.capture(board).items == before.items)
+        await service.poll()
+        #expect(!store.database.clipboard.contains { $0.plainText == "Late words" })
+    }
+
+    @MainActor
+    private final class Gate {
+        var log: [String] = []
+        var waiter: CheckedContinuation<Void, Never>?
+        func wait() async { await withCheckedContinuation { waiter = $0 } }
+        func open() { waiter?.resume() }
+    }
+
+    @Test func borrowingsTakeTurnsSoNeitherRestoresTheOthersContents() async {
+        let service = ClipboardService(
+            store: LibraryStore(fileURL: nil), pasteboard: pasteboard(with: mixedContents), textRecognizer: nil)
+        let gate = Gate()
+        let first = Task {
+            await service.borrowing {
+                gate.log.append("first")
+                await gate.wait()
+                gate.log.append("first done")
+            }
+        }
+        for _ in 0..<20 where gate.waiter == nil { await Task.yield() }
+        let second = Task { await service.borrowing { gate.log.append("second") } }
+        for _ in 0..<20 { await Task.yield() }
+        #expect(gate.log == ["first"])
+        gate.open()
+        await first.value
+        await second.value
+        #expect(gate.log == ["first", "first done", "second"])
     }
 
     @Test func theClipboardServiceKeepsTheBorrowedCopyAndTheRestoreOutOfHistory() async throws {

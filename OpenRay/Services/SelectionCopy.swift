@@ -55,6 +55,9 @@ enum SelectionCopy {
         var postCopy: @MainActor (pid_t) throws -> Void = { try SyntheticInput.postCopy(toProcess: $0) }
         /// How long the app has to answer the copy.
         var timeout: Duration = .milliseconds(300)
+        /// How long after an unanswered copy (a timeout, or a cancel) a late copy is still caught
+        /// and put back, so it never stays on the person's clipboard.
+        var lateCopyGrace: Duration = .milliseconds(1_000)
         var pollInterval: Duration = .milliseconds(15)
         var sleep: @MainActor (Duration) async throws -> Void = { try await Task.sleep(for: $0) }
         /// Called with the app's copy, marked, right before the clipboard is put back. Tests read it.
@@ -65,9 +68,11 @@ enum SelectionCopy {
 
     /// The text the app copied. Throws `SelectionReadError.nothingSelected` when the copy didn't
     /// change the clipboard in time, or left no text; the clipboard is the person's either way.
+    /// An unanswered copy hands its snapshot to `unanswered`, which watches for a late one
+    /// (`putBackLateCopy`).
     static func read(
         from application: NSRunningApplication?, sourceName: String, pasteboard: NSPasteboard,
-        environment: Environment = .live
+        environment: Environment = .live, unanswered: (PasteboardSnapshot) -> Void = { _ in }
     ) async throws -> String {
         try environment.checkAllowed()
         guard environment.isTrusted() else { throw SelectionReadError.accessibilityOff }
@@ -88,21 +93,45 @@ enum SelectionCopy {
             }
             attempt += 1
         }
-        // A copy that landed, even one that came too late or after a cancel, is put back.
         guard changed() else {
+            unanswered(snapshot)
             if cancelled { throw CancellationError() }
             throw SelectionReadError.nothingSelected(app: sourceName)
         }
+        let text = takeCopy(over: snapshot, from: pasteboard, environment: environment)
+        if cancelled { throw CancellationError() }
+        guard let text, !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            throw SelectionReadError.nothingSelected(app: sourceName)
+        }
+        return text
+    }
+
+    /// Watches, for `lateCopyGrace`, for a copy that lands after the fallback gave up, and puts the
+    /// clipboard back when one does. The first change in that time is taken to be the app's copy:
+    /// the launcher is in front, so it's very unlikely to be the person's own.
+    static func putBackLateCopy(over snapshot: PasteboardSnapshot, on pasteboard: NSPasteboard, environment: Environment)
+        async
+    {
+        let attempts = max(1, Int((environment.lateCopyGrace / environment.pollInterval).rounded(.up)))
+        for _ in 0..<attempts {
+            try? await environment.sleep(environment.pollInterval)
+            guard pasteboard.changeCount == snapshot.changeCount else {
+                _ = takeCopy(over: snapshot, from: pasteboard, environment: environment)
+                return
+            }
+        }
+    }
+
+    /// Marks the app's copy transient and concealed, reads its text and puts the snapshot back.
+    private static func takeCopy(over snapshot: PasteboardSnapshot, from pasteboard: NSPasteboard, environment: Environment)
+        -> String?
+    {
         pasteboard.addTypes([transientType, concealedType], owner: nil)
         pasteboard.setData(Data(), forType: transientType)
         pasteboard.setData(Data(), forType: concealedType)
         let text = pasteboard.string(forType: .string)
         environment.willRestore(pasteboard)
         snapshot.restore(to: pasteboard)
-        if cancelled { throw CancellationError() }
-        guard let text, !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
-            throw SelectionReadError.nothingSelected(app: sourceName)
-        }
         return text
     }
 }

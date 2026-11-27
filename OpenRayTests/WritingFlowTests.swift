@@ -192,10 +192,16 @@ struct WritingFlowTests {
         let engine = TestAIEngine()
         let model = model(engine: engine)
         defer { model.stop() }
+        let copies = PasteLog()
         model.selectionContextReader = { throw SelectionReadError.nothingSelected(app: "Notes") }
-        model.selectionCopyReader = { _ in throw SelectionReadError.nothingSelected(app: "Notes") }
+        model.selectionCopyReader = { _ in
+            copies.posted.append(0)
+            throw SelectionReadError.nothingSelected(app: "Notes")
+        }
         model.openAI(.rewrite)
-        await model.selectionCaptureTask?.value
+        // Accessibility saw an empty selection, so no ⌘C was sent.
+        #expect(model.selectionCaptureTask == nil)
+        #expect(copies.posted.isEmpty)
         #expect(model.selectionNotice == "Nothing selected in Notes.")
         #expect(model.ai.attachments.isEmpty)
         #expect(engine.prompts.isEmpty)
@@ -469,6 +475,23 @@ struct WritingFlowTests {
         #expect(log.posted.count == 1)
         #expect(hud.presented.last?.message == LauncherModel.copiedHUD)
         #expect(model.clipboard.readText() == "Good morning, team.")
+    }
+
+    @Test func aReplaceSelectionCommandWithACopiedSelectionOpensInOpenRay() async throws {
+        let engine = RecordingAIEngine()
+        let model = Slice7Fixtures.launcher(engine: engine)
+        defer { model.stop() }
+        let record = AICommandRecord(name: "Formal", prompt: "Formal: {selection}", output: "replace")
+        #expect(model.store.update { $0.aiCommands.append(record) })
+        model.commandCatalogDidChange()
+        // Copied, so its place is unknown: in place would only ever copy, so it opens instead.
+        model.selectionContextReader = { SelectedTextContext.copied("morning team", from: nil, sourceName: "Slack") }
+        let row = try #require(model.commandItems.first { $0.id == AICommand.id(for: record.id) })
+        model.perform(row)
+        #expect(model.destination == .ai)
+        #expect(model.inPlaceTask == nil)
+        await model.ai.waitForResponse()
+        #expect(model.canAcceptAIResponse)
     }
 
     // MARK: 8. Quick Fix

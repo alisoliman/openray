@@ -702,6 +702,8 @@ final class LauncherModel {
 
     func panelDidHide() {
         lastHiddenAt = .now
+        // A selection still being copied belongs to the launcher that asked; its copy is put back.
+        cancelSelectionCapture()
         showActions = false
         showShortcuts = false
         showsAttachmentPreview = false
@@ -1097,7 +1099,10 @@ final class LauncherModel {
                 focusRequest += 1
                 return
             }
-            if ai.command != nil || !ai.messages.isEmpty || !ai.attachments.isEmpty {
+            // Anything on screen, a typed passage included, goes into the history first.
+            if ai.command != nil || !ai.messages.isEmpty || !ai.attachments.isEmpty
+                || !ai.draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            {
                 startWritingRun(ai.command == nil ? ai.action : .rewrite)
             }
             aiSelectionTarget = nil

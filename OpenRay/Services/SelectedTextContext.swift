@@ -9,9 +9,11 @@ enum SelectionReadError: LocalizedError, Equatable {
     case secureInput
     case noSourceApp
     case protectedField
-    /// The app shows no focused element, or no selected text, over Accessibility.
+    /// The app shows no focused element, or no selected text, over Accessibility; a selection
+    /// may still be there.
     case notExposed(app: String)
-    /// Accessibility says nothing is selected, or the app's Copy left the clipboard as it was.
+    /// Nothing is selected: Accessibility shows an empty selection, or the app's Copy left the
+    /// clipboard as it was.
     case nothingSelected(app: String)
 
     var errorDescription: String? {
@@ -27,12 +29,12 @@ enum SelectionReadError: LocalizedError, Equatable {
         }
     }
 
-    /// Accessibility saw no selection, but the app's own Copy might still have one.
+    /// Accessibility couldn't see whether anything is selected, but the app's own Copy might.
+    /// When Accessibility shows an empty selection, no copy is sent: editors such as code
+    /// editors copy the whole line when nothing is selected.
     var allowsCopyFallback: Bool {
-        switch self {
-        case .notExposed, .nothingSelected: true
-        default: false
-        }
+        if case .notExposed = self { return true }
+        return false
     }
 }
 
@@ -134,7 +136,14 @@ struct SelectedTextContext {
         AXUIElementSetMessagingTimeout(app, 0.2)
         guard let element = focusedElement(in: app) else { throw SelectionReadError.notExposed(app: sourceName) }
         guard !isSecure(element) else { throw SelectionReadError.protectedField }
-        guard let text = selectedText(in: element) else { throw SelectionReadError.nothingSelected(app: sourceName) }
+        guard let text = selectedText(in: element) else {
+            // Only an empty selection Accessibility can place is certainly nothing; otherwise the
+            // app may just not be sharing it.
+            if selectedRange(in: element)?.length == 0, hasSelectedTextAttribute(element) {
+                throw SelectionReadError.nothingSelected(app: sourceName)
+            }
+            throw SelectionReadError.notExposed(app: sourceName)
+        }
         let range = selectedRange(in: element)
         let probe = Probe(
             frontmostProcess: { NSWorkspace.shared.frontmostApplication?.processIdentifier },
@@ -193,7 +202,14 @@ struct SelectedTextContext {
         return text
     }
 
-    private static func selectedRange(in element: AXUIElement) -> NSRange? {
+    /// Whether the element answers for its selected text at all, even with an empty one.
+    private static func hasSelectedTextAttribute(_ element: AXUIElement) -> Bool {
+        var value: CFTypeRef?
+        return AXUIElementCopyAttributeValue(element, kAXSelectedTextAttribute as CFString, &value) == .success
+            && value is String
+    }
+
+    fileprivate static func selectedRange(in element: AXUIElement) -> NSRange? {
         var value: CFTypeRef?
         guard AXUIElementCopyAttributeValue(element, kAXSelectedTextRangeAttribute as CFString, &value) == .success,
             let value, CFGetTypeID(value) == AXValueGetTypeID()
@@ -214,12 +230,17 @@ struct FocusedFieldContext {
     let sourceName: String
     /// Throws unless the app is frontmost and the same field still holds the same value.
     var validate: @MainActor () throws -> Void
-    /// Sets the field's value through Accessibility. False when the field doesn't allow it.
+    /// Sets a one-line field's value through Accessibility. False when the field doesn't take it,
+    /// and for text areas, where a set value would skip undo; those are pasted over instead.
     var replaceValue: @MainActor (String) -> Bool
     /// Selects the whole value, so a paste replaces it. False when the field doesn't allow it.
     var selectAll: @MainActor () -> Bool
 
-    static func capture(from application: NSRunningApplication?) throws -> FocusedFieldContext {
+    /// The field's value. `selectionHidden` refuses when the field has a selection it doesn't share,
+    /// so Prefer Selection never widens to the whole field over a selection it couldn't read.
+    static func capture(from application: NSRunningApplication?, selectionHidden refuses: Bool) throws
+        -> FocusedFieldContext
+    {
         guard AXIsProcessTrusted() else { throw SelectionReadError.accessibilityOff }
         guard !IsSecureEventInputEnabled() else { throw SelectionReadError.secureInput }
         guard let application, !application.isTerminated,
@@ -232,6 +253,9 @@ struct FocusedFieldContext {
             throw SelectionReadError.notExposed(app: sourceName)
         }
         guard !SelectedTextContext.isSecure(element) else { throw SelectionReadError.protectedField }
+        if refuses, (SelectedTextContext.selectedRange(in: element)?.length ?? 0) > 0 {
+            throw SelectionReadError.notExposed(app: sourceName)
+        }
         func value() -> String? {
             var value: CFTypeRef?
             guard AXUIElementCopyAttributeValue(element, kAXValueAttribute as CFString, &value) == .success else {
@@ -242,6 +266,14 @@ struct FocusedFieldContext {
         guard let text = value(), !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             throw LibraryValidationError("There's no text to fix in \(sourceName).")
         }
+        // Pictures and attachments in the text can't survive a plain replace.
+        guard !text.contains("\u{FFFC}") else {
+            throw LibraryValidationError(
+                "\(sourceName)'s field has pictures or attachments. Select the text to fix, then run Quick Fix again.")
+        }
+        var role: CFTypeRef?
+        AXUIElementCopyAttributeValue(element, kAXRoleAttribute as CFString, &role)
+        let isOneLine = role as? String == kAXTextFieldRole
         let pid = application.processIdentifier
         return FocusedFieldContext(
             text: text, application: application, sourceName: sourceName,
@@ -256,11 +288,14 @@ struct FocusedFieldContext {
             },
             replaceValue: { newValue in
                 var settable: DarwinBoolean = false
-                guard AXUIElementIsAttributeSettable(element, kAXValueAttribute as CFString, &settable) == .success,
+                guard isOneLine,
+                    AXUIElementIsAttributeSettable(element, kAXValueAttribute as CFString, &settable) == .success,
                     settable.boolValue
                 else { return false }
+                // Accepted is done: a field may store the text a little differently, and pasting
+                // over it again would double it.
                 return AXUIElementSetAttributeValue(element, kAXValueAttribute as CFString, newValue as CFString)
-                    == .success && value() == newValue
+                    == .success
             },
             selectAll: {
                 var range = CFRange(location: 0, length: (text as NSString).length)

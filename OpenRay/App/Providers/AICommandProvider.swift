@@ -128,7 +128,11 @@ final class AICommandProvider: CommandProvider {
             // A choice such as Change Tone's tone is asked first, with its default picked, and
             // the command runs on ↵ in the fields (work item 1). The registry fills defaults into
             // `ref`, so the row's own values tell whether the fields were shown.
-            let choices = model.argumentSpecs(for: item).filter { if case .dropdown = $0.type { true } else { false } }
+            // Only a choice that always resolves to a value (its default, or a required first
+            // option), so the fields can't come back after ↵.
+            let choices = model.argumentSpecs(for: item).filter { spec in
+                if case .dropdown = spec.type { spec.defaultValue != nil || !spec.isOptional } else { false }
+            }
             if case .provided(let row) = item.action, choices.contains(where: { row.arguments[$0.name] == nil }),
                 model.beginArguments(for: item)
             {
@@ -166,8 +170,11 @@ final class AICommandProvider: CommandProvider {
             render(command, plan: plan, arguments: resolved, in: model)
             return
         }
+        // A copy fallback answers later; by then the person may have moved on.
+        let destination = model.destination
+        let conversation = model.ai.conversationToken
         model.resolveSelection { [weak model] result in
-            guard let model else { return }
+            guard let model, model.destination == destination, model.ai.conversationToken == conversation else { return }
             switch result {
             case .success(let selection):
                 self.render(command, plan: plan, arguments: resolved, selection: selection, in: model)
@@ -188,7 +195,9 @@ final class AICommandProvider: CommandProvider {
             let run = try AICommandRenderer.render(
                 command, plan: plan, values: values, capabilities: model.ai.capabilities,
                 sourceAppName: selection?.sourceName ?? model.previousApplicationName)
-            if run.replacesInPlace, let selection = model.lastCapturedSelection {
+            // In place needs the selection's exact place; a copied one opens in OpenRay, where ↵
+            // can still paste over it.
+            if run.replacesInPlace, let selection = model.lastCapturedSelection, selection.canReplace {
                 model.runInPlace(command: run, on: .selection(selection), title: command.name)
             } else {
                 model.openAI(command: run)

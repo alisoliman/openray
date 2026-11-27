@@ -103,9 +103,13 @@ final class ClipboardService {
     @ObservationIgnored private var attributedGeneration: Int?
     /// Text recognition for the last captured image, while it runs. Tests await it.
     @ObservationIgnored private(set) var pendingRecognition: Task<Void, Never>?
-    /// How many borrowings of the clipboard are under way (a selection copy, a paste back).
-    /// Capture waits for them, so what OpenRay puts there and puts back never becomes history.
+    /// How many borrowings of the clipboard hold it (a selection copy, its late-copy watch, a paste
+    /// back). Capture waits for them, so what OpenRay puts there and puts back never becomes history.
     @ObservationIgnored private var borrowings = 0
+    /// Borrowings waiting their turn, oldest first.
+    @ObservationIgnored private var waitingBorrowers: [CheckedContinuation<Void, Never>] = []
+    /// The watch for a selection copy that lands late, while it runs. Tests await it.
+    @ObservationIgnored private(set) var lateCopyWatch: Task<Void, Never>?
 
     private struct CapturePolicy: Equatable {
         var enabled: Bool
@@ -456,31 +460,58 @@ final class ClipboardService {
     }
 
     /// Reads the selection in another app with that app's own Copy (`SelectionCopy`), while
-    /// capture waits, and puts the clipboard back as it was.
+    /// capture waits, and puts the clipboard back as it was. An unanswered copy is watched for a
+    /// while longer, so one that lands late is put back too.
     func readSelectionByCopying(
         from application: NSRunningApplication?, sourceName: String, environment: SelectionCopy.Environment
     ) async throws -> String {
-        let before = pasteboard.changeCount
-        let wasExcluded = excludedGeneration == before
-        let wasAttributed = attributedGeneration == before
-        borrowings += 1
-        defer {
-            borrowings -= 1
-            if pasteboard.changeCount != before { adoptCurrentGeneration(excluded: wasExcluded, attributed: wasAttributed) }
+        try await borrowing {
+            let before = pasteboard.changeCount
+            let wasExcluded = excludedGeneration == before
+            let wasAttributed = attributedGeneration == before
+            defer {
+                if pasteboard.changeCount != before { adoptCurrentGeneration(excluded: wasExcluded, attributed: wasAttributed) }
+            }
+            return try await SelectionCopy.read(
+                from: application, sourceName: sourceName, pasteboard: pasteboard, environment: environment
+            ) { snapshot in
+                watchForLateCopy(over: snapshot, environment: environment)
+            }
         }
-        return try await SelectionCopy.read(
-            from: application, sourceName: sourceName, pasteboard: pasteboard, environment: environment)
     }
 
-    /// Runs `body` while capture waits, so a paste back's temporary write and the restore after it
-    /// never reach history.
-    func borrowing<T>(_ body: () async throws -> T) async rethrows -> T {
+    /// Keeps the clipboard borrowed while `SelectionCopy.putBackLateCopy` watches. The watch takes
+    /// its share now, while the copy's borrowing still holds the clipboard, so nothing slips between.
+    private func watchForLateCopy(over snapshot: PasteboardSnapshot, environment: SelectionCopy.Environment) {
+        let board = pasteboard
         borrowings += 1
-        defer {
-            borrowings -= 1
-            lastChange = pasteboard.changeCount
+        lateCopyWatch = Task { [weak self] in
+            await SelectionCopy.putBackLateCopy(over: snapshot, on: board, environment: environment)
+            self?.releaseBorrowing()
         }
+    }
+
+    /// Runs `body` with the clipboard to itself: one borrowing at a time, in order, so a paste
+    /// back's restore and a selection copy never take each other's contents for the person's.
+    /// Capture waits meanwhile, so nothing OpenRay puts there or puts back becomes history.
+    func borrowing<T>(_ body: () async throws -> T) async rethrows -> T {
+        if borrowings > 0 {
+            // `releaseBorrowing` counts this borrowing before it resumes it.
+            await withCheckedContinuation { waitingBorrowers.append($0) }
+        } else {
+            borrowings += 1
+        }
+        defer { releaseBorrowing() }
         return try await body()
+    }
+
+    private func releaseBorrowing() {
+        borrowings -= 1
+        lastChange = pasteboard.changeCount
+        if borrowings == 0, !waitingBorrowers.isEmpty {
+            borrowings += 1
+            waitingBorrowers.removeFirst().resume()
+        }
     }
 
     private func adoptCurrentGeneration(excluded: Bool, attributed: Bool) {

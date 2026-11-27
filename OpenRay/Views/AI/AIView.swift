@@ -890,60 +890,9 @@ private struct AttachmentPopover: View {
     }
 }
 
+/// A result's changes as VoiceOver reads them, since the marks are only drawn.
 enum DiffText {
-    /// Deletions are struck through and insertions underlined, so the diff doesn't rely on color alone.
-    static func attributed(_ diff: WordDiff) -> AttributedString {
-        var result = AttributedString()
-        for (index, segment) in diff.segments.enumerated() {
-            // A plain thin space keeps a struck word and its replacement from reading as one word.
-            if index > 0, case .added = segment, case .removed = diff.segments[index - 1] {
-                result.append(AttributedString("\u{2009}"))
-            }
-            switch segment {
-            case .same(let text):
-                result.append(AttributedString(text))
-            case .removed(let text):
-                result.append(chip(text) { run in
-                    run.strikethroughStyle = .single
-                    run.foregroundColor = OR.Color.danger
-                    run.backgroundColor = OR.Color.diffDelete
-                })
-            case .added(let text):
-                result.append(chip(text) { run in
-                    run.underlineStyle = .single
-                    run.foregroundColor = OR.Color.success
-                    run.backgroundColor = OR.Color.diffAdd
-                    run.font = Font(NSFont.systemFont(ofSize: 14, weight: .w550))
-                })
-            }
-        }
-        return result
-    }
-
-    /// A change styled as a chip: six-per-em spaces pad its visible words so the highlight
-    /// extends past the glyphs, and the strike or underline stays on the words. Surrounding
-    /// spaces and line breaks stay plain, so a change that ends a line doesn't push the next one over.
-    private static func chip(_ text: String, style: (inout AttributedString) -> Void) -> AttributedString {
-        guard let first = text.firstIndex(where: { !$0.isWhitespace }),
-            let last = text.lastIndex(where: { !$0.isWhitespace })
-        else {
-            var plain = AttributedString(text)
-            style(&plain)
-            return plain
-        }
-        var core = AttributedString(String(text[first...last]))
-        style(&core)
-        var pad = AttributedString("\u{2006}")
-        pad.backgroundColor = core.backgroundColor
-        var result = AttributedString(String(text[..<first]))
-        result.append(pad)
-        result.append(core)
-        result.append(pad)
-        result.append(AttributedString(String(text[text.index(after: last)...])))
-        return result
-    }
-
-    /// The diff as VoiceOver reads it, since strikethrough and underline aren't spoken:
+    /// The diff as VoiceOver reads it, since the green marks and red bars aren't spoken:
     /// “on [monday, changed to Monday].”
     static func spoken(_ diff: WordDiff) -> String {
         func words(_ text: String) -> String {
