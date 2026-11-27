@@ -377,6 +377,10 @@ struct WritingReviewTests {
         environment.isTrusted = { true }
         environment.secureInput = { false }
         environment.postCopy = { _ in }
+        // The Mac's own input record and front app never reach a test.
+        environment.frontmostProcess = { 1 }
+        environment.lastInputAt = { 0 }
+        environment.now = { 1 }
         environment.timeout = .milliseconds(60)
         environment.lateAnswerWindow = .milliseconds(60)
         environment.pollInterval = .milliseconds(20)

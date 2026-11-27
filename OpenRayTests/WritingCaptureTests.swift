@@ -56,6 +56,9 @@ struct WritingCaptureTests {
         var polls = 0
         var disturbed = false
         var finished = 0
+        /// The app the fake reports in front, and when the fake's last key or click was.
+        var front: pid_t? = 1
+        var lastInput: TimeInterval = 0
         /// Runs on each poll, before the poll looks at the board.
         var onPoll: (Int) -> Void = { _ in }
     }
@@ -82,6 +85,10 @@ struct WritingCaptureTests {
         }
         environment.isUndisturbed = { !seen.disturbed }
         environment.didFinish = { seen.finished += 1 }
+        // ⌘C goes at 10 on the fake clock; any key or click after that is the person's.
+        environment.frontmostProcess = { seen.front }
+        environment.lastInputAt = { seen.lastInput }
+        environment.now = { 10 }
         return environment
     }
 
@@ -124,7 +131,10 @@ struct WritingCaptureTests {
         let outcome = try await SelectionCopy.read(
             from: otherApp, sourceName: "Editor", pasteboard: board, snapshot: try PasteboardSnapshot.capture(board),
             environment: environment(seen))
-        #expect(outcome == .unanswered)
+        guard case .unanswered = outcome else {
+            Issue.record("Expected no answer, got \(outcome)")
+            return
+        }
         // Waited the whole timeout (60 ms in 20 ms polls), and wrote nothing.
         #expect(seen.polls == 3)
         #expect(board.changeCount == generation)
@@ -216,7 +226,7 @@ struct WritingCaptureTests {
         #expect(store.database.clipboard.contains { $0.plainText == "Copied afterwards" })
     }
 
-    @Test func dismissalEndsTheLateWindowSoALaterCopyStays() async throws {
+    @Test func dismissalEndsTheLateWindowSoALaterCopyStaysButOutOfHistory() async throws {
         let store = LibraryStore(fileURL: nil)
         #expect(store.update { $0.preferences.clipboardEnabled = true })
         let board = pasteboard(with: mixedContents)
@@ -234,8 +244,9 @@ struct WritingCaptureTests {
         }
         await service.lateCopyWatch?.value
         #expect(board.string(forType: .string) == "Copied after closing")
+        // It may be the app's late answer, so History leaves it out (re-review #10).
         await service.poll()
-        #expect(store.database.clipboard.contains { $0.plainText == "Copied after closing" })
+        #expect(!store.database.clipboard.contains { $0.plainText == "Copied after closing" })
     }
 
     // MARK: Snapshots and the guard (review major 3, minor rule 4)
@@ -472,7 +483,7 @@ struct WritingCaptureTests {
         let outcome = await PasteBack.run(
             "Improved text", into: .current, clipboard: service(board), validate: {},
             environment: pasteEnvironment(log, board: board, secureInput: true))
-        #expect(outcome == .copied("Secure Input is on, so nothing was pasted. Your text is copied; paste it with ⌘V."))
+        #expect(outcome == .copied("Secure Input is on, so nothing was pasted."))
         #expect(log.posted.isEmpty)
     }
 

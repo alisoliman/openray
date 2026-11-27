@@ -17,6 +17,9 @@ enum SelectionReadError: LocalizedError, Equatable {
     case nothingSelected(app: String)
     /// The clipboard changed again while the app's copy was being read: that's someone's own copy.
     case copyInterrupted(app: String)
+    /// A change OpenRay can't tell apart from someone else's copy: another app came forward, or a
+    /// key or click reached the Mac, while the app's copy was awaited.
+    case copyUnattributable(app: String)
 
     var errorDescription: String? {
         switch self {
@@ -30,6 +33,8 @@ enum SelectionReadError: LocalizedError, Equatable {
         case .nothingSelected(let app): "Nothing selected in \(app)."
         case .copyInterrupted(let app):
             "Your clipboard changed while the selection in \(app) was read, so OpenRay left it as it is."
+        case .copyUnattributable(let app):
+            "OpenRay couldn't be sure the copy came from \(app), so it didn't use it and left your clipboard as it is. Paste or type the text instead."
         }
     }
 
@@ -78,11 +83,10 @@ struct SelectedTextContext {
     ) throws {
         guard isUsable(capturedRange, for: capturedText) else {
             throw LibraryValidationError(
-                "\(sourceName) doesn't say exactly where the selection is, so nothing was replaced. Your result is copied; paste it with ⌘V.")
+                "\(sourceName) doesn't say exactly where the selection is, so nothing was replaced.")
         }
         guard appIsRunning, isFrontmost, sameElement, currentText == capturedText, currentRange == capturedRange else {
-            throw LibraryValidationError(
-                "The original selection in \(sourceName) changed. Your rewrite is copied; select where it belongs and paste with ⌘V.")
+            throw LibraryValidationError("The original selection in \(sourceName) changed, so nothing was replaced.")
         }
     }
 

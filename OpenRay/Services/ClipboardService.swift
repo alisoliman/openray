@@ -448,6 +448,7 @@ final class ClipboardService {
         var snapshot = try PasteboardSnapshot.capture(pasteboard)
         snapshot.wasExcluded = excludedGeneration == snapshot.changeCount
         snapshot.wasAttributed = attributedGeneration == snapshot.changeCount
+        snapshot.wasPending = lastChange != snapshot.changeCount
         return snapshot
     }
 
@@ -468,12 +469,15 @@ final class ClipboardService {
         case written(Int)
         /// Not written. The board may have been cleared to `cleared` first.
         case failed(cleared: Int?)
+        /// Not written: a copy landed after the snapshot, and it stays.
+        case superseded
     }
 
     /// Writes a writing result for a paste: plain text, and formatting when given, in one item
     /// that carries the transient and concealed markers from the start, so neither OpenRay's
-    /// history nor other clipboard managers ever keep it.
-    func copyTransient(_ text: String, richText: ClipboardRichText? = nil) -> TransientWrite {
+    /// history nor other clipboard managers ever keep it. With `generation`, the snapshot's, a
+    /// copy that landed after the snapshot is never cleared away.
+    func copyTransient(_ text: String, richText: ClipboardRichText? = nil, over generation: Int? = nil) -> TransientWrite {
         lastCopyError = nil
         let item = NSPasteboardItem()
         item.setString(text, forType: .string)
@@ -481,14 +485,16 @@ final class ClipboardService {
         if let html = richText?.html { item.setData(html, forType: .html) }
         item.setData(Data(), forType: SelectionCopy.transientType)
         item.setData(Data(), forType: SelectionCopy.concealedType)
+        if let generation, pasteboard.changeCount != generation { return .superseded }
         let result = writeOwned([item])
         if let generation = result.written { return .written(generation) }
         return .failed(cleared: result.cleared)
     }
 
     /// Reads the selection in another app with that app's own Copy (`SelectionCopy`), while
-    /// capture waits. An unanswered copy is watched a little longer, so a late answer is put back
-    /// too, unless the launcher is disturbed first.
+    /// capture waits. Once ⌘C went without a certain answer, the clipboard stays borrowed a little
+    /// longer: a late answer that can still be attributed to the app is put back, and whatever else
+    /// lands meanwhile stays on the clipboard but out of History.
     func readSelectionByCopying(
         from application: NSRunningApplication?, sourceName: String, environment: SelectionCopy.Environment
     ) async throws -> String {
@@ -498,36 +504,80 @@ final class ClipboardService {
             try Task.checkCancellation()
             guard environment.isUndisturbed() else { throw CancellationError() }
             let snapshot = try self.snapshot()
-            switch try await SelectionCopy.read(
-                from: application, sourceName: sourceName, pasteboard: pasteboard, snapshot: snapshot,
-                environment: environment)
-            {
+            let posted = PostedCopy()
+            var copying = environment
+            copying.postCopy = { pid in
+                try environment.postCopy(pid)
+                posted.value = true
+            }
+            let outcome: SelectionCopy.Outcome
+            do {
+                outcome = try await SelectionCopy.read(
+                    from: application, sourceName: sourceName, pasteboard: pasteboard, snapshot: snapshot,
+                    environment: copying)
+            } catch {
+                // ⌘C went and no answer was taken: the app may still answer, and nothing tells that
+                // apart from someone's own copy (re-review #10).
+                if posted.value {
+                    watching = true
+                    watchLate(over: snapshot, attribution: nil, source: application, environment: environment)
+                }
+                throw error
+            }
+            switch outcome {
             case .answered(let text, let restored):
                 if let restored { adopt(restored, from: snapshot) }
                 guard let text, !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
                     throw SelectionReadError.nothingSelected(app: sourceName)
                 }
                 return text
-            case .unanswered:
+            case .unanswered(let attribution):
                 watching = true
-                watchForLateAnswer(over: snapshot, environment: environment)
+                watchLate(over: snapshot, attribution: attribution, source: application, environment: environment)
                 throw SelectionReadError.nothingSelected(app: sourceName)
             }
         }
     }
 
-    /// Keeps the clipboard borrowed while `SelectionCopy.putBackLateAnswer` watches. The watch
-    /// takes its share now, while the copy's borrowing still holds the clipboard, so nothing slips
-    /// between.
-    private func watchForLateAnswer(over snapshot: PasteboardSnapshot, environment: SelectionCopy.Environment) {
+    @MainActor
+    private final class PostedCopy {
+        var value = false
+    }
+
+    /// Keeps the clipboard borrowed while `SelectionCopy.watchLate` watches. The watch takes its
+    /// share now, while the copy's borrowing still holds the clipboard, so nothing slips between.
+    /// A late answer put back keeps what was known of the person's copy. A change it can't
+    /// attribute stays on the clipboard, out of History, and out of `{clipboard}` when the app
+    /// the selection was copied from is one the person excluded.
+    private func watchLate(
+        over snapshot: PasteboardSnapshot, attribution: SelectionCopy.Attribution?, source: NSRunningApplication?,
+        environment: SelectionCopy.Environment
+    ) {
         let board = pasteboard
         borrowings += 1
         lateCopyWatch = Task { [weak self] in
-            let restored = await SelectionCopy.putBackLateAnswer(over: snapshot, on: board, environment: environment)
-            if let restored { self?.adopt(restored, from: snapshot) }
+            let late = await SelectionCopy.watchLate(
+                over: snapshot, attribution: attribution, on: board, environment: environment)
+            switch late {
+            case .none: break
+            case .restored(let generation): self?.adopt(generation, from: snapshot)
+            case .ambiguous(let generation): self?.keepOutOfHistory(generation, copiedFrom: source)
+            case .notRestored: environment.didFailToRestore(PasteboardBorrowError.notRestored.localizedDescription)
+            }
             self?.releaseBorrowing()
             environment.didFinish()
         }
+    }
+
+    /// A generation that may be a copied selection: the clipboard keeps it, History never records
+    /// it, and `{clipboard}` never inserts it when it may be an excluded app's.
+    private func keepOutOfHistory(_ generation: Int, copiedFrom source: NSRunningApplication?) {
+        guard pasteboard.changeCount == generation else { return }
+        lastChange = generation
+        let excluded = !ClipboardPolicy.shouldCapture(
+            types: [], sourceBundleID: source?.bundleIdentifier,
+            excluded: store.database.preferences.effectiveClipboardExclusions, secureInput: false)
+        if excluded { excludedGeneration = generation }
     }
 
     /// Runs `body` with the clipboard to itself: one borrowing at a time, in order, so a paste
@@ -557,6 +607,9 @@ final class ClipboardService {
     }
 
     private func adopt(_ generation: Int, from snapshot: PasteboardSnapshot) {
+        // A copy the poll hadn't classified yet is put back unclassified, still pending: the poll
+        // takes it to History, or keeps it out, and marks its exclusion as it would have.
+        guard !snapshot.wasPending else { return }
         ownedGenerations.insert(generation)
         lastChange = generation
         if snapshot.wasExcluded { excludedGeneration = generation }
@@ -587,15 +640,15 @@ enum SyntheticInput {
 
     /// `validateTarget` runs last, right before ⌘V, so a writing result never replaces text that
     /// changed after its selection was captured (`SelectedTextContext.validateForPaste`). If it
-    /// throws, no key is sent.
+    /// throws, no key is sent. Its errors say what happened only: whether ⌘V would paste the text
+    /// depends on who owns the clipboard by then, which the caller checks.
     static func paste(
         into application: NSRunningApplication, expectedChangeCount: Int,
         validateTarget: () throws -> Void = {}, environment: PasteEnvironment = .live
     ) async throws {
         try environment.checkAllowed()
         guard environment.isTrusted() else {
-            throw LibraryValidationError(
-                "Copied to the clipboard. Enable Accessibility in Settings for direct paste, or press ⌘V in your app.")
+            throw LibraryValidationError("Accessibility is off, so nothing was pasted. Enable it in Settings for direct paste.")
         }
         environment.activate(application)
         let pid = application.processIdentifier
@@ -609,11 +662,10 @@ enum SyntheticInput {
         func check() throws {
             // Secure Input means a password field may have the keyboard: no key goes there.
             guard !environment.secureInput() else {
-                throw LibraryValidationError(
-                    "Secure Input is on, so nothing was pasted. Your text is copied; paste it with ⌘V.")
+                throw LibraryValidationError("Secure Input is on, so nothing was pasted.")
             }
             guard stillTargeted() else {
-                throw LibraryValidationError("The target app or clipboard changed. Your text is copied; paste it with ⌘V.")
+                throw LibraryValidationError("The target app or clipboard changed, so nothing was pasted.")
             }
         }
         try check()
@@ -736,9 +788,13 @@ enum PasteBack {
                     "OpenRay couldn't keep a full copy of your clipboard, so nothing was pasted and your clipboard is as it was.")
             }
             let written: Int
-            switch clipboard.copyTransient(text, richText: richText) {
+            // Published only over the generation the snapshot read: a copy that came after it is
+            // the person's, and stays.
+            switch clipboard.copyTransient(text, richText: richText, over: snapshot.changeCount) {
             case .written(let generation):
                 written = generation
+            case .superseded:
+                return .notPasted("Something was copied just now, so nothing was pasted and that copy stays on your clipboard.")
             case .failed(let cleared):
                 // A write that cleared the board and failed puts the person's copy back.
                 let recovered = cleared.map { (try? clipboard.restore(snapshot, over: $0)) == true } ?? true
