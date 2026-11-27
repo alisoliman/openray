@@ -177,9 +177,11 @@ struct WritingReviewTests {
         #expect(model.pasteBackTask == nil)
         #expect(log.posted.isEmpty)
         #expect(model.clipboard.readText() == "A helpful reply.")
-        // The paste is in ⌘K, by name and with no key of its own.
+        // ⌘↵ stays registered as Copy Response; the paste is in ⌘K, by name and with no key of its own.
         let entries = model.actions(for: nil)
-        #expect(!entries.contains { $0.id == "secondary" })
+        let copyEntry = try #require(entries.first { $0.id == "secondary" })
+        #expect(copyEntry.title == "Copy Response")
+        #expect(copyEntry.key == .return && copyEntry.modifiers == .command)
         let paste = try #require(entries.first { $0.id == "pasteResponse" })
         #expect(paste.title == "Paste Response to Mail")
         #expect(paste.shortcut == nil && paste.key == nil)

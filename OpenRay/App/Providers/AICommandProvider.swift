@@ -162,10 +162,13 @@ final class AICommandProvider: CommandProvider {
             model.feedback = .warning(error.localizedDescription)
             return
         }
+        // The app it ran in, as it was then: the launcher's source follows the app in front, so a
+        // windowless run that finishes later compares against this, never against where you are.
+        let origin = model.writingSourceApplication?.processIdentifier
         // Replace Selection needs the selection whatever its prompt reads; other commands read it
         // only when their prompt uses it.
         guard plan.requirements.selection || command.replacesInPlace, model.readsSelectionImplicitly else {
-            render(command, plan: plan, arguments: resolved, in: model)
+            render(command, plan: plan, arguments: resolved, origin: origin, in: model)
             return
         }
         // A copy fallback answers later; by then the person may have moved on.
@@ -175,12 +178,12 @@ final class AICommandProvider: CommandProvider {
             guard let model, model.destination == destination, model.ai.conversationToken == conversation else { return }
             switch result {
             case .success(let selection):
-                self.render(command, plan: plan, arguments: resolved, selection: selection, in: model)
+                self.render(command, plan: plan, arguments: resolved, selection: selection, origin: origin, in: model)
             case .failure(let error) where error is CancellationError:
                 // The person moved on while the app's copy was awaited: nothing runs.
                 return
             case .failure(let error):
-                self.render(command, plan: plan, arguments: resolved, selectionFailure: error, in: model)
+                self.render(command, plan: plan, arguments: resolved, selectionFailure: error, origin: origin, in: model)
             }
         }
     }
@@ -188,15 +191,26 @@ final class AICommandProvider: CommandProvider {
     private func render(
         _ command: AICommand, plan: PlaceholderPlan, arguments: [PlaceholderArgument.ID: String],
         selection: SelectedTextContext? = nil,
-        selectionFailure: (any Error)? = nil, in model: LauncherModel
+        selectionFailure: (any Error)? = nil, origin: pid_t?, in model: LauncherModel
     ) {
         var values = model.placeholderValues(for: plan, selection: selection, readsSelection: selectionFailure == nil)
         values.arguments = arguments
-        // A windowless command's panel comes up to say why only while its app is still in front.
+        // A windowless command's panel comes up to say why only while its app is still in front. A
+        // copy OpenRay couldn't attribute gets only a quiet HUD there: the clipboard was left as it
+        // is, and the person copies or types the text themselves (final review, blocker 1).
         func report(_ reason: String) {
-            if !command.replacesInPlace || model.showPanelForWindowlessRun(otherwise: reason) {
+            guard command.replacesInPlace, !model.isPanelShowing else {
                 model.feedback = .warning(reason)
+                return
             }
+            if case .copyUnattributable(let app)? = selectionFailure as? SelectionReadError {
+                model.hud.show(
+                    HUDMessage(
+                        "“\(command.name)” didn't run: OpenRay couldn't be sure the copy came from \(app).",
+                        symbol: "exclamationmark.triangle", style: .info))
+                return
+            }
+            if model.showPanelForWindowlessRun(from: origin, otherwise: reason) { model.feedback = .warning(reason) }
         }
         do {
             let run = try AICommandRenderer.render(
@@ -217,7 +231,7 @@ final class AICommandProvider: CommandProvider {
                 }
                 guard
                     model.showPanelForWindowlessRun(
-                        otherwise: "“\(command.name)” didn't run: \(selection.sourceName) isn't in front any more.")
+                        from: origin, otherwise: "“\(command.name)” didn't run: \(selection.sourceName) isn't in front any more.")
                 else { return }
                 model.lastCapturedSelection = selection
             }

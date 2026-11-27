@@ -225,8 +225,9 @@ extension LauncherModel {
             let outcome = await PasteBack.run(
                 text, richText: richText, into: application, clipboard: self.clipboard,
                 validate: {
-                    try SelectedTextContext.verifyFocus(destination.focusIsOriginal?(), sourceName: destination.name)
+                    // The password check first, so the last read before ⌘V is the focus's identity.
                     try Self.refuseProtectedField(in: application, name: destination.name, isSecure: isSecure)
+                    try SelectedTextContext.verifyFocus(destination.focusIsOriginal?(), sourceName: destination.name)
                 },
                 environment: environment, willPaste: { [weak self] in self?.panel?.dismiss(restoreFocus: false) })
             self.finish(outcome, success: label, inPlace: false)
@@ -404,15 +405,18 @@ extension LauncherModel {
             }
             // Selected within the paste, right before ⌘V, so a caret moved meanwhile is caught. Focus
             // can move while the selection is set and read back, so the field is checked again
-            // after: still the focused element, still not a password field.
+            // after, and last of all the element focused now must be the captured one, by identity.
             validate = {
                 try Self.refuseProtectedField(in: application, name: field.sourceName, isSecure: isSecure)
                 try field.validate()
                 guard field.selectAll() else {
                     throw LibraryValidationError("\(field.sourceName) didn't select its whole text, so nothing was replaced.")
                 }
-                try field.validate()
                 try Self.refuseProtectedField(in: application, name: field.sourceName, isSecure: isSecure)
+                try field.validate()
+                guard field.isStillFocused() else {
+                    throw LibraryValidationError("Another field in \(field.sourceName) has the keyboard now, so nothing was replaced.")
+                }
             }
         }
         let outcome = await PasteBack.run(
@@ -531,13 +535,14 @@ extension LauncherModel {
     var isPanelShowing: Bool { panelVisibility?() ?? panel?.isVisible ?? true }
 
     /// Brings the panel up for a windowless run that needs it after all (a selection copied with no
-    /// place to replace, or a reason to give), but only while the app it ran in is still in front:
-    /// the panel never takes focus from an app the person moved to. Then a quiet HUD says why
-    /// instead (re-review, windowless delayed copy). Returns whether the panel is showing.
+    /// place to replace, or a reason to give), but only while the app it ran in, `origin`, read
+    /// when it was invoked, is still in front: the panel never takes focus from an app the person
+    /// moved to, even though that app is the launcher's source by then. Otherwise a quiet HUD says
+    /// why instead. Returns whether the panel is showing.
     @discardableResult
-    func showPanelForWindowlessRun(otherwise message: String) -> Bool {
+    func showPanelForWindowlessRun(from origin: pid_t?, otherwise message: String) -> Bool {
         guard !isPanelShowing else { return true }
-        guard let source = writingSourceApplication, frontmostProcess() == source.processIdentifier else {
+        guard let origin, frontmostProcess() == origin else {
             hud.show(HUDMessage(message, symbol: "exclamationmark.triangle", style: .info))
             return false
         }

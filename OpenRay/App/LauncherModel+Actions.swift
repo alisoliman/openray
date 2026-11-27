@@ -1046,21 +1046,21 @@ extension LauncherModel {
                     id: "stop", title: "Stop Response", symbol: "stop.fill", shortcut: .command("."), group: .item
                 ) { [weak self] in self?.ai.cancel() })
         }
-        // Work item 5: ↵ pastes (or copies), ⌘↵ always copies, ⌥↵ pastes with formatting. With
-        // Copy as the primary action, the paste is here by name, with no key of its own.
+        // Work item 5: ↵ pastes (or copies), ⌘↵ always copies, ⌥↵ pastes with formatting. ⌘↵ is
+        // registered in both modes, so it works where no field takes it (an AI Command's result)
+        // and from ⌘K. With Copy as the primary action, the paste is here by name, with no key.
         if canAcceptAIResponse {
             entries.append(
                 ActionEntry(
                     id: "accept", title: aiAcceptTitle, symbol: aiPrimaryPastes ? "arrow.down.doc" : "doc.on.doc",
                     shortcut: .return, group: .item
                 ) { [weak self] in self?.acceptAIResponse() })
-            if aiPrimaryPastes {
-                entries.append(
-                    ActionEntry(
-                        id: "secondary", title: aiSecondaryTitle, symbol: "doc.on.doc",
-                        shortcut: .commandReturn, key: .return, modifiers: .command, group: .item
-                    ) { [weak self] in self?.performAISecondary() })
-            } else {
+            entries.append(
+                ActionEntry(
+                    id: "secondary", title: aiSecondaryTitle, symbol: "doc.on.doc",
+                    shortcut: .commandReturn, key: .return, modifiers: .command, group: .item
+                ) { [weak self] in self?.performAISecondary() })
+            if !aiPrimaryPastes {
                 entries.append(
                     ActionEntry(id: "pasteResponse", title: aiPasteResponseTitle, symbol: "arrow.down.doc", group: .item) {
                         [weak self] in self?.pasteWritingResult()

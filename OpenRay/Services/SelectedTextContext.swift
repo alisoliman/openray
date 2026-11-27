@@ -266,6 +266,9 @@ struct FocusedFieldContext {
     /// Selects the whole value and confirms the selection covers exactly it, so a paste replaces
     /// it. False when the field doesn't allow it, or the selection came out different.
     var selectAll: @MainActor () -> Bool
+    /// The last check before ⌘V: the element focused now is the one captured, by identity, and
+    /// isn't a password field, from one read of the focus. `capture` always sets it.
+    var isStillFocused: @MainActor () -> Bool = { true }
 
     /// The field's value. `selectionHidden` refuses when the field has a selection it doesn't share,
     /// so Prefer Selection never widens to the whole field over a selection it couldn't read.
@@ -341,6 +344,10 @@ struct FocusedFieldContext {
                     AXUIElementSetAttributeValue(element, kAXSelectedTextRangeAttribute as CFString, value) == .success
                 else { return false }
                 return SelectedTextContext.selectedRange(in: element) == whole
+            },
+            isStillFocused: {
+                guard let focused = SelectedTextContext.focusedElement(in: app) else { return false }
+                return CFEqual(focused, element) && !SelectedTextContext.isSecure(focused)
             })
     }
 }

@@ -214,7 +214,7 @@ struct WritingRereviewTests {
         #expect(fakes.finished == 1)
     }
 
-    @Test func aWindowlessReplaceSelectionFallsBackToExplicitInputOnAnUnattributableCopy() async throws {
+    @Test func aWindowlessReplaceSelectionShowsOnlyAQuietHUDForAnUnattributableCopy() async throws {
         let app = try #require(runningApps.first)
         let engine = RecordingAIEngine()
         let board = board("Earlier copy")
@@ -222,7 +222,7 @@ struct WritingRereviewTests {
             store: LibraryStore(fileURL: nil), ai: AIChatModel(engine: engine), pasteboard: board,
             registry: CommandRegistry(providers: [AIWritingCommandProvider(), AICommandProvider()]))
         defer { model.stop() }
-        _ = installHUD(on: model)
+        let hud = installHUD(on: model)
         let record = AICommandRecord(name: "Formal", prompt: "Formal: {selection}", output: "replaceSelection")
         #expect(model.store.update { $0.aiCommands.append(record) })
         model.commandCatalogDidChange()
@@ -233,6 +233,7 @@ struct WritingRereviewTests {
         model.inputMonitoring = WritingReviewTests.FakeInput()
         model.selectionContextReader = { throw SelectionReadError.notExposed(app: "Slack") }
         let fakes = Fakes()
+        fakes.front = app.processIdentifier
         fakes.onPoll = { poll in
             if poll == 2 {
                 fakes.lastInput = 11
@@ -244,11 +245,14 @@ struct WritingRereviewTests {
         model.perform(row)
         await model.selectionCaptureTask?.value
         await model.clipboard.lateCopyWatch?.value
-        // Nothing ran on the copy; the panel asks for the text, and the copy stays.
+        // Nothing ran on the copy, the copy stays, and no panel comes up: a quiet HUD says why
+        // (final review, blocker 1).
         #expect(fakes.posted == [app.processIdentifier])
         #expect(engine.requests.isEmpty)
         #expect(model.inPlaceTask == nil)
-        #expect(model.feedback?.text.contains("couldn't be sure the copy came from") == true)
+        #expect(model.feedback == nil)
+        #expect(hud.presented.last?.message.text.contains("couldn't be sure the copy came from") == true)
+        #expect(hud.presented.last?.message.style == .info)
         #expect(board.string(forType: .string) == "Copied elsewhere")
     }
 
