@@ -1,14 +1,29 @@
 import Foundation
 
-/// Where an AI Command's answer goes.
+/// What an AI Command's answer is, which sets its instructions. The stored values are Slice 7's.
 enum AICommandOutput: String, CaseIterable, Identifiable, Sendable {
-    /// Shown in the launcher with Copy, Paste and Continue in Chat.
+    /// An answer to read, with Markdown.
     case show
-    /// Replaces the selected text, after a word diff of the changes.
+    /// A transform of the selected text: the result alone, which ↵ pastes over the selection.
     case replace
 
     var id: String { rawValue }
-    var title: String { self == .show ? "Show in OpenRay" : "Replace Selection" }
+}
+
+/// Where an AI Command's result goes: Raycast's Output Behavior.
+enum AIOutputBehavior: String, CaseIterable, Identifiable, Sendable {
+    /// In the launcher, where ↵ pastes it. Every command saved before Replace Selection existed
+    /// opens here, `replace` included: in v0.2.0 that meant show the result, then ↵ replaces.
+    case openInOpenRay
+    /// Over the selection with no window, after strict checks, confirmed with a HUD. It has its
+    /// own stored value, so no earlier record can mean it.
+    case replaceSelection
+
+    var id: String { rawValue }
+    var title: String { self == .openInOpenRay ? "Open in OpenRay" : "Replace Selection" }
+
+    /// The record's `output` for Replace Selection. `show` and `replace` both open in OpenRay.
+    static let replaceSelectionValue = "replaceSelection"
 }
 
 /// What produces a command's answer.
@@ -35,11 +50,19 @@ struct AICommand: Identifiable, Hashable, Sendable {
     var reasoning: AIReasoningLevel? = nil
     var guardrail: AIGuardrail = .permissive
     var output: AICommandOutput = .show
+    var behavior: AIOutputBehavior = .openInOpenRay
     var performer: AICommandPerformer = .model
     /// The built-in this one was copied from.
     var duplicatedFrom: String? = nil
 
     var isBuiltIn: Bool { recordID == nil }
+
+    /// Replace Selection with no window: the person's own commands set to it. Built-ins can't be
+    /// edited, so they always open in OpenRay.
+    var replacesInPlace: Bool { !isBuiltIn && behavior == .replaceSelection }
+
+    /// The record's `output`: the answer kind, or `replaceSelection`.
+    var storedOutput: String { behavior == .replaceSelection ? AIOutputBehavior.replaceSelectionValue : output.rawValue }
 
     static let idPrefix = "aicommand."
     static func id(for recordID: UUID) -> String { idPrefix + recordID.uuidString }
@@ -47,7 +70,8 @@ struct AICommand: Identifiable, Hashable, Sendable {
     init(
         id: String, recordID: UUID? = nil, name: String, symbol: String, prompt: String, subtitle: String = "",
         creativity: AICreativity = .low, reasoning: AIReasoningLevel? = nil, guardrail: AIGuardrail = .permissive,
-        output: AICommandOutput = .show, performer: AICommandPerformer = .model, duplicatedFrom: String? = nil
+        output: AICommandOutput = .show, behavior: AIOutputBehavior = .openInOpenRay, performer: AICommandPerformer = .model,
+        duplicatedFrom: String? = nil
     ) {
         self.id = id
         self.recordID = recordID
@@ -59,12 +83,19 @@ struct AICommand: Identifiable, Hashable, Sendable {
         self.reasoning = reasoning
         self.guardrail = guardrail
         self.output = output
+        // Replacing the selection takes the transformed text alone.
+        self.behavior = behavior
+        if behavior == .replaceSelection { self.output = .replace }
         self.performer = performer
         self.duplicatedFrom = duplicatedFrom
     }
 
-    /// Reads a library record. Unknown setting values fall back to the defaults.
+    /// Reads a library record. Unknown setting values fall back to the defaults. This is also the
+    /// Output Behavior migration: records from before Replace Selection (`show`, `replace`, none)
+    /// open in OpenRay, keeping the instructions they had; only `replaceSelection` replaces in
+    /// place. Stored values aren't rewritten, so an earlier build still reads them as it did.
     init(record: AICommandRecord) {
+        let replacesSelection = record.output == AIOutputBehavior.replaceSelectionValue
         self.init(
             id: Self.id(for: record.id), recordID: record.id,
             name: record.name?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty ?? "Untitled AI Command",
@@ -73,6 +104,7 @@ struct AICommand: Identifiable, Hashable, Sendable {
             reasoning: record.reasoning.flatMap(AIReasoningLevel.init(rawValue:)),
             guardrail: record.guardrail.flatMap(AIGuardrail.init(rawValue:)) ?? .standard,
             output: record.output.flatMap(AICommandOutput.init(rawValue:)) ?? .show,
+            behavior: replacesSelection ? .replaceSelection : .openInOpenRay,
             duplicatedFrom: record.duplicatedFrom)
     }
 
@@ -80,7 +112,7 @@ struct AICommand: Identifiable, Hashable, Sendable {
     func record(createdAt: Date = .now) -> AICommandRecord {
         AICommandRecord(
             id: recordID ?? UUID(), name: name, symbol: symbol, prompt: prompt, creativity: creativity.rawValue,
-            reasoning: reasoning?.rawValue, guardrail: guardrail.rawValue, output: output.rawValue,
+            reasoning: reasoning?.rawValue, guardrail: guardrail.rawValue, output: storedOutput,
             duplicatedFrom: duplicatedFrom, createdAt: createdAt)
     }
 
@@ -93,9 +125,10 @@ struct AICommand: Identifiable, Hashable, Sendable {
             case .translation(let argument):
                 "Translate the following text into {argument name=\"\(argument)\" options=\"\(TranslationLanguages.all.map(\.name).joined(separator: ", "))\" default=\"English\" | raw}. Keep its meaning, tone and formatting. Return only the translation.\n\n{selection}"
             }
+        // A copy keeps its Output Behavior: a built-in's copy opens in OpenRay, as the built-in does.
         return AICommandRecord(
             id: UUID(), name: name ?? "\(self.name) Copy", symbol: symbol, prompt: prompt, creativity: creativity.rawValue,
-            reasoning: reasoning?.rawValue, guardrail: guardrail.rawValue, output: output.rawValue,
+            reasoning: reasoning?.rawValue, guardrail: guardrail.rawValue, output: storedOutput,
             duplicatedFrom: duplicatedFrom ?? id, createdAt: .now)
     }
 
@@ -202,6 +235,8 @@ struct AICommandRun: Equatable, Sendable {
     var performer: AICommandPerformer
     /// The translation target, for the Translate command.
     var targetLanguageID: String?
+    /// Replace Selection with no window (`AICommand.replacesInPlace`).
+    var replacesInPlace = false
 }
 
 enum AICommandError: LocalizedError, Equatable {
@@ -237,7 +272,8 @@ enum AICommandRenderer {
             return AICommandRun(
                 commandID: command.id, title: command.name, symbol: command.symbol, prompt: prompt,
                 source: command.output == .replace ? selection : nil, sourceAppName: sourceAppName, output: command.output,
-                profile: command.profile(capabilities: capabilities), performer: .model)
+                profile: command.profile(capabilities: capabilities), performer: .model,
+                replacesInPlace: command.replacesInPlace)
         case .translation(let argument):
             guard let text = selection, !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
                 throw AICommandError.noText
@@ -248,7 +284,7 @@ enum AICommandRenderer {
                 commandID: command.id, title: "Translate to \(language.name)", symbol: command.symbol, prompt: text,
                 source: text, sourceAppName: sourceAppName, output: command.output,
                 profile: command.profile(capabilities: capabilities), performer: command.performer,
-                targetLanguageID: language.id)
+                targetLanguageID: language.id, replacesInPlace: command.replacesInPlace)
         }
     }
 }
@@ -256,7 +292,8 @@ enum AICommandRenderer {
 // MARK: - Import and export
 
 /// Plain JSON for sharing AI Commands: an array of objects with `name` (or `title`),
-/// `prompt`, and optional `icon`, `creativity`, `reasoning`, `guardrail` and `output`.
+/// `prompt`, and optional `icon`, `creativity`, `reasoning`, `guardrail` and `output` (`show`,
+/// `replace` or `replaceSelection`, as stored).
 /// Exported files use the same keys, sorted.
 enum AICommandTransfer {
     static let maximumBytes = 2_000_000
@@ -295,10 +332,13 @@ enum AICommandTransfer {
                 (item[key] as? String).map { $0.lowercased() }.flatMap(T.init(rawValue:))?.rawValue
             }
             let icon = (item["icon"] as? String).flatMap { $0.allSatisfy { $0.isLetter || $0.isNumber || $0 == "." } ? $0 : nil }
+            let replacesSelection =
+                (item["output"] as? String)?.lowercased() == AIOutputBehavior.replaceSelectionValue.lowercased()
             return AICommandRecord(
                 id: UUID(), name: name, symbol: icon, prompt: prompt,
                 creativity: value("creativity", as: AICreativity.self), reasoning: value("reasoning", as: AIReasoningLevel.self),
-                guardrail: value("guardrail", as: AIGuardrail.self), output: value("output", as: AICommandOutput.self),
+                guardrail: value("guardrail", as: AIGuardrail.self),
+                output: replacesSelection ? AIOutputBehavior.replaceSelectionValue : value("output", as: AICommandOutput.self),
                 createdAt: .now)
         }
         guard !records.isEmpty else {
@@ -312,7 +352,7 @@ enum AICommandTransfer {
             var object = [
                 "name": command.name, "prompt": command.prompt, "icon": command.symbol,
                 "creativity": command.creativity.rawValue, "guardrail": command.guardrail.rawValue,
-                "output": command.output.rawValue,
+                "output": command.storedOutput,
             ]
             if let reasoning = command.reasoning { object["reasoning"] = reasoning.rawValue }
             return object

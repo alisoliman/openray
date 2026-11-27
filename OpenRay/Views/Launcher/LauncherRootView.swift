@@ -186,8 +186,7 @@ private struct GlobalShortcutButtons: View {
                     Button("Actions") { model.showActions.toggle() }.keyboardShortcut("k")
                     Button("New") {
                         if model.destination == .ai {
-                            model.ai.newConversation()
-                            model.focusRequest += 1
+                            model.newAIConversation()
                         } else {
                             model.createItem()
                         }

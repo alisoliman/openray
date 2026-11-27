@@ -334,28 +334,26 @@ struct RedesignTests {
         model.files.stop()
     }
 
-    /// Changed by the main merge review (finding 4): reopening a writing command keeps its
-    /// finished result and offers a different selection, which replaces it only when chosen.
-    @Test func writingCommandsKeepTheirResultAndOfferANewSelection() async {
+    /// Changed by the Raycast-parity writing rebuild (work item 3): a writing command runs a new
+    /// selection at once, and its finished result stays one ⌘[ away.
+    @Test func writingCommandsRunANewSelectionAndKeepTheResultInHistory() async {
         let model = model()
         defer { model.stop() }
         var selection = "Their are two things."
         model.selectionReader = { selection }
         model.openAI(.proofread)
         #expect(model.ai.attachments.first?.text == "Their are two things.")
-        model.ai.send()
         await model.ai.waitForResponse()
         #expect(model.ai.lastSource == "Their are two things.")
         model.leaveAI()
         selection = "A different passage."
         model.openAI(.proofread)
+        #expect(model.ai.attachments.first?.text == "A different passage.")
+        await model.ai.waitForResponse()
+        #expect(model.ai.lastSource == "A different passage.")
+        model.showWritingRun(-1)
         #expect(model.ai.lastSource == "Their are two things.")
         #expect(model.ai.messages.count == 2)
-        #expect(model.pendingNewSelection?.text == "A different passage.")
-        model.usePendingSelection()
-        #expect(model.ai.attachments.first?.text == "A different passage.")
-        #expect(model.ai.messages.isEmpty)
-        #expect(model.ai.lastSource == nil)
         model.files.stop()
     }
 

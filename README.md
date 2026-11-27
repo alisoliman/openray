@@ -54,11 +54,13 @@ Irreversible commands (Empty Trash, Shut Down, Restart, Log Out, Quit All, Quit 
 
 ### Rewrite text where you are working
 
-1. Select text in another app, press **⌥ Space**, and choose **Improve Writing** or another writing command. With Accessibility on, the selection is attached; add an instruction if you like, then press **Return**.
+1. Select text in another app and run **Improve Writing** or another writing command, from **⌥ Space**, an alias, a hotkey or a favorite. It runs at once on the selection, and the result streams in under the command's name. Apps that don't share their selection over Accessibility are read by copying it, with your clipboard put back exactly. Only a copy that arrives while OpenRay waits, before you type, click or close it, is read; anything you copy yourself stays. With nothing selected, OpenRay says so and offers the clipboard or typing.
 2. Type a follow-up such as “Make it warmer” and press **Return** to refine the result. Each follow-up carries the original passage, the current result and your earlier requests.
-3. With the field empty, press **Return** to replace the original selection in its app. OpenRay first checks that the same text is still selected in the same place; if it changed, the result is copied instead. A result goes back where its passage came from, even if you used another app in between.
+3. With the field empty, press **Return** to paste the result over your selection: OpenRay closes, brings the app forward and, if the same text field is still focused and Secure Input is off, pastes, then puts your previous clipboard back and confirms with a short message such as **Improved**. A result only ever goes back to the app its run came from; if that app quit, it stays in OpenRay to copy. If it can't paste, it says why, and suggests **⌘V** only when the result is what's on the clipboard.
 
-**Try Again (⌘R)** repeats the last request with the context it had; a follow-up that failed waits in the field and never lets an older result be used by default. **Use Result as New Passage** in **⌘K** starts a fresh run from the result, keeping where it goes back to. After an insertion, select the inserted text and reopen OpenRay before replacing it again. **New Chat** or a different passage releases the target. Ask never imports a selection on its own.
+**⌘Return** copies the result instead and **⌥Return** pastes it with its formatting. **⌘R** regenerates it with other wording and **⇧⌘R** more freely. **⌘K** has **Show Original** and **Show Changes**; Fix Spelling & Grammar marks its changes as it opens (**Settings → Apple Intelligence → Writing commands**). Each new selection starts a new run, and **⌘[** and **⌘]** go back and forth between runs, so nothing is lost; reopening OpenRay soon after returns to the last result. **⌘J** continues a result in the AI Chat window. A stopped or failed run is never pasted.
+
+**Quick Fix** runs Fix Spelling & Grammar (or the command you choose) in place, with no window, on the selection or, with **Prefer selection** off or an empty selection, the whole text field. It and AI Commands set to **Replace Selection** replace text only while the app is still in front, no password field is focused and the text is exactly as it was; they never move focus.
 
 ## Keyboard shortcuts
 
@@ -66,8 +68,8 @@ Irreversible commands (Empty Trash, Shut Down, Restart, Log Out, Quit All, Quit 
 | --- | --- |
 | **⌥ Space** | Show or hide OpenRay; configurable in Settings. |
 | **↑ / ↓**, **← / →** | Select a result; arrows move in two dimensions in the favorites strip and the windows grid. |
-| **Return** | Open, run, or copy the selected result. The action bar always names what Return does. In AI: send, or with an empty field use a finished writing result. |
-| **⌘Return** | Send the result into the app you came from, such as **Paste to Mail**. In AI: add a new line, as **⇧Return** does. |
+| **Return** | Open, run, or copy the selected result. The action bar always names what Return does. In AI: send, or with an empty field paste a finished writing result back into its app. |
+| **⌘Return** | Send the result into the app you came from, such as **Paste to Mail**. On a writing result: copy it. In chat: add a new line, as **⇧Return** does. |
 | **Tab** | Enter the selected command's scope, start a quicklink's search term, or ask AI with the current search. |
 | **Delete** on an empty field | Leave the current scope or quicklink search term. |
 | **⌘K** | Search every action for the selection; each shows its own shortcut. |
@@ -79,7 +81,7 @@ Irreversible commands (Empty Trash, Shut Down, Restart, Log Out, Quit All, Quit 
 | **Escape** | Close exactly one layer: a confirmation, actions, an editor, AI, a scope, the search, then the launcher. |
 | **⌘[** | Go back one step, even when Escape is set to close the window. |
 
-In AI, the keys follow the conversation (an owner decision taken from the September writing review): **Return** sends, **⇧Return** or **⌘Return** adds a new line, and **Return** on an empty field uses a finished writing result. Use **Stop** or **⌘.** to cancel a response; a stopped or partial result is never used by default.
+In AI chat, **Return** sends and **⇧Return** or **⌘Return** adds a new line. On a writing result, the keys follow Raycast: **Return** pastes it (or copies it, with **Settings → Apple Intelligence → Writing commands → Primary action** set to **Copy Response**; Paste Response is then in **⌘K**), **⌘Return** always copies it, **⌥Return** pastes it formatted, **⌘R** and **⇧⌘R** regenerate it, **⌘J** continues it in chat, **⌘N** starts a new one and **⌘[** / **⌘]** move between runs. Use **Stop** or **⌘.** to cancel a response; a stopped or partial result is never used by default.
 
 ### Command aliases and hotkeys
 
@@ -122,6 +124,8 @@ Clipboard history skips confidential/transient content markers, known password m
 History defaults to **7 days and 100 entries**, with a configurable maximum of 500 entries and a 64 MB content budget. Images are stored as PNGs up to 10 MB each. Copied files are references to the originals; clearing history never deletes those originals. Pausing capture keeps saved history available. Pinned entries are kept past the retention period and entry limit, and claim the 64 MB budget before unpinned entries.
 
 AI runs on-device with no cloud fallback. Clipboard and selected text reach the model only when you attach them, or when you start a writing command, which uses the text selected in the app you came from. That selection and where it came from stay in memory for the writing task, so the result can replace it after OpenRay checks it hasn't changed. Launcher conversations are not saved automatically; **Save as Note** saves the chosen response, and the AI Chat window saves its chats on this Mac. AI input is limited to 6,000 characters.
+
+When an app doesn't share its selection over Accessibility, a writing command sends that app **⌘C** and reads its answer. macOS doesn't say which app wrote the clipboard, so OpenRay takes a clipboard change as the app's answer only when every check it can make holds: nothing on the copy marks it as from another device (Universal Clipboard) or names another app as its writer; the app is still in front, or OpenRay over it, and you haven't typed, clicked or closed OpenRay since; and, when the app shares its text field's contents, the copied text is in that field. Otherwise OpenRay doesn't use the copy, never puts anything back over it, and asks you to paste or type the text (a windowless command shows a short message instead). One case remains that no check can catch: if the app ignores **⌘C** and, within that fraction of a second, something that writes the clipboard without a keystroke (such as clipboard sync) copies unmarked text (text that's also in the field, when the app shares it), OpenRay can take it for the selection. Other launchers that read selections this way share this limit. A copy OpenRay couldn't place stays on your clipboard but out of clipboard history.
 
 ### Local data
 

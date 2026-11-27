@@ -21,11 +21,14 @@ struct ArgumentSession {
     func value(at index: Int) -> String { specs.indices.contains(index) ? values[specs[index].name] ?? "" : "" }
 }
 
-/// A launcher key that isn't text editing: ⌘Esc, ⌘W, ⌘[ and ⌃J/⌃K with Vim navigation on.
+/// A launcher key that isn't text editing: ⌘Esc, ⌘W, ⌘[, ⌘] and ⌃J/⌃K with Vim navigation on.
 enum LauncherKeyCommand: Equatable {
     case popToRoot, closeWindow, moveDown, moveUp
-    /// ⌘[ (main #12): one step back, whatever Esc is set to do.
+    /// ⌘[ (main #12): one step back, whatever Esc is set to do. On a writing run with an
+    /// earlier one, the previous run (work item 3).
     case back
+    /// ⌘]: the next writing run.
+    case forward
 
     /// The command for a key press, from its hardware key code and modifiers. Pure, so it's
     /// tested without events.
@@ -34,6 +37,7 @@ enum LauncherKeyCommand: Equatable {
         case (53, .command): .popToRoot
         case (13, .command): .closeWindow
         case (33, .command): .back
+        case (30, .command): .forward
         case (38, .control) where vim: .moveDown
         case (40, .control) where vim: .moveUp
         default: nil
@@ -715,11 +719,19 @@ extension LauncherModel {
             panel?.dismiss()
         case .back:
             guard onboarding == nil else { return false }
+            // A writing run with an earlier one shows that run, as Raycast's Quick AI does.
+            if confirmation == nil, !showShortcuts, !showActions, !showsAttachmentPreview, canShowPreviousRun {
+                showWritingRun(-1)
+                return true
+            }
             // Back never hides the launcher: on an empty Everything there's nowhere to go.
             let atRoot =
                 destination == .search && section == .home && query.isEmpty && confirmation == nil && !showShortcuts
                 && !showActions && argumentSession == nil && argumentLink == nil && !showsAttachmentPreview && editor == nil
             if !atRoot { goBack() }
+        case .forward:
+            guard onboarding == nil, confirmation == nil, !showShortcuts, !showActions, canShowNextRun else { return false }
+            showWritingRun(1)
         case .moveDown, .moveUp:
             let offset = command == .moveDown ? 1 : -1
             if showActions {

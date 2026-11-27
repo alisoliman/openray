@@ -52,7 +52,7 @@ struct OpenRayHelpView: View {
                         shortcut(["⌘", "["], "Go back one step, even when Esc is set to close the window")
                     }
                     paragraph(
-                        "In AI the keys follow the conversation: Return sends, ⇧Return or ⌘Return adds a line, and Return on an empty field uses a finished writing result.")
+                        "In AI chat, Return sends and ⇧Return or ⌘Return adds a line. On a writing result, Return pastes it back into the app you came from, ⌘Return copies it and ⌥Return pastes it with formatting. With the AI Primary action set to Copy Response, Return copies too, and Paste Response is in ⌘K.")
                         .foregroundStyle(OR.Color.text2)
                 }
 
@@ -88,9 +88,11 @@ struct OpenRayHelpView: View {
 
                 section("Work with AI", kind: .ai, symbol: nil) {
                     paragraph(
-                        "Press Tab on any search to ask AI. Writing commands such as Fix Spelling & Grammar pick up the text you selected in another app and show what changed. Press Return on the empty field to replace the selection in its app; OpenRay checks the selection is unchanged first, and copies the result instead if it isn't.")
+                        "Select text in any app and run a writing command such as Improve Writing or Fix Spelling & Grammar, from search, an alias or a hotkey. It runs at once on your selection, and the result streams in. Return pastes it over the selection, closes OpenRay and puts your clipboard back; a short message confirms it. It goes only to the app the run came from; if it can't paste, OpenRay says why and keeps the result to copy.")
                     paragraph(
-                        "After a result, type a follow-up such as Make it warmer and press Return to refine it. Try Again (⌘R) repeats the last request with the context it had, and Use Result as New Passage in ⌘K starts over from the result.")
+                        "Type a follow-up such as Make it warmer and press Return to refine a result. ⌘R regenerates it with different wording, and ⇧⌘R more freely. ⌘K has Show Original and Show Changes, and Fix Spelling & Grammar marks its changes as it opens. Each new selection starts a new run; ⌘[ and ⌘] go back and forth between runs, and ⌘J continues one in chat.")
+                    paragraph(
+                        "When an app doesn't share its selection, OpenRay copies it and puts your clipboard back; anything you copy yourself meanwhile stays. With nothing selected, it says so; use the clipboard or type the text instead. Quick Fix fixes the selection, or the whole text field, in place with no window.")
                     paragraph(
                         "In chat, Return sends and ⇧Return or ⌘Return adds a line. Attach the clipboard or your selection explicitly. Requests are limited to 6,000 characters.")
                     paragraph(

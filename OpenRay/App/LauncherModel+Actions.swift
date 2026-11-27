@@ -124,8 +124,8 @@ extension LauncherModel {
         }
     }
 
-    /// ⌘1–⌘8: favorites, or retargeting a quicklink argument. A finished writing
-    /// result claims ⌘1–⌘3 for its views, so those numbers switch the view there.
+    /// ⌘1–⌘8: favorites, or retargeting a quicklink argument. An AI entry bound to a ⌘-number
+    /// would take that number there.
     func performNumber(_ number: Int) {
         guard !showActions, confirmation == nil, editor == nil, onboarding == nil else { return }
         if destination == .ai, (1...9).contains(number), let key = String(number).first,
@@ -207,7 +207,7 @@ extension LauncherModel {
     func pasteSelected() {
         if confirmation != nil || showActions || isCollapsedToBar || argumentSession != nil { return }
         if destination == .ai {
-            pasteAIResponse()
+            if ai.action == .chat { pasteAIResponse() } else { performAISecondary() }
             return
         }
         // ⌘↩ only does something when the bar names it.
@@ -264,37 +264,20 @@ extension LauncherModel {
         panel?.dismiss(restoreFocus: false)
         Task {
             do { try await SyntheticInput.paste(into: target, expectedChangeCount: changeCount) } catch {
-                // Show first: showing can reset to Home, which clears feedback.
+                // Show first: showing can reset to Home, which clears feedback. ⌘V is offered only
+                // while the copy still owns the clipboard.
                 panel?.show()
-                feedback = .error(error.localizedDescription)
+                let owned = clipboard.changeCount == changeCount
+                feedback = .error(owned ? "\(error.localizedDescription) \(Self.pasteItYourself)" : error.localizedDescription)
             }
         }
     }
 
-    /// Pastes the latest reply into the app OpenRay was opened from (⌘K "Paste to …").
+    /// Pastes the latest chat reply into the app OpenRay was opened from (⌘K "Paste to …").
     func pasteAIResponse() {
         guard let response = ai.latestResponse, !ai.isGenerating, !aiResultIsUnchanged else { return }
         paste(response.text)
     }
-
-    /// The selection the current writing result replaces: the one its passage came from, pinned
-    /// to this conversation (main #13). Nil for chat and for passages from elsewhere.
-    ///
-    /// The pinned selection must still be the passage on screen (a clipboard or typed passage,
-    /// even with the same text, has no target), the result must come from it, and its place in
-    /// the app must be known.
-    var aiReplaceTarget: SelectedTextContext? {
-        guard ai.action != .chat, let pin = aiSelectionTarget, pin.conversation == ai.conversationToken,
-            pin.context.canReplace
-        else { return nil }
-        if ai.command != nil { return ai.lastAttachment?.id == pin.attachmentID ? pin.context : nil }
-        guard ai.attachments.first?.id == pin.attachmentID else { return nil }
-        if ai.lastSource != nil, ai.lastAttachment?.id != pin.attachmentID { return nil }
-        return pin.context
-    }
-
-    /// Whether accepting the result (↩ on an empty field) replaces its selection in place.
-    var aiReplacesSource: Bool { aiReplaceTarget != nil }
 
     /// Paste into the app in front, which may not be where the passage came from.
     var aiPasteTitle: String {
@@ -302,33 +285,23 @@ extension LauncherModel {
             ? "Paste to \(targetAppName)" : "Copy · ⌘V in \(targetAppName)"
     }
 
-    // MARK: - AI keys (owner decision: main #12/#13's keys inside the AI view)
+    // MARK: - AI keys (work item 5: ↵ pastes, ⌘↵ copies, ⌥↵ pastes formatted)
 
-    /// Whether ↩ on an empty field accepts the latest writing result: finished, not stopped or
-    /// failed, not yet inserted, and with something to give back.
+    /// Whether ↵ on an empty field can use the latest writing result: finished, not stopped or
+    /// failed, and with something to give back.
     var canAcceptAIResponse: Bool {
         guard ai.action != .chat, !ai.isGenerating, !isPastingAIResponse, ai.errorMessage == nil,
             ai.failedRevision == nil, ai.instruction.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
             let last = ai.messages.last, last.role == .assistant, !last.isPartial, !last.text.isEmpty,
             !aiResultIsUnchanged
         else { return false }
-        if let inserted = insertedAIResult, inserted.conversation == ai.conversationToken, inserted.text == last.text {
-            return false
-        }
         return true
     }
 
-    /// What ↩ does with a finished result: replace the selection it came from, or copy it.
-    var aiAcceptTitle: String {
-        guard let target = aiReplaceTarget else { return "Copy Result" }
-        let canReplace = windows.hasPermission && target.application.map { !$0.isTerminated } == true
-        return canReplace || !clipboard.usesGeneralPasteboard
-            ? "Replace in \(target.sourceName)" : "Copy · ⌘V in \(target.sourceName)"
-    }
-
-    /// ↩ in the AI view's fields. Chat and the passage composer send. In a writing command's
-    /// field, typed text runs the command or, once there's a result, revises it; an empty field
-    /// accepts the result. Held keys never get here twice (see `AIComposerInput`).
+    /// ↵ in the AI view's fields. Chat and the passage composer send. In a writing command's
+    /// field, typed text revises the result; an empty field uses it (Paste Response, or Copy
+    /// Response with Primary Action set to copy). Held keys never get here twice (see
+    /// `AIComposerInput`).
     func submitAI() {
         guard !ai.isGenerating else { return }
         if ai.action == .chat || ai.isRevising || ai.messages.last?.role != .assistant {
@@ -344,77 +317,32 @@ extension LauncherModel {
         focusRequest += 1
     }
 
-    /// Replaces the original selection with the result after checking it's unchanged, or copies
-    /// the result when it has no selection to go back to (main #13).
-    func acceptAIResponse() {
-        guard canAcceptAIResponse, let response = ai.messages.last?.text else { return }
-        let conversation = ai.conversationToken
-        guard let target = aiReplaceTarget else {
-            copy(response, label: ai.title)
-            return
-        }
-        guard mayWriteClipboard else { return }
-        guard clipboard.copy(response) else {
-            feedback = .error("Couldn't copy the result. Try again.")
-            return
-        }
-        guard clipboard.usesGeneralPasteboard, !sideEffects.isInert else {
-            feedback = .info("Copied to the isolated verification pasteboard. Cross-app paste is disabled in this mode.")
-            return
-        }
-        guard let application = target.application, !application.isTerminated, windows.hasPermission else {
-            toast("Copied. Open \(target.sourceName) and press ⌘V, or turn on Accessibility for direct paste.")
-            return
-        }
-        let changeCount = clipboard.changeCount
-        isPastingAIResponse = true
-        panel?.dismiss(restoreFocus: false)
-        Task {
-            defer { isPastingAIResponse = false }
-            do {
-                try await SyntheticInput.paste(
-                    into: application, expectedChangeCount: changeCount, validateTarget: target.validateForPaste)
-                // The selection it replaced is gone; later results are copied until a new one is chosen.
-                insertedAIResult = (conversation, response)
-                if aiSelectionTarget?.conversation == conversation { aiSelectionTarget = nil }
-                feedback = .success(
-                    "Inserted in \(target.sourceName). To replace it again, select the inserted text and reopen OpenRay.")
-            } catch {
-                // Show first: showing can reset to Home, which clears feedback.
-                panel?.show()
-                feedback = .error(error.localizedDescription)
-            }
-        }
-    }
-
     /// Starts a fresh writing run on the latest result, keeping where it goes back to (main #13's
-    /// Use Last Result). The model starts from a clean context.
+    /// Use Last Result), and runs it at once, as any chosen passage does. The model starts from a
+    /// clean context; the run before stays in history.
     func continueAIFromResult() {
         guard ai.action != .chat, ai.command == nil, !ai.isGenerating, let result = ai.lastCompletedResult else { return }
         let target = aiReplaceTarget
+        let destination = aiRunDestination
         let action = ai.action
         let appName = ai.lastAttachment?.appName
-        ai.newConversation(action: action)
-        ai.open(action)
+        startWritingRun(action)
+        // The new run goes back where this one does.
+        aiDestination = destination.map { RunDestination(
+            conversation: ai.conversationToken, application: $0.application, name: $0.name,
+            focusIsOriginal: $0.focusIsOriginal) }
         ai.attach(AIAttachment(source: target == nil ? .response : .selection, text: result, appName: appName))
         // The target is carried forward explicitly, bound to the new passage.
         if let target, let attached = ai.attachments.first, attached.text == result {
             aiSelectionTarget = PinnedSelection(context: target, conversation: ai.conversationToken, attachmentID: attached.id)
         }
+        if ai.canSend { ai.send() }
         focusRequest += 1
     }
 
     /// A result with nothing to paste back is a state, not something to paste:
     /// proofreading that changed nothing, or action items that found none.
-    var aiResultIsUnchanged: Bool {
-        guard !ai.isGenerating, let response = ai.latestResponse else { return false }
-        switch ai.action {
-        case .proofread: return response.text == ai.lastSource
-        // A follow-up's reply is free-form text: only an extraction can find nothing.
-        case .actionItems: return !ai.repliesToRevision(response) && response.checklistItems.isEmpty
-        default: return false
-        }
-    }
+    var aiResultIsUnchanged: Bool { ai.resultIsUnchanged }
 
     func saveResponseAsNote() {
         guard let response = ai.latestResponse else { return }
@@ -830,8 +758,8 @@ extension LauncherModel {
     }
 
     /// ⌘↩ in ⌘K runs the entry bound to ⌘↩ where you are, whatever row is highlighted or
-    /// filtered. In AI nothing is: ⌘↩ adds a line there, and pasting into another app takes
-    /// choosing Paste explicitly.
+    /// filtered. On a writing result that's the action ↩ doesn't do; in chat nothing is, as ⌘↩
+    /// adds a line there and pasting into another app takes choosing Paste explicitly.
     func performCommandReturnAction() {
         guard let entry = actionEntries.first(where: { $0.shortcut == .commandReturn }) else { return }
         performAction(entry)
@@ -1110,6 +1038,7 @@ extension LauncherModel {
     private func aiActions() -> [ActionEntry] {
         var entries: [ActionEntry] = []
         let response = ai.isGenerating ? nil : ai.latestResponse
+        let isWriting = ai.action != .chat
         if ai.isGenerating {
             entries.append(
                 ActionEntry(
@@ -1117,15 +1046,33 @@ extension LauncherModel {
                     id: "stop", title: "Stop Response", symbol: "stop.fill", shortcut: .command("."), group: .item
                 ) { [weak self] in self?.ai.cancel() })
         }
-        // ↩ on an empty field does this (main #13): replace the selection it came from, or copy.
+        // Work item 5: ↵ pastes (or copies), ⌘↵ always copies, ⌥↵ pastes with formatting. ⌘↵ is
+        // registered in both modes, so it works where no field takes it (an AI Command's result)
+        // and from ⌘K. With Copy as the primary action, the paste is here by name, with no key.
         if canAcceptAIResponse {
             entries.append(
                 ActionEntry(
-                    id: "accept", title: aiAcceptTitle, symbol: aiReplacesSource ? "arrow.uturn.left" : "doc.on.doc",
+                    id: "accept", title: aiAcceptTitle, symbol: aiPrimaryPastes ? "arrow.down.doc" : "doc.on.doc",
                     shortcut: .return, group: .item
                 ) { [weak self] in self?.acceptAIResponse() })
+            entries.append(
+                ActionEntry(
+                    id: "secondary", title: aiSecondaryTitle, symbol: "doc.on.doc",
+                    shortcut: .commandReturn, key: .return, modifiers: .command, group: .item
+                ) { [weak self] in self?.performAISecondary() })
+            if !aiPrimaryPastes {
+                entries.append(
+                    ActionEntry(id: "pasteResponse", title: aiPasteResponseTitle, symbol: "arrow.down.doc", group: .item) {
+                        [weak self] in self?.pasteWritingResult()
+                    })
+            }
+            entries.append(
+                ActionEntry(
+                    id: "pasteFormatted", title: "Paste Formatted Response", symbol: "doc.richtext",
+                    shortcut: KeyShortcut(["⌥", "↩"]), key: .return, modifiers: .option, group: .item
+                ) { [weak self] in self?.pasteWritingResult(formatted: true) })
         }
-        if response != nil {
+        if !isWriting, response != nil {
             entries.append(
                 ActionEntry(id: "copy", title: "Copy Response", symbol: "doc.on.doc", shortcut: .command("C", shift: true),
                             key: "c", modifiers: [.command, .shift], group: .item)
@@ -1133,45 +1080,57 @@ extension LauncherModel {
                     if let text = self?.ai.latestResponse?.text { self?.copy(text) }
                 })
             if !aiResultIsUnchanged {
-                // ⌘↩ inserts a new line in AI, so pasting into the app in front is in ⌘K only.
+                // ⌘↩ inserts a new line in chat, so pasting into the app in front is in ⌘K only.
                 entries.append(
                     ActionEntry(id: "paste", title: aiPasteTitle, symbol: "arrow.down.doc", group: .item) { [weak self] in
                         self?.pasteAIResponse()
                     })
             }
-            // “No action items found.” isn't worth keeping as a note.
-            if !(ai.action == .actionItems && aiResultIsUnchanged) {
-                entries.append(
-                    ActionEntry(
-                        id: "note", title: "Save as Note", symbol: "note.text.badge.plus", shortcut: .command("S"),
-                        key: "s", modifiers: .command, group: .item
-                    ) { [weak self] in self?.saveResponseAsNote() })
-            }
         }
-        // A stopped writing result can't be copied, but it can be tried again.
-        if ai.canRetry {
+        // “No action items found.” isn't worth keeping as a note.
+        if response != nil, !(ai.action == .actionItems && aiResultIsUnchanged) {
             entries.append(
                 ActionEntry(
-                    id: "retry", title: "Try Again", symbol: "arrow.clockwise", shortcut: .command("R"), key: "r",
-                    modifiers: .command, group: .item
-                ) { [weak self] in self?.ai.retry() })
+                    id: "note", title: "Save as Note", symbol: "note.text.badge.plus", shortcut: .command("S"),
+                    key: "s", modifiers: .command, group: .item
+                ) { [weak self] in self?.saveResponseAsNote() })
         }
-        // The attachment controls, for the keyboard. Writing commands take their
-        // passage before the first run, as the Use Clipboard and Use Selection buttons do.
+        // A stopped writing result can't be pasted, but it can be generated again.
+        if ai.canRetry {
+            if isWriting {
+                entries.append(
+                    ActionEntry(
+                        id: "retry", title: "Regenerate", symbol: "arrow.clockwise", shortcut: .command("R"), key: "r",
+                        modifiers: .command, group: .item
+                    ) { [weak self] in self?.regenerateAIResult() })
+                entries.append(
+                    ActionEntry(
+                        id: "retryCreative", title: "Regenerate, More Creative", symbol: "wand.and.sparkles",
+                        shortcut: .command("R", shift: true), key: "r", modifiers: [.command, .shift], group: .item
+                    ) { [weak self] in self?.regenerateAIResult(creative: true) })
+            } else {
+                entries.append(
+                    ActionEntry(
+                        id: "retry", title: "Try Again", symbol: "arrow.clockwise", shortcut: .command("R"), key: "r",
+                        modifiers: .command, group: .item
+                    ) { [weak self] in self?.ai.retry() })
+            }
+        }
+        // The attachment controls, for the keyboard. Writing commands take their passage when
+        // there's none, as the Use Clipboard and Use Selection buttons do.
         if ai.availability.isAvailable, !ai.isGenerating {
-            let isChat = ai.action == .chat
-            if isChat || ai.messages.isEmpty {
+            if !isWriting || (ai.messages.isEmpty && ai.attachments.isEmpty) {
                 if !ai.attachments.contains(where: { $0.source == .clipboard }) {
                     entries.append(
                         ActionEntry(
-                            id: "attachClipboard", title: isChat ? "Attach Clipboard" : "Use Clipboard",
+                            id: "attachClipboard", title: isWriting ? "Use Clipboard" : "Attach Clipboard",
                             symbol: "list.clipboard", group: .organize
                         ) { [weak self] in self?.attachClipboardToAI() })
                 }
                 if !ai.attachments.contains(where: { $0.source == .selection }) {
                     entries.append(
                         ActionEntry(
-                            id: "attachSelection", title: isChat ? "Attach Selection" : "Use Selection",
+                            id: "attachSelection", title: isWriting ? "Use Selection" : "Attach Selection",
                             symbol: "character.cursor.ibeam", group: .organize
                         ) { [weak self] in
                             self?.attachSelectionFromPreviousApp(reportErrors: true)
@@ -1179,34 +1138,28 @@ extension LauncherModel {
                         })
                 }
             }
-            if let attachment = ai.attachments.last {
+            if !isWriting, let attachment = ai.attachments.last {
                 entries.append(
                     ActionEntry(
                         id: "removeAttachment", title: "Remove Attachment", symbol: "xmark.circle", group: .organize
                     ) { [weak self] in self?.ai.removeAttachment(attachment.id) })
             }
         }
-        if pendingNewSelection != nil, ai.action != .chat, !ai.isGenerating {
-            entries.append(
-                ActionEntry(
-                    id: "useNewSelection", title: "Use New Selection as Passage", symbol: "character.cursor.ibeam",
-                    group: .organize
-                ) { [weak self] in self?.usePendingSelection() })
-        }
-        if ai.action != .chat, ai.command == nil, !ai.isGenerating, ai.lastCompletedResult != nil {
+        if isWriting, ai.command == nil, !ai.isGenerating, ai.lastCompletedResult != nil {
             entries.append(
                 ActionEntry(
                     id: "continueResult", title: "Use Result as New Passage", symbol: "arrow.triangle.2.circlepath",
                     group: .organize
                 ) { [weak self] in self?.continueAIFromResult() })
         }
-        if ai.action != .chat, response != nil {
+        if isWriting, response != nil {
             entries.append(
-                ActionEntry(id: "chat", title: "Continue in Chat", symbol: "bubble.left.and.text.bubble.right", group: .organize)
-                { [weak self] in
+                ActionEntry(
+                    id: "chat", title: "Ask About It in Chat", symbol: "bubble.left.and.text.bubble.right", group: .organize
+                ) { [weak self] in
                     guard let self, !self.ai.isGenerating, let text = self.ai.latestResponse?.text else { return }
-                    // The writing command keeps its work for when it's opened again.
-                    self.stashWritingSession()
+                    // The writing run stays in the history.
+                    self.commitWritingRun()
                     self.ai.newConversation(action: .chat)
                     self.ai.open(.chat)
                     self.ai.attach(AIAttachment(source: .response, text: text))
@@ -1217,27 +1170,36 @@ extension LauncherModel {
         if !ai.isGenerating {
             entries.append(
                 ActionEntry(
-                    id: "new", title: ai.action == .chat ? "New Chat" : "Start Over", symbol: "square.and.pencil",
+                    id: "new", title: isWriting && ai.command == nil ? "New" : "New Chat", symbol: "square.and.pencil",
                     shortcut: .command("N"), group: .organize
-                ) { [weak self] in
-                    self?.ai.newConversation()
-                    self?.focusRequest += 1
-                })
+                ) { [weak self] in self?.newAIConversation() })
         }
-        // ⌘1–⌘3 switch a finished writing result between its three views.
-        if ai.action.showsDiff, let response, !response.isPartial, ai.lastSource != nil, !aiResultIsUnchanged {
-            let modes: [(mode: AIDiffMode, title: String, symbol: String)] = [
-                (.changes, "Show Changes", "plus.forwardslash.minus"),
-                (.result, "Show Result", "doc.text"),
-                (.original, "Show Original", "doc.plaintext"),
-            ]
-            for (index, option) in modes.enumerated() {
-                let key = Character("\(index + 1)")
+        // ⌘[ and ⌘] are the launcher's own keys (see `handle(_:)`).
+        if canShowPreviousRun {
+            entries.append(
+                ActionEntry(
+                    id: "previousRun", title: "Previous Run", symbol: "chevron.backward", shortcut: .command("["),
+                    group: .organize
+                ) { [weak self] in self?.showWritingRun(-1) })
+        }
+        if canShowNextRun {
+            entries.append(
+                ActionEntry(
+                    id: "nextRun", title: "Next Run", symbol: "chevron.forward", shortcut: .command("]"), group: .organize
+                ) { [weak self] in self?.showWritingRun(1) })
+        }
+        // The original passage, and the result with its changes marked, are a ⌘K away.
+        if isWriting, let response, !response.isPartial, !aiResultIsUnchanged, ai.lastSource != nil,
+            ai.command == nil || ai.command?.source != nil
+        {
+            var modes: [(mode: AIDiffMode, title: String, symbol: String)] = [(.result, "Show Response", "doc.text")]
+            if ai.lastDiff != nil { modes.append((.changes, "Show Changes", "plus.forwardslash.minus")) }
+            modes.append((.original, "Show Original", "doc.plaintext"))
+            for option in modes {
                 entries.append(
                     ActionEntry(
-                        id: "diff.\(index + 1)", title: option.title,
-                        symbol: ai.diffMode == option.mode ? "checkmark" : option.symbol,
-                        shortcut: .command(String(key)), key: KeyEquivalent(key), modifiers: .command, group: .panel
+                        id: "view.\(option.title)", title: option.title,
+                        symbol: ai.diffMode == option.mode ? "checkmark" : option.symbol, group: .panel
                     ) { [weak self] in self?.ai.diffMode = option.mode })
             }
         }

@@ -3,9 +3,9 @@ import Testing
 
 @testable import OpenRay
 
-/// main #13's writing journey on the 2.0 AI view: the selection is pinned to its writing task, a
-/// follow-up revises the result with its context, ↩ on an empty field accepts it, and failures
-/// never accept an older result by default.
+/// main #13's writing journey on the 2.0 AI view, as the Raycast-parity rebuild runs it: a
+/// captured selection runs at once and is pinned to its run, a follow-up revises the result with
+/// its context, ↩ on an empty field pastes it back, and failures never use an older result.
 @MainActor
 struct MainMergeAIWritingTests {
     private func model(engine: TestAIEngine = TestAIEngine()) -> LauncherModel {
@@ -20,34 +20,34 @@ struct MainMergeAIWritingTests {
         return context
     }
 
-    /// Opens a writing command on a captured selection and runs it to a result.
+    /// Opens a writing command on a captured selection, which runs it to a result at once.
     private func runWriting(
         _ model: LauncherModel, _ action: AIAction = .rewrite, passage: String = "We was ready yesterday.",
         source: String = "Source editor"
     ) async {
         model.setCapturedSelection(selection(passage, source: source))
         model.openAI(action)
-        model.submitAI()
         await model.ai.waitForResponse()
     }
 
-    @Test func aSelectedPassageRunsOnReturnAndReturnThenReplacesItInItsApp() async {
-        let model = model()
+    @Test func aSelectedPassageRunsAtOnceAndReturnPastesTheResultBack() async {
+        let engine = TestAIEngine()
+        let model = model(engine: engine)
         defer { model.stop() }
         model.setCapturedSelection(selection("We was ready yesterday."))
         model.openAI(.rewrite)
-        // 2.0 shows the passage first, so an instruction can be added; ↩ runs it.
+        // Work item 1: no second ↩; the run starts as the command opens.
+        #expect(model.ai.isGenerating)
         #expect(model.ai.attachments.first?.text == "We was ready yesterday.")
         #expect(model.aiReplaceTarget?.sourceName == "Source editor")
-        #expect(!model.canAcceptAIResponse)
-        model.submitAI()
         await model.ai.waitForResponse()
+        #expect(engine.prompts == ["We was ready yesterday."])
         #expect(model.ai.messages.count == 2)
         #expect(model.canAcceptAIResponse)
-        #expect(model.aiAcceptTitle == "Replace in Source editor")
-        #expect(model.aiReplacesSource)
+        #expect(model.aiAcceptTitle == "Paste Response")
+        #expect(model.aiSecondaryTitle == "Copy Response")
 
-        // ↩ on the empty field accepts: here, the isolated pasteboard gets the result.
+        // ↩ on the empty field pastes: here, the isolated pasteboard gets the result.
         model.submitAI()
         #expect(model.clipboard.readText() == "A helpful reply.")
         #expect(model.feedback?.text.contains("isolated verification pasteboard") == true)
@@ -77,7 +77,7 @@ struct MainMergeAIWritingTests {
         #expect(model.ai.acceptedRevisions == ["Make it warmer"])
         #expect(model.ai.lastSource == "Original passage")
         #expect(model.aiReplaceTarget?.sourceName == "Original app")
-        #expect(model.aiAcceptTitle == "Replace in Original app")
+        #expect(model.aiAcceptTitle == "Paste Response")
 
         // The next follow-up carries the earlier one.
         model.ai.instruction = "Use one sentence"
@@ -139,7 +139,7 @@ struct MainMergeAIWritingTests {
         #expect(try #require(engine.prompts.last).contains("<revision_request>\nMake it formal\n</revision_request>"))
     }
 
-    @Test func aFailedFirstRunGivesTheInstructionBack() async {
+    @Test func aFailedFirstRunKeepsThePassageAndReturnRunsItAgain() async {
         let engine = TestAIEngine()
         engine.snapshots = []
         engine.failure = .busy
@@ -147,14 +147,13 @@ struct MainMergeAIWritingTests {
         defer { model.stop() }
         model.setCapturedSelection(selection("A passage"))
         model.openAI(.rewrite)
-        model.ai.instruction = "Keep it short"
-        model.submitAI()
         await model.ai.waitForResponse()
         #expect(model.ai.errorMessage != nil)
-        #expect(model.ai.instruction == "Keep it short")
+        #expect(model.ai.attachments.first?.text == "A passage")
         #expect(!model.canAcceptAIResponse)
         engine.failure = nil
         engine.snapshots = ["Short."]
+        model.ai.instruction = "Keep it short"
         model.submitAI()
         await model.ai.waitForResponse()
         #expect(engine.prompts.last == "A passage")
@@ -170,20 +169,21 @@ struct MainMergeAIWritingTests {
         model.ai.newConversation()
         #expect(model.aiReplaceTarget == nil)
 
-        // A clipboard passage in the same conversation never replaces the old selection.
-        model.setCapturedSelection(selection("Source passage"))
-        model.openAI(.rewrite)
+        // A clipboard passage is a new run that never goes back over the old selection.
+        await runWriting(model, passage: "Source passage")
         #expect(model.aiReplaceTarget != nil)
         _ = model.clipboard.copy("An independent passage")
         model.attachClipboardToAI()
+        #expect(model.ai.attachments.first?.source == .clipboard)
         #expect(model.aiReplaceTarget == nil)
-        model.submitAI()
         await model.ai.waitForResponse()
         #expect(model.ai.lastSource == "An independent passage")
-        #expect(model.aiAcceptTitle == "Copy Result")
+        #expect(model.aiReplaceTarget == nil)
+        // The selection's run is one ⌘[ away.
+        #expect(model.writingRuns.last?.snapshot.lastSource == "Source passage")
     }
 
-    @Test func useResultAsNewPassageStartsFreshAndKeepsTheTarget() async throws {
+    @Test func useResultAsNewPassageRunsOnItAndKeepsTheTarget() async throws {
         let engine = TestAIEngine()
         let model = model(engine: engine)
         defer { model.stop() }
@@ -191,22 +191,19 @@ struct MainMergeAIWritingTests {
         let resets = engine.resetCount
         let entry = try #require(model.actions(for: nil).first { $0.id == "continueResult" })
         entry.perform()
-        #expect(model.ai.messages.isEmpty)
         #expect(model.ai.attachments.first?.text == "A helpful reply.")
         #expect(model.aiReplaceTarget?.sourceName == "Notes")
         #expect(engine.resetCount > resets)
-        model.submitAI()
         await model.ai.waitForResponse()
         #expect(engine.prompts.last == "A helpful reply.")
-        #expect(model.aiAcceptTitle == "Replace in Notes")
+        #expect(model.aiAcceptTitle == "Paste Response")
     }
 
-    @Test func anInsertedResultIsNeverInsertedTwice() async throws {
+    @Test func aResultBeingPastedIsNeverPastedTwice() async throws {
         let model = model()
         defer { model.stop() }
         await runWriting(model)
-        let text = try #require(model.ai.messages.last?.text)
-        model.insertedAIResult = (model.ai.conversationToken, text)
+        model.isPastingAIResponse = true
         #expect(!model.canAcceptAIResponse)
         #expect(!model.actions(for: nil).contains { $0.id == "accept" })
     }
@@ -256,12 +253,11 @@ struct MainMergeAIWritingTests {
 
         engine.snapshots = ["Partial", "Partial text"]
         engine.delay = .milliseconds(100)
-        // The finished result is kept; the new selection is offered and taken explicitly.
+        // A new selection starts a new run at once (work item 3).
         model.setCapturedSelection(selection("Teh cat sat."))
         model.openAI(.proofread)
-        #expect(model.pendingNewSelection?.text == "Teh cat sat.")
-        model.usePendingSelection()
-        model.submitAI()
+        #expect(model.ai.attachments.first?.text == "Teh cat sat.")
+        #expect(model.ai.isGenerating)
         model.ai.cancel()
         await model.ai.waitForResponse()
         #expect(model.ai.latestResponse == nil)

@@ -44,9 +44,10 @@ final class AICommandProvider: CommandProvider {
                 mode: .noView, badge: "Command"),
             CommandDescriptor(
                 id: Self.quickFixID, title: "Quick Fix",
-                subtitle: available ? "Runs \(quickFixTitle(in: hub)) on your selection" : "Not available yet", kind: .ai,
-                symbol: "wand.and.stars", keywords: ["AI", "fix", "selection", "grammar", "hotkey"], mode: .ai,
-                badge: "AI command", isUnavailable: !available && !quickFixIsTranslation(in: hub)),
+                subtitle: available ? "Runs \(quickFixTitle(in: hub)) in place on your text" : "Not available yet", kind: .ai,
+                symbol: "wand.and.stars", keywords: ["AI", "fix", "selection", "grammar", "hotkey"],
+                // It replaces text in the app you're in, with no window (work item 8).
+                mode: .noView, badge: "AI command", isUnavailable: !available && !quickFixIsTranslation(in: hub)),
             CommandDescriptor(
                 id: Self.createID, title: "Create AI Command", subtitle: "A prompt you can run on any text", kind: .ai,
                 symbol: "plus.bubble", keywords: ["AI", "new", "prompt", "custom"], mode: .noView, badge: "Command",
@@ -71,7 +72,8 @@ final class AICommandProvider: CommandProvider {
             id: command.id, title: command.name,
             subtitle: usable ? LauncherModel.aiCommandSubtitle : "Not available yet", kind: .ai, symbol: command.symbol,
             keywords: ["AI", "command", command.subtitle].filter { !$0.isEmpty }, arguments: arguments(for: command, in: model),
-            mode: .ai, badge: "AI command", detail: usable && !command.subtitle.isEmpty ? command.subtitle : nil,
+            // Replace Selection runs with no window, so a hotkey never shows the panel first.
+            mode: command.replacesInPlace ? .noView : .ai, badge: "AI command", detail: usable && !command.subtitle.isEmpty ? command.subtitle : nil,
             isUnavailable: !usable)
     }
 
@@ -106,13 +108,9 @@ final class AICommandProvider: CommandProvider {
             hub.openChatWindow()
         case Self.quickFixID:
             model.store.recordUse(of: item.id)
-            let target = hub.settings.quickFixCommandID
-            // A target that needs a value opens its fields first, then runs on the selection.
-            if let targetItem = model.bindableCommands.first(where: { $0.id == target }), model.needsArguments(targetItem) {
-                model.beginArguments(for: targetItem)
-                return
-            }
-            run(commandID: target, arguments: [:], in: model, startsWritingCommands: true)
+            // It reads its target first; a command that needs a value then asks for it, and runs
+            // in place on that target.
+            model.runQuickFix()
         case Self.createID:
             model.store.recordUse(of: item.id)
             hub.requestEditor(.newCommand)
@@ -123,17 +121,31 @@ final class AICommandProvider: CommandProvider {
             // Rows in Search AI Commands carry the command's own id, so the registry fills
             // their arguments through the same fields as a root search does.
             let commandID = ref.payload ?? ref.id
+            // A choice such as Change Tone's tone is asked first, with its default picked, and
+            // the command runs on ↵ in the fields (work item 1). The registry fills defaults into
+            // `ref`, so the row's own values tell whether the fields were shown.
+            // Only a choice that always resolves to a value (its default, or a required first
+            // option), so the fields can't come back after ↵.
+            let choices = model.argumentSpecs(for: item).filter { spec in
+                if case .dropdown = spec.type { spec.defaultValue != nil || !spec.isOptional } else { false }
+            }
+            if case .provided(let row) = item.action, choices.contains(where: { row.arguments[$0.name] == nil }) {
+                // A windowless command's hotkey left the panel hidden; the fields live in it.
+                if model.panel?.isVisible == false { model.panel?.show() }
+                if model.beginArguments(for: item) { return }
+            }
             model.store.recordUse(of: commandID)
-            run(commandID: commandID, arguments: ref.arguments, in: model, startsWritingCommands: false)
+            run(commandID: commandID, arguments: ref.arguments, in: model)
         }
     }
 
     /// Runs a command by id: an original writing command, an added built-in or a custom one.
-    /// Placeholders are read now, after the arguments validate.
-    func run(commandID: String, arguments: [String: String], in model: LauncherModel, startsWritingCommands: Bool) {
+    /// Placeholders are read now, after the arguments validate; `{selection}` uses the ⌘C
+    /// fallback when Accessibility sees no selection, so the run can wait for it. A custom
+    /// command set to Replace Selection runs in place with no window.
+    func run(commandID: String, arguments: [String: String], in model: LauncherModel) {
         if let action = AIWritingCommandProvider.writingActions.first(where: { "ai.\($0.id)" == commandID }) {
-            // Only a selection captured by this run goes at once; resumed work waits for the person.
-            model.openAI(action, runsCapturedSelection: startsWritingCommands)
+            model.openAI(action)
             return
         }
         guard let command = model.aiHub.aiCommands.first(where: { $0.id == commandID }) else {
@@ -145,16 +157,90 @@ final class AICommandProvider: CommandProvider {
             model.feedback = .warning(issue.message)
             return
         }
+        let resolved: [PlaceholderArgument.ID: String]
+        do { resolved = try plan.resolveArguments(arguments) } catch {
+            model.feedback = .warning(error.localizedDescription)
+            return
+        }
+        // The app it ran in, as it was then: the launcher's source follows the app in front, so a
+        // windowless run that finishes later compares against this, never against where you are.
+        let origin = model.writingSourceApplication?.processIdentifier
+        // Replace Selection needs the selection whatever its prompt reads; other commands read it
+        // only when their prompt uses it.
+        guard plan.requirements.selection || command.replacesInPlace, model.readsSelectionImplicitly else {
+            render(command, plan: plan, arguments: resolved, origin: origin, in: model)
+            return
+        }
+        // A copy fallback answers later; by then the person may have moved on.
+        let destination = model.destination
+        let conversation = model.ai.conversationToken
+        model.resolveSelection { [weak model] result in
+            guard let model, model.destination == destination, model.ai.conversationToken == conversation else { return }
+            switch result {
+            case .success(let selection):
+                self.render(command, plan: plan, arguments: resolved, selection: selection, origin: origin, in: model)
+            case .failure(let error) where error is CancellationError:
+                // The person moved on while the app's copy was awaited: nothing runs.
+                return
+            case .failure(let error):
+                self.render(command, plan: plan, arguments: resolved, selectionFailure: error, origin: origin, in: model)
+            }
+        }
+    }
+
+    private func render(
+        _ command: AICommand, plan: PlaceholderPlan, arguments: [PlaceholderArgument.ID: String],
+        selection: SelectedTextContext? = nil,
+        selectionFailure: (any Error)? = nil, origin: pid_t?, in model: LauncherModel
+    ) {
+        var values = model.placeholderValues(for: plan, selection: selection, readsSelection: selectionFailure == nil)
+        values.arguments = arguments
+        // A windowless command's panel comes up to say why only while its app is still in front. A
+        // copy OpenRay couldn't attribute gets only a quiet HUD there: the clipboard was left as it
+        // is, and the person copies or types the text themselves (final review, blocker 1).
+        func report(_ reason: String) {
+            guard command.replacesInPlace, !model.isPanelShowing else {
+                model.feedback = .warning(reason)
+                return
+            }
+            if case .copyUnattributable(let app)? = selectionFailure as? SelectionReadError {
+                model.hud.show(
+                    HUDMessage(
+                        "“\(command.name)” didn't run: OpenRay couldn't be sure the copy came from \(app).",
+                        symbol: "exclamationmark.triangle", style: .info))
+                return
+            }
+            if model.showPanelForWindowlessRun(from: origin, otherwise: reason) { model.feedback = .warning(reason) }
+        }
         do {
-            let resolved = try plan.resolveArguments(arguments)
-            var values = model.placeholderValues(for: plan)
-            values.arguments = resolved
             let run = try AICommandRenderer.render(
                 command, plan: plan, values: values, capabilities: model.ai.capabilities,
-                sourceAppName: model.previousApplicationName)
+                sourceAppName: selection?.sourceName ?? model.writingSourceApplication?.localizedName)
+            if run.replacesInPlace {
+                if let selection, selection.canReplace {
+                    model.runInPlace(command: run, on: .selection(selection), title: command.name)
+                    return
+                }
+                // No exact place to replace: a copied selection opens in OpenRay, where ↵ can still
+                // paste over it. The windowless command's panel may be hidden; it comes up only
+                // while the app the command ran in is still in front.
+                guard let selection else {
+                    report(
+                        "\(selectionFailure?.localizedDescription ?? "Nothing is selected.") “\(command.name)” replaces the selected text, so select some first.")
+                    return
+                }
+                guard
+                    model.showPanelForWindowlessRun(
+                        from: origin, otherwise: "“\(command.name)” didn't run: \(selection.sourceName) isn't in front any more.")
+                else { return }
+                model.lastCapturedSelection = selection
+            }
             model.openAI(command: run)
+        } catch AICommandError.noText where selectionFailure != nil {
+            // Say why there was no selection, such as “Nothing selected in Notes.”
+            report("\(selectionFailure?.localizedDescription ?? "") Select some text, or copy it, then run the command again.")
         } catch {
-            model.feedback = .warning(error.localizedDescription)
+            report(error.localizedDescription)
         }
     }
 
@@ -168,7 +254,7 @@ final class AICommandProvider: CommandProvider {
         return (originals + hub.aiCommands).map { command in
             LauncherItem(
                 id: command.id, title: command.name,
-                subtitle: command.isBuiltIn ? "Built-in · \(command.subtitle)" : command.output.title,
+                subtitle: command.isBuiltIn ? "Built-in · \(command.subtitle)" : command.behavior.title,
                 symbol: command.symbol, kind: .ai, badge: command.isBuiltIn ? "Built-in" : "Custom",
                 keywords: command.subtitle,
                 action: .provided(
@@ -242,7 +328,7 @@ final class AICommandProvider: CommandProvider {
     func preview(for item: LauncherItem, ref: ProvidedRef, in model: LauncherModel) -> ProvidedPreview? {
         guard let command = command(for: ref, in: model) else { return nil }
         var metadata: [(label: String, value: String)] = [
-            ("Output", command.output.title), ("Creativity", command.creativity.title),
+            ("Output Behavior", command.behavior.title), ("Creativity", command.creativity.title),
         ]
         if command.performer != .model { metadata = [("Runs with", "Apple Translation")] }
         if let reasoning = command.reasoning { metadata.append(("Reasoning", reasoning.title)) }

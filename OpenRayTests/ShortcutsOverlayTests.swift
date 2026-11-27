@@ -83,12 +83,13 @@ struct ShortcutsOverlayTests {
         #expect(keys(overlay.localRows, for: AIAction.proofread.runTitle) == ["↩"])
         #expect(overlay.localRows.filter { $0.0 == "New Line" }.map(\.1) == [["⇧", "↩"], ["⌘", "↩"]])
 
-        // Nothing has run yet, so there's nothing to try again.
-        #expect(keys(overlay.localRows, for: "Try Again") == nil)
+        // Nothing has run yet, so there's nothing to regenerate.
+        #expect(keys(overlay.localRows, for: "Regenerate") == nil)
 
+        // A chosen passage runs at once (work item 1), so only Stop applies while it does.
         model.openAI(.proofread, attachment: AIAttachment(source: .clipboard, text: "Teh cat sat."))
         overlay = ShortcutsOverlay(model: model, selected: nil)
-        #expect(keys(overlay.localRows, for: AIAction.proofread.runTitle) == ["↩"])
+        #expect(overlay.localRows.map(\.0) == ["Stop"])
         #expect(keys(overlay.localRows, for: "New Line") == nil)
     }
 
@@ -101,7 +102,6 @@ struct ShortcutsOverlayTests {
             pasteboard: NSPasteboard.withUniqueName())
         defer { model.stop() }
         model.openAI(.proofread, attachment: AIAttachment(source: .clipboard, text: "Teh cat sat."))
-        model.ai.send()
         var spins = 0
         while model.ai.messages.last?.text.isEmpty != false, spins < 1_000 {
             await Task.yield()
@@ -112,9 +112,9 @@ struct ShortcutsOverlayTests {
         model.ai.cancel()
         await model.ai.waitForResponse()
         #expect(model.ai.latestResponse == nil)
-        // ⌘R is bound through the AI's action entries.
+        // ⌘R is bound through the AI's action entries, as Regenerate.
         #expect(ActionShortcutButtons.entries(for: model, selected: nil).contains { $0.id == "retry" })
-        #expect(keys(ShortcutsOverlay(model: model, selected: nil).localRows, for: "Try Again") == ["⌘", "R"])
+        #expect(keys(ShortcutsOverlay(model: model, selected: nil).localRows, for: "Regenerate") == ["⌘", "R"])
     }
 
     @Test func hiddenShortcutButtonsBindNothingWhileActionsOrAConfirmationAreOpen() throws {

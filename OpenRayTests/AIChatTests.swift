@@ -325,7 +325,7 @@ struct AIChatTests {
         #expect(chat.lastDiff?.changeCount == 1)
     }
 
-    @Test func diffModeResetsForEachRunAndNewConversation() async {
+    @Test func diffModeFollowsTheHighlightSettingForEachRunAndNewConversation() async {
         let engine = TestAIEngine()
         engine.snapshots = ["There are two things."]
         let chat = AIChatModel(engine: engine)
@@ -335,11 +335,13 @@ struct AIChatTests {
         await chat.waitForResponse()
         chat.diffMode = .original
         chat.retry()
-        #expect(chat.diffMode == .changes)
+        #expect(chat.diffMode == .result)
         await chat.waitForResponse()
-        chat.diffMode = .result
-        chat.newConversation()
+        // Fix Spelling & Grammar marks its changes unless that's turned off.
         #expect(chat.diffMode == .changes)
+        chat.diffMode = .original
+        chat.newConversation()
+        #expect(chat.diffMode == .result)
         #expect(chat.lastDiff == nil)
     }
 

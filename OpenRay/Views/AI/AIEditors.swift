@@ -76,12 +76,13 @@ struct AICommandEditor: View {
         self.model = model
         self.original = original
         self.close = close
+        // A new command opens in OpenRay, as Raycast's do; Replace Selection is a choice below.
         _command = State(
             initialValue: original
                 ?? AICommand(
                     id: "", name: "", symbol: "sparkles",
                     prompt: "Rewrite the following text so it's friendlier.\n\n{selection}", creativity: .low,
-                    guardrail: .permissive, output: .replace))
+                    guardrail: .permissive, output: .show))
     }
 
     private var isBuiltIn: Bool { original?.isBuiltIn == true }
@@ -127,9 +128,18 @@ struct AICommandEditor: View {
                         }
                     }
                 }
-                Section("Output") {
-                    Picker("Result", selection: $command.output) {
-                        ForEach(AICommandOutput.allCases) { Text($0.title).tag($0) }
+                Section {
+                    Picker(
+                        "Output Behavior",
+                        selection: Binding(
+                            get: { command.behavior },
+                            set: { behavior in
+                                command.behavior = behavior
+                                // Replacing the selection takes the transformed text alone.
+                                if behavior == .replaceSelection { command.output = .replace }
+                            })
+                    ) {
+                        ForEach(AIOutputBehavior.allCases) { Text($0.title).tag($0) }
                     }
                     Picker("Creativity", selection: $command.creativity) {
                         ForEach(AICreativity.allCases) { Text($0.title).tag($0) }
@@ -143,6 +153,15 @@ struct AICommandEditor: View {
                     Picker("Guardrail", selection: $command.guardrail) {
                         ForEach(AIGuardrail.allCases) { Text($0.title).tag($0) }
                     }
+                } header: {
+                    Text("Output")
+                } footer: {
+                    Text(
+                        command.behavior == .replaceSelection
+                            ? "Replace Selection writes the result over the selected text with no window, once OpenRay checks the selection hasn't changed. If it has, the result is copied instead."
+                            : "Open in OpenRay shows the result in the launcher, where Return pastes it into the app you came from."
+                    )
+                    .font(.system(size: 11.5)).foregroundStyle(.secondary)
                 }
             }
             .formStyle(.grouped)
