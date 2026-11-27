@@ -345,7 +345,7 @@ struct WritingFlowTests {
         #expect(AISettings(database: LibraryDatabase()).primaryAction == .paste)
     }
 
-    @Test func primaryActionCopySwapsReturnAndCommandReturnAndTheToastPreviewsTheResult() async {
+    @Test func primaryActionCopyMakesReturnCopyAndTheToastPreviewsTheResult() async {
         let model = model()
         defer { model.stop() }
         #expect(model.aiHub.updateSettings { $0.primaryAction = .copy })
@@ -354,7 +354,8 @@ struct WritingFlowTests {
         model.openAI(.rewrite)
         await model.ai.waitForResponse()
         #expect(model.aiAcceptTitle == "Copy Response")
-        #expect(model.aiSecondaryTitle == "Paste Response")
+        // ⌘↵ copies in both modes (owner decision, review #11); it never pastes.
+        #expect(model.aiSecondaryTitle == "Copy Response")
         model.submitAI()
         #expect(model.clipboard.readText() == "A helpful reply.")
         // The preview is the result, never the command's name.

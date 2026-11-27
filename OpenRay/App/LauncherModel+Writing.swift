@@ -120,12 +120,12 @@ extension LauncherModel {
 
     /// What ↵ does with a finished result.
     var aiAcceptTitle: String { aiPrimaryPastes ? aiPasteResponseTitle : "Copy Response" }
-    /// What ⌘↵ does: the other one, so the two keys never do the same thing. With Copy as the
-    /// primary action that's a paste, named with the app it goes into.
-    var aiSecondaryTitle: String { aiPrimaryPastes ? "Copy Response" : aiPasteResponseTitle }
+    /// What ⌘↵ does: always Copy Response, so a copy key never edits the source document. With
+    /// Copy as the primary action, ↵ copies too, and the paste is in ⌘K by name.
+    var aiSecondaryTitle: String { "Copy Response" }
 
     /// “Paste Response to Notes”: the paste names the app the run is bound to.
-    private var aiPasteResponseTitle: String {
+    var aiPasteResponseTitle: String {
         guard let destination = aiRunDestination else { return "Paste Response" }
         return "Paste Response to \(destination.name)"
     }
@@ -163,10 +163,10 @@ extension LauncherModel {
         if aiPrimaryPastes { pasteWritingResult() } else { copyWritingResult() }
     }
 
-    /// ⌘↵ on a finished result.
+    /// ⌘↵ on a finished result: Copy Response, whatever ↵ does.
     func performAISecondary() {
         guard canAcceptAIResponse else { return }
-        if aiPrimaryPastes { copyWritingResult() } else { pasteWritingResult() }
+        copyWritingResult()
     }
 
     /// Copy Response: the panel stays, and the toast shows the start of what was copied.

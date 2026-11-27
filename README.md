@@ -81,7 +81,7 @@ Irreversible commands (Empty Trash, Shut Down, Restart, Log Out, Quit All, Quit 
 | **Escape** | Close exactly one layer: a confirmation, actions, an editor, AI, a scope, the search, then the launcher. |
 | **⌘[** | Go back one step, even when Escape is set to close the window. |
 
-In AI chat, **Return** sends and **⇧Return** or **⌘Return** adds a new line. On a writing result, the keys follow Raycast: **Return** pastes it (or copies it, with **Settings → Apple Intelligence → Writing commands → Primary action** set to **Copy Response**), **⌘Return** does the other, **⌥Return** pastes it formatted, **⌘R** and **⇧⌘R** regenerate it, **⌘J** continues it in chat, **⌘N** starts a new one and **⌘[** / **⌘]** move between runs. Use **Stop** or **⌘.** to cancel a response; a stopped or partial result is never used by default.
+In AI chat, **Return** sends and **⇧Return** or **⌘Return** adds a new line. On a writing result, the keys follow Raycast: **Return** pastes it (or copies it, with **Settings → Apple Intelligence → Writing commands → Primary action** set to **Copy Response**; Paste Response is then in **⌘K**), **⌘Return** always copies it, **⌥Return** pastes it formatted, **⌘R** and **⇧⌘R** regenerate it, **⌘J** continues it in chat, **⌘N** starts a new one and **⌘[** / **⌘]** move between runs. Use **Stop** or **⌘.** to cancel a response; a stopped or partial result is never used by default.
 
 ### Command aliases and hotkeys
 

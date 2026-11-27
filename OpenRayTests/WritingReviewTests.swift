@@ -154,21 +154,39 @@ struct WritingReviewTests {
         #expect(model.feedback?.text.contains("password field") == true)
     }
 
-    // MARK: Major 11: the swap is named
+    // MARK: Major 11: ⌘↵ always copies (owner decision, round 3)
 
-    @Test func withCopyAsPrimaryCommandReturnPastesAndSaysWhere() async throws {
+    @Test func withCopyAsPrimaryCommandReturnStillCopiesAndThePasteIsInCommandKByName() async throws {
         let app = try #require(runningApps.first)
         let model = model()
         defer { model.stop() }
+        _ = installHUD(on: model)
+        let log = installPaste(on: model, front: app)
         #expect(model.aiHub.updateSettings { $0.primaryAction = .copy })
         model.setCapturedSelection(selection("A passage", source: "Mail", application: app))
         model.openAI(.rewrite)
         await model.ai.waitForResponse()
         #expect(model.aiAcceptTitle == "Copy Response")
-        #expect(model.aiSecondaryTitle == "Paste Response to Mail")
+        #expect(model.aiSecondaryTitle == "Copy Response")
         let rows = ShortcutsOverlay(model: model, selected: nil).localRows
-        #expect(rows.first { $0.0 == "Paste Response to Mail" }?.1 == ["⌘", "↩"])
-        #expect(model.actions(for: nil).first { $0.id == "secondary" }?.title == "Paste Response to Mail")
+        #expect(rows.filter { $0.0 == "Copy Response" }.map(\.1) == [["↩"], ["⌘", "↩"]])
+        #expect(rows.first { $0.0 == "Paste Formatted Response" }?.1 == ["⌥", "↩"])
+        #expect(!rows.contains { $0.0.hasPrefix("Paste Response") })
+        // ⌘↵ copies; nothing reaches Mail.
+        model.pasteSelected()
+        #expect(model.pasteBackTask == nil)
+        #expect(log.posted.isEmpty)
+        #expect(model.clipboard.readText() == "A helpful reply.")
+        // The paste is in ⌘K, by name and with no key of its own.
+        let entries = model.actions(for: nil)
+        #expect(!entries.contains { $0.id == "secondary" })
+        let paste = try #require(entries.first { $0.id == "pasteResponse" })
+        #expect(paste.title == "Paste Response to Mail")
+        #expect(paste.shortcut == nil && paste.key == nil)
+        #expect(entries.first { $0.id == "pasteFormatted" }?.modifiers == .option)
+        paste.perform()
+        await model.pasteBackTask?.value
+        #expect(log.posted == [app.processIdentifier])
     }
 
     // MARK: Major 12: drafts never leave a full history

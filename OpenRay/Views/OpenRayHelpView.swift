@@ -52,7 +52,7 @@ struct OpenRayHelpView: View {
                         shortcut(["⌘", "["], "Go back one step, even when Esc is set to close the window")
                     }
                     paragraph(
-                        "In AI chat, Return sends and ⇧Return or ⌘Return adds a line. On a writing result, Return pastes it back into the app you came from, ⌘Return copies it and ⌥Return pastes it with formatting.")
+                        "In AI chat, Return sends and ⇧Return or ⌘Return adds a line. On a writing result, Return pastes it back into the app you came from, ⌘Return copies it and ⌥Return pastes it with formatting. With the AI Primary action set to Copy Response, Return copies too, and Paste Response is in ⌘K.")
                         .foregroundStyle(OR.Color.text2)
                 }
 

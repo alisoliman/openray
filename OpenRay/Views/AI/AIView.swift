@@ -178,8 +178,11 @@ struct AIView: View {
                     model.acceptAIResponse()
                 }
                 .accessibilityIdentifier("ai.accept")
-                ActionBarButton(title: model.aiSecondaryTitle, keys: ["⌘", "↩"], style: .ghost) {
-                    model.performAISecondary()
+                // ⌘↩ always copies; when ↩ copies too, the paste is in ⌘K.
+                if model.aiPrimaryPastes {
+                    ActionBarButton(title: model.aiSecondaryTitle, keys: ["⌘", "↩"], style: .ghost) {
+                        model.performAISecondary()
+                    }
                 }
             } else if model.aiResultIsUnchanged {
                 ActionBarButton(title: "Done", keys: ["↩"]) { model.leaveAI() }

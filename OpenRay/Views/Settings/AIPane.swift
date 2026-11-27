@@ -209,7 +209,7 @@ private struct AIWritingSettingsSection: View {
                 SettingRowLabel(
                     title: "Primary action",
                     detail:
-                        "What Return does on a result. Paste Response pastes it over your selection in the app you came from and puts your clipboard back. ⌘Return does the other.")
+                        "What Return does on a result. Paste Response pastes it over your selection in the app you came from and puts your clipboard back. ⌘Return always copies; with Copy Response, Paste Response is in ⌘K.")
             }
             .neutralMenus()
         } header: {
