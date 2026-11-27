@@ -103,6 +103,9 @@ final class ClipboardService {
     @ObservationIgnored private var attributedGeneration: Int?
     /// Text recognition for the last captured image, while it runs. Tests await it.
     @ObservationIgnored private(set) var pendingRecognition: Task<Void, Never>?
+    /// How many borrowings of the clipboard are under way (a selection copy, a paste back).
+    /// Capture waits for them, so what OpenRay puts there and puts back never becomes history.
+    @ObservationIgnored private var borrowings = 0
 
     private struct CapturePolicy: Equatable {
         var enabled: Bool
@@ -164,7 +167,7 @@ final class ClipboardService {
             store.pruneClipboard(now: now)
             lastPrune = now
         }
-        guard store.database.preferences.clipboardEnabled, !isProcessing else { return }
+        guard store.database.preferences.clipboardEnabled, !isProcessing, borrowings == 0 else { return }
         refreshAccessStatus()
         guard accessBehavior != .alwaysDeny else { return }
         guard pasteboard.changeCount != lastChange else { return }
@@ -423,6 +426,68 @@ final class ClipboardService {
         attributedGeneration = lastChange
         return success
     }
+
+    // MARK: Borrowing the clipboard (writing commands)
+
+    /// Everything on the clipboard now, every item and type, to put back later.
+    func snapshot() -> PasteboardSnapshot { PasteboardSnapshot.capture(pasteboard) }
+
+    /// Puts a snapshot back. The restored copy keeps what OpenRay knew about it (an excluded app's
+    /// copy stays excluded from `{clipboard}`) and never becomes a new history entry.
+    func restore(_ snapshot: PasteboardSnapshot) {
+        guard sideEffects.mayWrite(to: pasteboard) else { return }
+        let wasExcluded = excludedGeneration == snapshot.changeCount
+        let wasAttributed = attributedGeneration == snapshot.changeCount
+        snapshot.restore(to: pasteboard)
+        adoptCurrentGeneration(excluded: wasExcluded, attributed: wasAttributed)
+    }
+
+    /// Writes a writing result for a paste: plain text, and formatting when given, marked transient
+    /// so neither OpenRay's history nor other clipboard managers keep it.
+    @discardableResult
+    func copyTransient(_ text: String, richText: ClipboardRichText? = nil) -> Bool {
+        lastCopyError = nil
+        let item = NSPasteboardItem()
+        item.setString(text, forType: .string)
+        if let rtf = richText?.rtf { item.setData(rtf, forType: .rtf) }
+        if let html = richText?.html { item.setData(html, forType: .html) }
+        item.setData(Data(), forType: SelectionCopy.transientType)
+        return write([item])
+    }
+
+    /// Reads the selection in another app with that app's own Copy (`SelectionCopy`), while
+    /// capture waits, and puts the clipboard back as it was.
+    func readSelectionByCopying(
+        from application: NSRunningApplication?, sourceName: String, environment: SelectionCopy.Environment
+    ) async throws -> String {
+        let before = pasteboard.changeCount
+        let wasExcluded = excludedGeneration == before
+        let wasAttributed = attributedGeneration == before
+        borrowings += 1
+        defer {
+            borrowings -= 1
+            if pasteboard.changeCount != before { adoptCurrentGeneration(excluded: wasExcluded, attributed: wasAttributed) }
+        }
+        return try await SelectionCopy.read(
+            from: application, sourceName: sourceName, pasteboard: pasteboard, environment: environment)
+    }
+
+    /// Runs `body` while capture waits, so a paste back's temporary write and the restore after it
+    /// never reach history.
+    func borrowing<T>(_ body: () async throws -> T) async rethrows -> T {
+        borrowings += 1
+        defer {
+            borrowings -= 1
+            lastChange = pasteboard.changeCount
+        }
+        return try await body()
+    }
+
+    private func adoptCurrentGeneration(excluded: Bool, attributed: Bool) {
+        lastChange = pasteboard.changeCount
+        if excluded { excludedGeneration = lastChange }
+        if attributed { attributedGeneration = lastChange }
+    }
 }
 
 @MainActor
@@ -466,17 +531,27 @@ enum SyntheticInput {
         }
         func stillTargeted() -> Bool {
             environment.frontmostProcess() == pid && environment.changeCount() == expectedChangeCount
-                && !environment.secureInput()
         }
-        guard stillTargeted() else {
-            throw LibraryValidationError("The target app or clipboard changed. Your text is copied; paste it with ⌘V.")
+        func check() throws {
+            // Secure Input means a password field may have the keyboard: no key goes there.
+            guard !environment.secureInput() else {
+                throw LibraryValidationError(
+                    "Secure Input is on, so nothing was pasted. Your text is copied; paste it with ⌘V.")
+            }
+            guard stillTargeted() else {
+                throw LibraryValidationError("The target app or clipboard changed. Your text is copied; paste it with ⌘V.")
+            }
         }
+        try check()
         try validateTarget()
         // The validation can take a moment over Accessibility; check again right before the key.
-        guard stillTargeted() else {
-            throw LibraryValidationError("The target app or clipboard changed. Your text is copied; paste it with ⌘V.")
-        }
+        try check()
         try environment.postPaste(pid)
+    }
+
+    /// ⌘C to `pid` only, for the selection fallback when Accessibility can't see the selection.
+    static func postCopy(toProcess pid: pid_t) throws {
+        try key(CGKeyCode(kVK_ANSI_C), flags: .maskCommand, toProcess: pid, what: "copying the selection in another app")
     }
 
     /// Posts one key press to `pid` only. Every synthetic key event OpenRay sends
@@ -525,8 +600,10 @@ enum SyntheticInput {
     }
 
     /// ⌘V goes to the app it's meant for only, so a focus change can't send it elsewhere.
-    private static func key(_ code: CGKeyCode, flags: CGEventFlags = [], toProcess pid: pid_t) throws {
-        try SideEffectGuard.check("pasting into other apps")
+    private static func key(
+        _ code: CGKeyCode, flags: CGEventFlags = [], toProcess pid: pid_t, what: String = "pasting into other apps"
+    ) throws {
+        try SideEffectGuard.check(what)
         guard let down = CGEvent(keyboardEventSource: nil, virtualKey: code, keyDown: true),
             let up = CGEvent(keyboardEventSource: nil, virtualKey: code, keyDown: false)
         else {
@@ -536,6 +613,60 @@ enum SyntheticInput {
             event.flags = flags
             event.setIntegerValueField(.eventSourceUserData, value: marker)
             event.postToPid(pid)
+        }
+    }
+}
+
+/// How a writing result reaches the app it's for (work item 6): written to the clipboard marked
+/// transient, the panel closed and the app activated, the target checked, ⌘V, and once the paste
+/// has landed, the person's own clipboard put back. When it can't paste, the result stays on the
+/// clipboard and nothing is put back.
+@MainActor
+enum PasteBack {
+    struct Environment {
+        var paste = SyntheticInput.PasteEnvironment.live
+        /// Long enough for the app to read the clipboard before it's restored.
+        var restoreDelay: Duration = .milliseconds(400)
+        var sleep: @MainActor (Duration) async -> Void = { try? await Task.sleep(for: $0) }
+
+        static var live: Environment { Environment() }
+    }
+
+    enum Outcome: Equatable {
+        case pasted
+        /// On the clipboard, not pasted, with why.
+        case copied(String)
+        /// Not even copied.
+        case failed(String)
+    }
+
+    /// `validate` is the target check: the lenient focus check for an explicit ↵, or
+    /// `SelectedTextContext.validateForPaste` for unattended replaces. `willPaste` runs once the
+    /// result is on the clipboard, before the app is activated: the launcher closes there.
+    static func run(
+        _ text: String, richText: ClipboardRichText? = nil, into application: NSRunningApplication,
+        clipboard: ClipboardService, validate: () throws -> Void, environment: Environment = .live,
+        willPaste: () -> Void = {}
+    ) async -> Outcome {
+        await clipboard.borrowing {
+            let snapshot = clipboard.snapshot()
+            guard clipboard.copyTransient(text, richText: richText) else {
+                return .failed(clipboard.lastCopyError ?? "Couldn't write to the clipboard. Try again.")
+            }
+            let written = clipboard.changeCount
+            var paste = environment.paste
+            paste.changeCount = { clipboard.changeCount }
+            willPaste()
+            do {
+                try await SyntheticInput.paste(
+                    into: application, expectedChangeCount: written, validateTarget: validate, environment: paste)
+            } catch {
+                return .copied(error.localizedDescription)
+            }
+            await environment.sleep(environment.restoreDelay)
+            // Something copied meanwhile is the person's own, and stays.
+            if clipboard.changeCount == written { clipboard.restore(snapshot) }
+            return .pasted
         }
     }
 }

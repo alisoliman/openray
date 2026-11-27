@@ -1,6 +1,41 @@
 import AppKit
 import Carbon
 
+/// Why the selection in another app couldn't be read. Two of them, where Accessibility saw no
+/// selection, may still be answered by the app's own Copy (`allowsCopyFallback`).
+enum SelectionReadError: LocalizedError, Equatable {
+    case accessibilityOff
+    /// A password field, or the lock screen, holds Secure Input.
+    case secureInput
+    case noSourceApp
+    case protectedField
+    /// The app shows no focused element, or no selected text, over Accessibility.
+    case notExposed(app: String)
+    /// Accessibility says nothing is selected, or the app's Copy left the clipboard as it was.
+    case nothingSelected(app: String)
+
+    var errorDescription: String? {
+        switch self {
+        case .accessibilityOff:
+            "Accessibility access is required to read selected text. Paste or type the text instead."
+        case .secureInput:
+            "Secure Input is on, so the selection can't be read. Finish with the password field, or paste the text here."
+        case .noSourceApp: "Select text in another app first."
+        case .protectedField: "Protected text cannot be used for writing assistance."
+        case .notExposed(let app): "\(app) doesn't share its selected text. Paste or type the text instead."
+        case .nothingSelected(let app): "Nothing selected in \(app)."
+        }
+    }
+
+    /// Accessibility saw no selection, but the app's own Copy might still have one.
+    var allowsCopyFallback: Bool {
+        switch self {
+        case .notExposed, .nothingSelected: true
+        default: false
+        }
+    }
+}
+
 /// A selection belongs to the app and editor that supplied it, even if the user
 /// visits another app while a writing response is running.
 @MainActor
@@ -14,6 +49,9 @@ struct SelectedTextContext {
     /// Where the text was selected. Without it the result can be read and copied, but never
     /// replaces anything: identical text elsewhere in the same field would pass every other check.
     var range: NSRange?
+    /// Whether the element that was focused at capture still is; nil when that can't be read.
+    /// ↵ on a result checks only this, the app and Secure Input before it pastes (work item 6).
+    var focusIsOriginal: @MainActor () -> Bool? = { nil }
 
     /// Whether a result may replace this selection in place: its range must be usable.
     var canReplace: Bool { Self.isUsable(range, for: text) }
@@ -39,6 +77,15 @@ struct SelectedTextContext {
         guard appIsRunning, isFrontmost, sameElement, currentText == capturedText, currentRange == capturedRange else {
             throw LibraryValidationError(
                 "The original selection in \(sourceName) changed. Your rewrite is copied; select where it belongs and paste with ⌘V.")
+        }
+    }
+
+    /// The check before an explicit ↵ pastes a result: the same element is still focused when
+    /// that can be read. The text and range may have changed; the person chose to paste.
+    nonisolated static func verifyFocus(_ focusIsOriginal: Bool?, sourceName: String) throws {
+        guard focusIsOriginal != false else {
+            throw LibraryValidationError(
+                "The text field you selected in \(sourceName) isn't focused any more, so nothing was pasted.")
         }
     }
 
@@ -77,27 +124,22 @@ struct SelectedTextContext {
     }
 
     static func capture(from application: NSRunningApplication?) throws -> SelectedTextContext {
-        guard AXIsProcessTrusted(), !IsSecureEventInputEnabled() else {
-            throw LibraryValidationError("Select text in your app and enable Accessibility in Settings to use it here.")
-        }
+        guard AXIsProcessTrusted() else { throw SelectionReadError.accessibilityOff }
+        guard !IsSecureEventInputEnabled() else { throw SelectionReadError.secureInput }
         guard let application, !application.isTerminated,
             application.processIdentifier != ProcessInfo.processInfo.processIdentifier
-        else { throw LibraryValidationError("Select text in another app first.") }
+        else { throw SelectionReadError.noSourceApp }
+        let sourceName = application.localizedName ?? "your app"
         let app = AXUIElementCreateApplication(application.processIdentifier)
         AXUIElementSetMessagingTimeout(app, 0.2)
-        let element = try focusedElement(in: app)
-        var role: CFTypeRef?
-        AXUIElementCopyAttributeValue(element, kAXSubroleAttribute as CFString, &role)
-        guard role as? String != kAXSecureTextFieldSubrole else {
-            throw LibraryValidationError("Protected text cannot be used for writing assistance.")
-        }
-        let text = try selectedText(in: element)
+        guard let element = focusedElement(in: app) else { throw SelectionReadError.notExposed(app: sourceName) }
+        guard !isSecure(element) else { throw SelectionReadError.protectedField }
+        guard let text = selectedText(in: element) else { throw SelectionReadError.nothingSelected(app: sourceName) }
         let range = selectedRange(in: element)
-        let sourceName = application.localizedName ?? "your app"
         let probe = Probe(
             frontmostProcess: { NSWorkspace.shared.frontmostApplication?.processIdentifier },
-            focusIsOriginal: { (try? focusedElement(in: app)).map { CFEqual($0, element) } },
-            text: { try? selectedText(in: element) },
+            focusIsOriginal: { focusedElement(in: app).map { CFEqual($0, element) } },
+            text: { selectedText(in: element) },
             range: { selectedRange(in: element) })
         var context = SelectedTextContext(text: text, application: application, sourceName: sourceName) {
             try validate(
@@ -106,24 +148,48 @@ struct SelectedTextContext {
         }
         context.element = element
         context.range = range
+        context.focusIsOriginal = probe.focusIsOriginal
         return context
     }
 
-    private static func focusedElement(in app: AXUIElement) throws -> AXUIElement {
+    /// A selection the app's own Copy gave, after Accessibility saw none. Its place in the field
+    /// is unknown, so it never replaces anything unattended; ↵ can still paste over it. The
+    /// element focused now, when Accessibility shows one, is what ↵ checks later.
+    static func copied(_ text: String, from application: NSRunningApplication?, sourceName: String) -> SelectedTextContext {
+        let appElement = application.map { AXUIElementCreateApplication($0.processIdentifier) }
+        if let appElement { AXUIElementSetMessagingTimeout(appElement, 0.2) }
+        let focused = AXIsProcessTrusted() ? appElement.flatMap(focusedElement(in:)) : nil
+        var context = SelectedTextContext(text: text, application: application, sourceName: sourceName) {
+            try verifyUnchanged(
+                capturedText: text, capturedRange: nil, appIsRunning: true, sameElement: false, currentText: nil,
+                currentRange: nil, sourceName: sourceName)
+        }
+        context.element = focused
+        if let appElement, let focused {
+            context.focusIsOriginal = { focusedElement(in: appElement).map { CFEqual($0, focused) } }
+        }
+        return context
+    }
+
+    fileprivate static func focusedElement(in app: AXUIElement) -> AXUIElement? {
         var value: CFTypeRef?
         guard AXUIElementCopyAttributeValue(app, kAXFocusedUIElementAttribute as CFString, &value) == .success,
             let value, CFGetTypeID(value) == AXUIElementGetTypeID()
-        else {
-            throw LibraryValidationError("This app does not expose its selected text. Paste a passage to get started.")
-        }
+        else { return nil }
         return unsafeDowncast(value, to: AXUIElement.self)
     }
 
-    private static func selectedText(in element: AXUIElement) throws -> String {
+    fileprivate static func isSecure(_ element: AXUIElement) -> Bool {
+        var role: CFTypeRef?
+        AXUIElementCopyAttributeValue(element, kAXSubroleAttribute as CFString, &role)
+        return role as? String == kAXSecureTextFieldSubrole
+    }
+
+    private static func selectedText(in element: AXUIElement) -> String? {
         var value: CFTypeRef?
         guard AXUIElementCopyAttributeValue(element, kAXSelectedTextAttribute as CFString, &value) == .success,
             let text = value as? String, !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-        else { throw LibraryValidationError("No text is selected in the source app. Paste a passage to get started.") }
+        else { return nil }
         return text
     }
 
@@ -135,5 +201,71 @@ struct SelectedTextContext {
         var range = CFRange()
         guard AXValueGetValue(unsafeDowncast(value, to: AXValue.self), .cfRange, &range) else { return nil }
         return NSRange(location: range.location, length: range.length)
+    }
+}
+
+/// Quick Fix's whole-field target (work item 8): the focused text field's full value, for when
+/// nothing is selected or Prefer Selection is off. Replacing it is unattended, so it checks the
+/// app, the focus and the value are all unchanged first.
+@MainActor
+struct FocusedFieldContext {
+    let text: String
+    let application: NSRunningApplication?
+    let sourceName: String
+    /// Throws unless the app is frontmost and the same field still holds the same value.
+    var validate: @MainActor () throws -> Void
+    /// Sets the field's value through Accessibility. False when the field doesn't allow it.
+    var replaceValue: @MainActor (String) -> Bool
+    /// Selects the whole value, so a paste replaces it. False when the field doesn't allow it.
+    var selectAll: @MainActor () -> Bool
+
+    static func capture(from application: NSRunningApplication?) throws -> FocusedFieldContext {
+        guard AXIsProcessTrusted() else { throw SelectionReadError.accessibilityOff }
+        guard !IsSecureEventInputEnabled() else { throw SelectionReadError.secureInput }
+        guard let application, !application.isTerminated,
+            application.processIdentifier != ProcessInfo.processInfo.processIdentifier
+        else { throw SelectionReadError.noSourceApp }
+        let sourceName = application.localizedName ?? "your app"
+        let app = AXUIElementCreateApplication(application.processIdentifier)
+        AXUIElementSetMessagingTimeout(app, 0.2)
+        guard let element = SelectedTextContext.focusedElement(in: app) else {
+            throw SelectionReadError.notExposed(app: sourceName)
+        }
+        guard !SelectedTextContext.isSecure(element) else { throw SelectionReadError.protectedField }
+        func value() -> String? {
+            var value: CFTypeRef?
+            guard AXUIElementCopyAttributeValue(element, kAXValueAttribute as CFString, &value) == .success else {
+                return nil
+            }
+            return value as? String
+        }
+        guard let text = value(), !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            throw LibraryValidationError("There's no text to fix in \(sourceName).")
+        }
+        let pid = application.processIdentifier
+        return FocusedFieldContext(
+            text: text, application: application, sourceName: sourceName,
+            validate: {
+                let focused = SelectedTextContext.focusedElement(in: app).map { CFEqual($0, element) }
+                guard NSWorkspace.shared.frontmostApplication?.processIdentifier == pid, !application.isTerminated,
+                    focused == true, value() == text
+                else {
+                    throw LibraryValidationError(
+                        "The text in \(sourceName) changed. Your result is copied; paste it with ⌘V.")
+                }
+            },
+            replaceValue: { newValue in
+                var settable: DarwinBoolean = false
+                guard AXUIElementIsAttributeSettable(element, kAXValueAttribute as CFString, &settable) == .success,
+                    settable.boolValue
+                else { return false }
+                return AXUIElementSetAttributeValue(element, kAXValueAttribute as CFString, newValue as CFString)
+                    == .success && value() == newValue
+            },
+            selectAll: {
+                var range = CFRange(location: 0, length: (text as NSString).length)
+                guard let whole = AXValueCreate(.cfRange, &range) else { return false }
+                return AXUIElementSetAttributeValue(element, kAXSelectedTextRangeAttribute as CFString, whole) == .success
+            })
     }
 }
