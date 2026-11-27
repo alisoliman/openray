@@ -192,32 +192,41 @@ final class AICommandProvider: CommandProvider {
     ) {
         var values = model.placeholderValues(for: plan, selection: selection, readsSelection: selectionFailure == nil)
         values.arguments = arguments
+        // A windowless command's panel comes up to say why only while its app is still in front.
+        func report(_ reason: String) {
+            if !command.replacesInPlace || model.showPanelForWindowlessRun(otherwise: reason) {
+                model.feedback = .warning(reason)
+            }
+        }
         do {
             let run = try AICommandRenderer.render(
                 command, plan: plan, values: values, capabilities: model.ai.capabilities,
-                sourceAppName: selection?.sourceName ?? model.previousApplicationName)
+                sourceAppName: selection?.sourceName ?? model.writingSourceApplication?.localizedName)
             if run.replacesInPlace {
                 if let selection, selection.canReplace {
                     model.runInPlace(command: run, on: .selection(selection), title: command.name)
                     return
                 }
                 // No exact place to replace: a copied selection opens in OpenRay, where ↵ can still
-                // paste over it. The windowless command's panel may be hidden.
-                if model.panel?.isVisible == false { model.panel?.show() }
+                // paste over it. The windowless command's panel may be hidden; it comes up only
+                // while the app the command ran in is still in front.
                 guard let selection else {
-                    model.feedback = .warning(
+                    report(
                         "\(selectionFailure?.localizedDescription ?? "Nothing is selected.") “\(command.name)” replaces the selected text, so select some first.")
                     return
                 }
+                guard
+                    model.showPanelForWindowlessRun(
+                        otherwise: "“\(command.name)” didn't run: \(selection.sourceName) isn't in front any more.")
+                else { return }
                 model.lastCapturedSelection = selection
             }
             model.openAI(command: run)
         } catch AICommandError.noText where selectionFailure != nil {
             // Say why there was no selection, such as “Nothing selected in Notes.”
-            model.feedback = .warning(
-                "\(selectionFailure?.localizedDescription ?? "") Select some text, or copy it, then run the command again.")
+            report("\(selectionFailure?.localizedDescription ?? "") Select some text, or copy it, then run the command again.")
         } catch {
-            model.feedback = .warning(error.localizedDescription)
+            report(error.localizedDescription)
         }
     }
 

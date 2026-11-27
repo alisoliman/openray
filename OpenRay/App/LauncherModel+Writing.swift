@@ -197,23 +197,23 @@ extension LauncherModel {
             environment = .live
         }
         guard let destination = aiRunDestination else {
-            feedback = .warning("This result has no app to go back to. Copy it with \(aiPrimaryPastes ? "⌘↩" : "↩").")
+            feedback = .warning("This result has no app to go back to. Copy it with ⌘↩.")
             return
         }
         guard let application = destination.liveApplication else {
-            feedback = .warning(
-                "\(destination.name) isn't open any more, so nothing was pasted. Copy the result with \(aiPrimaryPastes ? "⌘↩" : "↩").")
+            feedback = .warning("\(destination.name) isn't open any more, so nothing was pasted. Copy the result with ⌘↩.")
             return
         }
         let label = Self.pastTense(forCommandID: ai.commandID, inPlace: false)
-        // Without Accessibility no key can be sent: copy, go back to the app and say so.
-        guard pasteBackEnvironment != nil || windows.hasPermission else {
-            guard clipboard.copy(text, richText: richText) else {
+        // Without Accessibility no key can be sent: copy, go back to the app and say so. The copy
+        // carries both privacy markers, as every paste back's does, so no clipboard manager keeps it.
+        guard environment.paste.isTrusted() else {
+            guard case .written = clipboard.copyTransient(text, richText: richText) else {
                 feedback = .error(clipboard.lastCopyError ?? "Couldn't write to the clipboard. Try again.")
                 return
             }
             panel?.dismiss(restoreFocus: false)
-            application.activate()
+            environment.paste.activate(application)
             hud.show(Self.copiedHUD)
             return
         }
@@ -255,8 +255,8 @@ extension LauncherModel {
                         style: .warning))
         case .copied(let reason):
             hud.show(Self.copiedHUD)
-            // Reopening shows why.
-            if !inPlace { feedback = .warning(reason) }
+            // Reopening shows why. The result was seen to own the clipboard, so ⌘V pastes it.
+            if !inPlace { feedback = .warning("\(reason) \(Self.pasteItYourself)") }
         case .notPasted(let reason):
             if inPlace {
                 hud.show(HUDMessage("Not replaced. \(reason)", symbol: "exclamationmark.triangle.fill", style: .warning))
@@ -268,6 +268,8 @@ extension LauncherModel {
     }
 
     static let copiedHUD = HUDMessage("Copied — press ⌘V to paste", symbol: "doc.on.clipboard", style: .warning)
+    /// Added to a reason only once the text is seen to own the clipboard.
+    static let pasteItYourself = "Your text is copied; paste it with ⌘V."
 
     /// The HUD's word for a result put back: “Improved”, “Fixed”, “Shortened”…
     static func pastTense(forCommandID id: String, inPlace: Bool) -> String {
@@ -400,13 +402,17 @@ extension LauncherModel {
                     HUDMessage("Not replaced. \(error.localizedDescription)", symbol: "exclamationmark.triangle.fill", style: .warning))
                 return
             }
-            // Selected within the paste, right before ⌘V, so a caret moved meanwhile is caught.
+            // Selected within the paste, right before ⌘V, so a caret moved meanwhile is caught. Focus
+            // can move while the selection is set and read back, so the field is checked again
+            // after: still the focused element, still not a password field.
             validate = {
                 try Self.refuseProtectedField(in: application, name: field.sourceName, isSecure: isSecure)
                 try field.validate()
                 guard field.selectAll() else {
                     throw LibraryValidationError("\(field.sourceName) didn't select its whole text, so nothing was replaced.")
                 }
+                try field.validate()
+                try Self.refuseProtectedField(in: application, name: field.sourceName, isSecure: isSecure)
             }
         }
         let outcome = await PasteBack.run(
@@ -463,14 +469,35 @@ extension LauncherModel {
         }
         guard let command else { return }
         // A command that needs a value asks for it, then runs in place on the target read now.
+        // The form can wait on screen a long time, so the command is checked again on submit.
         if let item = bindableCommands.first(where: { $0.id == command.id }), needsArguments(item) {
             panel?.show()
             beginArguments(item: item, specs: argumentSpecs(for: item)) { [weak self] values in
-                self?.runQuickFix(command, on: target, arguments: values)
+                guard let self, let current = self.quickFixCommandStillRuns(command.id) else { return }
+                self.runQuickFix(current, on: target, arguments: values)
             }
             return
         }
         runQuickFix(command, on: target, arguments: [:])
+    }
+
+    /// The AI Command a Quick Fix form was opened for, as it is now, while Quick Fix still runs it:
+    /// it still exists, it and Quick Fix are still turned on, and it's still Quick Fix's choice.
+    /// Otherwise the launcher says why and nothing runs.
+    private func quickFixCommandStillRuns(_ id: String) -> AICommand? {
+        guard let command = aiHub.aiCommands.first(where: { $0.id == id }) else {
+            feedback = .error("That AI Command no longer exists, so Quick Fix didn't run.")
+            return nil
+        }
+        guard isCommandEnabled(id), isCommandEnabled(AICommandProvider.quickFixID) else {
+            feedback = .warning("“\(command.name)” is turned off, so Quick Fix didn't run. Turn it on in Settings › Commands.")
+            return nil
+        }
+        guard aiHub.settings.quickFixCommandID == id else {
+            feedback = .warning("Quick Fix runs another command now. Run Quick Fix again.")
+            return nil
+        }
+        return command
     }
 
     private func runQuickFix(_ command: AICommand, on target: InPlaceTarget, arguments: [String: String]) {
@@ -495,7 +522,37 @@ extension LauncherModel {
         if let focusedFieldReader { return try focusedFieldReader() }
         try sideEffects.check("reading the focused field in another app")
         guard windows.hasPermission else { throw SelectionReadError.accessibilityOff }
-        return try FocusedFieldContext.capture(from: previousApplication, selectionHidden: refuses)
+        return try FocusedFieldContext.capture(from: writingSourceApplication, selectionHidden: refuses)
+    }
+
+    // MARK: - Windowless runs
+
+    /// Whether the launcher is on screen. Without a panel, as in tests, it counts as showing.
+    var isPanelShowing: Bool { panelVisibility?() ?? panel?.isVisible ?? true }
+
+    /// Brings the panel up for a windowless run that needs it after all (a selection copied with no
+    /// place to replace, or a reason to give), but only while the app it ran in is still in front:
+    /// the panel never takes focus from an app the person moved to. Then a quiet HUD says why
+    /// instead (re-review, windowless delayed copy). Returns whether the panel is showing.
+    @discardableResult
+    func showPanelForWindowlessRun(otherwise message: String) -> Bool {
+        guard !isPanelShowing else { return true }
+        guard let source = writingSourceApplication, frontmostProcess() == source.processIdentifier else {
+            hud.show(HUDMessage(message, symbol: "exclamationmark.triangle", style: .info))
+            return false
+        }
+        panel?.show()
+        return true
+    }
+
+    /// A clipboard OpenRay couldn't put back after a selection copy: said in the panel, or with a
+    /// HUD when it's hidden, never dropped.
+    func reportUnrestoredClipboard(_ reason: String) {
+        if isPanelShowing {
+            feedback = .error(reason)
+        } else {
+            hud.show(HUDMessage(reason, symbol: "exclamationmark.triangle.fill", style: .warning))
+        }
     }
 
     // MARK: - Shortcuts overlay

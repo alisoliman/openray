@@ -208,6 +208,12 @@ final class LauncherModel {
     @ObservationIgnored var focusedFieldIsSecure: @MainActor (NSRunningApplication) -> Bool = {
         SelectedTextContext.focusedFieldIsSecure(in: $0)
     }
+    /// The app in front now, read before a windowless run brings the panel up. Tests set it.
+    @ObservationIgnored var frontmostProcess: @MainActor () -> pid_t? = {
+        NSWorkspace.shared.frontmostApplication?.processIdentifier
+    }
+    /// Stands in for the panel's visibility; tests have no panel.
+    @ObservationIgnored var panelVisibility: (@MainActor () -> Bool)?
     /// True while a result is being pasted into its app.
     var isPastingAIResponse = false
     /// The app the ⌘C fallback is reading the selection from, while it does.
@@ -991,19 +997,25 @@ final class LauncherModel {
     }
 
     /// Binds the run on screen to the app its result goes back to: the selection's app, with its
-    /// focus check, or else the app the launcher was opened from. OpenRay itself is never one.
+    /// focus check, or else the app the launcher was opened from. That's `foregroundApplication`,
+    /// which choosing a window for a layout never changes. OpenRay itself is never one.
     func bindDestination(to selection: SelectedTextContext?) {
         aiDestination = nil
-        guard let application = selection?.application ?? previousApplication, !application.isTerminated,
+        guard let application = selection?.application ?? foregroundApplication, !application.isTerminated,
             application.processIdentifier != ProcessInfo.processInfo.processIdentifier
         else { return }
         let name =
             selection?.application != nil
-            ? selection?.sourceName ?? "your app" : application.localizedName ?? previousApplicationName ?? "your app"
+            ? selection?.sourceName ?? "your app" : application.localizedName ?? "your app"
         aiDestination = RunDestination(
             conversation: ai.conversationToken, application: application, name: name,
             focusIsOriginal: selection?.application != nil ? selection?.focusIsOriginal : nil)
     }
+
+    /// The app writing commands read from and go back to: the one the launcher was opened from,
+    /// or a hotkey ran in. Never the window-layout picker's choice (re-review #6).
+    var writingSourceApplication: NSRunningApplication? { foregroundApplication }
+    private var writingSourceName: String { foregroundApplication?.localizedName ?? "your app" }
 
     /// The selection in the app OpenRay was opened from, with its app, element and range, so a
     /// result can later replace exactly it. One mechanism for writing commands, `{selection}`
@@ -1012,13 +1024,13 @@ final class LauncherModel {
         if let selectionContextReader { return try selectionContextReader() }
         if let selectionReader {
             return SelectedTextContext(
-                text: try selectionReader(), application: previousApplication,
-                sourceName: previousApplicationName ?? "your app", validateForPaste: {})
+                text: try selectionReader(), application: writingSourceApplication,
+                sourceName: writingSourceName, validateForPaste: {})
         }
         // Another app's text: a launch inert by its own rule, or by an injected one, never reads it.
         try sideEffects.check("reading the selection in another app")
         guard windows.hasPermission else { throw SelectionReadError.accessibilityOff }
-        return try SelectedTextContext.capture(from: previousApplication)
+        return try SelectedTextContext.capture(from: writingSourceApplication)
     }
 
     /// The selection by the app's own Copy, once Accessibility saw none (work item 2). A clipboard
@@ -1027,7 +1039,7 @@ final class LauncherModel {
     /// trust checks stand in for the launch's, and the live ⌘C is guarded by the process's rule.
     func copySelection(from application: NSRunningApplication?) async throws -> SelectedTextContext {
         if let selectionCopyReader { return try await selectionCopyReader(application) }
-        let name = application?.localizedName ?? previousApplicationName ?? "your app"
+        let name = application?.localizedName ?? writingSourceName
         let session = SelectionCaptureSession()
         selectionCaptureSession?.disturb()
         selectionCaptureSession = session
@@ -1038,6 +1050,7 @@ final class LauncherModel {
         }
         var environment = selectionCopyEnvironment
         environment.isUndisturbed = { [weak session] in session.map { !$0.isDisturbed } ?? false }
+        environment.didFailToRestore = { [weak self] reason in self?.reportUnrestoredClipboard(reason) }
         let finish = environment.didFinish
         environment.didFinish = {
             if let monitor { monitoring.remove(monitor) }
@@ -1057,8 +1070,8 @@ final class LauncherModel {
         do {
             completion(.success(try captureSelection()))
         } catch let error as SelectionReadError where allowsCopy && error.allowsCopyFallback {
-            let application = previousApplication
-            readingSelectionFrom = application?.localizedName ?? previousApplicationName ?? "your app"
+            let application = writingSourceApplication
+            readingSelectionFrom = application?.localizedName ?? writingSourceName
             selectionCaptureTask = Task { [weak self] in
                 guard let self else { return }
                 let result: Result<SelectedTextContext, any Error>

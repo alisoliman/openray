@@ -264,9 +264,11 @@ extension LauncherModel {
         panel?.dismiss(restoreFocus: false)
         Task {
             do { try await SyntheticInput.paste(into: target, expectedChangeCount: changeCount) } catch {
-                // Show first: showing can reset to Home, which clears feedback.
+                // Show first: showing can reset to Home, which clears feedback. ⌘V is offered only
+                // while the copy still owns the clipboard.
                 panel?.show()
-                feedback = .error(error.localizedDescription)
+                let owned = clipboard.changeCount == changeCount
+                feedback = .error(owned ? "\(error.localizedDescription) \(Self.pasteItYourself)" : error.localizedDescription)
             }
         }
     }
