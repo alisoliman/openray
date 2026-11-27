@@ -89,7 +89,7 @@ struct WritingFlowTests {
         paste.postPaste = { pid in
             log.posted.append(pid)
             log.pastedText = clipboard.readText()
-            log.pastedTypes = Set(clipboard.snapshot().items.first?.map(\.type) ?? [])
+            log.pastedTypes = Set((try? clipboard.snapshot())?.items.first?.map(\.type) ?? [])
         }
         var environment = PasteBack.Environment()
         environment.paste = paste
@@ -641,13 +641,13 @@ struct WritingFlowTests {
         #expect(log.selectedAll == 1)
         #expect(paste.posted == [app.processIdentifier])
 
-        // A field that changed while the model worked is left alone; the result is copied.
+        // A field that changed while the model worked is left alone, and so is the clipboard.
         model.focusedFieldReader = { self.field("Teh whole feild.", application: app, log: log, unchanged: false) }
         model.runQuickFix()
         await model.inPlaceTask?.value
         #expect(log.replaced.count == 1)
         #expect(paste.posted.count == 1)
-        #expect(hud.presented.last?.message == LauncherModel.copiedHUD)
+        #expect(hud.presented.last?.message.text == "Not replaced. The text in Mail changed.")
     }
 
     @Test func quickFixPrefersTheSelectionUnlessThatsTurnedOff() async throws {

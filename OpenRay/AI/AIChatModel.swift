@@ -146,6 +146,17 @@ final class AIChatModel {
                 || !instruction.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || !attachments.isEmpty
                 || !messages.isEmpty
         }
+
+        /// A finished result with nothing unsent: no typed passage or follow-up, no failure. Only
+        /// these may leave a full history; drafts and unsent work never do.
+        var isSettled: Bool {
+            guard let last = messages.last, last.role == .assistant, !last.isPartial, !last.text.isEmpty else {
+                return false
+            }
+            return draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                && instruction.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && failedRevision == nil
+                && errorMessage == nil
+        }
     }
 
     /// The writing run on screen, writing command or AI Command, for putting away. Nil for chat
@@ -331,6 +342,17 @@ final class AIChatModel {
         guard let last = messages.last, last.role == .assistant, !last.text.isEmpty, action == .chat || !last.isPartial
         else { return nil }
         return last
+    }
+
+    /// A result with nothing to give back: proofreading that changed nothing, or action items
+    /// that found none. A follow-up's reply is free-form text, so only an extraction can be empty.
+    var resultIsUnchanged: Bool {
+        guard !isGenerating, let response = latestResponse else { return false }
+        switch action {
+        case .proofread: return response.text == lastSource
+        case .actionItems: return !repliesToRevision(response) && response.checklistItems.isEmpty
+        default: return false
+        }
     }
 
     /// Try Again needs a finished run to repeat. A stopped writing result counts here,

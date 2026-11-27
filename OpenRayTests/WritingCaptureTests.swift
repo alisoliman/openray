@@ -3,9 +3,14 @@ import Testing
 
 @testable import OpenRay
 
-/// The writing rebuild's clipboard work (work items 2 and 6): the ⌘C selection fallback and the
-/// paste back, both on private pasteboards with fake key posters, so nothing reaches another app
-/// or the person's clipboard.
+/// A pasteboard item whose promised type never arrives: a board that can't be read whole.
+private final class SilentProvider: NSObject, NSPasteboardItemDataProvider {
+    func pasteboard(_ pasteboard: NSPasteboard?, item: NSPasteboardItem, provideDataForType type: NSPasteboard.PasteboardType) {}
+}
+
+/// The writing rebuild's clipboard work (work items 2 and 6, review blocker 1 and majors 2–5): the
+/// ⌘C selection fallback and the paste back, both on private pasteboards with fake key posters and
+/// clocks, so nothing reaches another app or the person's clipboard.
 @MainActor
 struct WritingCaptureTests {
     /// Another app's process, which the fakes never touch: the fallback refuses OpenRay itself.
@@ -38,124 +43,261 @@ struct WritingCaptureTests {
         ]
     }
 
-    /// What the fakes saw.
+    /// Someone else writing to the board: another app, or the person.
+    private func write(_ text: String, to board: NSPasteboard) {
+        board.clearContents()
+        board.setString(text, forType: .string)
+    }
+
+    /// What the fakes saw, and whether the launcher was disturbed.
     @MainActor
     private final class Recorder {
         var posted: [pid_t] = []
-        var markedTypes: Set<String> = []
         var polls = 0
-        var closed = false
+        var disturbed = false
+        var finished = 0
+        /// Runs on each poll, before the poll looks at the board.
+        var onPoll: (Int) -> Void = { _ in }
     }
 
     /// A copy environment that never touches the Mac: `copy` stands in for the app's ⌘C.
     private func environment(
-        timeout: Duration = .milliseconds(60), copy: @escaping @MainActor (pid_t) -> Void = { _ in },
-        sleeps: SleepLog = SleepLog()
+        _ seen: Recorder = Recorder(), copy: @escaping @MainActor (pid_t) -> Void = { _ in }
     ) -> SelectionCopy.Environment {
         var environment = SelectionCopy.Environment()
         environment.checkAllowed = {}
         environment.isTrusted = { true }
         environment.secureInput = { false }
-        environment.postCopy = { copy($0) }
-        environment.timeout = timeout
+        environment.postCopy = { pid in
+            seen.posted.append(pid)
+            copy(pid)
+        }
+        environment.timeout = .milliseconds(60)
+        environment.lateAnswerWindow = .milliseconds(60)
         environment.pollInterval = .milliseconds(20)
-        environment.sleep = { sleeps.record($0) }
+        environment.sleep = { _ in
+            try Task.checkCancellation()
+            seen.polls += 1
+            seen.onPoll(seen.polls)
+        }
+        environment.isUndisturbed = { !seen.disturbed }
+        environment.didFinish = { seen.finished += 1 }
         return environment
     }
 
-    // MARK: Selection fallback
+    private func service(_ board: NSPasteboard, store: LibraryStore = LibraryStore(fileURL: nil), source: String = "com.example.editor")
+        -> ClipboardService
+    {
+        ClipboardService(
+            store: store, pasteboard: board,
+            captureContext: { ClipboardCaptureContext(sourceName: "Editor", sourceBundleID: source, secureInput: false) },
+            textRecognizer: nil)
+    }
 
-    @Test func theCopyFallbackReadsTheAppsCopyMarksItAndRestoresEveryItemAndType() async throws {
+    // MARK: The app's answer
+
+    @Test func theAppsAnswerIsReadAndTheClipboardPutBackWhole() async throws {
         let board = pasteboard(with: mixedContents)
-        let before = PasteboardSnapshot.capture(board)
+        let before = try PasteboardSnapshot.capture(board)
         let seen = Recorder()
-        var environment = environment(copy: { pid in
-            seen.posted.append(pid)
-            board.clearContents()
-            board.setString("Selected words", forType: .string)
-        })
-        environment.willRestore = { seen.markedTypes = Set(($0.types ?? []).map(\.rawValue)) }
         let app = otherApp
-        let text = try await SelectionCopy.read(from: app, sourceName: "Editor", pasteboard: board, environment: environment)
+        let outcome = try await SelectionCopy.read(
+            from: app, sourceName: "Editor", pasteboard: board, snapshot: before,
+            environment: environment(seen, copy: { _ in self.write("Selected words", to: board) }))
+        guard case .answered(let text, let restored) = outcome else {
+            Issue.record("Expected an answer, got \(outcome)")
+            return
+        }
         #expect(text == "Selected words")
         #expect(seen.posted == [app.processIdentifier])
-        // The copy was marked before anything else could keep it.
-        #expect(seen.markedTypes.isSuperset(of: ["org.nspasteboard.TransientType", "org.nspasteboard.ConcealedType"]))
-        // Every item and type is back, in order.
-        #expect(PasteboardSnapshot.capture(board).items == before.items)
+        // Put back right after the read: every item and type, in order.
+        #expect(restored == board.changeCount)
+        #expect(try PasteboardSnapshot.capture(board).items == before.items)
         #expect(board.pasteboardItems?.count == 2)
         #expect(board.pasteboardItems?.first?.data(forType: .rtf) == Data("{\\rtf1 Earlier copy}".utf8))
     }
 
-    @Test func nothingSelectedLeavesTheClipboardAloneAndSaysWhere() async {
+    @Test func noAnswerLeavesTheClipboardAlone() async throws {
         let board = pasteboard(with: mixedContents)
         let generation = board.changeCount
-        let sleeps = SleepLog()
-        await #expect(throws: SelectionReadError.nothingSelected(app: "Editor")) {
-            try await SelectionCopy.read(
-                from: otherApp, sourceName: "Editor", pasteboard: board, environment: environment(sleeps: sleeps))
-        }
-        // Waited the whole timeout (60 ms in 20 ms polls), then left the clipboard as it was.
-        #expect(sleeps.durations == [.milliseconds(20), .milliseconds(20), .milliseconds(20)])
+        let seen = Recorder()
+        let outcome = try await SelectionCopy.read(
+            from: otherApp, sourceName: "Editor", pasteboard: board, snapshot: try PasteboardSnapshot.capture(board),
+            environment: environment(seen))
+        #expect(outcome == .unanswered)
+        // Waited the whole timeout (60 ms in 20 ms polls), and wrote nothing.
+        #expect(seen.polls == 3)
         #expect(board.changeCount == generation)
-        #expect(board.pasteboardItems?.first?.string(forType: .string) == "Earlier copy")
         #expect(SelectionReadError.nothingSelected(app: "Editor").errorDescription == "Nothing selected in Editor.")
     }
 
-    @Test func aCopyThatLandsJustBeforeTheTimeoutIsReadAndPutBack() async throws {
+    @Test func anAnswerOnTheLastPollIsStillTheApps() async throws {
         let board = pasteboard(with: mixedContents)
-        let before = PasteboardSnapshot.capture(board)
-        var environment = environment()
+        let before = try PasteboardSnapshot.capture(board)
         let seen = Recorder()
-        environment.sleep = { _ in
-            seen.polls += 1
-            // The app answers on the last poll.
-            if seen.polls == 3 {
-                board.clearContents()
-                board.setString("Late words", forType: .string)
+        seen.onPoll = { poll in if poll == 3 { self.write("Late words", to: board) } }
+        let outcome = try await SelectionCopy.read(
+            from: otherApp, sourceName: "Editor", pasteboard: board, snapshot: before, environment: environment(seen))
+        guard case .answered(let text, _) = outcome else {
+            Issue.record("Expected an answer, got \(outcome)")
+            return
+        }
+        #expect(text == "Late words")
+        #expect(try PasteboardSnapshot.capture(board).items == before.items)
+    }
+
+    // MARK: Someone else's copy always wins (review blocker 1)
+
+    @Test func aCopyMadeDuringTheWaitIsNeverReadOrUndone() async throws {
+        let board = pasteboard(with: mixedContents)
+        let seen = Recorder()
+        // The person types or clicks in OpenRay, then copies, while the app hasn't answered.
+        seen.onPoll = { poll in
+            if poll == 2 {
+                seen.disturbed = true
+                self.write("The person's own copy", to: board)
             }
         }
-        let text = try await SelectionCopy.read(from: otherApp, sourceName: "Editor", pasteboard: board, environment: environment)
-        #expect(text == "Late words")
-        #expect(PasteboardSnapshot.capture(board).items == before.items)
-    }
-
-    @Test func aCopyWithoutTextIsNothingSelectedAndStillPutBack() async {
-        let board = pasteboard(with: mixedContents)
-        let before = PasteboardSnapshot.capture(board)
-        let environment = environment(copy: { _ in
-            board.clearContents()
-            board.setData(Data([9]), forType: .png)
-        })
-        await #expect(throws: SelectionReadError.nothingSelected(app: "Finder")) {
-            try await SelectionCopy.read(from: self.otherApp, sourceName: "Finder", pasteboard: board, environment: environment)
+        await #expect(throws: CancellationError.self) {
+            try await SelectionCopy.read(
+                from: self.otherApp, sourceName: "Editor", pasteboard: board,
+                snapshot: try PasteboardSnapshot.capture(board), environment: self.environment(seen))
         }
-        #expect(PasteboardSnapshot.capture(board).items == before.items)
+        #expect(board.string(forType: .string) == "The person's own copy")
     }
 
-    @Test func secureInputMissingAccessibilityAndAnInertLaunchSendNoKey() async {
+    @Test func aDisturbedCaptureSendsNoCopy() async throws {
         let board = pasteboard(with: mixedContents)
         let seen = Recorder()
-        var environment = environment(copy: { seen.posted.append($0) })
+        seen.disturbed = true
+        await #expect(throws: CancellationError.self) {
+            try await SelectionCopy.read(
+                from: self.otherApp, sourceName: "Editor", pasteboard: board,
+                snapshot: try PasteboardSnapshot.capture(board), environment: self.environment(seen))
+        }
+        #expect(seen.posted.isEmpty)
+    }
+
+    @Test func aLateAnswerInsideTheWindowIsPutBackAndKeptOutOfHistory() async throws {
+        let store = LibraryStore(fileURL: nil)
+        #expect(store.update { $0.preferences.clipboardEnabled = true })
+        let board = pasteboard(with: mixedContents)
+        let before = try PasteboardSnapshot.capture(board)
+        let service = service(board, store: store)
+        let seen = Recorder()
+        // Three polls time the copy out; it lands during the 300 ms-style window after them.
+        seen.onPoll = { poll in if poll == 5 { self.write("Late words", to: board) } }
+        await #expect(throws: SelectionReadError.nothingSelected(app: "Editor")) {
+            try await service.readSelectionByCopying(from: self.otherApp, sourceName: "Editor", environment: self.environment(seen))
+        }
+        await service.poll()
+        await service.lateCopyWatch?.value
+        #expect(try PasteboardSnapshot.capture(board).items == before.items)
+        #expect(seen.finished == 1)
+        await service.poll()
+        #expect(!store.database.clipboard.contains { $0.plainText == "Late words" })
+    }
+
+    @Test func aCopyAfterTheWindowStaysAndGoesToHistory() async throws {
+        let store = LibraryStore(fileURL: nil)
+        #expect(store.update { $0.preferences.clipboardEnabled = true })
+        let board = pasteboard(with: mixedContents)
+        let service = service(board, store: store)
+        let seen = Recorder()
+        await #expect(throws: SelectionReadError.nothingSelected(app: "Editor")) {
+            try await service.readSelectionByCopying(from: self.otherApp, sourceName: "Editor", environment: self.environment(seen))
+        }
+        await service.lateCopyWatch?.value
+        #expect(seen.polls == 6)
+        // Nothing watches any more: the person's copy is theirs.
+        write("Copied afterwards", to: board)
+        await service.poll()
+        #expect(board.string(forType: .string) == "Copied afterwards")
+        #expect(store.database.clipboard.contains { $0.plainText == "Copied afterwards" })
+    }
+
+    @Test func dismissalEndsTheLateWindowSoALaterCopyStays() async throws {
+        let store = LibraryStore(fileURL: nil)
+        #expect(store.update { $0.preferences.clipboardEnabled = true })
+        let board = pasteboard(with: mixedContents)
+        let service = service(board, store: store)
+        let seen = Recorder()
+        // The panel closes during the late window, then a copy lands.
+        seen.onPoll = { poll in
+            if poll == 4 {
+                seen.disturbed = true
+                self.write("Copied after closing", to: board)
+            }
+        }
+        await #expect(throws: SelectionReadError.nothingSelected(app: "Editor")) {
+            try await service.readSelectionByCopying(from: self.otherApp, sourceName: "Editor", environment: self.environment(seen))
+        }
+        await service.lateCopyWatch?.value
+        #expect(board.string(forType: .string) == "Copied after closing")
+        await service.poll()
+        #expect(store.database.clipboard.contains { $0.plainText == "Copied after closing" })
+    }
+
+    // MARK: Snapshots and the guard (review major 3, minor rule 4)
+
+    @Test func anIncompleteClipboardIsNeverBorrowed() async throws {
+        let board = NSPasteboard.withUniqueName()
+        board.clearContents()
+        let item = NSPasteboardItem()
+        item.setString("Visible", forType: .string)
+        item.setDataProvider(SilentProvider(), forTypes: [NSPasteboard.PasteboardType("com.example.promised")])
+        board.writeObjects([item])
+        #expect(throws: PasteboardBorrowError.unreadable) { try PasteboardSnapshot.capture(board) }
+        let seen = Recorder()
+        await #expect(throws: PasteboardBorrowError.unreadable) {
+            try await self.service(board).readSelectionByCopying(
+                from: self.otherApp, sourceName: "Editor", environment: self.environment(seen))
+        }
+        #expect(seen.posted.isEmpty)
+        #expect(board.string(forType: .string) == "Visible")
+    }
+
+    @Test func restoreGoesOnlyOverItsOwnGenerationAndNeverOnTheGeneralBoardWhileInert() throws {
+        let board = pasteboard(with: mixedContents)
+        let snapshot = try PasteboardSnapshot.capture(board)
+        write("Newer copy", to: board)
+        #expect(try snapshot.restore(to: board, over: board.changeCount - 1) == nil)
+        #expect(board.string(forType: .string) == "Newer copy")
+        #expect(try snapshot.restore(to: board, over: board.changeCount) != nil)
+        #expect(try PasteboardSnapshot.capture(board).items == snapshot.items)
+        // The process's own rule refuses the general pasteboard before touching it.
+        #expect(throws: SideEffectGuard.Blocked.self) {
+            try snapshot.restore(to: .general, over: NSPasteboard.general.changeCount)
+        }
+    }
+
+    @Test func refusalsSendNoKey() async throws {
+        let board = pasteboard(with: mixedContents)
+        let snapshot = try PasteboardSnapshot.capture(board)
+        let seen = Recorder()
+        var environment = environment(seen)
         environment.secureInput = { true }
         await #expect(throws: SelectionReadError.secureInput) {
-            try await SelectionCopy.read(from: self.otherApp, sourceName: "Editor", pasteboard: board, environment: environment)
+            try await SelectionCopy.read(
+                from: self.otherApp, sourceName: "Editor", pasteboard: board, snapshot: snapshot, environment: environment)
         }
         environment.secureInput = { false }
         environment.isTrusted = { false }
         await #expect(throws: SelectionReadError.accessibilityOff) {
-            try await SelectionCopy.read(from: self.otherApp, sourceName: "Editor", pasteboard: board, environment: environment)
+            try await SelectionCopy.read(
+                from: self.otherApp, sourceName: "Editor", pasteboard: board, snapshot: snapshot, environment: environment)
         }
         // The default guard in the test host refuses before any key.
         environment.isTrusted = { true }
         environment.checkAllowed = SelectionCopy.Environment().checkAllowed
         await #expect(throws: SideEffectGuard.Blocked.self) {
-            try await SelectionCopy.read(from: self.otherApp, sourceName: "Editor", pasteboard: board, environment: environment)
+            try await SelectionCopy.read(
+                from: self.otherApp, sourceName: "Editor", pasteboard: board, snapshot: snapshot, environment: environment)
         }
         // OpenRay never copies from itself.
         environment.checkAllowed = {}
         await #expect(throws: SelectionReadError.noSourceApp) {
-            try await SelectionCopy.read(from: .current, sourceName: "OpenRay", pasteboard: board, environment: environment)
+            try await SelectionCopy.read(from: .current, sourceName: "OpenRay", pasteboard: board, snapshot: snapshot, environment: environment)
         }
         #expect(seen.posted.isEmpty)
     }
@@ -170,34 +312,7 @@ struct WritingCaptureTests {
         #expect(!SelectionReadError.nothingSelected(app: "Slack").allowsCopyFallback)
     }
 
-    @Test func aCopyThatLandsAfterTheTimeoutIsStillPutBackAndKeptOutOfHistory() async throws {
-        let store = LibraryStore(fileURL: nil)
-        #expect(store.update { $0.preferences.clipboardEnabled = true })
-        let board = pasteboard(with: mixedContents)
-        let before = PasteboardSnapshot.capture(board)
-        let service = ClipboardService(store: store, pasteboard: board, textRecognizer: nil)
-        var environment = environment()
-        let seen = Recorder()
-        environment.sleep = { _ in
-            seen.polls += 1
-            // Three polls time the copy out; it lands during the watch after them.
-            if seen.polls == 5 {
-                board.clearContents()
-                board.setString("Late words", forType: .string)
-            }
-        }
-        environment.willRestore = { seen.markedTypes = Set(($0.types ?? []).map(\.rawValue)) }
-        await #expect(throws: SelectionReadError.nothingSelected(app: "Editor")) {
-            try await service.readSelectionByCopying(from: self.otherApp, sourceName: "Editor", environment: environment)
-        }
-        await service.poll()
-        let watch = try #require(service.lateCopyWatch)
-        await watch.value
-        #expect(seen.markedTypes.contains("org.nspasteboard.ConcealedType"))
-        #expect(PasteboardSnapshot.capture(board).items == before.items)
-        await service.poll()
-        #expect(!store.database.clipboard.contains { $0.plainText == "Late words" })
-    }
+    // MARK: Borrowing (review major 4)
 
     @MainActor
     private final class Gate {
@@ -208,8 +323,7 @@ struct WritingCaptureTests {
     }
 
     @Test func borrowingsTakeTurnsSoNeitherRestoresTheOthersContents() async {
-        let service = ClipboardService(
-            store: LibraryStore(fileURL: nil), pasteboard: pasteboard(with: mixedContents), textRecognizer: nil)
+        let service = service(pasteboard(with: mixedContents))
         let gate = Gate()
         let first = Task {
             await service.borrowing {
@@ -228,25 +342,50 @@ struct WritingCaptureTests {
         #expect(gate.log == ["first", "first done", "second"])
     }
 
-    @Test func theClipboardServiceKeepsTheBorrowedCopyAndTheRestoreOutOfHistory() async throws {
+    @Test func theAnswerAndTheRestoreStayOutOfHistory() async throws {
         let store = LibraryStore(fileURL: nil)
         #expect(store.update { $0.preferences.clipboardEnabled = true })
         let board = pasteboard(with: [[(NSPasteboard.PasteboardType.string.rawValue, Data("Earlier copy".utf8))]])
-        let service = ClipboardService(
-            store: store, pasteboard: board,
-            captureContext: { ClipboardCaptureContext(sourceName: "Editor", sourceBundleID: "com.example.editor", secureInput: false) },
-            textRecognizer: nil)
+        let service = service(board, store: store)
         await service.poll()
         let entries = store.database.clipboard.count
-        let environment = environment(copy: { _ in
-            board.clearContents()
-            board.setString("Selected words", forType: .string)
-        })
-        let text = try await service.readSelectionByCopying(from: otherApp, sourceName: "Editor", environment: environment)
+        let text = try await service.readSelectionByCopying(
+            from: otherApp, sourceName: "Editor", environment: environment(copy: { _ in self.write("Selected words", to: board) }))
         #expect(text == "Selected words")
         await service.poll()
         #expect(store.database.clipboard.count == entries)
         #expect(!store.database.clipboard.contains { $0.plainText == "Selected words" })
+    }
+
+    @Test func anExcludedCopyStaysExcludedAndAnAllowedOneUsableAfterARestore() async throws {
+        let store = LibraryStore(fileURL: nil)
+        #expect(store.update {
+            $0.preferences.clipboardEnabled = true
+            $0.preferences.excludedClipboardBundleIDs = ["com.example.vault"]
+        })
+        let board = NSPasteboard.withUniqueName()
+        let excluded = service(board, store: store, source: "com.example.vault")
+        // Copied from the excluded app once the service is watching.
+        write("Secret", to: board)
+        await excluded.poll()
+        #expect(excluded.placeholderText() == nil)
+        _ = try await excluded.readSelectionByCopying(
+            from: otherApp, sourceName: "Editor", environment: environment(copy: { _ in self.write("Selected words", to: board) }))
+        // Put back under a new generation, and still never offered to {clipboard}.
+        #expect(board.string(forType: .string) == "Secret")
+        #expect(excluded.placeholderText() == nil)
+
+        let allowedBoard = NSPasteboard.withUniqueName()
+        let allowed = service(allowedBoard, store: store)
+        write("Allowed", to: allowedBoard)
+        await allowed.poll()
+        #expect(allowed.placeholderText(unattributedIsExcluded: true) == "Allowed")
+        let log = PasteLog()
+        let outcome = await PasteBack.run(
+            "Improved", into: .current, clipboard: allowed, validate: {}, environment: pasteEnvironment(log, board: allowedBoard))
+        #expect(outcome == .pasted(restored: true))
+        // Still attributed after the paste back, so a quicklink can use it.
+        #expect(allowed.placeholderText(unattributedIsExcluded: true) == "Allowed")
     }
 
     // MARK: Paste back
@@ -255,28 +394,32 @@ struct WritingCaptureTests {
     private final class PasteLog {
         var posted: [pid_t] = []
         var activated: [pid_t] = []
-        /// What the clipboard held when ⌘V went: its text and types.
+        /// What the clipboard held when ⌘V went: its items and their types.
         var pastedText: String?
-        var pastedTypes: Set<String> = []
+        var pastedItems: [[String]] = []
         var sleeps: [Duration] = []
+        var frontmostReads = 0
     }
 
     private func pasteEnvironment(
-        _ log: PasteLog, board: NSPasteboard, frontmost: @escaping @MainActor () -> pid_t? = {
-            NSRunningApplication.current.processIdentifier
-        }, secureInput: Bool = false
+        _ log: PasteLog, board: NSPasteboard,
+        frontmost: @escaping @MainActor () -> pid_t? = { NSRunningApplication.current.processIdentifier },
+        secureInput: Bool = false, pause: @escaping @MainActor () -> Void = {}
     ) -> PasteBack.Environment {
         var paste = SyntheticInput.PasteEnvironment()
         paste.checkAllowed = {}
         paste.isTrusted = { true }
         paste.activate = { log.activated.append($0.processIdentifier) }
-        paste.frontmostProcess = frontmost
+        paste.frontmostProcess = {
+            log.frontmostReads += 1
+            return frontmost()
+        }
         paste.secureInput = { secureInput }
-        paste.pause = {}
+        paste.pause = { pause() }
         paste.postPaste = { pid in
             log.posted.append(pid)
             log.pastedText = board.string(forType: .string)
-            log.pastedTypes = Set((board.types ?? []).map(\.rawValue))
+            log.pastedItems = (board.pasteboardItems ?? []).map { $0.types.map(\.rawValue) }
         }
         var environment = PasteBack.Environment()
         environment.paste = paste
@@ -285,34 +428,34 @@ struct WritingCaptureTests {
         return environment
     }
 
-    @Test func pastingBackMarksTheResultTransientThenRestoresTheClipboard() async {
+    @Test func theResultIsPublishedMarkedInOneItemThenTheClipboardComesBack() async throws {
         let board = pasteboard(with: mixedContents)
-        let before = PasteboardSnapshot.capture(board)
-        let service = ClipboardService(store: LibraryStore(fileURL: nil), pasteboard: board, textRecognizer: nil)
+        let before = try PasteboardSnapshot.capture(board)
+        let service = service(board)
         let log = PasteLog()
         let me = NSRunningApplication.current
         let seen = Recorder()
         let outcome = await PasteBack.run(
             "Improved text", into: me, clipboard: service, validate: {},
-            environment: pasteEnvironment(log, board: board), willPaste: { seen.closed = true })
-        #expect(outcome == .pasted)
-        #expect(seen.closed)
+            environment: pasteEnvironment(log, board: board), willPaste: { seen.finished += 1 })
+        #expect(outcome == .pasted(restored: true))
+        #expect(seen.finished == 1)
         #expect(log.activated == [me.processIdentifier])
         #expect(log.posted == [me.processIdentifier])
         #expect(log.pastedText == "Improved text")
-        #expect(log.pastedTypes.contains("org.nspasteboard.TransientType"))
-        // The paste had its moment, then the person's clipboard came back whole.
+        // One item, with both markers from its first write.
+        #expect(log.pastedItems.count == 1)
+        #expect(Set(log.pastedItems.first ?? []).isSuperset(of: ["org.nspasteboard.TransientType", "org.nspasteboard.ConcealedType"]))
         #expect(log.sleeps == [.milliseconds(400)])
-        #expect(PasteboardSnapshot.capture(board).items == before.items)
+        #expect(try PasteboardSnapshot.capture(board).items == before.items)
     }
 
-    @Test func aFailedPasteLeavesTheResultCopiedAndNothingRestored() async {
+    @Test func aRefusedPasteLeavesTheResultCopiedAndSaysPressCommandV() async {
         let board = pasteboard(with: mixedContents)
-        let service = ClipboardService(store: LibraryStore(fileURL: nil), pasteboard: board, textRecognizer: nil)
         let log = PasteLog()
         // Another app came to the front.
         let outcome = await PasteBack.run(
-            "Improved text", into: .current, clipboard: service, validate: {},
+            "Improved text", into: .current, clipboard: service(board), validate: {},
             environment: pasteEnvironment(log, board: board, frontmost: { 1 }))
         guard case .copied = outcome else {
             Issue.record("Expected the result to be copied, got \(outcome)")
@@ -323,29 +466,62 @@ struct WritingCaptureTests {
         #expect(board.string(forType: .string) == "Improved text")
     }
 
-    @Test func secureInputRefusesThePasteAndSaysSo() async {
+    @Test func secureInputRefusesThePaste() async {
         let board = pasteboard(with: mixedContents)
-        let service = ClipboardService(store: LibraryStore(fileURL: nil), pasteboard: board, textRecognizer: nil)
         let log = PasteLog()
         let outcome = await PasteBack.run(
-            "Improved text", into: .current, clipboard: service, validate: {},
+            "Improved text", into: .current, clipboard: service(board), validate: {},
             environment: pasteEnvironment(log, board: board, secureInput: true))
         #expect(outcome == .copied("Secure Input is on, so nothing was pasted. Your text is copied; paste it with ⌘V."))
         #expect(log.posted.isEmpty)
     }
 
-    @Test func aCopyMadeBeforeTheRestoreIsThePersonsAndStays() async {
+    @Test func aCopyMadeWhileTheAppComesForwardIsNeverClaimed() async {
         let board = pasteboard(with: mixedContents)
-        let service = ClipboardService(store: LibraryStore(fileURL: nil), pasteboard: board, textRecognizer: nil)
+        let log = PasteLog()
+        // The app takes a moment to come forward; meanwhile the person copies.
+        let environment = pasteEnvironment(
+            log, board: board, frontmost: { log.frontmostReads > 1 ? NSRunningApplication.current.processIdentifier : 1 },
+            pause: { self.write("The person's own copy", to: board) })
+        let outcome = await PasteBack.run("Improved text", into: .current, clipboard: service(board), validate: {}, environment: environment)
+        // ⌘V would paste their copy, so the result isn't said to be on the clipboard.
+        guard case .notPasted = outcome else {
+            Issue.record("Expected not pasted, got \(outcome)")
+            return
+        }
+        #expect(log.posted.isEmpty)
+        #expect(board.string(forType: .string) == "The person's own copy")
+    }
+
+    @Test func aCopyMadeBeforeTheRestoreIsThePersonsStaysAndGoesToHistory() async {
+        let store = LibraryStore(fileURL: nil)
+        #expect(store.update { $0.preferences.clipboardEnabled = true })
+        let board = pasteboard(with: mixedContents)
+        let service = service(board, store: store)
         let log = PasteLog()
         var environment = pasteEnvironment(log, board: board)
-        environment.sleep = { _ in
-            board.clearContents()
-            board.setString("Copied meanwhile", forType: .string)
-        }
+        environment.sleep = { _ in self.write("Copied meanwhile", to: board) }
         let outcome = await PasteBack.run("Improved text", into: .current, clipboard: service, validate: {}, environment: environment)
-        #expect(outcome == .pasted)
+        #expect(outcome == .pasted(restored: true))
         #expect(board.string(forType: .string) == "Copied meanwhile")
+        await service.poll()
+        #expect(store.database.clipboard.contains { $0.plainText == "Copied meanwhile" })
+    }
+
+    @Test func anUnattendedPasteNeverTakesFocusOrTheClipboard() async {
+        let board = pasteboard(with: mixedContents)
+        let generation = board.changeCount
+        let log = PasteLog()
+        let outcome = await PasteBack.run(
+            "Improved text", into: .current, clipboard: service(board), validate: {}, activates: false,
+            environment: pasteEnvironment(log, board: board, frontmost: { 1 }))
+        guard case .notPasted = outcome else {
+            Issue.record("Expected not pasted, got \(outcome)")
+            return
+        }
+        #expect(log.activated.isEmpty)
+        #expect(log.posted.isEmpty)
+        #expect(board.changeCount == generation)
     }
 
     @Test func theLenientCheckRefusesOnlyAnotherFocusedField() throws {

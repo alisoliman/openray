@@ -197,6 +197,17 @@ final class LauncherModel {
     /// The selection a writing result goes back over (main #13): pinned to its conversation and
     /// its passage, never to whichever app happens to be in front later.
     var aiSelectionTarget: PinnedSelection?
+    /// The app the run on screen pastes into, bound when the run started.
+    var aiDestination: RunDestination?
+    /// The ⌘C fallback under way, so dismissal and the person's input can stop it.
+    @ObservationIgnored var selectionCaptureSession: SelectionCaptureSession?
+    /// Watches the person's keys and clicks in OpenRay while a selection is copied. Inert launches
+    /// install nothing; tests pass a fake.
+    @ObservationIgnored var inputMonitoring: any LocalEventMonitoring = AppKitLocalEventMonitoring()
+    /// Whether an app's focused element is a password field, read right before a paste. Tests set it.
+    @ObservationIgnored var focusedFieldIsSecure: @MainActor (NSRunningApplication) -> Bool = {
+        SelectedTextContext.focusedFieldIsSecure(in: $0)
+    }
     /// True while a result is being pasted into its app.
     var isPastingAIResponse = false
     /// The app the ⌘C fallback is reading the selection from, while it does.
@@ -228,6 +239,36 @@ final class LauncherModel {
     struct StashedWriting {
         var snapshot: AIChatModel.WritingSnapshot
         var pin: PinnedSelection?
+        var destination: RunDestination?
+    }
+
+    /// The app a run's result is pasted into: bound when the run starts, kept with it in history,
+    /// and never swapped for whichever app is in front later (review blocker 6).
+    struct RunDestination {
+        var conversation: UUID
+        var application: NSRunningApplication
+        var processIdentifier: pid_t
+        var bundleIdentifier: String?
+        var name: String
+        /// Whether the field focused at capture still is; nil when there was none to check.
+        var focusIsOriginal: (@MainActor () -> Bool?)?
+
+        init(conversation: UUID, application: NSRunningApplication, name: String, focusIsOriginal: (@MainActor () -> Bool?)?) {
+            self.conversation = conversation
+            self.application = application
+            processIdentifier = application.processIdentifier
+            bundleIdentifier = application.bundleIdentifier
+            self.name = name
+            self.focusIsOriginal = focusIsOriginal
+        }
+
+        /// The bound app while it's still the same running app; nil once it quit.
+        var liveApplication: NSRunningApplication? {
+            guard !application.isTerminated, application.processIdentifier == processIdentifier,
+                application.bundleIdentifier == bundleIdentifier
+            else { return nil }
+            return application
+        }
     }
 
     /// A selection a result goes back over, bound to the passage the person chose: the attachment
@@ -702,7 +743,7 @@ final class LauncherModel {
 
     func panelDidHide() {
         lastHiddenAt = .now
-        // A selection still being copied belongs to the launcher that asked; its copy is put back.
+        // A selection still being copied stops: from now on a clipboard change is the person's.
         cancelSelectionCapture()
         showActions = false
         showShortcuts = false
@@ -853,6 +894,7 @@ final class LauncherModel {
                     aiSelectionTarget = PinnedSelection(
                         context: selection, conversation: ai.conversationToken, attachmentID: nil)
                 }
+                bindDestination(to: lastCapturedSelection)
             }
             focusRequest += 1
             return
@@ -937,13 +979,30 @@ final class LauncherModel {
         focusRequest += 1
     }
 
-    /// Puts the run on screen into the history and opens an empty one for `action`.
+    /// Puts the run on screen into the history and opens an empty one for `action`, bound to the
+    /// app the launcher was opened from.
     func startWritingRun(_ action: AIAction) {
         cancelSelectionCapture()
         commitWritingRun()
         ai.newConversation(action: action)
         ai.open(action)
         selectionNotice = nil
+        bindDestination(to: nil)
+    }
+
+    /// Binds the run on screen to the app its result goes back to: the selection's app, with its
+    /// focus check, or else the app the launcher was opened from. OpenRay itself is never one.
+    func bindDestination(to selection: SelectedTextContext?) {
+        aiDestination = nil
+        guard let application = selection?.application ?? previousApplication, !application.isTerminated,
+            application.processIdentifier != ProcessInfo.processInfo.processIdentifier
+        else { return }
+        let name =
+            selection?.application != nil
+            ? selection?.sourceName ?? "your app" : application.localizedName ?? previousApplicationName ?? "your app"
+        aiDestination = RunDestination(
+            conversation: ai.conversationToken, application: application, name: name,
+            focusIsOriginal: selection?.application != nil ? selection?.focusIsOriginal : nil)
     }
 
     /// The selection in the app OpenRay was opened from, with its app, element and range, so a
@@ -962,14 +1021,29 @@ final class LauncherModel {
         return try SelectedTextContext.capture(from: previousApplication)
     }
 
-    /// The selection by the app's own Copy, once Accessibility saw none (work item 2).
+    /// The selection by the app's own Copy, once Accessibility saw none (work item 2). A clipboard
+    /// change counts as the app's answer only while this capture is undisturbed: the panel stays
+    /// up and the person doesn't type, click or copy in OpenRay. The environment's own guard and
+    /// trust checks stand in for the launch's, and the live ⌘C is guarded by the process's rule.
     func copySelection(from application: NSRunningApplication?) async throws -> SelectedTextContext {
         if let selectionCopyReader { return try await selectionCopyReader(application) }
-        try sideEffects.check("copying the selection in another app")
-        guard windows.hasPermission else { throw SelectionReadError.accessibilityOff }
         let name = application?.localizedName ?? previousApplicationName ?? "your app"
-        let text = try await clipboard.readSelectionByCopying(
-            from: application, sourceName: name, environment: selectionCopyEnvironment)
+        let session = SelectionCaptureSession()
+        selectionCaptureSession?.disturb()
+        selectionCaptureSession = session
+        let monitoring = inputMonitoring
+        let monitor = monitoring.add([.keyDown, .leftMouseDown, .rightMouseDown, .otherMouseDown]) { [weak session] event in
+            MainActor.assumeIsolated { session?.disturb() }
+            return event
+        }
+        var environment = selectionCopyEnvironment
+        environment.isUndisturbed = { [weak session] in session.map { !$0.isDisturbed } ?? false }
+        let finish = environment.didFinish
+        environment.didFinish = {
+            if let monitor { monitoring.remove(monitor) }
+            finish()
+        }
+        let text = try await clipboard.readSelectionByCopying(from: application, sourceName: name, environment: environment)
         return SelectedTextContext.copied(text, from: application, sourceName: name)
     }
 
@@ -999,8 +1073,11 @@ final class LauncherModel {
         }
     }
 
-    /// Stops a ⌘C fallback still waiting; its copy is still put back.
+    /// Stops a ⌘C fallback still waiting, and its late-answer watch: after this, no clipboard
+    /// change is read as the app's answer or put back over.
     func cancelSelectionCapture() {
+        selectionCaptureSession?.disturb()
+        selectionCaptureSession = nil
         selectionCaptureTask?.cancel()
         selectionCaptureTask = nil
         readingSelectionFrom = nil
@@ -1024,6 +1101,9 @@ final class LauncherModel {
                 if startsNewRun { self.startWritingRun(self.ai.action) }
                 self.attachSelection(selection)
                 if self.ai.canSend { self.ai.send() }
+            case .failure(let error) where error is CancellationError:
+                // The person typed or clicked while the app's copy was awaited.
+                self.selectionNotice = "Stopped reading the selection, so the clipboard was left as it is."
             case .failure(let error):
                 self.selectionNotice = error.localizedDescription
             }
@@ -1076,6 +1156,7 @@ final class LauncherModel {
             attached.text == selection.text
         {
             aiSelectionTarget = PinnedSelection(context: selection, conversation: ai.conversationToken, attachmentID: attached.id)
+            bindDestination(to: selection)
         }
     }
 

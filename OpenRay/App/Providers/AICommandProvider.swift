@@ -72,7 +72,8 @@ final class AICommandProvider: CommandProvider {
             id: command.id, title: command.name,
             subtitle: usable ? LauncherModel.aiCommandSubtitle : "Not available yet", kind: .ai, symbol: command.symbol,
             keywords: ["AI", "command", command.subtitle].filter { !$0.isEmpty }, arguments: arguments(for: command, in: model),
-            mode: .ai, badge: "AI command", detail: usable && !command.subtitle.isEmpty ? command.subtitle : nil,
+            // Replace Selection runs with no window, so a hotkey never shows the panel first.
+            mode: command.replacesInPlace ? .noView : .ai, badge: "AI command", detail: usable && !command.subtitle.isEmpty ? command.subtitle : nil,
             isUnavailable: !usable)
     }
 
@@ -107,13 +108,8 @@ final class AICommandProvider: CommandProvider {
             hub.openChatWindow()
         case Self.quickFixID:
             model.store.recordUse(of: item.id)
-            let target = hub.settings.quickFixCommandID
-            // A target that needs a value opens its fields first, then runs on the selection.
-            if let targetItem = model.bindableCommands.first(where: { $0.id == target }), model.needsArguments(targetItem) {
-                model.panel?.show()
-                model.beginArguments(for: targetItem)
-                return
-            }
+            // It reads its target first; a command that needs a value then asks for it, and runs
+            // in place on that target.
             model.runQuickFix()
         case Self.createID:
             model.store.recordUse(of: item.id)
@@ -133,10 +129,10 @@ final class AICommandProvider: CommandProvider {
             let choices = model.argumentSpecs(for: item).filter { spec in
                 if case .dropdown = spec.type { spec.defaultValue != nil || !spec.isOptional } else { false }
             }
-            if case .provided(let row) = item.action, choices.contains(where: { row.arguments[$0.name] == nil }),
-                model.beginArguments(for: item)
-            {
-                return
+            if case .provided(let row) = item.action, choices.contains(where: { row.arguments[$0.name] == nil }) {
+                // A windowless command's hotkey left the panel hidden; the fields live in it.
+                if model.panel?.isVisible == false { model.panel?.show() }
+                if model.beginArguments(for: item) { return }
             }
             model.store.recordUse(of: commandID)
             run(commandID: commandID, arguments: ref.arguments, in: model)
@@ -166,7 +162,9 @@ final class AICommandProvider: CommandProvider {
             model.feedback = .warning(error.localizedDescription)
             return
         }
-        guard plan.requirements.selection, model.readsSelectionImplicitly else {
+        // Replace Selection needs the selection whatever its prompt reads; other commands read it
+        // only when their prompt uses it.
+        guard plan.requirements.selection || command.replacesInPlace, model.readsSelectionImplicitly else {
             render(command, plan: plan, arguments: resolved, in: model)
             return
         }
@@ -178,6 +176,9 @@ final class AICommandProvider: CommandProvider {
             switch result {
             case .success(let selection):
                 self.render(command, plan: plan, arguments: resolved, selection: selection, in: model)
+            case .failure(let error) where error is CancellationError:
+                // The person moved on while the app's copy was awaited: nothing runs.
+                return
             case .failure(let error):
                 self.render(command, plan: plan, arguments: resolved, selectionFailure: error, in: model)
             }
@@ -195,13 +196,22 @@ final class AICommandProvider: CommandProvider {
             let run = try AICommandRenderer.render(
                 command, plan: plan, values: values, capabilities: model.ai.capabilities,
                 sourceAppName: selection?.sourceName ?? model.previousApplicationName)
-            // In place needs the selection's exact place; a copied one opens in OpenRay, where ↵
-            // can still paste over it.
-            if run.replacesInPlace, let selection = model.lastCapturedSelection, selection.canReplace {
-                model.runInPlace(command: run, on: .selection(selection), title: command.name)
-            } else {
-                model.openAI(command: run)
+            if run.replacesInPlace {
+                if let selection, selection.canReplace {
+                    model.runInPlace(command: run, on: .selection(selection), title: command.name)
+                    return
+                }
+                // No exact place to replace: a copied selection opens in OpenRay, where ↵ can still
+                // paste over it. The windowless command's panel may be hidden.
+                if model.panel?.isVisible == false { model.panel?.show() }
+                guard let selection else {
+                    model.feedback = .warning(
+                        "\(selectionFailure?.localizedDescription ?? "Nothing is selected.") “\(command.name)” replaces the selected text, so select some first.")
+                    return
+                }
+                model.lastCapturedSelection = selection
             }
+            model.openAI(command: run)
         } catch AICommandError.noText where selectionFailure != nil {
             // Say why there was no selection, such as “Nothing selected in Notes.”
             model.feedback = .warning(

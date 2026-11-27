@@ -177,9 +177,9 @@ struct AICommandTests {
         // The default runs Fix Spelling & Grammar at once, in place, with no window (work item 8).
         #expect(model.destination == .search)
         #expect(engine.actionPrompts == ["They was late."])
-        // The stand-in selection has no app to go back to, so the result is copied and the HUD says so.
-        #expect(model.clipboard.readText() == "They were late.")
-        #expect(model.hud.current == LauncherModel.copiedHUD)
+        // The stand-in selection has no app to go back to: nothing is replaced or copied, and the HUD says so.
+        #expect(model.clipboard.readText() == nil)
+        #expect(model.hud.current?.text == "Not replaced: OpenRay can't tell which app the text is in.")
 
         #expect(model.aiHub.updateSettings { $0.quickFixCommandID = AICommand.explainSimply.id })
         model.perform(quickFix)

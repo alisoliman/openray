@@ -15,6 +15,8 @@ enum SelectionReadError: LocalizedError, Equatable {
     /// Nothing is selected: Accessibility shows an empty selection, or the app's Copy left the
     /// clipboard as it was.
     case nothingSelected(app: String)
+    /// The clipboard changed again while the app's copy was being read: that's someone's own copy.
+    case copyInterrupted(app: String)
 
     var errorDescription: String? {
         switch self {
@@ -26,6 +28,8 @@ enum SelectionReadError: LocalizedError, Equatable {
         case .protectedField: "Protected text cannot be used for writing assistance."
         case .notExposed(let app): "\(app) doesn't share its selected text. Paste or type the text instead."
         case .nothingSelected(let app): "Nothing selected in \(app)."
+        case .copyInterrupted(let app):
+            "Your clipboard changed while the selection in \(app) was read, so OpenRay left it as it is."
         }
     }
 
@@ -180,6 +184,15 @@ struct SelectedTextContext {
         return context
     }
 
+    /// Whether the app's focused element is a password field, read now. False when it can't be
+    /// read, and in an inert launch, which never reads another app.
+    static func focusedFieldIsSecure(in application: NSRunningApplication) -> Bool {
+        guard !SideEffectGuard.isInert, AXIsProcessTrusted() else { return false }
+        let app = AXUIElementCreateApplication(application.processIdentifier)
+        AXUIElementSetMessagingTimeout(app, 0.2)
+        return focusedElement(in: app).map(isSecure) ?? false
+    }
+
     fileprivate static func focusedElement(in app: AXUIElement) -> AXUIElement? {
         var value: CFTypeRef?
         guard AXUIElementCopyAttributeValue(app, kAXFocusedUIElementAttribute as CFString, &value) == .success,
@@ -233,7 +246,8 @@ struct FocusedFieldContext {
     /// Sets a one-line field's value through Accessibility. False when the field doesn't take it,
     /// and for text areas, where a set value would skip undo; those are pasted over instead.
     var replaceValue: @MainActor (String) -> Bool
-    /// Selects the whole value, so a paste replaces it. False when the field doesn't allow it.
+    /// Selects the whole value and confirms the selection covers exactly it, so a paste replaces
+    /// it. False when the field doesn't allow it, or the selection came out different.
     var selectAll: @MainActor () -> Bool
 
     /// The field's value. `selectionHidden` refuses when the field has a selection it doesn't share,
@@ -253,7 +267,9 @@ struct FocusedFieldContext {
             throw SelectionReadError.notExposed(app: sourceName)
         }
         guard !SelectedTextContext.isSecure(element) else { throw SelectionReadError.protectedField }
-        if refuses, (SelectedTextContext.selectedRange(in: element)?.length ?? 0) > 0 {
+        // With Prefer Selection on, only an empty selection Accessibility can place widens to
+        // the whole field: one it can't read may hide a selection.
+        if refuses, SelectedTextContext.selectedRange(in: element)?.length != 0 {
             throw SelectionReadError.notExposed(app: sourceName)
         }
         func value() -> String? {
@@ -278,17 +294,20 @@ struct FocusedFieldContext {
         return FocusedFieldContext(
             text: text, application: application, sourceName: sourceName,
             validate: {
+                // Checked again right before anything is written, directly or by paste.
+                guard !IsSecureEventInputEnabled(), !SelectedTextContext.isSecure(element) else {
+                    throw LibraryValidationError("A password field has the keyboard, so nothing was replaced.")
+                }
                 let focused = SelectedTextContext.focusedElement(in: app).map { CFEqual($0, element) }
                 guard NSWorkspace.shared.frontmostApplication?.processIdentifier == pid, !application.isTerminated,
                     focused == true, value() == text
                 else {
-                    throw LibraryValidationError(
-                        "The text in \(sourceName) changed. Your result is copied; paste it with ⌘V.")
+                    throw LibraryValidationError("The text in \(sourceName) changed, so nothing was replaced.")
                 }
             },
             replaceValue: { newValue in
                 var settable: DarwinBoolean = false
-                guard isOneLine,
+                guard isOneLine, !IsSecureEventInputEnabled(), !SelectedTextContext.isSecure(element),
                     AXUIElementIsAttributeSettable(element, kAXValueAttribute as CFString, &settable) == .success,
                     settable.boolValue
                 else { return false }
@@ -298,9 +317,13 @@ struct FocusedFieldContext {
                     == .success
             },
             selectAll: {
-                var range = CFRange(location: 0, length: (text as NSString).length)
-                guard let whole = AXValueCreate(.cfRange, &range) else { return false }
-                return AXUIElementSetAttributeValue(element, kAXSelectedTextRangeAttribute as CFString, whole) == .success
+                // Selected, then read back: a paste must cover exactly the whole value.
+                let whole = NSRange(location: 0, length: (text as NSString).length)
+                var range = CFRange(location: whole.location, length: whole.length)
+                guard let value = AXValueCreate(.cfRange, &range),
+                    AXUIElementSetAttributeValue(element, kAXSelectedTextRangeAttribute as CFString, value) == .success
+                else { return false }
+                return SelectedTextContext.selectedRange(in: element) == whole
             })
     }
 }

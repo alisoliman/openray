@@ -110,6 +110,9 @@ final class ClipboardService {
     @ObservationIgnored private var waitingBorrowers: [CheckedContinuation<Void, Never>] = []
     /// The watch for a selection copy that lands late, while it runs. Tests await it.
     @ObservationIgnored private(set) var lateCopyWatch: Task<Void, Never>?
+    /// The generations OpenRay wrote or put back while borrowing. Only these are taken as seen
+    /// when the borrowing ends; a copy the person makes meanwhile goes to the poll as usual.
+    @ObservationIgnored private var ownedGenerations: Set<Int> = []
 
     private struct CapturePolicy: Equatable {
         var enabled: Bool
@@ -417,83 +420,120 @@ final class ClipboardService {
         return item
     }
 
-    /// Every write goes through here, so the general pasteboard is refused while inert.
-    private func write(_ items: [NSPasteboardItem]) -> Bool {
+    /// Every write goes through here, so the general pasteboard is refused while inert. Only the
+    /// generation this write made is taken as OpenRay's: another writer's never is.
+    private func write(_ items: [NSPasteboardItem]) -> Bool { writeOwned(items).written != nil }
+
+    /// Writes `items`. `written` is the generation they hold, nil when the write failed or another
+    /// writer came in between; `cleared` is the generation the board was cleared to, if it was.
+    private func writeOwned(_ items: [NSPasteboardItem]) -> (written: Int?, cleared: Int?) {
         do { try sideEffects.checkWrite(to: pasteboard) } catch {
             lastCopyError = error.localizedDescription
-            return false
+            return (nil, nil)
         }
         for item in items { item.setString("1", forType: NSPasteboard.PasteboardType("com.openray.generated")) }
-        pasteboard.clearContents()
-        let success = pasteboard.writeObjects(items)
-        lastChange = pasteboard.changeCount
-        attributedGeneration = lastChange
-        return success
+        let generation = pasteboard.clearContents()
+        guard pasteboard.writeObjects(items), pasteboard.changeCount == generation else { return (nil, generation) }
+        lastChange = generation
+        attributedGeneration = generation
+        if borrowings > 0 { ownedGenerations.insert(generation) }
+        return (generation, generation)
     }
 
     // MARK: Borrowing the clipboard (writing commands)
 
-    /// Everything on the clipboard now, every item and type, to put back later.
-    func snapshot() -> PasteboardSnapshot { PasteboardSnapshot.capture(pasteboard) }
-
-    /// Puts a snapshot back. The restored copy keeps what OpenRay knew about it (an excluded app's
-    /// copy stays excluded from `{clipboard}`) and never becomes a new history entry.
-    func restore(_ snapshot: PasteboardSnapshot) {
-        guard sideEffects.mayWrite(to: pasteboard) else { return }
-        let wasExcluded = excludedGeneration == snapshot.changeCount
-        let wasAttributed = attributedGeneration == snapshot.changeCount
-        snapshot.restore(to: pasteboard)
-        adoptCurrentGeneration(excluded: wasExcluded, attributed: wasAttributed)
+    /// Everything on the clipboard now, every item and type, with what OpenRay knew about it.
+    /// Throws when it can't be read whole: then nothing may be borrowed.
+    func snapshot() throws -> PasteboardSnapshot {
+        var snapshot = try PasteboardSnapshot.capture(pasteboard)
+        snapshot.wasExcluded = excludedGeneration == snapshot.changeCount
+        snapshot.wasAttributed = attributedGeneration == snapshot.changeCount
+        return snapshot
     }
 
-    /// Writes a writing result for a paste: plain text, and formatting when given, marked transient
-    /// so neither OpenRay's history nor other clipboard managers keep it.
+    /// Puts a snapshot back over `generation` (OpenRay's own write, or the source app's answer)
+    /// and only over it: a newer copy is the person's and stays. The restored copy keeps what
+    /// OpenRay knew about the original, so an excluded app's copy stays out of `{clipboard}` and
+    /// an allowed one stays usable. Returns whether it was put back.
     @discardableResult
-    func copyTransient(_ text: String, richText: ClipboardRichText? = nil) -> Bool {
+    func restore(_ snapshot: PasteboardSnapshot, over generation: Int) throws -> Bool {
+        guard let restored = try snapshot.restore(to: pasteboard, over: generation) else { return false }
+        adopt(restored, from: snapshot)
+        return true
+    }
+
+    /// The outcome of writing a result for a paste back.
+    enum TransientWrite: Equatable {
+        /// On the board as this generation.
+        case written(Int)
+        /// Not written. The board may have been cleared to `cleared` first.
+        case failed(cleared: Int?)
+    }
+
+    /// Writes a writing result for a paste: plain text, and formatting when given, in one item
+    /// that carries the transient and concealed markers from the start, so neither OpenRay's
+    /// history nor other clipboard managers ever keep it.
+    func copyTransient(_ text: String, richText: ClipboardRichText? = nil) -> TransientWrite {
         lastCopyError = nil
         let item = NSPasteboardItem()
         item.setString(text, forType: .string)
         if let rtf = richText?.rtf { item.setData(rtf, forType: .rtf) }
         if let html = richText?.html { item.setData(html, forType: .html) }
         item.setData(Data(), forType: SelectionCopy.transientType)
-        return write([item])
+        item.setData(Data(), forType: SelectionCopy.concealedType)
+        let result = writeOwned([item])
+        if let generation = result.written { return .written(generation) }
+        return .failed(cleared: result.cleared)
     }
 
     /// Reads the selection in another app with that app's own Copy (`SelectionCopy`), while
-    /// capture waits, and puts the clipboard back as it was. An unanswered copy is watched for a
-    /// while longer, so one that lands late is put back too.
+    /// capture waits. An unanswered copy is watched a little longer, so a late answer is put back
+    /// too, unless the launcher is disturbed first.
     func readSelectionByCopying(
         from application: NSRunningApplication?, sourceName: String, environment: SelectionCopy.Environment
     ) async throws -> String {
-        try await borrowing {
-            let before = pasteboard.changeCount
-            let wasExcluded = excludedGeneration == before
-            let wasAttributed = attributedGeneration == before
-            defer {
-                if pasteboard.changeCount != before { adoptCurrentGeneration(excluded: wasExcluded, attributed: wasAttributed) }
-            }
-            return try await SelectionCopy.read(
-                from: application, sourceName: sourceName, pasteboard: pasteboard, environment: environment
-            ) { snapshot in
-                watchForLateCopy(over: snapshot, environment: environment)
+        var watching = false
+        defer { if !watching { environment.didFinish() } }
+        return try await borrowing {
+            try Task.checkCancellation()
+            guard environment.isUndisturbed() else { throw CancellationError() }
+            let snapshot = try self.snapshot()
+            switch try await SelectionCopy.read(
+                from: application, sourceName: sourceName, pasteboard: pasteboard, snapshot: snapshot,
+                environment: environment)
+            {
+            case .answered(let text, let restored):
+                if let restored { adopt(restored, from: snapshot) }
+                guard let text, !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+                    throw SelectionReadError.nothingSelected(app: sourceName)
+                }
+                return text
+            case .unanswered:
+                watching = true
+                watchForLateAnswer(over: snapshot, environment: environment)
+                throw SelectionReadError.nothingSelected(app: sourceName)
             }
         }
     }
 
-    /// Keeps the clipboard borrowed while `SelectionCopy.putBackLateCopy` watches. The watch takes
-    /// its share now, while the copy's borrowing still holds the clipboard, so nothing slips between.
-    private func watchForLateCopy(over snapshot: PasteboardSnapshot, environment: SelectionCopy.Environment) {
+    /// Keeps the clipboard borrowed while `SelectionCopy.putBackLateAnswer` watches. The watch
+    /// takes its share now, while the copy's borrowing still holds the clipboard, so nothing slips
+    /// between.
+    private func watchForLateAnswer(over snapshot: PasteboardSnapshot, environment: SelectionCopy.Environment) {
         let board = pasteboard
         borrowings += 1
         lateCopyWatch = Task { [weak self] in
-            await SelectionCopy.putBackLateCopy(over: snapshot, on: board, environment: environment)
+            let restored = await SelectionCopy.putBackLateAnswer(over: snapshot, on: board, environment: environment)
+            if let restored { self?.adopt(restored, from: snapshot) }
             self?.releaseBorrowing()
+            environment.didFinish()
         }
     }
 
     /// Runs `body` with the clipboard to itself: one borrowing at a time, in order, so a paste
     /// back's restore and a selection copy never take each other's contents for the person's.
-    /// Capture waits meanwhile, so nothing OpenRay puts there or puts back becomes history.
+    /// Capture waits meanwhile; anything the person copies meanwhile is classified by the poll
+    /// afterwards, as usual.
     func borrowing<T>(_ body: () async throws -> T) async rethrows -> T {
         if borrowings > 0 {
             // `releaseBorrowing` counts this borrowing before it resumes it.
@@ -507,17 +547,20 @@ final class ClipboardService {
 
     private func releaseBorrowing() {
         borrowings -= 1
-        lastChange = pasteboard.changeCount
+        // Only what OpenRay wrote or put back counts as seen; another copy is left for the poll.
+        if ownedGenerations.contains(pasteboard.changeCount) { lastChange = pasteboard.changeCount }
+        if borrowings == 0 { ownedGenerations.removeAll() }
         if borrowings == 0, !waitingBorrowers.isEmpty {
             borrowings += 1
             waitingBorrowers.removeFirst().resume()
         }
     }
 
-    private func adoptCurrentGeneration(excluded: Bool, attributed: Bool) {
-        lastChange = pasteboard.changeCount
-        if excluded { excludedGeneration = lastChange }
-        if attributed { attributedGeneration = lastChange }
+    private func adopt(_ generation: Int, from snapshot: PasteboardSnapshot) {
+        ownedGenerations.insert(generation)
+        lastChange = generation
+        if snapshot.wasExcluded { excludedGeneration = generation }
+        if snapshot.wasAttributed { attributedGeneration = generation }
     }
 }
 
@@ -664,40 +707,64 @@ enum PasteBack {
     }
 
     enum Outcome: Equatable {
-        case pasted
-        /// On the clipboard, not pasted, with why.
+        /// Pasted. `restored` is false when the person's clipboard couldn't be put back.
+        case pasted(restored: Bool)
+        /// Not pasted, and the result owns the clipboard, so ⌘V pastes it: with why.
         case copied(String)
-        /// Not even copied.
-        case failed(String)
+        /// Not pasted, and the clipboard isn't the result's: nothing was written, or someone
+        /// copied over it. With why.
+        case notPasted(String)
     }
 
-    /// `validate` is the target check: the lenient focus check for an explicit ↵, or
-    /// `SelectedTextContext.validateForPaste` for unattended replaces. `willPaste` runs once the
-    /// result is on the clipboard, before the app is activated: the launcher closes there.
+    /// `validate` is the target check: the lenient focus check for an explicit ↵, or the strict
+    /// one for unattended replaces. `activates` is false for those: the app must already be in
+    /// front, and focus never moves. `willPaste` runs once the result is on the clipboard, before
+    /// the app is activated: the launcher closes there.
     static func run(
         _ text: String, richText: ClipboardRichText? = nil, into application: NSRunningApplication,
-        clipboard: ClipboardService, validate: () throws -> Void, environment: Environment = .live,
-        willPaste: () -> Void = {}
+        clipboard: ClipboardService, validate: () throws -> Void, activates: Bool = true,
+        environment: Environment = .live, willPaste: () -> Void = {}
     ) async -> Outcome {
         await clipboard.borrowing {
-            let snapshot = clipboard.snapshot()
-            guard clipboard.copyTransient(text, richText: richText) else {
-                return .failed(clipboard.lastCopyError ?? "Couldn't write to the clipboard. Try again.")
+            guard activates || environment.paste.frontmostProcess() == application.processIdentifier else {
+                let name = application.localizedName ?? "The app"
+                return .notPasted("\(name) isn't in front any more, so nothing was replaced.")
             }
-            let written = clipboard.changeCount
+            // An incomplete copy can't be put back, so nothing is borrowed.
+            guard let snapshot = try? clipboard.snapshot() else {
+                return .notPasted(
+                    "OpenRay couldn't keep a full copy of your clipboard, so nothing was pasted and your clipboard is as it was.")
+            }
+            let written: Int
+            switch clipboard.copyTransient(text, richText: richText) {
+            case .written(let generation):
+                written = generation
+            case .failed(let cleared):
+                // A write that cleared the board and failed puts the person's copy back.
+                let recovered = cleared.map { (try? clipboard.restore(snapshot, over: $0)) == true } ?? true
+                let reason = clipboard.lastCopyError ?? "Couldn't write to the clipboard."
+                return .notPasted(recovered ? reason : "\(reason) \(PasteboardBorrowError.notRestored.localizedDescription)")
+            }
             var paste = environment.paste
             paste.changeCount = { clipboard.changeCount }
+            if !activates { paste.activate = { _ in } }
             willPaste()
             do {
                 try await SyntheticInput.paste(
                     into: application, expectedChangeCount: written, validateTarget: validate, environment: paste)
             } catch {
-                return .copied(error.localizedDescription)
+                // ⌘V pastes what's on the clipboard: say so only while that's the result.
+                return clipboard.changeCount == written
+                    ? .copied(error.localizedDescription) : .notPasted(error.localizedDescription)
             }
             await environment.sleep(environment.restoreDelay)
             // Something copied meanwhile is the person's own, and stays.
-            if clipboard.changeCount == written { clipboard.restore(snapshot) }
-            return .pasted
+            do {
+                try clipboard.restore(snapshot, over: written)
+                return .pasted(restored: true)
+            } catch {
+                return .pasted(restored: false)
+            }
         }
     }
 }

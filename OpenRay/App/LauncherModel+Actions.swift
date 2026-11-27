@@ -321,9 +321,14 @@ extension LauncherModel {
     func continueAIFromResult() {
         guard ai.action != .chat, ai.command == nil, !ai.isGenerating, let result = ai.lastCompletedResult else { return }
         let target = aiReplaceTarget
+        let destination = aiRunDestination
         let action = ai.action
         let appName = ai.lastAttachment?.appName
         startWritingRun(action)
+        // The new run goes back where this one does.
+        aiDestination = destination.map { RunDestination(
+            conversation: ai.conversationToken, application: $0.application, name: $0.name,
+            focusIsOriginal: $0.focusIsOriginal) }
         ai.attach(AIAttachment(source: target == nil ? .response : .selection, text: result, appName: appName))
         // The target is carried forward explicitly, bound to the new passage.
         if let target, let attached = ai.attachments.first, attached.text == result {
@@ -335,15 +340,7 @@ extension LauncherModel {
 
     /// A result with nothing to paste back is a state, not something to paste:
     /// proofreading that changed nothing, or action items that found none.
-    var aiResultIsUnchanged: Bool {
-        guard !ai.isGenerating, let response = ai.latestResponse else { return false }
-        switch ai.action {
-        case .proofread: return response.text == ai.lastSource
-        // A follow-up's reply is free-form text: only an extraction can find nothing.
-        case .actionItems: return !ai.repliesToRevision(response) && response.checklistItems.isEmpty
-        default: return false
-        }
-    }
+    var aiResultIsUnchanged: Bool { ai.resultIsUnchanged }
 
     func saveResponseAsNote() {
         guard let response = ai.latestResponse else { return }

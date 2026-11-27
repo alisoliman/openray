@@ -5,14 +5,13 @@ import SwiftUI
 // person's AI Commands): runs kept in a history, ↵ pasting a result back into its app, and the
 // runs that replace text in place with no window.
 
-/// Where ↵ pastes a writing result: the app its selection came from, with that selection's
-/// focus check, or the app the launcher was opened from.
+/// One ⌘C fallback. Once the panel closes or the person types, clicks or copies in OpenRay, it's
+/// disturbed: from then on no clipboard change counts as the source app's answer, and nothing is
+/// put back over one.
 @MainActor
-struct AIPasteTarget {
-    var application: NSRunningApplication
-    var name: String
-    /// Whether the element focused at capture still is; nil when there's nothing to check.
-    var focusIsOriginal: (@MainActor () -> Bool?)?
+final class SelectionCaptureSession {
+    private(set) var isDisturbed = false
+    func disturb() { isDisturbed = true }
 }
 
 /// What an in-place run (Replace Selection, Quick Fix) replaces.
@@ -47,17 +46,24 @@ enum InPlaceTarget {
 extension LauncherModel {
     // MARK: - History (⌘[ / ⌘])
 
-    /// Puts the writing run on screen into the history, or updates it there. A run that was
-    /// emptied leaves it. Nothing happens for chat or while a reply is written.
+    /// Puts the writing run on screen into the history, or updates it there, with the app it's
+    /// bound to. A run that was emptied leaves it. Nothing happens for chat or while a reply is
+    /// written. Past the limit, the oldest finished results go; drafts and unsent work never do.
     func commitWritingRun() {
         guard let snapshot = ai.writingSnapshot() else { return }
-        let pin = aiSelectionTarget.flatMap { $0.conversation == snapshot.conversationToken ? $0 : nil }
-        let run = StashedWriting(snapshot: snapshot, pin: pin)
-        if let index = writingRuns.firstIndex(where: { $0.snapshot.conversationToken == snapshot.conversationToken }) {
+        let token = snapshot.conversationToken
+        let run = StashedWriting(
+            snapshot: snapshot, pin: aiSelectionTarget.flatMap { $0.conversation == token ? $0 : nil },
+            destination: aiDestination.flatMap { $0.conversation == token ? $0 : nil })
+        if let index = writingRuns.firstIndex(where: { $0.snapshot.conversationToken == token }) {
             if snapshot.hasWork { writingRuns[index] = run } else { writingRuns.remove(at: index) }
         } else if snapshot.hasWork {
             writingRuns.append(run)
-            if writingRuns.count > Self.writingHistoryLimit { writingRuns.removeFirst(writingRuns.count - Self.writingHistoryLimit) }
+        }
+        while writingRuns.filter(\.snapshot.isSettled).count > Self.writingHistoryLimit,
+            let oldest = writingRuns.firstIndex(where: \.snapshot.isSettled)
+        {
+            writingRuns.remove(at: oldest)
         }
     }
 
@@ -70,7 +76,8 @@ extension LauncherModel {
     var canShowPreviousRun: Bool { showsWritingRun && writingRunPosition > 0 }
     var canShowNextRun: Bool { showsWritingRun && writingRunPosition < writingRuns.count - 1 }
 
-    /// ⌘[ (-1) and ⌘] (+1): the run before or after the one on screen, which is kept first.
+    /// ⌘[ (-1) and ⌘] (+1): the run before or after the one on screen, which is kept first. A run
+    /// comes back with the app it's bound to.
     func showWritingRun(_ offset: Int) {
         guard showsWritingRun else { return }
         let token = ai.conversationToken
@@ -82,6 +89,7 @@ extension LauncherModel {
         let run = writingRuns[target]
         ai.restoreWriting(run.snapshot)
         aiSelectionTarget = run.pin
+        aiDestination = run.destination
         selectionNotice = nil
         feedback = nil
         focusRequest += 1
@@ -111,9 +119,16 @@ extension LauncherModel {
     var aiPrimaryPastes: Bool { aiHub.settings.primaryAction == .paste }
 
     /// What ↵ does with a finished result.
-    var aiAcceptTitle: String { aiPrimaryPastes ? "Paste Response" : "Copy Response" }
-    /// What ⌘↵ does: the other one, so the two keys never do the same thing.
-    var aiSecondaryTitle: String { aiPrimaryPastes ? "Copy Response" : "Paste Response" }
+    var aiAcceptTitle: String { aiPrimaryPastes ? aiPasteResponseTitle : "Copy Response" }
+    /// What ⌘↵ does: the other one, so the two keys never do the same thing. With Copy as the
+    /// primary action that's a paste, named with the app it goes into.
+    var aiSecondaryTitle: String { aiPrimaryPastes ? "Copy Response" : aiPasteResponseTitle }
+
+    /// “Paste Response to Notes”: the paste names the app the run is bound to.
+    private var aiPasteResponseTitle: String {
+        guard let destination = aiRunDestination else { return "Paste Response" }
+        return "Paste Response to \(destination.name)"
+    }
 
     /// The result ↵ uses: the latest finished reply of a writing run.
     private var usableAIResult: String? {
@@ -134,15 +149,12 @@ extension LauncherModel {
         return pin.context
     }
 
-    /// Where ↵ pastes: the selection's app, or the app the launcher was opened from.
-    var aiPasteTarget: AIPasteTarget? {
-        if let selection = aiReplaceTarget, let application = selection.application, !application.isTerminated {
-            return AIPasteTarget(application: application, name: selection.sourceName, focusIsOriginal: selection.focusIsOriginal)
+    /// The app the run on screen is bound to, whether or not it's still running.
+    var aiRunDestination: RunDestination? {
+        guard ai.action != .chat, let aiDestination, aiDestination.conversation == ai.conversationToken else {
+            return nil
         }
-        guard let application = previousApplication, !application.isTerminated,
-            application.processIdentifier != ProcessInfo.processInfo.processIdentifier
-        else { return nil }
-        return AIPasteTarget(application: application, name: previousApplicationName ?? "your app", focusIsOriginal: nil)
+        return aiDestination
     }
 
     /// ↵ on a finished result with an empty field.
@@ -164,9 +176,11 @@ extension LauncherModel {
     }
 
     /// Paste Response (↵) and Paste Formatted Response (⌥↵), as Raycast does it: the result goes on
-    /// the clipboard marked transient, the panel closes, the app comes forward, and, if it's
-    /// still the app with the same field focused and Secure Input off, ⌘V; then the person's
-    /// clipboard comes back and a HUD says it's done. If it can't paste, the result stays copied.
+    /// the clipboard marked transient and concealed, the panel closes, the run's own app comes
+    /// forward, and, if it's in front with the same field focused, no password field focused and
+    /// Secure Input off, ⌘V; then the person's clipboard comes back and a HUD says it's done. A
+    /// changed range in that field still passes: the person chose to paste. The run's app is the
+    /// only target: when it quit, the result stays here for Copy.
     func pasteWritingResult(formatted: Bool = false) {
         guard canAcceptAIResponse, let text = usableAIResult else { return }
         let richText = formatted ? AIFormattedText.richText(fromMarkdown: text) : nil
@@ -182,8 +196,13 @@ extension LauncherModel {
             }
             environment = .live
         }
-        guard let target = aiPasteTarget else {
-            copy(text)
+        guard let destination = aiRunDestination else {
+            feedback = .warning("This result has no app to go back to. Copy it with \(aiPrimaryPastes ? "⌘↩" : "↩").")
+            return
+        }
+        guard let application = destination.liveApplication else {
+            feedback = .warning(
+                "\(destination.name) isn't open any more, so nothing was pasted. Copy the result with \(aiPrimaryPastes ? "⌘↩" : "↩").")
             return
         }
         let label = Self.pastTense(forCommandID: ai.commandID, inPlace: false)
@@ -194,34 +213,57 @@ extension LauncherModel {
                 return
             }
             panel?.dismiss(restoreFocus: false)
-            target.application.activate()
+            application.activate()
             hud.show(Self.copiedHUD)
             return
         }
         isPastingAIResponse = true
+        let isSecure = focusedFieldIsSecure
         pasteBackTask = Task { [weak self] in
             guard let self else { return }
             defer { self.isPastingAIResponse = false }
             let outcome = await PasteBack.run(
-                text, richText: richText, into: target.application, clipboard: self.clipboard,
-                validate: { try SelectedTextContext.verifyFocus(target.focusIsOriginal?(), sourceName: target.name) },
+                text, richText: richText, into: application, clipboard: self.clipboard,
+                validate: {
+                    try SelectedTextContext.verifyFocus(destination.focusIsOriginal?(), sourceName: destination.name)
+                    try Self.refuseProtectedField(in: application, name: destination.name, isSecure: isSecure)
+                },
                 environment: environment, willPaste: { [weak self] in self?.panel?.dismiss(restoreFocus: false) })
-            self.finish(outcome, success: label)
+            self.finish(outcome, success: label, inPlace: false)
         }
     }
 
-    /// The HUD after a paste back, or the reason in the panel when nothing reached the clipboard.
-    private func finish(_ outcome: PasteBack.Outcome, success label: String) {
+    /// Right before a key or a write: no password field may have the keyboard.
+    static func refuseProtectedField(
+        in application: NSRunningApplication, name: String, isSecure: @MainActor (NSRunningApplication) -> Bool
+    ) throws {
+        guard !isSecure(application) else {
+            throw LibraryValidationError("A password field has the keyboard in \(name), so nothing was pasted.")
+        }
+    }
+
+    /// The HUD after a paste back. “Press ⌘V” only while the result owns the clipboard; otherwise
+    /// the result stays in view (or, unattended, the HUD says why), to copy or try again.
+    private func finish(_ outcome: PasteBack.Outcome, success label: String, inPlace: Bool) {
         switch outcome {
-        case .pasted:
-            hud.show(HUDMessage(label, symbol: "checkmark.circle.fill"))
+        case .pasted(let restored):
+            hud.show(
+                restored
+                    ? HUDMessage(label, symbol: "checkmark.circle.fill")
+                    : HUDMessage(
+                        "\(label), but your previous clipboard couldn't be put back", symbol: "checkmark.circle.fill",
+                        style: .warning))
         case .copied(let reason):
             hud.show(Self.copiedHUD)
             // Reopening shows why.
-            feedback = .warning(reason)
-        case .failed(let reason):
-            panel?.show()
-            feedback = .error(reason)
+            if !inPlace { feedback = .warning(reason) }
+        case .notPasted(let reason):
+            if inPlace {
+                hud.show(HUDMessage("Not replaced. \(reason)", symbol: "exclamationmark.triangle.fill", style: .warning))
+            } else {
+                panel?.show()
+                feedback = .warning("\(reason) Copy the result, or try again.")
+            }
         }
     }
 
@@ -267,8 +309,8 @@ extension LauncherModel {
     }
 
     /// Runs a writing command or AI Command with no window and replaces `target` with its result,
-    /// after the strict checks (work items 7 and 8). A HUD says how it went; when the text can't
-    /// be replaced, the result stays on the clipboard.
+    /// after the strict checks (work items 7 and 8). A HUD says how it went. A result with nothing
+    /// to give back (no corrections, no action items) is only reported.
     func runInPlace(action: AIAction? = nil, command: AICommandRun? = nil, on target: InPlaceTarget, title: String) {
         let commandID = command?.commandID ?? action.map(AIWritingCommandProvider.commandID(for:)) ?? ""
         if panel?.isVisible == true { panel?.dismiss() }
@@ -290,20 +332,34 @@ extension LauncherModel {
                         chat.errorMessage ?? chat.availability.detail, symbol: "exclamationmark.triangle.fill", style: .error))
                 return
             }
-            if result == target.text {
-                self.hud.show(HUDMessage(action == .proofread ? "No corrections needed" : "No changes", symbol: "checkmark.circle.fill"))
+            if chat.resultIsUnchanged || result == target.text {
+                let status =
+                    switch chat.action {
+                    case .proofread: "No corrections needed"
+                    case .actionItems: "No action items found"
+                    default: "No changes"
+                    }
+                self.hud.show(HUDMessage(status, symbol: "checkmark.circle.fill"))
                 return
             }
             await self.place(result, at: target, label: Self.pastTense(forCommandID: commandID, inPlace: true))
         }
     }
 
-    /// Replaces the target's text: a field through Accessibility where it allows it, otherwise a
-    /// paste over the selection, after the strict checks.
+    /// Replaces the target's text, after the strict checks, without ever moving focus: the app must
+    /// still be in front. A one-line field is set through Accessibility; otherwise the selection,
+    /// or the whole field selected right before the paste, is pasted over.
     private func place(_ result: String, at target: InPlaceTarget, label: String) async {
         guard let application = target.application else {
-            _ = clipboard.copy(result)
-            hud.show(Self.copiedHUD)
+            hud.show(
+                HUDMessage(
+                    "Not replaced: OpenRay can't tell which app the text is in.", symbol: "exclamationmark.triangle.fill",
+                    style: .warning))
+            return
+        }
+        guard !application.isTerminated else {
+            hud.show(
+                HUDMessage("Not replaced: \(target.sourceName) quit.", symbol: "exclamationmark.triangle.fill", style: .warning))
             return
         }
         let environment: PasteBack.Environment
@@ -311,38 +367,57 @@ extension LauncherModel {
             environment = pasteBackEnvironment
         } else {
             guard clipboard.usesGeneralPasteboard, !sideEffects.isInert else {
-                _ = clipboard.copy(result)
-                hud.show(Self.copiedHUD)
+                if clipboard.copy(result) { hud.show(Self.copiedHUD) }
                 return
             }
             environment = .live
         }
+        guard environment.paste.frontmostProcess() == application.processIdentifier else {
+            hud.show(
+                HUDMessage(
+                    "Not replaced: \(target.sourceName) isn't in front any more.", symbol: "exclamationmark.triangle.fill",
+                    style: .warning))
+            return
+        }
+        let isSecure = focusedFieldIsSecure
         let validate: () throws -> Void
         switch target {
         case .selection(let selection):
-            validate = selection.validateForPaste
+            validate = {
+                try Self.refuseProtectedField(in: application, name: selection.sourceName, isSecure: isSecure)
+                try selection.validateForPaste()
+            }
         case .field(let field):
             do {
+                try Self.refuseProtectedField(in: application, name: field.sourceName, isSecure: isSecure)
                 try field.validate()
                 if field.replaceValue(result) {
                     hud.show(HUDMessage(label, symbol: "checkmark.circle.fill"))
                     return
                 }
-                guard field.selectAll() else { throw LibraryValidationError("\(field.sourceName) can't replace its text.") }
             } catch {
-                _ = clipboard.copy(result)
-                hud.show(Self.copiedHUD)
+                hud.show(
+                    HUDMessage("Not replaced. \(error.localizedDescription)", symbol: "exclamationmark.triangle.fill", style: .warning))
                 return
             }
-            validate = field.validate
+            // Selected within the paste, right before ⌘V, so a caret moved meanwhile is caught.
+            validate = {
+                try Self.refuseProtectedField(in: application, name: field.sourceName, isSecure: isSecure)
+                try field.validate()
+                guard field.selectAll() else {
+                    throw LibraryValidationError("\(field.sourceName) didn't select its whole text, so nothing was replaced.")
+                }
+            }
         }
         let outcome = await PasteBack.run(
-            result, into: application, clipboard: clipboard, validate: validate, environment: environment)
-        finish(outcome, success: label)
+            result, into: application, clipboard: clipboard, validate: validate, activates: false, environment: environment)
+        finish(outcome, success: label, inPlace: true)
     }
 
-    /// Quick Fix (work item 8): its command, run in place on the selection, or with Prefer
-    /// Selection off or nothing selected, on the whole focused field.
+    /// Quick Fix (work item 8): its command, run in place on the selection or, with Prefer Selection
+    /// off or a selection Accessibility shows to be empty, on the whole focused field. The target
+    /// is read first; a command with fields asks for them in the launcher, then runs in place on
+    /// that same target.
     func runQuickFix() {
         let hub = aiHub
         let settings = hub.settings
@@ -366,8 +441,9 @@ extension LauncherModel {
             if settings.quickFixPrefersSelection {
                 do {
                     selection = try captureSelection()
-                } catch SelectionReadError.nothingSelected, SelectionReadError.notExposed {
-                    // The whole field, unless it has a selection it doesn't share.
+                } catch SelectionReadError.nothingSelected {
+                    // Accessibility shows an empty selection: the whole field. A selection it
+                    // can't read isn't widened over.
                     selection = nil
                 }
             }
@@ -386,12 +462,24 @@ extension LauncherModel {
             return
         }
         guard let command else { return }
+        // A command that needs a value asks for it, then runs in place on the target read now.
+        if let item = bindableCommands.first(where: { $0.id == command.id }), needsArguments(item) {
+            panel?.show()
+            beginArguments(item: item, specs: argumentSpecs(for: item)) { [weak self] values in
+                self?.runQuickFix(command, on: target, arguments: values)
+            }
+            return
+        }
+        runQuickFix(command, on: target, arguments: [:])
+    }
+
+    private func runQuickFix(_ command: AICommand, on target: InPlaceTarget, arguments: [String: String]) {
         let plan = command.template.plan(snippets: PlaceholderValues.snippetLookup(store.database))
         var selection: SelectedTextContext?
         if case .selection(let captured) = target { selection = captured }
         do {
-            let resolved = try plan.resolveArguments([:])
-            var values = placeholderValues(for: plan, selection: selection)
+            let resolved = try plan.resolveArguments(arguments)
+            var values = placeholderValues(for: plan, selection: selection, readsSelection: false)
             values.selection = target.text
             values.arguments = resolved
             let run = try AICommandRenderer.render(
