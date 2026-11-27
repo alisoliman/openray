@@ -197,6 +197,19 @@ struct SelectedTextContext {
         return focusedElement(in: app).map(isSecure) ?? false
     }
 
+    /// The whole value of the app's focused element, read now, so a copied selection can be checked
+    /// against it. Nil when it can't be read, for a password field, and in an inert launch, which
+    /// never reads another app.
+    static func focusedValue(in application: NSRunningApplication) -> String? {
+        guard !SideEffectGuard.isInert, AXIsProcessTrusted() else { return nil }
+        let app = AXUIElementCreateApplication(application.processIdentifier)
+        AXUIElementSetMessagingTimeout(app, 0.2)
+        guard let element = focusedElement(in: app), !isSecure(element) else { return nil }
+        var value: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(element, kAXValueAttribute as CFString, &value) == .success else { return nil }
+        return value as? String
+    }
+
     fileprivate static func focusedElement(in app: AXUIElement) -> AXUIElement? {
         var value: CFTypeRef?
         guard AXUIElementCopyAttributeValue(app, kAXFocusedUIElementAttribute as CFString, &value) == .success,

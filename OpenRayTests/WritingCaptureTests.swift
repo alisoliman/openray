@@ -56,8 +56,9 @@ struct WritingCaptureTests {
         var polls = 0
         var disturbed = false
         var finished = 0
-        /// The app the fake reports in front, and when the fake's last key or click was.
-        var front: pid_t? = 1
+        /// The app the fake reports in front (OpenRay's panel, over the source app), and when the
+        /// fake's last key or click was.
+        var front: pid_t? = ProcessInfo.processInfo.processIdentifier
         var lastInput: TimeInterval = 0
         /// Runs on each poll, before the poll looks at the board.
         var onPoll: (Int) -> Void = { _ in }
@@ -89,6 +90,7 @@ struct WritingCaptureTests {
         environment.frontmostProcess = { seen.front }
         environment.lastInputAt = { seen.lastInput }
         environment.now = { 10 }
+        environment.focusedValue = { _ in nil }
         return environment
     }
 

@@ -49,7 +49,7 @@ extension SideEffectGuard {
     var restrictedByProcess: SideEffectGuard { effective }
 }
 
-struct ClipboardCaptureContext: Sendable {
+struct ClipboardCaptureContext: Sendable, Equatable {
     var sourceName: String
     var sourceBundleID: String?
     var secureInput: Bool
@@ -113,6 +113,19 @@ final class ClipboardService {
     /// The generations OpenRay wrote or put back while borrowing. Only these are taken as seen
     /// when the borrowing ends; a copy the person makes meanwhile goes to the poll as usual.
     @ObservationIgnored private var ownedGenerations: Set<Int> = []
+    /// A copy the poll hadn't classified when OpenRay borrowed the clipboard, put back as this
+    /// generation, with the source it was classified with then. The poll records it with that
+    /// source, never with whichever app is in front later.
+    @ObservationIgnored private var carriedSource: (generation: Int, context: ClipboardCaptureContext)?
+    /// Test seam: runs at the two moments a write can lose to another copy, so a test can land one.
+    @ObservationIgnored var writeStageHook: (@MainActor (WriteStage) -> Void)?
+
+    enum WriteStage {
+        /// After the permission check and the tagging, right before the generation check and the clear.
+        case beforeGenerationCheck
+        /// After the clear, before the items are written.
+        case afterClear
+    }
 
     private struct CapturePolicy: Equatable {
         var enabled: Bool
@@ -182,7 +195,13 @@ final class ClipboardService {
         let change = lastChange
         let generation = captureGeneration
         let copiedAt = now
-        let source = captureContext()
+        let source: ClipboardCaptureContext
+        if let carried = carriedSource, carried.generation == change {
+            source = carried.context
+        } else {
+            source = captureContext()
+        }
+        carriedSource = nil
         guard
             ClipboardPolicy.shouldCapture(
                 types: [], sourceBundleID: source.sourceBundleID,
@@ -422,22 +441,34 @@ final class ClipboardService {
 
     /// Every write goes through here, so the general pasteboard is refused while inert. Only the
     /// generation this write made is taken as OpenRay's: another writer's never is.
-    private func write(_ items: [NSPasteboardItem]) -> Bool { writeOwned(items).written != nil }
+    private func write(_ items: [NSPasteboardItem]) -> Bool {
+        if case .written = writeOwned(items) { return true }
+        return false
+    }
 
-    /// Writes `items`. `written` is the generation they hold, nil when the write failed or another
-    /// writer came in between; `cleared` is the generation the board was cleared to, if it was.
-    private func writeOwned(_ items: [NSPasteboardItem]) -> (written: Int?, cleared: Int?) {
+    /// Writes `items` after the permission check and the tagging. With `generation`, only over
+    /// it: the check runs right before the clear, so nothing but the clear itself comes between
+    /// them. A copy that lands after the clear wins, and nothing is written over it. The
+    /// generation after the write must be the clear's own, OpenRay's.
+    private func writeOwned(_ items: [NSPasteboardItem], over generation: Int? = nil) -> TransientWrite {
         do { try sideEffects.checkWrite(to: pasteboard) } catch {
             lastCopyError = error.localizedDescription
-            return (nil, nil)
+            return .failed(cleared: nil)
         }
         for item in items { item.setString("1", forType: NSPasteboard.PasteboardType("com.openray.generated")) }
-        let generation = pasteboard.clearContents()
-        guard pasteboard.writeObjects(items), pasteboard.changeCount == generation else { return (nil, generation) }
-        lastChange = generation
-        attributedGeneration = generation
-        if borrowings > 0 { ownedGenerations.insert(generation) }
-        return (generation, generation)
+        writeStageHook?(.beforeGenerationCheck)
+        if let generation, pasteboard.changeCount != generation { return .superseded }
+        let cleared = pasteboard.clearContents()
+        writeStageHook?(.afterClear)
+        guard pasteboard.changeCount == cleared else {
+            lastCopyError = "Something else was copied at the same moment, so it was kept. Try again."
+            return .superseded
+        }
+        guard pasteboard.writeObjects(items), pasteboard.changeCount == cleared else { return .failed(cleared: cleared) }
+        lastChange = cleared
+        attributedGeneration = cleared
+        if borrowings > 0 { ownedGenerations.insert(cleared) }
+        return .written(cleared)
     }
 
     // MARK: Borrowing the clipboard (writing commands)
@@ -449,6 +480,16 @@ final class ClipboardService {
         snapshot.wasExcluded = excludedGeneration == snapshot.changeCount
         snapshot.wasAttributed = attributedGeneration == snapshot.changeCount
         snapshot.wasPending = lastChange != snapshot.changeCount
+        if snapshot.wasPending {
+            // Classified now, by the poll's own rule, as the poll would have had it run: the copy
+            // keeps that source and exclusion when it's put back (final review, major 4).
+            let source = captureContext()
+            snapshot.pendingSource = source
+            snapshot.wasExcluded = !ClipboardPolicy.shouldCapture(
+                types: [], sourceBundleID: source.sourceBundleID,
+                excluded: store.database.preferences.effectiveClipboardExclusions, secureInput: source.secureInput)
+            snapshot.wasAttributed = true
+        }
         return snapshot
     }
 
@@ -469,14 +510,14 @@ final class ClipboardService {
         case written(Int)
         /// Not written. The board may have been cleared to `cleared` first.
         case failed(cleared: Int?)
-        /// Not written: a copy landed after the snapshot, and it stays.
+        /// Not written: a copy landed after the snapshot, or right after the clear, and it stays.
         case superseded
     }
 
     /// Writes a writing result for a paste: plain text, and formatting when given, in one item
     /// that carries the transient and concealed markers from the start, so neither OpenRay's
     /// history nor other clipboard managers ever keep it. With `generation`, the snapshot's, a
-    /// copy that landed after the snapshot is never cleared away.
+    /// copy that landed after the snapshot is never cleared away (see `writeOwned`).
     func copyTransient(_ text: String, richText: ClipboardRichText? = nil, over generation: Int? = nil) -> TransientWrite {
         lastCopyError = nil
         let item = NSPasteboardItem()
@@ -485,10 +526,7 @@ final class ClipboardService {
         if let html = richText?.html { item.setData(html, forType: .html) }
         item.setData(Data(), forType: SelectionCopy.transientType)
         item.setData(Data(), forType: SelectionCopy.concealedType)
-        if let generation, pasteboard.changeCount != generation { return .superseded }
-        let result = writeOwned([item])
-        if let generation = result.written { return .written(generation) }
-        return .failed(cleared: result.cleared)
+        return writeOwned([item], over: generation)
     }
 
     /// Reads the selection in another app with that app's own Copy (`SelectionCopy`), while
@@ -607,11 +645,14 @@ final class ClipboardService {
     }
 
     private func adopt(_ generation: Int, from snapshot: PasteboardSnapshot) {
-        // A copy the poll hadn't classified yet is put back unclassified, still pending: the poll
-        // takes it to History, or keeps it out, and marks its exclusion as it would have.
-        guard !snapshot.wasPending else { return }
-        ownedGenerations.insert(generation)
-        lastChange = generation
+        if snapshot.wasPending, let source = snapshot.pendingSource {
+            // Still new to History: the poll records it, or leaves it out, with the source it was
+            // classified with when it was borrowed.
+            carriedSource = (generation, source)
+        } else {
+            ownedGenerations.insert(generation)
+            lastChange = generation
+        }
         if snapshot.wasExcluded { excludedGeneration = generation }
         if snapshot.wasAttributed { attributedGeneration = generation }
     }
@@ -796,6 +837,10 @@ enum PasteBack {
             case .superseded:
                 return .notPasted("Something was copied just now, so nothing was pasted and that copy stays on your clipboard.")
             case .failed(let cleared):
+                // A copy that came in after the clear is someone's own, and stays.
+                if let cleared, clipboard.changeCount != cleared {
+                    return .notPasted("Something was copied just now, so nothing was pasted and that copy stays on your clipboard.")
+                }
                 // A write that cleared the board and failed puts the person's copy back.
                 let recovered = cleared.map { (try? clipboard.restore(snapshot, over: $0)) == true } ?? true
                 let reason = clipboard.lastCopyError ?? "Couldn't write to the clipboard."

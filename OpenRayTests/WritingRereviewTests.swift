@@ -44,8 +44,10 @@ struct WritingRereviewTests {
         var disturbed = false
         var finished = 0
         var restoreFailures: [String] = []
-        /// The app the copy environment reports in front, and when its last key or click was.
-        var front: pid_t? = 1
+        /// The app the copy environment reports in front (OpenRay's panel, over the source app),
+        /// when its last key or click was, and the source app's focused value.
+        var front: pid_t? = ProcessInfo.processInfo.processIdentifier
+        var focusedValue: String?
         var lastInput: TimeInterval = 0
         /// The app the paste environment reports in front.
         var pasteFront: pid_t?
@@ -78,6 +80,7 @@ struct WritingRereviewTests {
         environment.frontmostProcess = { fakes.front }
         environment.lastInputAt = { fakes.lastInput }
         environment.now = { 10 }
+        environment.focusedValue = { _ in fakes.focusedValue }
         return environment
     }
 

@@ -16,9 +16,11 @@ struct PasteboardSnapshot: Equatable, Sendable {
     /// excluded, and one whose source it had classified. Carried to the generation it's put back as.
     var wasExcluded = false
     var wasAttributed = false
-    /// A copy the capture poll hadn't classified yet. It's put back unclassified, so the poll still
-    /// takes it to History, or keeps it out, as it would have.
+    /// A copy the capture poll hadn't classified yet. It's classified when it's borrowed, by the
+    /// poll's own rule, and put back with that source, so History and `{clipboard}` treat it as the
+    /// poll would have, never by whichever app is in front later.
     var wasPending = false
+    var pendingSource: ClipboardCaptureContext?
 
     /// The whole board, or an error when any item or type can't be read, or the board changes
     /// while it's read: an incomplete copy can't be put back, so nothing may be borrowed then.
@@ -77,23 +79,33 @@ enum PasteboardBorrowError: LocalizedError, Equatable {
 /// The selection fallback for apps whose selection Accessibility can't see (work item 2): ⌘C goes
 /// to the source app alone, and only its answer is read and put back.
 ///
-/// A clipboard change counts as that answer only while it can be told apart from anyone else's
-/// copy: within the timeout, before the panel closes and before the person types, clicks or copies
-/// in OpenRay. OpenRay can't see input made in other apps, as on a windowless hotkey run, so the
-/// app in front must also be the one that was when ⌘C went, and no key or click may have reached
-/// the Mac since (re-review #1). A change that can't be attributed is never read, nothing is put
-/// back over it, and the person is asked for the text instead. The answer is put back right after
-/// it's read. The source app writes it, so it carries no privacy markers, and clipboard managers
-/// that poll quickly may still see it, as with Raycast.
+/// macOS doesn't say which process wrote the clipboard, so a change is taken as the app's answer
+/// only when every check OpenRay can make holds (final review, blocker 1):
+/// - nothing on it says it came from another device or another app (Universal Clipboard's marker,
+///   `org.nspasteboard.source`, a password manager's own type);
+/// - the source app is still in front, or OpenRay's panel over it, the launcher is undisturbed and
+///   no key or click has reached the Mac since ⌘C went;
+/// - when the source app's focused element shares its whole value, the copied text is in it.
+///
+/// Anything else is never read, nothing is put back over it, and the person is asked for the text
+/// instead. What's left is a silent writer, such as a clipboard sync, that writes unmarked text
+/// (text the focused field also holds, when it shares it) while the app ignores ⌘C; Raycast has
+/// the same race. The answer is put back right after it's read. The source app writes it, so it
+/// carries no privacy markers, and clipboard managers that poll quickly may still see it, as with
+/// Raycast.
 @MainActor
 enum SelectionCopy {
     static let transientType = NSPasteboard.PasteboardType("org.nspasteboard.TransientType")
     static let concealedType = NSPasteboard.PasteboardType("org.nspasteboard.ConcealedType")
     /// The bundle id of the app that wrote a copy, where the app follows nspasteboard.org's convention.
     static let sourceType = NSPasteboard.PasteboardType("org.nspasteboard.source")
+    /// Types that say a copy came from another device.
+    static let remoteTypes: Set<String> = ["com.apple.is-remote-clipboard"]
+    /// Types an app writes on its own copies, with the bundle id prefixes of the apps that write them.
+    static let writerTypes: [String: [String]] = ["com.agilebits.onepassword": ["com.agilebits.", "com.1password."]]
 
     /// What the fallback does on the Mac. The live one is guarded; tests pass a fake key poster
-    /// that writes to a private pasteboard, and their own clock and input record.
+    /// that writes to a private pasteboard, and their own clock, input record and field.
     struct Environment {
         var checkAllowed: @MainActor () throws -> Void = {
             try SideEffectGuard.check("copying the selection in another app")
@@ -118,6 +130,9 @@ enum SelectionCopy {
         /// uptime clock. OpenRay's own ⌘C, posted to one app, isn't counted.
         var lastInputAt: @MainActor () -> TimeInterval = { HardwareInput.lastKeyOrClick() }
         var now: @MainActor () -> TimeInterval = { ProcessInfo.processInfo.systemUptime }
+        /// The whole value of the app's focused element, when Accessibility shares it; nil when it
+        /// doesn't, and in an inert launch, which never reads another app.
+        var focusedValue: @MainActor (NSRunningApplication) -> String? = { SelectedTextContext.focusedValue(in: $0) }
         /// Called with the answer, right before the clipboard is put back. Tests read it.
         var willRestore: @MainActor (NSPasteboard) -> Void = { _ in }
         /// Puts the snapshot back over a generation; see `PasteboardSnapshot.restore(to:over:)`,
@@ -133,25 +148,54 @@ enum SelectionCopy {
         static var live: Environment { Environment() }
     }
 
-    /// What tells the source app's answer apart from anyone else's copy: the app in front when ⌘C
-    /// went, when it went, and the source app.
+    /// What tells the source app's answer apart from anyone else's copy: the source app, and when
+    /// ⌘C went to it.
     struct Attribution: Equatable {
-        var front: pid_t?
+        var application: NSRunningApplication
         var postedAt: TimeInterval
-        var bundleIdentifier: String?
 
-        /// Whether a change seen now can still be the source app's: no key or click anywhere since
-        /// ⌘C went, and the same app in front, or OpenRay, whose panel may still be coming forward.
+        /// Whether a change seen now can still be the source app's: the source app in front, or
+        /// OpenRay, whose panel shows over it, and no key or click anywhere since ⌘C went.
         @MainActor func holds(_ environment: Environment) -> Bool {
             let current = environment.frontmostProcess()
-            guard current == front || current == ProcessInfo.processInfo.processIdentifier else { return false }
+            guard current == application.processIdentifier || current == ProcessInfo.processInfo.processIdentifier
+            else { return false }
             return environment.lastInputAt() <= postedAt
         }
 
-        /// Whether the copy on the board says another app wrote it.
-        @MainActor func isClaimedElsewhere(on pasteboard: NSPasteboard) -> Bool {
-            guard let writer = pasteboard.string(forType: SelectionCopy.sourceType), !writer.isEmpty else { return false }
-            return writer != bundleIdentifier
+        /// Whether the copy on the board carries a mark of another device, or of another app.
+        @MainActor func isMarkedElsewhere(on pasteboard: NSPasteboard) -> Bool {
+            let bundle = application.bundleIdentifier ?? ""
+            for item in pasteboard.pasteboardItems ?? [] {
+                let types = Set(item.types.map(\.rawValue))
+                guard SelectionCopy.remoteTypes.isDisjoint(with: types) else { return true }
+                if let writer = item.string(forType: SelectionCopy.sourceType), !writer.isEmpty, writer != bundle {
+                    return true
+                }
+                for (type, prefixes) in SelectionCopy.writerTypes where types.contains(type) {
+                    if !prefixes.contains(where: bundle.hasPrefix) { return true }
+                }
+            }
+            return false
+        }
+
+        /// Whether `text` can have come from the app's focused element: always when Accessibility
+        /// doesn't share its whole value, otherwise only when the value holds it. Runs of
+        /// whitespace compare as one space, since apps copy line breaks and spaces their own way.
+        @MainActor func fitsFocusedValue(_ text: String?, _ environment: Environment) -> Bool {
+            guard let value = environment.focusedValue(application), !Self.flattened(value).isEmpty else { return true }
+            guard let text else { return false }
+            let copied = Self.flattened(text)
+            return !copied.isEmpty && Self.flattened(value).contains(copied)
+        }
+
+        static func flattened(_ text: String) -> String {
+            text.split(whereSeparator: \.isWhitespace).joined(separator: " ")
+        }
+
+        /// Every check on the generation on the board now, read within it.
+        @MainActor func accepts(_ text: String?, on pasteboard: NSPasteboard, _ environment: Environment) -> Bool {
+            holds(environment) && !isMarkedElsewhere(on: pasteboard) && fitsFocusedValue(text, environment)
         }
     }
 
@@ -178,7 +222,7 @@ enum SelectionCopy {
 
     /// Sends ⌘C and waits for the app's answer. `snapshot` must be the board as it is now. Throws
     /// `CancellationError` when the wait is disturbed or cancelled, and `copyUnattributable` when a
-    /// change could be someone else's: nothing is read then, and nothing is put back.
+    /// change, or the app in front, fails a check: nothing is read then, and nothing is put back.
     static func read(
         from application: NSRunningApplication?, sourceName: String, pasteboard: NSPasteboard,
         snapshot: PasteboardSnapshot, environment: Environment = .live
@@ -193,9 +237,9 @@ enum SelectionCopy {
         try Task.checkCancellation()
         guard environment.isUndisturbed() else { throw CancellationError() }
         guard pasteboard.changeCount == snapshot.changeCount else { throw PasteboardBorrowError.unreadable }
-        let attribution = Attribution(
-            front: environment.frontmostProcess(), postedAt: environment.now(),
-            bundleIdentifier: application.bundleIdentifier)
+        let attribution = Attribution(application: application, postedAt: environment.now())
+        // Another app in front already: no answer could be told apart, so no ⌘C goes.
+        guard attribution.holds(environment) else { throw SelectionReadError.copyUnattributable(app: sourceName) }
         try environment.postCopy(application.processIdentifier)
         guard
             let answer = try await waitForAnswer(
@@ -204,7 +248,7 @@ enum SelectionCopy {
         let text = pasteboard.string(forType: .string)
         // Read within the answer's own generation: anything written after it is someone else's.
         guard pasteboard.changeCount == answer else { throw SelectionReadError.copyInterrupted(app: sourceName) }
-        guard !attribution.isClaimedElsewhere(on: pasteboard) else {
+        guard attribution.accepts(text, on: pasteboard, environment) else {
             throw SelectionReadError.copyUnattributable(app: sourceName)
         }
         environment.willRestore(pasteboard)
@@ -214,10 +258,10 @@ enum SelectionCopy {
     }
 
     /// Watches `lateAnswerWindow` more after a capture that got no certain answer. With an
-    /// `attribution` (a timeout), a late answer that can still be attributed to the app is put
-    /// back over. Once the launcher is disturbed, a change can't be attributed, or without one (a
-    /// capture that ended unsure), nothing is put back: the watch waits out the window, and
-    /// whatever landed by then is reported ambiguous. A later copy is never undone.
+    /// `attribution` (a timeout), a late answer that passes every check is put back over. Once the
+    /// launcher is disturbed, a change fails a check, or without one (a capture that ended unsure),
+    /// nothing is put back: the watch waits out the window, and whatever landed by then is reported
+    /// ambiguous. A later copy is never undone.
     static func watchLate(
         over snapshot: PasteboardSnapshot, attribution: Attribution?, on pasteboard: NSPasteboard,
         environment: Environment
@@ -231,7 +275,8 @@ enum SelectionCopy {
             }
             let generation = pasteboard.changeCount
             guard attributable, let attribution, generation != snapshot.changeCount else { continue }
-            guard !attribution.isClaimedElsewhere(on: pasteboard) else {
+            let text = pasteboard.string(forType: .string)
+            guard pasteboard.changeCount == generation, attribution.accepts(text, on: pasteboard, environment) else {
                 attributable = false
                 continue
             }
